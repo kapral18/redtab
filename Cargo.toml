@@ -1,0 +1,32 @@
+[package]
+name = "redtab"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Terminal Reddit reader with tabs, built on a local Redlib instance"
+license = "MIT"
+repository = "https://github.com/kapral18/redtab"
+publish = false
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+crossterm = "0.29"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+nucleo-matcher = "0.3"
+ratatui = "0.30"
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
+scraper = "0.27"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+unicode-width = "0.2"
+textwrap = "0.16"
+signal-hook = "0.4"
+ureq = "3"
+url = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

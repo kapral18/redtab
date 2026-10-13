@@ -1,0 +1,2249 @@
+
+
+<!DOCTYPE html>
+<html lang="en" class="fixed_navbar">
+	<head>
+		
+		<title>
+	Neovim
+	
+</title>
+		<meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+		<meta name="description" content="View on Redlib, an alternative private front-end to Reddit.">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0">
+		
+		<!-- General PWA -->
+		<meta name="theme-color" content="#1F1F1F">
+		<!-- iOS Application -->
+		<meta name="apple-mobile-web-app-title" content="Redlib">
+		<meta name="apple-mobile-web-app-capable" content="yes">
+		<meta name="apple-mobile-web-app-status-bar-style" content="default">
+		<!-- Android -->
+		<meta name="mobile-web-app-capable" content="yes">
+		<!-- iOS Logo -->
+		<link href="/touch-icon-iphone.png" rel="apple-touch-icon">
+		<!-- OpenSearch description file -->
+		<link rel="search" type="application/opensearchdescription+xml" title="Search Redlib" href="/opensearch.xml">
+		<!-- PWA Manifest -->
+		<link rel="manifest" type="application/json" href="/manifest.json">
+		<link rel="shortcut icon" type="image/x-icon" href="/favicon.ico"> 
+		<link rel="stylesheet" type="text/css" href="/style.css?v=0.36.0">
+		<!-- Video quality -->
+		<div id="video_quality" data-value=""></div>
+		
+		</head>
+	<body class="
+		
+		
+		 
+		 fixed_navbar">
+		<!-- NAVIGATION BAR -->
+		<nav class="
+			 fixed_navbar">
+			<div id="logo">
+				<a id="redlib" href="/"><span id="red">red</span><span id="lib">lib.</span></a>
+				
+	<details id="feeds">
+		<summary>Feeds</summary>
+		<div id="feed_list">
+			<p>MAIN FEEDS</p>
+			<a href="/">Home</a>
+			
+				<a href="/r/popular">Popular</a>
+				<a href="/r/all">All</a>
+			
+			
+				<p>REDDIT FEEDS</p>
+				
+					<a href="/r/AcademicUAP" >AcademicUAP</a>
+				
+					<a href="/r/AliensRHere" >AliensRHere</a>
+				
+					<a href="/r/belasting" >belasting</a>
+				
+					<a href="/r/BestGitHubRepos" >BestGitHubRepos</a>
+				
+					<a href="/r/commandline" >commandline</a>
+				
+					<a href="/r/confessions" >confessions</a>
+				
+					<a href="/r/coolgithubprojects" >coolgithubprojects</a>
+				
+					<a href="/r/coolguides" >coolguides</a>
+				
+					<a href="/r/dotfiles" >dotfiles</a>
+				
+					<a href="/r/educationalgifs" >educationalgifs</a>
+				
+					<a href="/r/ExpatFIRE" >ExpatFIRE</a>
+				
+					<a href="/r/expats" >expats</a>
+				
+					<a href="/r/ExperiencedDevs" >ExperiencedDevs</a>
+				
+					<a href="/r/Glitch_in_the_Matrix" >Glitch_in_the_Matrix</a>
+				
+					<a href="/r/imaginarymaps" >imaginarymaps</a>
+				
+					<a href="/r/immortalists" >immortalists</a>
+				
+					<a href="/r/InternetIsBeautiful" >InternetIsBeautiful</a>
+				
+					<a href="/r/IWantOut" >IWantOut</a>
+				
+					<a href="/r/learndutch" >learndutch</a>
+				
+					<a href="/r/lifehacks" >lifehacks</a>
+				
+					<a href="/r/LifeProTips" >LifeProTips</a>
+				
+					<a href="/r/mechanical_gifs" >mechanical_gifs</a>
+				
+					<a href="/r/microbiomenews" >microbiomenews</a>
+				
+					<a href="/r/neovim" class="selected">neovim</a>
+				
+					<a href="/r/ObscurePatentDangers" >ObscurePatentDangers</a>
+				
+					<a href="/r/OSINT" >OSINT</a>
+				
+					<a href="/r/passive_income" >passive_income</a>
+				
+					<a href="/r/passiveincome" >passiveincome</a>
+				
+					<a href="/r/personalfinance" >personalfinance</a>
+				
+					<a href="/r/sidehustle" >sidehustle</a>
+				
+					<a href="/r/SideProject" >SideProject</a>
+				
+					<a href="/r/SipsTea" >SipsTea</a>
+				
+					<a href="/r/skeptic" >skeptic</a>
+				
+					<a href="/r/TikTokCringe" >TikTokCringe</a>
+				
+					<a href="/r/tmux" >tmux</a>
+				
+					<a href="/r/UnderReportedNews" >UnderReportedNews</a>
+				
+					<a href="/r/UpliftingNews" >UpliftingNews</a>
+				
+					<a href="/r/vim" >vim</a>
+				
+					<a href="/r/YouShouldKnow" >YouShouldKnow</a>
+				
+			
+		</div>
+	</details>
+
+			</div>
+			
+	<form action="/r/neovim/search" id="searchbox">
+	<input id="search" type="text" name="q" placeholder="Search" title="Search redlib" value="">
+	
+	<div id="inside">
+		<input type="checkbox" name="restrict_sr" id="restrict_sr" checked>
+		<label for="restrict_sr" class="search_label" title="Restrict search to this subreddit">in /r/neovim</label>
+	</div>
+	
+	<button class="submit">
+		<svg width="15" viewBox="0 0 110 100" fill="none" stroke-width="10" stroke-linecap="round">
+			<path d="M20 50 H100" />
+			<path d="M75 15 L100 50 L75 85" />
+			&rarr;
+		</svg>
+	</button>
+</form>
+
+			<div id="links">
+				<a id="reddit_link" href="#popup">
+					<span>reddit</span>
+					<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+						<path d="M22 2L12 22"/>
+						<path d="M2 6.70587C3.33333 8.07884 3.33333 11.5971 3.33333 11.5971M3.33333 19.647V11.5971M3.33333 11.5971C3.33333 11.5971 5.125 7.47817 8 7.47817C10.875 7.47817 12 8.85114 12 8.85114"/>
+					</svg>
+				</a>
+				
+					<div class="popup" id="popup">
+	<div class="popup-inner">
+		<h1>You are about to leave Redlib</h1>
+		<p>Do you want to continue?</p>
+		<p id="reddit_url">https://www.reddit.com/r/neovim/</p>
+		<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 639.24 563">
+			<defs>
+				<style>.cls-1{fill:#000000;}.cls-2{fill:#f8aa00;}</style>
+			</defs>
+			<path class="cls-2" d="M322.03,0c1.95,2.5,4.88,.9,7.33,1.65,10.5,3.21,17.65,10.39,22.83,19.35,93.64,162.06,186.98,324.29,280.25,486.56,15.73,20.19,2.49,51.27-22.92,54.37-1.21,.19-2.72-.54-3.49,1.08H239.03c-70.33-2.43-141.6,.79-212.08-1.74-17.49-4.92-23.16-15.88-26.91-32.26l-.04-1.97C88.74,354.76,194.49,188.2,289.92,18.43c6.2-10.66,15.03-16.94,27.61-17.36,.95-.03,2.05,.18,2.51-1.07h2Zm-2.43,545c94.95-.02,189.9,.04,284.85-.02,11.84-.73,20.75-13.19,16.68-23.55C523.83,355.97,430.74,187.62,332.05,23.07c-7.93-9.02-22.2-6.58-27.23,3.22C230.28,156.11,155.21,285.64,80.41,415.31c-19.88,34.41-39.31,69.07-59.78,103.14-2.43,4.05-4.24,8.8-1.68,14.18,3.92,8.24,9.59,12.37,18.82,12.37,93.95,0,187.9,0,281.85,0Z"/>
+			<path class="cls-1" d="M319.61,545c-93.95,0-187.9,0-281.85,0-9.22,0-14.89-4.13-18.82-12.37-2.56-5.38-.75-10.13,1.68-14.18,20.47-34.07,39.9-68.73,59.78-103.14C155.21,285.64,230.28,156.11,304.82,26.29c5.03-9.8,19.3-12.24,27.23-3.22,98.7,164.55,191.79,332.9,289.1,498.35,4.06,10.36-4.85,22.82-16.68,23.55-94.94,.06-189.9,0-284.85,.02Zm.44-462.31C238.88,223.22,158.17,362.95,77.28,503h485.54c-80.94-140.13-161.61-279.79-242.77-420.31Z"/>
+			<path class="cls-2" d="M320.05,82.69c81.16,140.52,161.83,280.18,242.77,420.31H77.28C158.17,362.95,238.88,223.22,320.05,82.69Zm36.05,118.99c-.14-46.75-68.32-52.32-74.66-4.76,.73,51.49,9.2,102.97,12.63,154.49,1.18,13.14,10.53,21.81,23.32,22.76,13.12,.97,23.89-9.13,24.96-21.58,4.44-49.99,9.4-101.22,13.76-150.91Zm-36.56,271.4c48.8,.76,49.24-74.7-.31-75.47-53.45,3-46.02,78.12,.31,75.47Z"/>
+			<path class="cls-1" d="M356.1,201.67c-4.36,49.69-9.31,100.91-13.76,150.91-1.07,12.45-11.84,22.56-24.96,21.58-12.79-.95-22.14-9.63-23.31-22.76-3.43-51.52-11.9-103-12.63-154.49,6.33-47.53,74.51-42.03,74.66,4.76Z"/>
+			<path class="cls-1" d="M319.54,473.08c-46.34,2.64-53.75-72.47-.31-75.47,49.56,.78,49.1,76.24,.31,75.47Z"/>
+		</svg>
+		<a id="goback" href="#">No, go back!</a>
+		<a id="toreddit" href="https://www.reddit.com/r/neovim/" rel="nofollow">Yes, take me to Reddit</a>
+	</div>
+</div>
+				
+				<a id="settings_link" href="/settings">
+					<span>settings</span>
+					<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+						<title>settings</title>
+						<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+					</svg>
+				</a>
+			</div>
+		</nav>
+		
+		<!-- MAIN CONTENT -->
+		
+	<main>
+		
+		<div id="column_one">
+			<form id="sort">
+				<div id="sort_options">
+					
+						
+		<a class="selected" href="/r/neovim/hot">
+			Hot
+		</a>
+	
+		<a  href="/r/neovim/new">
+			New
+		</a>
+	
+		<a  href="/r/neovim/top">
+			Top
+		</a>
+	
+		<a  href="/r/neovim/rising">
+			Rising
+		</a>
+	
+		<a  href="/r/neovim/controversial">
+			Controversial
+		</a>
+	
+					
+				</div>
+				
+			</form>
+
+			
+
+			
+
+			
+
+			
+			<div id="posts">
+			
+			
+			<hr class="sep" />
+			<div class="post stickied" id="1wglruo">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/AutoModerator">u/AutoModerator</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Sep 15 2026, 01:00:35 UTC">28d ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Dotfile Review%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#ff4500;"
+				dir="ltr"><span>Dotfile Review</span></a>
+		
+		<a href="/r/neovim/comments/1wglruo/monthly_dotfile_review_thread/">Monthly Dotfile Review Thread</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<div class="post_score" title="20">
+    
+    20
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>If you want your dotfiles reviewed, or just want to show off your awesome config, post a link and preferably a screenshot as a top comment.</p>
+
+<p>Everyone else can read through the configurations and comment suggestions, ask questions, compliment, etc.</p>
+
+<p>As always, please be civil. Constructive criticism is encouraged, but insulting will not be tolerated.</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1wglruo/monthly_dotfile_review_thread/" class="post_comments" title="12 comments">12 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post stickied" id="1x4ov5o">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/AutoModerator">u/AutoModerator</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 13 2026, 06:00:25 UTC">8h ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22101 Questions%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#ff66ac;"
+				dir="ltr"><span>101 Questions</span></a>
+		
+		<a href="/r/neovim/comments/1x4ov5o/weekly_101_questions_thread/">Weekly 101 Questions Thread</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<div class="post_score" title="3">
+    
+    3
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>A thread to ask anything related to Neovim. No matter how small it may be.</p>
+
+<p>Let&#39;s help each other and be kind.</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x4ov5o/weekly_101_questions_thread/" class="post_comments" title="8 comments">8 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x4v4sn">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/echasnovski">u/echasnovski</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 13 2026, 12:20:20 UTC">1h ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Plugin%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#0079d3;"
+				dir="ltr"><span>Plugin</span></a>
+		
+		<a href="/r/neovim/comments/1x4v4sn/five_year_anniversary_of_mininvim/">Five year anniversary of ‘mini.nvim’</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<a class="post_thumbnail" href="https://nvim-mini.org/blog/2026-10-13-five-year-anniversary.html" rel="nofollow">
+		
+		<div style="max-width:140px;max-height:73px;">
+			<svg width="140px" height="73px" xmlns="http://www.w3.org/2000/svg">
+				<image width="100%" height="100%" href="/preview/external-pre/Rs54yuAdaMsE0l8Sor1zPrFMUyCfgOvGSBZCm7uSczs.png?width=140&#38;height=73&#38;auto=webp&#38;s=92e56d525c6b194d546edf8fbf35f32cd702a3c8"/>
+				<desc>
+					<img loading="lazy" alt="Thumbnail" src="/preview/external-pre/Rs54yuAdaMsE0l8Sor1zPrFMUyCfgOvGSBZCm7uSczs.png?width=140&#38;height=73&#38;auto=webp&#38;s=92e56d525c6b194d546edf8fbf35f32cd702a3c8"/>
+				</desc>
+			</svg>
+		</div>
+		
+		<span>nvim-mini.org</span>
+	</a>
+	
+	<div class="post_score" title="Hidden">
+    
+    •
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x4v4sn/five_year_anniversary_of_mininvim/" class="post_comments" title="13 comments">13 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x465py">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/emrearmagan">u/emrearmagan</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 12 2026, 16:15:51 UTC">21h ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Plugin%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#0079d3;"
+				dir="ltr"><span>Plugin</span></a>
+		
+		<a href="/r/neovim/comments/1x465py/plugin_atlasnvim_v080_pr_reviews_and_issues/">[PLUGIN] atlas.nvim v0.8.0 - PR reviews and issues inside Neovim</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<a class="post_thumbnail" href="/r/neovim/comments/1x465py/plugin_atlasnvim_v080_pr_reviews_and_issues/" rel="nofollow">
+		
+		<div style="max-width:140px;max-height:93px;">
+			<svg width="140px" height="93px" xmlns="http://www.w3.org/2000/svg">
+				<image width="100%" height="100%" href="/preview/pre/o3a40v9ps1vh1.png?width=140&#38;height=93&#38;auto=webp&#38;s=8652f07084cc0c6b1948422f8194f39f681c9942"/>
+				<desc>
+					<img loading="lazy" alt="Thumbnail" src="/preview/pre/o3a40v9ps1vh1.png?width=140&#38;height=93&#38;auto=webp&#38;s=8652f07084cc0c6b1948422f8194f39f681c9942"/>
+				</desc>
+			</svg>
+		</div>
+		
+		<span>gallery</span>
+	</a>
+	
+	<div class="post_score" title="155">
+    
+    155
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>Hey <a href="/r/neovim/">r/neovim</a> </p>
+
+<p>I have been working more on <code>atlas.nvim</code> and just released <code>v0.8.0</code>!</p>
+
+<p>Some things added since my last post about <code>v0.4.0</code>:</p>
+
+<p>- Code suggestions, multiline comments and LSP support in reviews<br/>
+- Repository browsing<br/>
+- Pipelines and job logs<br/>
+- UI improvements and quality-of-life changes</p>
+
+<p>It works with GitHub, GitLab and Bitbucket PRs, plus Jira/GitHub/GitLab issues. There have also been quite a few fixes around reviews and comments.</p>
+
+<p>If you try it out, I would love to hear what works and what does not :)</p>
+
+<p><a href="https://github.com/emrearmagan/atlas.nvim">https://github.com/emrearmagan/atlas.nvim</a></p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x465py/plugin_atlasnvim_v080_pr_reviews_and_issues/" class="post_comments" title="32 comments">32 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x456u9">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/RedEye-Developers">u/RedEye-Developers</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 12 2026, 15:40:07 UTC">22h ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Discussion%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#ff8717;"
+				dir="ltr"><span>Discussion</span></a>
+		
+		<a href="/r/neovim/comments/1x456u9/would_rewriting_all_of_neovim_including_plugins/">Would Rewriting All of Neovim, Including Plugins and Configs Everything in 100% C Make It Faster?</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<div class="post_media_content">
+		<a href="/img/v52g9gad22vh1.png" class="post_media_image short" >
+			
+			<svg
+				width="312px"
+				height="148px"
+				xmlns="http://www.w3.org/2000/svg">
+					<image width="100%" height="100%" href="/img/v52g9gad22vh1.png"/>
+					<desc>
+						<img loading="lazy" alt="Post image" src="/img/v52g9gad22vh1.png"/>
+					</desc>
+			</svg>
+			
+		</a>
+	</div>
+	
+	<div class="post_score" title="139">
+    
+    139
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>I am just curious 100% C will make Neovim faster including plugin, configuration files everything.</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x456u9/would_rewriting_all_of_neovim_including_plugins/" class="post_comments" title="123 comments">123 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x4tnte">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/CoolkieTW">u/CoolkieTW</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 13 2026, 11:03:22 UTC">3h ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Need Help%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#0dd3bb;"
+				dir="ltr"><span>Need Help</span></a>
+		
+		<a href="/r/neovim/comments/1x4tnte/program_output_overwritten_by_program_exited_0/">Program output overwritten by [Program exited 0] message expected?</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<div class="post_score" title="1">
+    
+    1
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>If the program output equals or more lines than the window size. Last line of the output will be overwritten by &quot;[Program exited 0]&quot; message.</p>
+
+<p>For example there&#39;s a program output 12 lines of output, it supposed to look like this</p>
+
+<pre><code>1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+[Program exited 0]
+</code></pre>
+
+<p>However if the windows size is equals or smaller than 12. It will be look like this</p>
+
+<pre><code>1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+[Program exited 0] &lt;-- 12 should be here
+</code></pre>
+
+<p>Last line will be truncated by program exit message.</p>
+
+<p>This is the minimum code to reproduce the issue.</p>
+
+<pre><code>#include &lt;stdio.h&gt;
+
+int main(int argc, char *argv[]) {
+    int maxlines = 100;
+    for (int i=0; i&lt;maxlines; i++) {
+        printf(&quot;meow\n&quot;);
+    }
+    printf(&quot;LAST LINE&quot;);
+}
+</code></pre>
+
+<p><a href="/link/1x4tnte/video/3umskyp9w7vh1/player">https://reddit.com/link/1x4tnte/video/3umskyp9w7vh1/player</a></p>
+
+<p>I know in practice every program should always output \n at the end. However, if there are additional newline at the end, some of judge systems would not accept.</p>
+
+<p>I&#39;m not exactly sure if this this issue is intentional or unexpected. So I came here to get some feedback whether I should create a GitHub Issue for this.</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x4tnte/program_output_overwritten_by_program_exited_0/" class="post_comments" title="3 comments">3 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x4sqai">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/itmightbeCarlos">u/itmightbeCarlos</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 13 2026, 10:09:42 UTC">4h ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Plugin%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#0079d3;"
+				dir="ltr"><span>Plugin</span></a>
+		
+		<a href="/r/neovim/comments/1x4sqai/yamlnvim_singlefile_yaml_parser_encoder_for_your/">yaml.nvim: single-file YAML parser &#38; encoder for your plugins</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<div class="post_score" title="1">
+    
+    1
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>Hi everyone!</p>
+
+<p>Just wanted to share this small, self-contained plugin for parsing YAML files into Lua tables and encoding Lua tables into YAML strings, all in a single file, so you can copy-paste it into your plugins if you ever need to support YAML.</p>
+
+<p>I&#39;m currently using it on some dev branches of other plugins I&#39;m working on, and it works flawlessly, so I&#39;m leaving it here in case it&#39;s useful to anybody.</p>
+
+<p>Cheers!</p>
+
+<p><a href="https://github.com/cvigilv/yaml.nvim">https://github.com/cvigilv/yaml.nvim</a></p>
+
+<p><strong>AI disclosure:</strong> I used AI to convert a prototype parser and writer + the work I forked the repo from, into the final form you will see in the repo. I know we are in uncertain times regarding the ethics and use of this tool; therefore, I wanted to include this small disclosure at the end to be honest about the project&#39;s status.</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x4sqai/yamlnvim_singlefile_yaml_parser_encoder_for_your/" class="post_comments" title="2 comments">2 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x4au99">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/_JustPotato">u/_JustPotato</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 12 2026, 19:07:00 UTC">19h ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Random%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#646d73;"
+				dir="ltr"><span>Random</span></a>
+		
+		<a href="/r/neovim/comments/1x4au99/vimcomplete_a_selfhosted_vimmotion_esolang_with_a/">VimComplete: A Self-hosted Vim-motion Esolang with a Game of Life Implementation</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<div class="post_score" title="8">
+    
+    8
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>I originally intended to simulate Rule 110 using Vim motions (hence the name), but I fell down the rabbit hole. So here we are.</p>
+
+<p>VimComplete is a self-hosted esoteric programming language built around Vim motions. No Ex commands or the <code>=</code> register, which uses VimScript for evaluation. Each source line is executed using a <code>:normal!</code> command in the runtime.</p>
+
+<p>Registers <code>x</code>, <code>y</code>, and <code>z</code> are used to capture the exit code, stdout, and stderr, respectively. Register <code>c</code> passes command-line arguments.</p>
+
+<p>The repository currently includes:</p>
+
+<ul>
+<li>A bootstrapped compiler with preprocessing, validation, optimisation, and code generation stages</li>
+<li>A recursive text-substitution model for multi-module support, similar to C&#39;s <code>#include</code></li>
+<li>An implementation of Conway&#39;s Game of Life</li>
+<li>A standard library with search and replace, assertions, file diffs, basic arithmetic, and more</li>
+<li>Unit tests for the compiler and standard library</li>
+<li>A Cobra-based CLI, step debugger, and Neovim syntax highlighting support</li>
+</ul>
+
+<p>If you’re interested in how the source code works, <code>docs/techniques.md</code> describes some common techniques used for emulating standard programming constructs like subroutines, conditionals, iteration, and asserts.</p>
+
+<p>Do clone the repository instead of browsing the source GitHub because GitHub can’t render raw controls characters, which the source code is filled to the brim with.</p>
+
+<p>Repository link: <a href="https://github.com/ksaze/vim-complete">ksaze/vim-complete</a></p>
+
+<p>P.S. Surely this will help me land a job. Good going, me.</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x4au99/vimcomplete_a_selfhosted_vimmotion_esolang_with_a/" class="post_comments" title="0 comments">0 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x3hp7s">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/FoulBachelor">u/FoulBachelor</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 11 2026, 19:52:07 UTC">1d ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Plugin%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#0079d3;"
+				dir="ltr"><span>Plugin</span></a>
+		
+		<a href="/r/neovim/comments/1x3hp7s/shelllsp_one_static_binary_for_bashzshshdashksh/">shell-lsp: one static binary for bash/zsh/sh/dash/ksh that does the work of bashls, shellcheck, shfmt and more</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<div class="post_score" title="29">
+    
+    29
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>I am a long time nvim user and terminal based workflow enjoyer, and as such I have been making and deleting shell scripts for a few years at this point.</p>
+
+<p>I use zsh and found it frustrating that the <a href="https://github.com/bash-lsp/bash-language-server">bash language server</a> didn&#39;t have support for zsh, beyond their syntax overlap. Much time was spent trying to optimize away process forks and evals, without really having the tooling geared towards it.</p>
+
+<p>Another thing I found annoying was that even if I wrote bash, it wouldn&#39;t really lint in a way which allowed you to split your scripts into multiple files and to have proper linting for the usage of symbols in these merged scopes.</p>
+
+<p>I didn&#39;t really like that it offloaded work to separate binaries for formatting and linting, despite this being built into the language server protocol spec.</p>
+
+<p>Lastly I didn&#39;t like how it was written in Js and the performance overhead that came with it.</p>
+
+<p>So I spent the last couple of days making a full LSP implementation in go for all unixlike shells.</p>
+
+<p><a href="https://github.com/stubbedev/shell-lsp">shell-lsp</a></p>
+
+<p>It was made using AI via a clean room method, where agents created a feature and test suite and fixtures spec by looking at the bash-language-server, shfmt and shellcheck. This specification was extended to map features supported by more fully featured language servers like gopls and rust-analyzer, to provide richer support for refactoring and contextual completions.</p>
+
+<p>A separate set of agents then implemented this spec and test suite.</p>
+
+<p>Feel free to open an issue or send a pr if you decide to try it out. :)</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x3hp7s/shelllsp_one_static_binary_for_bashzshshdashksh/" class="post_comments" title="19 comments">19 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x2i84c">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/Wonderful-Plastic316">u/Wonderful-Plastic316</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 10 2026, 15:35:12 UTC">2d ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Random%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#646d73;"
+				dir="ltr"><span>Random</span></a>
+		
+		<a href="/r/neovim/comments/1x2i84c/my_gf_gave_me_a_star_as_a_gift_for_reaching_1k/">My gf gave me a star as a gift for reaching 1k stars on my neovim plugin</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<div class="post_media_content">
+		<a href="/img/qhawoiqsxmuh1.jpeg" class="post_media_image short" >
+			
+			<svg
+				width="1099px"
+				height="899px"
+				xmlns="http://www.w3.org/2000/svg">
+					<image width="100%" height="100%" href="/img/qhawoiqsxmuh1.jpeg"/>
+					<desc>
+						<img loading="lazy" alt="Post image" src="/img/qhawoiqsxmuh1.jpeg"/>
+					</desc>
+			</svg>
+			
+		</a>
+	</div>
+	
+	<div class="post_score" title="1144">
+    
+    1.1k
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>Hey vimmers,</p>
+
+<p>Recently, <a href="https://github.com/igorlfs/nvim-dap-view">nvim-dap-view</a> reached 1k stars on GitHub! Hooray!</p>
+
+<p>As a gift, I got this lovely star &#39;,:)</p>
+
+<p>Thanks to everyone who starred or contributed in some other way, you guys rock! Special thanks to <a href="https://github.com/Demorome">demorome</a> on GitHub, my first monthly sponsor!</p>
+
+<p>For those who&#39;re still coding by hand and don&#39;t know it yet, nvim-dap-view is an interface for debugging directly from neovim, based on <a href="https://codeberg.org/mfussenegger/nvim-dap">nvim-dap</a>. It is extensively customizable and even comes with built-in inline variable inspection (via virtual text). It&#39;s awesome!</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x2i84c/my_gf_gave_me_a_star_as_a_gift_for_reaching_1k/" class="post_comments" title="24 comments">24 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x39ptr">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/YaBoyUneven">u/YaBoyUneven</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 11 2026, 14:33:12 UTC">1d ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Need Help┃Solved%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#0dd3bb;"
+				dir="ltr"><span>Need Help┃Solved</span></a>
+		
+		<a href="/r/neovim/comments/1x39ptr/treesitter_was_set_up_but_no_syntax_highlighting/">Treesitter was set up but no syntax highlighting</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<div class="post_score" title="7">
+    
+    7
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>Hello I have a small problem: I have installed treesitter, its dependencies, parsers and querries, and started it, but there is no difference made to my syntax highlighting. Can someone help me figure out what I am doing wrong?</p>
+
+<p>Bastardized code I use:</p>
+
+<pre><code>--=====OPTIONS=====--
+
+-- Set &lt;space&gt; as the leader key
+-- See `:h mapleader`
+-- NOTE: Must happen before plugins are loaded (otherwise wrong leader will be used)
+vim.g.mapleader = &#39; &#39;
+
+-- OPTIONS
+--
+-- See `:h vim.o`
+-- NOTE: You can change these options as you wish!
+-- For more options, you can see `:h option-list`
+-- To see documentation for an option, you can use `:h &#39;optionname&#39;`, for example `:h &#39;number&#39;`
+-- (Note the single quotes)
+
+vim.o.number = true -- Show line numbers in a column.
+
+-- Show line numbers relative to where the cursor is.
+-- Affects the &#39;number&#39; option above, see `:h number_relativenumber`.
+vim.o.relativenumber = false
+
+-- Sync clipboard between OS and Neovim. Schedule the setting after `UIEnter` because it can
+-- increase startup-time. Remove this option if you want your OS clipboard to remain independent.
+-- See `:h &#39;clipboard&#39;`
+vim.api.nvim_create_autocmd(&#39;UIEnter&#39;, {
+ callback = function()
+   vim.o.clipboard = &#39;unnamedplus&#39;
+ end,
+})
+
+-- Case-insensitive searching UNLESS \C or one or more capital letters in the search term
+vim.o.ignorecase = true
+vim.o.smartcase = true
+
+vim.o.cursorline = true -- Highlight the line where the cursor is on.
+vim.o.scrolloff = 10 -- Keep this many screen lines above/below the cursor.
+vim.o.list = true -- Show &lt;tab&gt; and trailing spaces.
+
+-- If performing an operation that would fail due to unsaved changes in the buffer (like `:q`),
+-- instead raise a dialog asking if you wish to save the current file(s). See `:h &#39;confirm&#39;`
+vim.o.confirm = true
+
+-- KEYMAPS
+--
+-- See `:h vim.keymap.set()`, `:h mapping`, `:h keycodes`
+
+-- Use &lt;Esc&gt; to exit terminal mode
+vim.keymap.set(&#39;t&#39;, &#39;&lt;Esc&gt;&#39;, &#39;&lt;C-\\&gt;&lt;C-n&gt;&#39;)
+
+-- Map &lt;A-j&gt;, &lt;A-k&gt;, &lt;A-h&gt;, &lt;A-l&gt; to navigate between windows in any modes
+vim.keymap.set({ &#39;t&#39;, &#39;i&#39; }, &#39;&lt;A-h&gt;&#39;, &#39;&lt;C-\\&gt;&lt;C-n&gt;&lt;C-w&gt;h&#39;)
+vim.keymap.set({ &#39;t&#39;, &#39;i&#39; }, &#39;&lt;A-j&gt;&#39;, &#39;&lt;C-\\&gt;&lt;C-n&gt;&lt;C-w&gt;j&#39;)
+vim.keymap.set({ &#39;t&#39;, &#39;i&#39; }, &#39;&lt;A-k&gt;&#39;, &#39;&lt;C-\\&gt;&lt;C-n&gt;&lt;C-w&gt;k&#39;)
+vim.keymap.set({ &#39;t&#39;, &#39;i&#39; }, &#39;&lt;A-l&gt;&#39;, &#39;&lt;C-\\&gt;&lt;C-n&gt;&lt;C-w&gt;l&#39;)
+vim.keymap.set({ &#39;n&#39; }, &#39;&lt;A-h&gt;&#39;, &#39;&lt;C-w&gt;h&#39;)
+vim.keymap.set({ &#39;n&#39; }, &#39;&lt;A-j&gt;&#39;, &#39;&lt;C-w&gt;j&#39;)
+vim.keymap.set({ &#39;n&#39; }, &#39;&lt;A-k&gt;&#39;, &#39;&lt;C-w&gt;k&#39;)
+vim.keymap.set({ &#39;n&#39; }, &#39;&lt;A-l&gt;&#39;, &#39;&lt;C-w&gt;l&#39;)
+
+-- AUTOCOMMANDS (EVENT HANDLERS)
+--
+-- See `:h lua-guide-autocommands`, `:h autocmd`, `:h nvim_create_autocmd()`
+
+-- Highlight when yanking (copying) text.
+-- Try it with `yap` in normal mode. See `:h vim.hl.on_yank()`
+vim.api.nvim_create_autocmd(&#39;TextYankPost&#39;, {
+ desc = &#39;Highlight when yanking (copying) text&#39;,
+ callback = function()
+   vim.hl.on_yank()
+ end,
+})
+
+-- USER COMMANDS: DEFINE CUSTOM COMMANDS
+--
+-- See `:h nvim_create_user_command()` and `:h user-commands`
+
+-- Create a command `:GitBlameLine` that print the git blame for the current line
+vim.api.nvim_create_user_command(&#39;GitBlameLine&#39;, function()
+ local line_number = vim.fn.line(&#39;.&#39;) -- Get the current line number. See `:h line()`
+ local filename = vim.api.nvim_buf_get_name(0)
+ print(vim.system({ &#39;git&#39;, &#39;blame&#39;, &#39;-L&#39;, line_number .. &#39;,+1&#39;, filename }):wait().stdout)
+end, { desc = &#39;Print the git blame for the current line&#39; })
+
+-- PLUGINS
+--
+-- See `:h :packadd`, `:h vim.pack`
+--
+-- Add the &quot;nohlsearch&quot; package to automatically disable search highlighting after
+-- &#39;updatetime&#39; and when going to insert mode.
+vim.cmd(&#39;packadd! nohlsearch&#39;)
+
+-- Install third-party plugins via &quot;vim.pack.add()&quot;.
+vim.pack.add({
+ -- Quickstart configs for LSP
+ &#39;https://github.com/neovim/nvim-lspconfig&#39;,
+ -- Fuzzy picker
+ &#39;https://github.com/ibhagwan/fzf-lua&#39;,
+ -- Autocompletion
+ &#39;https://github.com/nvim-mini/mini.completion&#39;,
+ -- Enhanced quickfix/loclist
+ &#39;https://github.com/stevearc/quicker.nvim&#39;,
+ -- Git integration
+ &#39;https://github.com/lewis6991/gitsigns.nvim&#39;,
+ -- Autopairs
+ &#39;https://github.com/altermo/ultimate-autopair.nvim.git&#39;,
+ -- Tree-Sitter
+ &#39;https://github.com/nvim-treesitter/nvim-treesitter.git&#39;,
+})
+
+-- Treesitter stuff
+require(&#39;nvim-treesitter&#39;).install {&#39;cpp&#39;, &#39;lua&#39;}
+
+--Highlight C++ Treesitter
+vim.api.nvim_create_autocmd(&#39;FileType&#39;, {
+ pattern = &#39;*&#39;,
+ callback = function(args)
+       local buf = args.buf
+       local ft = vim.bo[buf].filetype
+
+       local lang = vim.treesitter.language.get_lang(ft)
+       if not lang then
+          return
+       end
+
+       local ok_add = pcall(vim.treesitter.language.add, lang)
+       if not ok_add then
+               return
+       end
+
+       pcall(vim.treesitter.start, buf, lang)
+ end,
+})
+
+-- require
+require(&#39;fzf-lua&#39;).setup { fzf_colors = true }
+require(&#39;mini.completion&#39;).setup {}
+require(&#39;quicker&#39;).setup {}
+require(&#39;gitsigns&#39;).setup {}
+require(&#39;ultimate-autopair&#39;).setup {}
+require(&#39;nvim-treesitter&#39;).setup {}
+</code></pre>
+
+<p>TURNS OUT THE STANDARD COLORSCHEME JUST DIDNT SUPPORT SYNTAX HIGHLIGHTING??</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x39ptr/treesitter_was_set_up_but_no_syntax_highlighting/" class="post_comments" title="3 comments">3 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x3dtvu">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/MarMarJinks">u/MarMarJinks</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 11 2026, 17:19:05 UTC">1d ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Need Help┃Solved%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#0dd3bb;"
+				dir="ltr"><span>Need Help┃Solved</span></a>
+		
+		<a href="/r/neovim/comments/1x3dtvu/treesitter_syntax_highlighting_issue_in_scss_files/">Treesitter syntax highlighting issue in SCSS files.</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<div class="post_score" title="4">
+    
+    4
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>Treesitter seems to have trouble on lines that are accessing anything from a namespace that isn&#39;t a simple variable.</p>
+
+<figure><a href="/preview/pre/gm5oiuxyevuh1.png?width=502&amp;format=png&amp;auto=webp&amp;s=15b7540a0711925fdfe572d04f7375376b7f42c7"><img loading="lazy" src="/preview/pre/gm5oiuxyevuh1.png?width=502&amp;format=png&amp;auto=webp&amp;s=15b7540a0711925fdfe572d04f7375376b7f42c7"></a></figure>
+
+<figure><a href="/preview/pre/2x3aphn0fvuh1.png?width=873&amp;format=png&amp;auto=webp&amp;s=765f4ecc7c104b2cf663d31ca2bd6c7841da63e6"><img loading="lazy" src="/preview/pre/2x3aphn0fvuh1.png?width=873&amp;format=png&amp;auto=webp&amp;s=765f4ecc7c104b2cf663d31ca2bd6c7841da63e6"></a></figure>
+
+<p>I also find it weird how it doesn&#39;t really differentiate between different types of selectors, even though normal CSS files seem to be fine:</p>
+
+<figure><a href="/preview/pre/prtnvkwgfvuh1.png?width=358&amp;format=png&amp;auto=webp&amp;s=6b5b2c6828a1b23a49659961adeaa5e59dc16d32"><img loading="lazy" src="/preview/pre/prtnvkwgfvuh1.png?width=358&amp;format=png&amp;auto=webp&amp;s=6b5b2c6828a1b23a49659961adeaa5e59dc16d32"></a></figure>
+
+<p>I haven&#39;t really touched the existing Treesitter config provided by kickstart.nvim at all.</p>
+
+<p>EDIT: I replaced my SCSS parser with <a href="https://github.com/simeonoff/tree-sitter-scss">https://github.com/simeonoff/tree-sitter-scss</a>, and it works ok now. It still doesn&#39;t differentiate between different types of selectors, but it&#39;s more usable now.</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x3dtvu/treesitter_syntax_highlighting_issue_in_scss_files/" class="post_comments" title="5 comments">5 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x2hp05">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/jakmazdev">u/jakmazdev</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 10 2026, 15:12:29 UTC">2d ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Color Scheme%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#46d160;"
+				dir="ltr"><span>Color Scheme</span></a>
+		
+		<a href="/r/neovim/comments/1x2hp05/oxide_a_minimalist_monochromebased_colorscheme/">oxide - a minimalist, monochrome-based colorscheme for neovim (and more)</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<a class="post_thumbnail" href="/r/neovim/comments/1x2hp05/oxide_a_minimalist_monochromebased_colorscheme/" rel="nofollow">
+		
+		<div style="max-width:140px;max-height:97px;">
+			<svg width="140px" height="97px" xmlns="http://www.w3.org/2000/svg">
+				<image width="100%" height="100%" href="/preview/pre/31l0thvoonuh1.png?width=140&#38;height=97&#38;auto=webp&#38;s=a0212c266344702753299508d70c86f501b6e481"/>
+				<desc>
+					<img loading="lazy" alt="Thumbnail" src="/preview/pre/31l0thvoonuh1.png?width=140&#38;height=97&#38;auto=webp&#38;s=a0212c266344702753299508d70c86f501b6e481"/>
+				</desc>
+			</svg>
+		</div>
+		
+		<span>gallery</span>
+	</a>
+	
+	<div class="post_score" title="143">
+    
+    143
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>Hey, I&#39;ve been working on oxide for over a year now and wanted to share it here ;)</p>
+
+<p>I kept trying different colorschemes and never quite found one that suited me. I like minimalism and find too many colors distracting. I tried fully monochrome themes too, but realized I still wanted color to help distinguish different parts of the code.</p>
+
+<p>With oxide, I use color for syntax highlighting and useful feedback, like errors and search matches. The rest of the UI stays quiet. The backgrounds, borders, and regular text use neutral grays without colored tints.</p>
+
+<p>I also like having a consistent palette across my tools, so I&#39;ve made ports for Zed, VS Code, Ghostty, kitty, WezTerm, and Alacritty, as well as tools like Yazi and Lazygit.</p>
+
+<p>You can find the Neovim version here: <a href="https://github.com/oxidescheme/nvim">https://github.com/oxidescheme/nvim</a></p>
+
+<p>It&#39;s still a small project, and I don&#39;t actively use every tool I&#39;ve made a port for, so some ports may have rough edges thus bug reports are welcome, and I&#39;d love to hear what you think, thanks!</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x2hp05/oxide_a_minimalist_monochromebased_colorscheme/" class="post_comments" title="15 comments">15 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x2akdv">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/piotr1215">u/piotr1215</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 10 2026, 09:01:43 UTC">3d ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Video%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#5353ac;"
+				dir="ltr"><span>Video</span></a>
+		
+		<a href="/r/neovim/comments/1x2akdv/neovim_multiline_editing_overview_multicursor/">Neovim Multi-Line Editing Overview, Multicursor Included</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<div class="post_score" title="129">
+    
+    129
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>Neovim nightly now ships native multicursor, so this was a good opportunity to summarize and showcase every other built-in way to edit many lines in neovim. Multi-editing in neovim is one of its coolest features and can be done in many ways depending on the task. With multicursor implemented in <em>neovim way</em> we have now even more power of editing.</p>
+
+<p>Huge thanks to neovim team and maintainers for landing this feature!</p>
+
+<p><a href="https://youtu.be/S5kfUZQNzhU">https://youtu.be/S5kfUZQNzhU</a></p>
+
+<hr/>
+
+<h2>#1 Visual Block: <code>Ctrl-v</code></h2>
+
+<p>Select a rectangle, then <code>I</code> or <code>A</code> types into every row of it.</p>
+
+<table><thead>
+<tr>
+<th>Keys</th>
+<th>Effect</th>
+</tr>
+</thead><tbody>
+<tr>
+<td><code>Ctrl-v G I- &lt;Esc&gt;</code></td>
+<td>Insert <code>-</code> before the column on every line</td>
+</tr>
+<tr>
+<td><code>Ctrl-v G $ A; &lt;Esc&gt;</code></td>
+<td>Append <code>;</code> at every line end</td>
+</tr>
+</tbody></table>
+
+<p>Best for the same column on adjacent lines. Breaks when the target moves from line to line.</p>
+
+<h2>#2 Normal on a Range: <code>:norm</code></h2>
+
+<p>Run normal-mode keys on each line of a range. Motions find each line&#39;s own target.</p>
+
+<table><thead>
+<tr>
+<th>Command</th>
+<th>Effect</th>
+</tr>
+</thead><tbody>
+<tr>
+<td><code>:%norm I-</code></td>
+<td>Prefix every line with <code>-</code></td>
+</tr>
+<tr>
+<td><code>:%norm xf]D</code></td>
+<td>Delete the <code>[</code>, jump to <code>]</code>, delete to the end</td>
+</tr>
+</tbody></table>
+
+<h2>#3 Global Command: <code>:g</code> and <code>:v</code></h2>
+
+<p>Pick lines by a condition anywhere in the file, then run a command on them.</p>
+
+<table><thead>
+<tr>
+<th>Command</th>
+<th>Effect</th>
+</tr>
+</thead><tbody>
+<tr>
+<td><code>:g/pattern/cmd</code></td>
+<td>Run cmd on lines that match</td>
+</tr>
+<tr>
+<td><code>:v/pattern/cmd</code></td>
+<td>Run cmd on lines that do not</td>
+</tr>
+<tr>
+<td><code>:v/:/s/^/[ok] /</code></td>
+<td>Prefix every line without a colon</td>
+</tr>
+<tr>
+<td><code>:g/error/.!tr a-z A-Z</code></td>
+<td>Run a CLI on matching lines only</td>
+</tr>
+</tbody></table>
+
+<h2>#4 Substitution: <code>:s</code></h2>
+
+<p>Rewrite every match of a regex, with groups and case changes.</p>
+
+<p><code>:%s/\v_(.)/\u\1/g</code> turns snake_case into camelCase:</p>
+
+<table><thead>
+<tr>
+<th>Part</th>
+<th>Meaning</th>
+</tr>
+</thead><tbody>
+<tr>
+<td><code>\v</code></td>
+<td>Very magic: <code>( )</code> group without backslashes</td>
+</tr>
+<tr>
+<td><code>_(.)</code></td>
+<td>An underscore and the letter after it</td>
+</tr>
+<tr>
+<td><code>\u\1</code></td>
+<td>That letter, uppercased</td>
+</tr>
+<tr>
+<td><code>g</code></td>
+<td>Every match on the line</td>
+</tr>
+</tbody></table>
+
+<h2>#5 External Commands: <code>:{range}!</code></h2>
+
+<p>Any tool that reads stdin and writes stdout becomes an edit.</p>
+
+<table><thead>
+<tr>
+<th>Command</th>
+<th>Effect</th>
+</tr>
+</thead><tbody>
+<tr>
+<td><code>:%!sort -u</code></td>
+<td>Sort the lines, drop duplicates</td>
+</tr>
+<tr>
+<td><code>:&#39;&lt;,&#39;&gt;!column -t</code></td>
+<td>Align the selection into columns</td>
+</tr>
+<tr>
+<td><code>:%!jq .</code></td>
+<td>Pretty-print JSON</td>
+</tr>
+</tbody></table>
+
+<h2>#6 Macros: <code>q</code> and <code>@</code></h2>
+
+<p>Record an edit once, replay it anywhere.</p>
+
+<table><thead>
+<tr>
+<th>Keys</th>
+<th>Effect</th>
+</tr>
+</thead><tbody>
+<tr>
+<td><code>qq ... +q</code></td>
+<td>Record the edit, end on the next line</td>
+</tr>
+<tr>
+<td><code>4@q</code></td>
+<td>Replay it four times</td>
+</tr>
+<tr>
+<td><code>&quot;qp</code></td>
+<td>Paste the macro as text to fix it</td>
+</tr>
+</tbody></table>
+
+<h2>#7 Multicursor: <code>Q</code> (nightly)</h2>
+
+<p>Place cursors, and every edit lands at each one as you type. One undo reverts all of them.</p>
+
+<table><thead>
+<tr>
+<th>Keys</th>
+<th>Effect</th>
+</tr>
+</thead><tbody>
+<tr>
+<td><code>{Visual}Q</code></td>
+<td>A cursor on each selected line</td>
+</tr>
+<tr>
+<td><code>zqgn</code></td>
+<td>A cursor on every search match</td>
+</tr>
+<tr>
+<td><code>1Q</code> / <code>2Q</code></td>
+<td>Force add / remove a cursor</td>
+</tr>
+<tr>
+<td><code>:g/pattern/normal! nQ</code></td>
+<td>A cursor on every match, by condition</td>
+</tr>
+<tr>
+<td><code>:cdo normal! Q</code></td>
+<td>A cursor at each quickfix item</td>
+</tr>
+<tr>
+<td><code>@q</code></td>
+<td>The macro replays at every cursor</td>
+</tr>
+</tbody></table>
+
+<p>A cursor whose edit cannot start, like <code>ct;</code> on a line with no <code>;</code>, is removed.</p>
+
+<h2>Which One to Use</h2>
+
+<p>Ask from the top; the first yes picks the method.</p>
+
+<table><thead>
+<tr>
+<th>Question</th>
+<th>Method</th>
+</tr>
+</thead><tbody>
+<tr>
+<td>A job a CLI tool already does?</td>
+<td><code>:%!</code> external commands</td>
+</tr>
+<tr>
+<td>Across files, or too many lines to watch?</td>
+<td><code>:s</code> or <code>:norm</code> with <code>:cdo</code></td>
+</tr>
+<tr>
+<td>An edit you will replay later?</td>
+<td>Macro</td>
+</tr>
+<tr>
+<td>One column on adjacent lines?</td>
+<td>Visual block</td>
+</tr>
+<tr>
+<td>Lines picked by a pattern?</td>
+<td><code>:g</code> or <code>:v</code></td>
+</tr>
+<tr>
+<td>One fixed string swapped for another?</td>
+<td><code>:s</code></td>
+</tr>
+<tr>
+<td>Anything else on screen</td>
+<td>Multicursor</td>
+</tr>
+</tbody></table>
+
+<h2>Keystroke Scoreboard</h2>
+
+<p>Same exercise, cursor on line 1, <code>nvim --clean</code>. Shortest other method against multicursor.</p>
+
+<table><thead>
+<tr>
+<th>Exercise</th>
+<th>Other method</th>
+<th>Keys</th>
+<th>Multicursor</th>
+<th>Keys</th>
+</tr>
+</thead><tbody>
+<tr>
+<td>add prefix</td>
+<td><code>&lt;C-V&gt;GI- &lt;Esc&gt;</code></td>
+<td>6</td>
+<td><code>VGQI- &lt;Esc&gt;</code></td>
+<td>7</td>
+</tr>
+<tr>
+<td>log levels</td>
+<td><code>qqxf]D+q4@q</code></td>
+<td>11</td>
+<td><code>VGQxf]D</code></td>
+<td>7</td>
+</tr>
+<tr>
+<td>brackets to quotes</td>
+<td><code>qqr&quot;f]r&quot;+q4@q</code></td>
+<td>13</td>
+<td><code>VGQr&quot;f]r&quot;</code></td>
+<td>9</td>
+</tr>
+<tr>
+<td>first field</td>
+<td><code>:%s/,.*&lt;CR&gt;</code></td>
+<td>8</td>
+<td><code>VGQf,D</code></td>
+<td>6</td>
+</tr>
+<tr>
+<td>add semicolons</td>
+<td><code>:%s/$/;&lt;CR&gt;</code></td>
+<td>8</td>
+<td><code>VGQA;&lt;Esc&gt;</code></td>
+<td>6</td>
+</tr>
+<tr>
+<td>wrap parens</td>
+<td><code>qqwi(&lt;Esc&gt;A)&lt;Esc&gt;+q4@q</code></td>
+<td>14</td>
+<td><code>VGQwi(&lt;Esc&gt;A)&lt;Esc&gt;</code></td>
+<td>10</td>
+</tr>
+<tr>
+<td>flip assignment</td>
+<td><code>qqdt=A=&lt;Esc&gt;p0xjq4@q</code></td>
+<td>16</td>
+<td><code>VGQdt=A=&lt;Esc&gt;p0x</code></td>
+<td>12</td>
+</tr>
+<tr>
+<td>conditional prefix</td>
+<td><code>:v/:/s/^/[ok] &lt;CR&gt;</code></td>
+<td>15</td>
+<td><code>/^\w*$&lt;CR&gt;zqgnI[ok] &lt;Esc&gt;</code></td>
+<td>18</td>
+</tr>
+<tr>
+<td>snake to camel</td>
+<td><code>:%s/\v_(.)/\u\1/g&lt;CR&gt;</code></td>
+<td>18</td>
+<td><code>/_&lt;CR&gt;zqgnx~</code></td>
+<td>9</td>
+</tr>
+</tbody></table>
+
+<p>Multicursor wins on-screen edits. A column or a condition still favors the classics.</p>
+
+<h2>Try It</h2>
+
+<ul>
+<li>Nightly build: <a href="https://github.com/neovim/neovim/releases/tag/nightly">https://github.com/neovim/neovim/releases/tag/nightly</a></li>
+<li><code>:help mcursor</code> covers every key, with examples</li>
+<li>The nine exercises, each checked against its goal: <a href="https://github.com/Piotr1215/youtube/tree/main/nvim-multi-line-editing">https://github.com/Piotr1215/youtube/tree/main/nvim-multi-line-editing</a></li>
+<li>Multicursor pull request: <a href="https://github.com/neovim/neovim/pull/41587">https://github.com/neovim/neovim/pull/41587</a> &lt;- merged to main</li>
+</ul>
+
+<p>Presentation source: <a href="https://github.com/Piotr1215/youtube/blob/main/nvim-multi-line-editing/presentation.md">https://github.com/Piotr1215/youtube/blob/main/nvim-multi-line-editing/presentation.md</a></p>
+
+<p>Dotfiles: <a href="https://github.com/Piotr1215/dotfiles">https://github.com/Piotr1215/dotfiles</a></p>
+
+<p>Which method do you reach for first, and will multicursor change that?</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x2akdv/neovim_multiline_editing_overview_multicursor/" class="post_comments" title="17 comments">17 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x1prs3">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/chapeupreto">u/chapeupreto</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 09 2026, 16:22:51 UTC">3d ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Announcement%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#ea0027;"
+				dir="ltr"><span>Announcement</span></a>
+		
+		<a href="/r/neovim/comments/1x1prs3/nvim_v0126_release/">NVIM v0.12.6 release</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<a class="post_thumbnail" href="https://github.com/neovim/neovim/commit/779c36969e31080503be2dfccbcc3f999e289606" rel="nofollow">
+		
+		<div style="max-width:140px;max-height:70px;">
+			<svg width="140px" height="70px" xmlns="http://www.w3.org/2000/svg">
+				<image width="100%" height="100%" href="/preview/external-pre/fjX3KThnlOMUHzjt1neeJ9DqObDuJJjDNtsmYiCB-64.png?width=140&#38;height=70&#38;auto=webp&#38;s=0e82c2bf60078f0104ac4dac34f9c16b56a97f38"/>
+				<desc>
+					<img loading="lazy" alt="Thumbnail" src="/preview/external-pre/fjX3KThnlOMUHzjt1neeJ9DqObDuJJjDNtsmYiCB-64.png?width=140&#38;height=70&#38;auto=webp&#38;s=0e82c2bf60078f0104ac4dac34f9c16b56a97f38"/>
+				</desc>
+			</svg>
+		</div>
+		
+		<span>github.com</span>
+	</a>
+	
+	<div class="post_score" title="206">
+    
+    206
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x1prs3/nvim_v0126_release/" class="post_comments" title="12 comments">12 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x2xph6">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/AldoZeroun">u/AldoZeroun</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 11 2026, 03:24:05 UTC">2d ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Discussion%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#ff8717;"
+				dir="ltr"><span>Discussion</span></a>
+		
+		<a href="/r/neovim/comments/1x2xph6/what_are_peoples_thoughts_on_ai_assisted_plugin/">What are people&#39;s thoughts on AI assisted plugin development</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<div class="post_score" title="0">
+    
+    0
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>I&#39;ve been developing a specification for a new markup syntax for about three years now, but kept putting off building neovim support (with a treesitter parser etc.) becauae I knew I was going to start by forking nvim-orgmode/orgmode as a base since my markup takes what I love about orgmode syntax and adds everything I felt was missing, and changes the syntax that I felt didn&#39;t express markup the way I wanted; but I wasn&#39;t ready to dive deeply into someone else&#39;s code until about a month ago.</p>
+
+<p>So I did the fork, and Implemented headings, lists, src blocks, and tables all with just debugging help from Gemini flash on the parser side because while I got 118% in my compilers class two years ago, I let the knowledge degrade a bit and I wasn&#39;t fully taking the time to learn treesitters conventions. Just shooting wildly from the hip to move as fast as possible (also I had forked tree-sitter-org, which helped get the ball rolling fast).</p>
+
+<p>Anyway, with those features alone I had 90% of the things I needed for day to day writing of notes that I used orgmode for previously, and was already using the plugin to write my school notes.</p>
+
+<p>But, then I discovered that I had access to antigravity with my Gemini pro subscription, so I installed it just to test it out. I had an idea for a new feature that I knew would make my life so much easier in a long document and so I wrote up a clear spec for it and handed it off to Gemini flash 3.6 and like 6 minutes later it existed and worked flawlessly. Cut to three days later of 12 hour workdays as project manager overseeing the rest of the all the old orgmode features being converted to my syntax, like agenda, task tracking etc.</p>
+
+<p>I still have a short list of small deferred decisions to make, but it&#39;s basically a complete plugin that would have taken me at least 4 more months at my old pace.</p>
+
+<p>Now, I just want to be clear that im not releasing it officially until ive fully tested each feature we built and ive reviewed the code, but I have this sense that people won&#39;t even give it the time of day because AI was involved. Which is fine because I built it for myself first and foremost and this whole project has really shifted my perspective on the future of software, that maybe we can all have tools tailored to our particular needs rather than trying to retrofit yaml into markdown to get metadata in our notes, as one specific example.</p>
+
+<p>But I want it to end up in the hands of people it will help just like orgmode helped me for years.</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x2xph6/what_are_peoples_thoughts_on_ai_assisted_plugin/" class="post_comments" title="36 comments">36 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x1iis8">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/0xdeadf1sh">u/0xdeadf1sh</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 09 2026, 11:07:57 UTC">4d ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Video%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#5353ac;"
+				dir="ltr"><span>Video</span></a>
+		
+		<a href="/r/neovim/comments/1x1iis8/reading_assembly_of_a_c_source_code_directly/">Reading assembly of a C source code directly inside neovim</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	
+	<div class="post_media_content">
+		<video class="post_media_video short" src="" width="2560" height="1550" poster="/preview/external-pre/bTM3aG1mMGM0ZnVoMTLQ8B-NxUFvkdugeM4PHPuUvhVqQEZmMTT-o_1ho7Me.png?auto=webp&#38;s=bd4e6c8a4435f9c3734a1b62725bcaf5da8f2285" preload="none" controls ><a href=>Video</a></video>
+	</div>
+	
+<div class="post_notification"><p><a href="/settings/update/?use_hls=on&redirect=r/neovim/%231x1iis8">Enable HLS</a> to view with audio, or <a href="/settings/update/?hide_hls_notification=on&redirect=r/neovim/%231x1iis8">disable this notification</a></p></div>
+
+	
+	
+	<div class="post_score" title="112">
+    
+    112
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x1iis8/reading_assembly_of_a_c_source_code_directly/" class="post_comments" title="12 comments">12 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x1lxsg">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/StatisticianGlum8108">u/StatisticianGlum8108</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 09 2026, 13:52:11 UTC">4d ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Plugin%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#0079d3;"
+				dir="ltr"><span>Plugin</span></a>
+		
+		<a href="/r/neovim/comments/1x1lxsg/tunanvim_neovim_plugin_for_competitive_programming/">tuna.nvim: neovim plugin for competitive programming</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	
+	<div class="post_media_content">
+		<video class="post_media_video short" src="" width="1920" height="1080" poster="/preview/external-pre/OXgzeWEyaW00Z3VoMWSxfeb4fSdXwAH2939sNhumG_D30FE0GbtF3qcVipsh.png?format=pjpg&#38;auto=webp&#38;s=f5efdee4c624318660ed4d6320ff9c833c39a3e7" preload="none" controls ><a href=>Video</a></video>
+	</div>
+	
+<div class="post_notification"><p><a href="/settings/update/?use_hls=on&redirect=r/neovim/%231x1lxsg">Enable HLS</a> to view with audio, or <a href="/settings/update/?hide_hls_notification=on&redirect=r/neovim/%231x1lxsg">disable this notification</a></p></div>
+
+	
+	
+	<div class="post_score" title="48">
+    
+    48
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>Hi all! I wrote <a href="https://github.com/FrancescoDerme/tuna.nvim">tuna.nvim</a> to serve all my competitive programming needs, and I hope it&#39;s useful to you as well. It is a ground-up rewrite of and successor to <a href="https://github.com/xeluxee/competitest.nvim">competitest.nvim</a>, which is no longer maintained. It adds many new features on top of the already excellent competitest, for example, I show off stress-testing in the video above.</p>
+
+<p>I am relatively new to the community, any feedback is appreciated :)</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x1lxsg/tunanvim_neovim_plugin_for_competitive_programming/" class="post_comments" title="8 comments">8 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x1g82z">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/Alternative-Tie-4970">u/Alternative-Tie-4970</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 09 2026, 08:49:01 UTC">4d ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Discussion%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#ff8717;"
+				dir="ltr"><span>Discussion</span></a>
+		
+		<a href="/r/neovim/comments/1x1g82z/telescope_vs_fzflua_vs_snacks_picker_vs_your/">Telescope vs fzf-lua vs snacks picker vs 🫵 your favorite picker</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<div class="post_score" title="41">
+    
+    41
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>Hello everyone,</p>
+
+<p>over these few years of intensively using neovim I&#39;ve seen a few pickers come up.</p>
+
+<p>The one that was kind of always there as long as I was using neovim was telescope, the classic, the ole reliable, and the one I am still currently using.</p>
+
+<p>Over time more of these started to pop up, first one I remember that&#39;ss sort of major is fzf-lua and recently it&#39;s folke&#39;s snacks picker.</p>
+
+<p>My question is what&#39;s the benefit of switching over to these new options? What do they do well that telescope just can&#39;t capture?</p>
+
+<p>There is always the benefit of performance, but that&#39;s one of the most advertised parts about them, so hearing about that isn&#39;t gonna mean much to me. Are there any improvements that go deeper beneath the surface, and don&#39;t just focus on being a faster telescope.</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x1g82z/telescope_vs_fzflua_vs_snacks_picker_vs_your/" class="post_comments" title="59 comments">59 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x1ui88">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/Jane_Keyamoto">u/Jane_Keyamoto</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 09 2026, 19:25:53 UTC">3d ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Plugin%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#0079d3;"
+				dir="ltr"><span>Plugin</span></a>
+		
+		<a href="/r/neovim/comments/1x1ui88/markdowntocnvim_i_built_a_lightweight/">markdown-toc.nvim : I built a lightweight, high-performance Markdown TOC plugin with Telescope support</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	
+	<div class="post_media_content">
+		<video class="post_media_video short" src="" width="1918" height="1015" poster="/preview/external-pre/ZmR1Y25pZDB0aHVoMUy3qpLioSvlxEbnKkIF7zuFAqfZlfwGF8bIt2rgwTZn.png?format=pjpg&#38;auto=webp&#38;s=5cbb698edbaffa5e96c5427f2411ac35be44b5fe" preload="none" controls ><a href=>Video</a></video>
+	</div>
+	
+<div class="post_notification"><p><a href="/settings/update/?use_hls=on&redirect=r/neovim/%231x1ui88">Enable HLS</a> to view with audio, or <a href="/settings/update/?hide_hls_notification=on&redirect=r/neovim/%231x1ui88">disable this notification</a></p></div>
+
+	
+	
+	<div class="post_score" title="3">
+    
+    3
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>A lightweight, high-performance, plugin to access markdown file headings (Table Of Content) with auto integrations with Telescope</p>
+
+<p># 🚀 Features</p>
+
+<p>✅ Auto integrations with Telescope if installed and if not will use native <a href="http://vim.select">vim.select</a></p>
+
+<p># 📦 Installation</p>
+
+<p>vim.pack.add({</p>
+
+<p>&quot;<a href="https://github.com/janecodelife/markdown-toc.nvim">https://github.com/janecodelife/markdown-toc.nvim</a>&quot;,</p>
+
+<p>&quot;<a href="https://github.com/nvim-telescope/telescope.nvim">https://github.com/nvim-telescope/telescope.nvim</a>&quot; ,</p>
+
+<p>})</p>
+
+<p>require(&quot;markdown-toc&quot;).setup({</p>
+
+<p>min_level = 1, -- Include everything from level 1 (#)</p>
+
+<p>max_level = 6, -- Down to level 6 (######)</p>
+
+<p>})</p>
+
+<p>vim.keymap.set(&quot;n&quot;, &quot;&lt;leader&gt;mo&quot;, &quot;&lt;cmd&gt;MarkdownTOC&lt;cr&gt;&quot;, { desc = &quot;Markdown Open TOC&quot; })</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x1ui88/markdowntocnvim_i_built_a_lightweight/" class="post_comments" title="0 comments">0 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x0v4kz">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/swaggermuffin64">u/swaggermuffin64</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 08 2026, 16:13:52 UTC">4d ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Tips and Tricks%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#ffb000;"
+				dir="ltr"><span>Tips and Tricks</span></a>
+		
+		<a href="/r/neovim/comments/1x0v4kz/free_vim_race_of_the_day_vim_gym/">Free VIM Race of the Day (VIM_GYM)</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	
+	<div class="post_media_content">
+		<video class="post_media_video short" src="" width="1920" height="1080" poster="/preview/external-pre/d21hYzU5aHVvOXVoMY8k4GJzuolCx-3UJQ9ykOkdo3Q8gV-qDAipeWCiu2rA.png?format=pjpg&#38;auto=webp&#38;s=0a4ba14f4bdb6c301547d83582281ab1718e16f7" preload="none" controls ><a href=>Video</a></video>
+	</div>
+	
+<div class="post_notification"><p><a href="/settings/update/?use_hls=on&redirect=r/neovim/%231x0v4kz">Enable HLS</a> to view with audio, or <a href="/settings/update/?hide_hls_notification=on&redirect=r/neovim/%231x0v4kz">disable this notification</a></p></div>
+
+	
+	
+	<div class="post_score" title="167">
+    
+    167
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>Hello all, long time no see! I wanted to make a post about a new feature added to VIM_GYM: <em>race of the day</em>. Every day at midnight UTC, a new race will be generated for everyone, and you get 3 attempts to get the best time you can. Your best time is also sharable, so you can flex on VIM noobs!!! </p>
+
+<p>Also:</p>
+
+<ul>
+<li>VIM_GYM is entirely free and open source btw</li>
+<li>It’s a really great way to warm up your fingers for using VIM for the day<br/></li>
+<li>Since quick play can still be slow to find a match, I thought this might be a more convenient way for people to compete<br/></li>
+<li>One of the most important aspects of being a VIM user is flexing it on other people, so I decided to make it a feature: a rich link to flex your race time on people in discord / slack. </li>
+</ul>
+
+<p>Let me know if anything breaks, and if you have any suggestions on how I could improve it. Thanks!!</p>
+
+<p>P.S. I&#39;m currently undefeated on daily races, my IGN is HIMONVIM. Come get worked, challenge link: <a href="https://vimgym.app/s/Cv88idqu2Y">https://vimgym.app/s/Cv88idqu2Y</a></p>
+
+<p>Main site link: <a href="https://vimgym.app">https://vimgym.app</a></p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x0v4kz/free_vim_race_of_the_day_vim_gym/" class="post_comments" title="27 comments">27 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x0vydd">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/AdAgile8106">u/AdAgile8106</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 08 2026, 16:45:44 UTC">4d ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Plugin%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#0079d3;"
+				dir="ltr"><span>Plugin</span></a>
+		
+		<a href="/r/neovim/comments/1x0vydd/i18ninlinenvim_show_the_translated_text_next_to/">i18n-inline.nvim: show the translated text next to t(&#39;key&#39;) calls</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	
+	<div class="post_media_content">
+		<video class="post_media_video short" src="/preview/pre/y9i0ct0yt9uh1.gif?format=mp4&#38;s=31f0a1ef66042b6ca9828d552632cb8341599682" width="1952" height="1500" poster="/preview/pre/y9i0ct0yt9uh1.gif?format=png8&#38;s=29a6b3f0dff30567b7984137b2fdf659f5a7799a" preload="none" controls ><a href=/preview/pre/y9i0ct0yt9uh1.gif?format=mp4&#38;s=31f0a1ef66042b6ca9828d552632cb8341599682>Video</a></video>
+	</div>
+	
+	
+	
+	<div class="post_score" title="93">
+    
+    93
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>Hi all,</p>
+
+<p>At work we used to keep a fallback string in every translation call, like `t(&#39;cart.empty&#39;, &#39;Your cart is empty&#39;)`. It caused two problems. Every time someone reworded a translation, the diff touched a bunch of components. And the fallbacks went stale like old comments do. The locale file got updated, the code didn&#39;t, and nobody was sure which one was right. We decided to drop them.</p>
+
+<p>Without them the code is a lot harder to read though. I hadn&#39;t realized how much I relied on those strings to see what a component actually says. VS Code has a few extensions that show the translation inline, but I looked around for Neovim (not very hard, to be fair) and didn&#39;t find one that did what I wanted. So I wrote one.  </p>
+
+<p><a href="https://github.com/BitYoungjae/i18n-inline.nvim">https://github.com/BitYoungjae/i18n-inline.nvim</a></p>
+
+<p>It reads your locale files and puts the value after each call as virtual text. If a call still has a default string that doesn&#39;t match the file, it shows `≠`, and if the key doesn&#39;t exist anywhere it shows `✗`. There&#39;s also a hover popover with every language, `:I18nJump ko` to open the locale file on that key&#39;s line, and `:I18nCheck` for unused and missing keys. Saving a locale file updates open buffers.</p>
+
+<p>Presets for i18next, next-intl, vue-i18n, Flutter gen-l10n and gettext, or you can write your own Lua patterns. JSON, `.arb` and `.po` files. Needs Neovim 0.10+, no dependencies, no default keymaps. You add a small `.i18n-inline.json` to your project root, and `:checkhealth i18n-inline` tells you if something&#39;s off.</p>
+
+<p>This is my first Neovim plugin and I&#39;m still learning how plugins are supposed to be built, so I&#39;m sure I&#39;ve gotten some things wrong. I&#39;ve mostly used it with i18next, so the other presets are less tested too. If something breaks or looks off, an issue on the repo would help a lot.</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x0vydd/i18ninlinenvim_show_the_translated_text_next_to/" class="post_comments" title="2 comments">2 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x0xzks">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/rohan_pckg">u/rohan_pckg</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 08 2026, 18:02:47 UTC">4d ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Color Scheme%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#46d160;"
+				dir="ltr"><span>Color Scheme</span></a>
+		
+		<a href="/r/neovim/comments/1x0xzks/i_made_a_tango_colorscheme_for_neovim_also/">I made a Tango colorscheme for Neovim (also supports Sublime Text &#38; Sublime Merge)</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<a class="post_thumbnail" href="/r/neovim/comments/1x0xzks/i_made_a_tango_colorscheme_for_neovim_also/" rel="nofollow">
+		
+		<div style="max-width:140px;max-height:76px;">
+			<svg width="140px" height="76px" xmlns="http://www.w3.org/2000/svg">
+				<image width="100%" height="100%" href="/preview/pre/ioeiul5e9auh1.png?width=140&#38;height=76&#38;auto=webp&#38;s=597237317028547f5c7d9d9c206ceb5c1b889e16"/>
+				<desc>
+					<img loading="lazy" alt="Thumbnail" src="/preview/pre/ioeiul5e9auh1.png?width=140&#38;height=76&#38;auto=webp&#38;s=597237317028547f5c7d9d9c206ceb5c1b889e16"/>
+				</desc>
+			</svg>
+		</div>
+		
+		<span>gallery</span>
+	</a>
+	
+	<div class="post_score" title="47">
+    
+    47
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>I&#39;ve been using the classic Tango palette for a while and decided to properly package my implementation as a Neovim colorscheme.</p>
+
+<p>It supports Treesitter, LSP semantic tokens, diagnostics, diffs and several common plugins, while keeping the original palette intact.</p>
+
+<p>I also bundled matching implementations for Sublime Text and Sublime Merge.</p>
+
+<p><strong>GitHub:</strong> <a href="https://github.com/rohan-pckg/tango-themes?utm_source=chatgpt.com">rohan-pckg/tango-themes</a></p>
+
+<p>Feedback welcome - especially if you spot any missing highlight groups or UI elements.</p>
+
+<p>Screenshots attached.</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x0xzks/i_made_a_tango_colorscheme_for_neovim_also/" class="post_comments" title="3 comments">3 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x0xo4m">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/4r73m190r0s">u/4r73m190r0s</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 08 2026, 17:50:28 UTC">4d ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Discussion%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#ff8717;"
+				dir="ltr"><span>Discussion</span></a>
+		
+		<a href="/r/neovim/comments/1x0xo4m/nix_vs_mise_for_neovim_tools/">Nix vs mise for Neovim tools</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	<div class="post_score" title="36">
+    
+    36
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>What is your preference for provisioning LSPs, debuggers, formatters, linters?</p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x0xo4m/nix_vs_mise_for_neovim_tools/" class="post_comments" title="35 comments">35 comments</a>
+	</div>
+</div>
+			
+			
+			
+			<hr class="sep" />
+			<div class="post" id="1x0ms3h">
+	<p class="post_header">
+		<a class="post_subreddit" href="/r/neovim">r/neovim</a>
+		<span class="dot">&bull;</span>
+		<a class="post_author " href="/u/roschaefer">u/roschaefer</a>
+		<span class="dot">&bull;</span>
+		<span class="created" title="Oct 08 2026, 09:49:21 UTC">5d ago</span>
+		
+	</p>
+	<h2 class="post_title">
+		
+			<a href="/r/neovim/search?q=flair_name%3A%22Plugin%22&restrict_sr=on"
+				class="post_flair"
+				style="color:black; background:#0079d3;"
+				dir="ltr"><span>Plugin</span></a>
+		
+		<a href="/r/neovim/comments/1x0ms3h/blamenvim_githubstyle_blame_for_neovim/">blame.nvim: GitHub-style blame for Neovim</a>
+	</h2>
+	<!-- POST MEDIA/THUMBNAIL -->
+	
+	
+	<div class="post_media_content">
+		<video class="post_media_video short" src="/preview/pre/3bp7zh3wq7uh1.gif?format=mp4&#38;s=db0c942fc1cb3bb8625c404b8857e749ab0dfdb0" width="1555" height="829" poster="/preview/pre/3bp7zh3wq7uh1.gif?format=png8&#38;s=9e48802b69d38c27eada67bcf50e9231088e8754" preload="none" controls ><a href=/preview/pre/3bp7zh3wq7uh1.gif?format=mp4&#38;s=db0c942fc1cb3bb8625c404b8857e749ab0dfdb0>Video</a></video>
+	</div>
+	
+	
+	
+	<div class="post_score" title="20">
+    
+    20
+    
+    <span class="label"> Upvotes</span></div>
+	<div class="post_body post_preview">
+		<!-- SC_OFF --><div class="md"><p>Hello people,</p>
+
+<p>When I want to understand why a certain line or block of code exists, I trace it back to the commit that introduced it. Often, the commit message sheds some light on the reasoning behind it.</p>
+
+<p>GitHub has a useful feature for this: the <strong>Blame</strong> button available on every file.</p>
+
+<p>I&#39;ve always wanted to use the same workflow locally in my editor. Let me introduce <a href="https://github.com/roschaefer/blame.nvim">blame.nvim</a>, a Neovim plugin for interactively exploring a file&#39;s Git blame history.</p>
+
+<p>It opens a dedicated tab with the blame information and file contents side by side. From a line, you can jump to the version before the commit that changed it and continue tracing its history.</p>
+
+<p>I originally used <a href="https://github.com/FabijanZulj/blame.nvim">FabijanZulj/blame.nvim</a>, which provides a similar workflow, but I repeatedly encountered stale-window errors in my setup: <code>... Invalid window id: ...</code></p>
+
+<p>That experience is why the entire blame session lives in a dedicated tab and owns the windows and buffers within it as one unit. This keeps it isolated from the user&#39;s existing layout.</p>
+
+<p>I&#39;ve been using it for a while now, and it does its job. Maybe it’ll be helpful to you as well? I&#39;d love to hear your feedback, bug reports, or feature requests.</p>
+
+<p>Repository: <a href="https://github.com/roschaefer/blame.nvim">https://github.com/roschaefer/blame.nvim</a></p>
+</div><!-- SC_ON -->
+	</div>
+
+	
+	
+
+	<div class="post_footer">
+		<a href="/r/neovim/comments/1x0ms3h/blamenvim_githubstyle_blame_for_neovim/" class="post_comments" title="2 comments">2 comments</a>
+	</div>
+</div>
+			
+			
+			
+			</div>
+			
+
+			<footer>
+				
+
+				
+				<a href="?sort=hot&t=&after=t3_1x0ms3h" accesskey="N">NEXT</a>
+				
+			</footer>
+		</div>
+		
+		
+		<aside>
+			
+			
+			<details class="panel" id="subreddit" open>
+				<summary id="subreddit_label">Subreddit</summary>
+				
+				<div id="top">
+					<div>Posts</div>
+					<a href="/r/neovim/wiki/index">Wiki</a>
+				</div>
+				
+				<div id="sub_meta">
+					<img loading="lazy" id="sub_icon" src="/style/t5_30kix/styles/communityIcon_n2hvyn96zwk81.png?width=256&#38;s=b2cd2f9dcc0cfbf94eee5a640f115dfca33dee1d" alt="Icon for r/neovim">
+					<h1 id="sub_title">Neovim</h1>
+					<p id="sub_name">r/neovim</p>
+					<p id="sub_description">Neovim is a hyperextensible Vim-based text editor. Learn more at neovim.io.</p>
+					<div id="sub_details">
+						<label>Members</label>
+						<label>Active</label>
+						<div title="165346">165.3k</div>
+						<div title="0">0</div>
+					</div>
+					<div id="sub_actions">
+						<div id="sub_subscription">
+							
+								<form action="/r/neovim/unsubscribe?redirect=r/neovim/" method="POST">
+									<button class="unsubscribe">Unsubscribe</button>
+								</form>
+							
+						</div>
+						<div id="sub_filter">
+							
+							<form action="/r/neovim/filter?redirect=r/neovim/" method="POST">
+								<button class="filter">Filter</button>
+							</form>
+							
+						</div>
+						
+				</div>
+			</details>
+			<details class="panel" id="sidebar">
+				<summary id="sidebar_label">Sidebar</summary>
+				<div id="sidebar_contents">
+					<!-- SC_OFF --><div class="md"><p><a href="/r/neovim/about/rules">Please read the rules before posting</a></p>
+
+<hr/>
+
+<h2>Neovim links</h2>
+
+<ul>
+<li><a href="https://neovim.io">Neovim.io</a></li>
+<li><a href="https://github.com/neovim/neovim">Neovim GitHub</a></li>
+<li><a href="https://twitter.com/neovim">Neovim Twitter</a></li>
+<li><a href="https://bsky.app/profile/neovim.io">Neovim Bluesky</a></li>
+<li><a href="https://hachyderm.io/@neovim">Neovim Mastodon</a></li>
+<li><a href="https://neovim.discourse.group">Neovim Discourse</a></li>
+<li><a href="https://matrix.to/#/#neovim:matrix.org">Neovim Matrix</a></li>
+</ul>
+
+<h2>Other resources</h2>
+
+<ul>
+<li><a href="/r/neovim/wiki/index/">r/neovim wiki</a></li>
+<li><a href="/r/neovim/wiki/index/getting-started/">Getting Started Guide</a></li>
+<li><a href="https://dotfyle.com/this-week-in-neovim">This Week in Neovim</a></li>
+<li><a href="https://github.com/rockerBOO/awesome-neovim">Awesome Neovim</a></li>
+<li><a href="https://dotfyle.com/">dotfyle</a></li>
+<li><a href="https://github.com/neovim/neovim/blob/master/CONTRIBUTING.md">Contributing</a></li>
+</ul>
+
+<p>Contributed to Neovim? Want flair? <a href="/message/compose?to=%2Fr%2Fneovim">Send us a message</a>!</p>
+</div><!-- SC_ON -->
+					
+				</div>
+			</details>
+			
+		</aside>
+		
+	</main>
+
+
+		<!-- FOOTER -->
+		
+			<footer>
+				<div class="footer-buttons">
+					<p><span id="version">v0.36.0&emsp;</span><a href="/info" title="View instance information">ⓘ View instance info</a>&emsp;<a href="https://github.com/redlib-org/redlib" title="View code on GitHub">&lt;&gt; Code</a></p>
+				</div>
+			</footer>
+		
+	</body>
+</html>
