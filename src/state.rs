@@ -41,6 +41,8 @@ impl State {
     /// Load state. A file that is not valid state JSON is moved aside; a file
     /// that cannot be read at all is left alone and saving is turned off.
     pub fn load(path: &Path) -> (Self, Option<String>) {
+        // Work on a symlink's target: a bad file is moved aside there, not the link.
+        let path = &resolve_link(path);
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Self::default(), None),
@@ -61,7 +63,14 @@ impl State {
         match serde_json::from_slice(&bytes) {
             Ok(state) => (state, None),
             Err(e) => {
-                let aside = path.with_extension("json.bad");
+                // A second bad file must not replace the first backup: give it a new name.
+                let mut aside = path.with_extension("json.bad");
+                if aside.exists() {
+                    let stamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs());
+                    aside = path.with_extension(format!("json.bad-{stamp}"));
+                }
                 match std::fs::rename(path, &aside) {
                     Ok(()) => (
                         Self::default(),
@@ -83,32 +92,215 @@ impl State {
             }
         }
     }
+}
 
+/// The file a path names: a symlink's target, also when that target does not exist
+/// yet (a dangling link, through any chain of links), so writing never replaces a
+/// link with a regular file.
+fn resolve_link(path: &Path) -> std::path::PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+    let mut current = path.to_path_buf();
+    // The same cap as the kernel's: a loop of links must not spin.
+    for _ in 0..40 {
+        let Ok(target) = std::fs::read_link(&current) else {
+            break;
+        };
+        current = match current.parent() {
+            Some(dir) if target.is_relative() => dir.join(target),
+            _ => target,
+        };
+    }
+    current
+}
+
+/// How long a save waits for another instance's save before giving up.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// A directory lock older than this was likely left by a crash (a save takes
+/// milliseconds): the error then tells the user how to clear it.
+const STALE_LOCK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Held while one instance reads, merges and replaces the state file; released on
+/// drop. Saves of several redtab instances take turns, so none drops another's changes.
+enum SaveLock {
+    /// `flock(2)` on `state.json.lock`; the file stays.
+    Flock(#[allow(dead_code)] std::fs::File),
+    /// `state.json.lockdir`, for filesystems where `flock` never works (some network
+    /// mounts): creating a directory is atomic everywhere. The two schemes do not see
+    /// each other, so this is safe only when every instance gets the fallback.
+    Dir(std::path::PathBuf),
+}
+
+impl Drop for SaveLock {
+    fn drop(&mut self) {
+        if let SaveLock::Dir(path) = self {
+            let _ = std::fs::remove_dir(&*path);
+        }
+    }
+}
+
+/// What a failed non-blocking `flock` means for the save.
+#[derive(Debug, PartialEq, Eq)]
+enum FlockFailure {
+    /// Someone holds it, or a signal interrupted: try again until the deadline.
+    Busy,
+    /// This filesystem has no `flock`: use the directory lock.
+    Unsupported,
+    Error,
+}
+
+fn flock_failure(errno: Option<i32>) -> FlockFailure {
+    match errno {
+        Some(libc::EWOULDBLOCK | libc::EINTR) => FlockFailure::Busy,
+        // ENOTSUP and EOPNOTSUPP differ on macOS, are equal on Linux; ENOSYS comes
+        // from filesystems mounted without flock support (Lustre).
+        Some(code)
+            if [libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOLCK, libc::ENOSYS].contains(&code) =>
+        {
+            FlockFailure::Unsupported
+        }
+        _ => FlockFailure::Error,
+    }
+}
+
+fn lock(target: &Path) -> Result<SaveLock> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = target.with_extension("json.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    // Polled with a deadline: a stalled instance must not freeze this one's quit.
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        // SAFETY: flock on a descriptor this function owns; no memory is involved.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(SaveLock::Flock(file));
+        }
+        let e = std::io::Error::last_os_error();
+        match flock_failure(e.raw_os_error()) {
+            FlockFailure::Busy if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            FlockFailure::Busy => return Err(busy(target)),
+            FlockFailure::Unsupported => return dir_lock(target),
+            FlockFailure::Error => {
+                return Err(e).with_context(|| format!("cannot lock {}", path.display()));
+            }
+        }
+    }
+}
+
+/// The lock for filesystems without `flock`: whoever creates `state.json.lockdir`
+/// holds it, and only the holder removes it. A lock is never broken automatically:
+/// "is it stale?" then "remove it" is not atomic, so a breaker could remove a newer
+/// holder's lock. A lock left by a crash blocks saves, and the error says to delete it.
+fn dir_lock(target: &Path) -> Result<SaveLock> {
+    let path = target.with_extension("json.lockdir");
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(SaveLock::Dir(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).with_context(|| format!("cannot lock {}", path.display())),
+        }
+        // A save takes milliseconds: a lock this old is no save to wait for. Saying
+        // so at once spares the UI a 2 s freeze on every save until it is deleted.
+        let age = std::fs::symlink_metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok());
+        if let Some(age) = age.filter(|&age| age > STALE_LOCK) {
+            return Err(anyhow::anyhow!(
+                "not saving: lock {} is {} s old; if no redtab is running, delete it",
+                path.display(),
+                age.as_secs()
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(busy(target));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn busy(target: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "not saving: another redtab is still saving {}",
+        target.display()
+    )
+}
+
+impl State {
     /// Write state, first merging what other redtab instances saved meanwhile.
-    /// Returns true when the merge changed the bookmark list. Fails without
-    /// touching the file when it could not be read at start.
-    pub fn save(&mut self, path: &Path, now: i64) -> Result<bool> {
+    /// Fails without touching the file when it could not be read at start, or when
+    /// it is now unreadable or not valid state: overwriting would lose what only it holds.
+    pub fn save(&mut self, path: &Path, now: i64) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
         if self.read_only {
             anyhow::bail!("not saving: {} could not be read at start", path.display());
         }
-        let before: Vec<String> = self.bookmarks.iter().map(|b| b.post.id.clone()).collect();
-        if let Ok(bytes) = std::fs::read(path)
-            && let Ok(disk) = serde_json::from_slice::<State>(&bytes)
-        {
-            self.merge(disk);
-        }
-        let changed = self.bookmarks.iter().map(|b| &b.post.id).ne(before.iter());
-        self.prune(now);
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
+        // Write through a symlink to its target, so the link stays a link.
+        let target = resolve_link(path);
+        if let Some(dir) = target.parent() {
+            // Reading history is private: a new state directory is the owner's only.
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
                 .with_context(|| format!("cannot create {}", dir.display()))?;
         }
-        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        std::fs::write(&tmp, serde_json::to_vec(self)?)
-            .with_context(|| format!("cannot write {}", tmp.display()))?;
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("cannot replace {}", path.display()))?;
-        Ok(changed)
+        // Another instance's save between our read and our rename would be lost:
+        // hold the lock from the read until the rename. Released when dropped.
+        let _lock = lock(&target)?;
+        match std::fs::read(&target) {
+            Ok(bytes) => {
+                let disk = serde_json::from_slice::<State>(&bytes).with_context(|| {
+                    format!("not saving: {} is no longer valid state", target.display())
+                })?;
+                self.merge(disk);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("not saving: cannot read {}", target.display()));
+            }
+        }
+        self.prune(now);
+        let json = serde_json::to_vec(self)?;
+        // Every save holds the lock, which is never broken, so one temp name is
+        // safe; the next save removes a crash's leftover.
+        let tmp = target.with_extension("json.tmp");
+        let write = || -> std::io::Result<()> {
+            let _ = std::fs::remove_file(&tmp);
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            // Keep the permissions the user gave the file.
+            if let Ok(meta) = std::fs::metadata(&target) {
+                file.set_permissions(meta.permissions())?;
+            }
+            file.write_all(&json)?;
+            // On disk before the rename, so a crash cannot leave an empty state file.
+            file.sync_all()?;
+            std::fs::rename(&tmp, &target)
+        };
+        if let Err(e) = write() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("cannot write {}", target.display()));
+        }
+        Ok(())
     }
 
     fn merge(&mut self, disk: State) {
@@ -133,6 +325,9 @@ impl State {
         for b in disk.bookmarks {
             match self.bookmarks.iter_mut().find(|m| m.post.id == b.post.id) {
                 Some(mine) if b.saved_at > mine.saved_at => *mine = b,
+                // The same save: a spoiler tag one instance learned from the post
+                // page sticks, whichever instance writes last.
+                Some(mine) if b.saved_at == mine.saved_at => mine.post.spoiler |= b.post.spoiler,
                 Some(_) => {}
                 None => self.bookmarks.push(b),
             }
@@ -178,10 +373,13 @@ impl State {
         }
     }
 
+    /// Listed in a load of its subreddit, or opened: a post you read is never new.
     pub fn is_seen(&self, subreddit: &str, id: &str) -> bool {
-        self.seen
-            .get(&subreddit.to_lowercase())
-            .is_some_and(|ids| ids.contains_key(id))
+        self.read.contains_key(id)
+            || self
+                .seen
+                .get(&subreddit.to_lowercase())
+                .is_some_and(|ids| ids.contains_key(id))
     }
 
     pub fn unseen<'a>(&self, subreddit: &str, posts: impl IntoIterator<Item = &'a Post>) -> usize {
@@ -193,7 +391,11 @@ impl State {
 
     pub fn mark_read(&mut self, post: &Post, now: i64) {
         self.read.insert(post.id.clone(), now);
-        self.mark_seen(&post.subreddit, [post.id.as_str()], now);
+        // Seen only where a first load already set the baseline: a list created
+        // here would make that first load skip it and show the rest as new.
+        if let Some(ids) = self.seen.get_mut(&post.subreddit.to_lowercase()) {
+            ids.insert(post.id.clone(), now);
+        }
     }
 
     pub fn is_read(&self, id: &str) -> bool {
@@ -206,6 +408,16 @@ impl State {
 
     pub fn is_bookmarked(&self, id: &str) -> bool {
         self.bookmarks.iter().any(|b| b.post.id == id)
+    }
+
+    /// Mark a bookmarked post spoiler-tagged when its post page says so; the listing
+    /// it was saved from may predate the tag. A tag is only ever added (merges OR
+    /// it), so a removed tag keeps the post hidden behind `v`. The rest of the stored
+    /// copy stays: the listing's small thumbnails are what the Bookmarks list draws.
+    pub fn mark_bookmark_spoiler(&mut self, id: &str) {
+        if let Some(b) = self.bookmarks.iter_mut().find(|b| b.post.id == id) {
+            b.post.spoiler = true;
+        }
     }
 
     /// Add or remove a bookmark; returns true when the post is now bookmarked.
@@ -253,6 +465,7 @@ mod tests {
             media: Media::None,
             stickied: false,
             nsfw: false,
+            spoiler: false,
         }
     }
 
@@ -397,6 +610,92 @@ mod tests {
     }
 
     #[test]
+    fn a_second_corrupt_file_keeps_the_first_backup() {
+        let dir = scratch("bad2");
+        let path = dir.join("state.json");
+        std::fs::write(&path, b"first").unwrap();
+        State::load(&path);
+        std::fs::write(&path, b"second").unwrap();
+        State::load(&path);
+        let first = std::fs::read_to_string(dir.join("state.json.bad")).unwrap();
+        let backups = std::fs::read_dir(&dir).unwrap().count();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(first, "first");
+        assert_eq!(backups, 2);
+    }
+
+    #[test]
+    fn a_file_corrupted_during_the_session_is_not_overwritten() {
+        let dir = scratch("midbad");
+        let path = dir.join("state.json");
+        let mut state = State::default();
+        state.save(&path, 1).unwrap();
+        std::fs::write(&path, b"{\"bookmarks\":[{\"post\":1}]}").unwrap();
+
+        let saved = state.save(&path, 2);
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(saved.is_err());
+        assert_eq!(on_disk, "{\"bookmarks\":[{\"post\":1}]}");
+    }
+
+    #[test]
+    fn saving_keeps_a_symlink_and_the_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("link");
+        let real = dir.join("real.json");
+        let link = dir.join("state.json");
+        std::fs::write(&real, b"{}").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut state = State::default();
+        state.toggle_bookmark(&post("a", "s"), 1);
+
+        state.save(&link, 1).unwrap();
+        let still_link = std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink();
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        let (loaded, _) = State::load(&real);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(still_link);
+        assert_eq!(mode, 0o600);
+        assert!(loaded.is_bookmarked("a"));
+    }
+
+    #[test]
+    fn a_dangling_or_corrupt_symlinked_state_file_keeps_the_link() {
+        let dir = scratch("link2");
+        let link = dir.join("state.json");
+        std::os::unix::fs::symlink("synced.json", &link).unwrap();
+        let mut state = State::default();
+        state.toggle_bookmark(&post("a", "s"), 1);
+        state.save(&link, 1).unwrap();
+        let dangling_kept = std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink();
+        let target_written = dir.join("synced.json").exists();
+
+        std::fs::write(dir.join("synced.json"), b"garbage").unwrap();
+        State::load(&link);
+        let corrupt_kept = std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink();
+        let backup = std::fs::read_to_string(dir.join("synced.json.bad")).ok();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(dangling_kept && target_written);
+        assert!(corrupt_kept, "the link itself was moved aside");
+        assert_eq!(backup.as_deref(), Some("garbage"));
+    }
+
+    #[test]
     fn unreadable_state_is_never_overwritten() {
         let dir = scratch("unreadable");
         let path = dir.join("state.json");
@@ -411,5 +710,227 @@ mod tests {
         assert!(warning.unwrap().contains("will not save"));
         assert!(saved.is_err(), "a skipped save must not report success");
         assert!(still_dir);
+    }
+
+    #[test]
+    fn opening_a_post_before_its_subreddit_loads_keeps_the_first_load_baseline() {
+        let mut state = State::default();
+        let listing = [post("a", "pics"), post("b", "pics"), post("x", "pics")];
+        let later = post("y", "pics");
+
+        // Opened from r/popular before r/pics ever loaded; `y` is not on its
+        // first page and shows up later.
+        state.mark_read(&listing[2], 1);
+        state.mark_read(&later, 1);
+        state.baseline("pics", &listing, 2);
+
+        assert!(state.is_read("x"));
+        assert_eq!(
+            state.unseen("pics", &listing),
+            0,
+            "the first load is the baseline"
+        );
+        assert_eq!(
+            state.unseen("pics", [&later]),
+            0,
+            "a read post is never new"
+        );
+    }
+
+    #[test]
+    fn a_spoiler_tag_learned_by_one_instance_survives_the_others_save() {
+        let dir = scratch("spoilmerge");
+        let path = dir.join("state.json");
+        let mut a = State::default();
+        a.toggle_bookmark(&post("p", "s"), 5);
+        a.save(&path, 5).unwrap();
+        let (mut b, _) = State::load(&path);
+        a.mark_bookmark_spoiler("p");
+
+        a.save(&path, 6).unwrap();
+        b.save(&path, 7).unwrap();
+        let (loaded, _) = State::load(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(loaded.bookmarks()[0].post.spoiler);
+    }
+
+    #[test]
+    fn the_directory_lock_lets_only_one_saver_in_at_a_time() {
+        let dir = scratch("dirlock");
+        let target = dir.join("state.json");
+        let counter = dir.join("counter");
+        std::fs::write(&counter, "0").unwrap();
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let (target, counter) = (target.clone(), counter.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..10 {
+                        let held = dir_lock(&target).unwrap();
+                        // Read, pause, write: without mutual exclusion increments are lost.
+                        let n: u32 = std::fs::read_to_string(&counter).unwrap().parse().unwrap();
+                        std::thread::yield_now();
+                        std::fs::write(&counter, (n + 1).to_string()).unwrap();
+                        drop(held);
+                        // Let the other thread in, so neither waits out LOCK_WAIT.
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        let total = std::fs::read_to_string(&counter).unwrap();
+        let lock_left = target.with_extension("json.lockdir").exists();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(total, "20");
+        assert!(!lock_left, "the lock is removed when released");
+    }
+
+    fn age(path: &Path) {
+        let old = std::time::SystemTime::now() - STALE_LOCK * 2;
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    #[test]
+    fn an_old_directory_lock_is_never_broken_while_its_holder_lives() {
+        let dir = scratch("oldlock");
+        let target = dir.join("state.json");
+        let lockdir = target.with_extension("json.lockdir");
+        let stalled = dir_lock(&target).unwrap();
+        age(&lockdir); // a holder stalled past STALE_LOCK, or a crash's leftover
+
+        let started = std::time::Instant::now();
+        let refused = dir_lock(&target).err().map(|e| e.to_string());
+        let waited = started.elapsed();
+        let still_held = lockdir.exists();
+        drop(stalled);
+        let after_release = dir_lock(&target).is_ok();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let message = refused.expect("a second holder must be refused");
+        assert!(
+            message.contains("if no redtab is running, delete it"),
+            "{message}"
+        );
+        assert!(still_held, "the holder's lock stays");
+        assert!(
+            waited < LOCK_WAIT / 2,
+            "no wait for a lock this old: {waited:?}"
+        );
+        assert!(after_release);
+    }
+
+    /// A lock in use gives up after `LOCK_WAIT`, leaves the lock alone and does not
+    /// tell the reader to delete it.
+    #[test]
+    fn a_lock_in_use_gives_up_after_the_wait_and_stays() {
+        let dir = scratch("freshlock");
+        let target = dir.join("state.json");
+        let held = dir_lock(&target).unwrap();
+
+        let started = std::time::Instant::now();
+        let refused = dir_lock(&target).err().map(|e| e.to_string());
+        let waited = started.elapsed();
+        let still_held = target.with_extension("json.lockdir").exists();
+        drop(held);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let message = refused.expect("a second holder must be refused");
+        assert!(waited >= LOCK_WAIT && waited < LOCK_WAIT * 3, "{waited:?}");
+        assert!(still_held);
+        assert!(!message.contains("delete"), "{message}");
+    }
+
+    #[test]
+    fn flock_errors_choose_wait_fallback_or_fail() {
+        assert_eq!(flock_failure(Some(libc::EWOULDBLOCK)), FlockFailure::Busy);
+        assert_eq!(flock_failure(Some(libc::EINTR)), FlockFailure::Busy);
+        for unsupported in [libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOLCK, libc::ENOSYS] {
+            assert_eq!(flock_failure(Some(unsupported)), FlockFailure::Unsupported);
+        }
+        assert_eq!(flock_failure(Some(libc::EBADF)), FlockFailure::Error);
+        assert_eq!(flock_failure(None), FlockFailure::Error);
+    }
+
+    #[test]
+    fn a_save_gives_up_when_another_instance_holds_the_lock() {
+        let dir = scratch("busy");
+        let path = dir.join("state.json");
+        let held = lock(&path).unwrap();
+        let mut state = State::default();
+        state.toggle_bookmark(&post("a", "s"), 1);
+
+        let started = std::time::Instant::now();
+        let saved = state.save(&path, 1);
+        let waited = started.elapsed();
+        drop(held);
+        let after = state.save(&path, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(saved.unwrap_err().to_string().contains("still saving"));
+        assert!(waited >= LOCK_WAIT && waited < LOCK_WAIT * 3, "{waited:?}");
+        assert!(after.is_ok(), "the lock is free again");
+    }
+
+    #[test]
+    fn saving_through_a_chain_of_dangling_links_keeps_every_link() {
+        let dir = scratch("chain");
+        std::fs::create_dir(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink("hop.json", dir.join("state.json")).unwrap();
+        std::os::unix::fs::symlink("real/state.json", dir.join("hop.json")).unwrap();
+        let mut state = State::default();
+        state.toggle_bookmark(&post("a", "s"), 1);
+
+        state.save(&dir.join("state.json"), 1).unwrap();
+        let is_link = |p: &str| {
+            std::fs::symlink_metadata(dir.join(p))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        };
+        let links = (is_link("state.json"), is_link("hop.json"));
+        let written = dir.join("real/state.json").is_file();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(links, (true, true));
+        assert!(written);
+    }
+
+    #[test]
+    fn simultaneous_saves_from_two_instances_lose_no_bookmark() {
+        let dir = scratch("race");
+        let path = dir.join("state.json");
+        let savers: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|who| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut state = State::default();
+                    for i in 0..60 {
+                        state.toggle_bookmark(&post(&format!("{who}{i}"), "s"), 1);
+                        state.save(&path, 1).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for s in savers {
+            s.join().unwrap();
+        }
+
+        let (loaded, _) = State::load(&path);
+        let lost: Vec<String> = ["a", "b"]
+            .iter()
+            .flat_map(|who| (0..60).map(move |i| format!("{who}{i}")))
+            .filter(|id| !loaded.is_bookmarked(id))
+            .collect();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(lost.is_empty(), "lost {} bookmarks: {lost:?}", lost.len());
     }
 }

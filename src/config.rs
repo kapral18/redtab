@@ -15,18 +15,22 @@ pub struct Config {
     pub redlib_url: String,
     /// Subreddits listed inline, in tab order.
     pub subscriptions: Vec<String>,
-    /// File with more subreddits; defaults to `<config dir>/subscriptions`.
+    /// File with more subreddits; defaults to `subscriptions` next to the config file.
     pub subscriptions_file: Option<PathBuf>,
     /// Posts per subreddit group on the Home wall.
     pub home_posts_per_group: usize,
     pub show_nsfw: bool,
-    /// Show images inline in the post view (kitty/iTerm2/sixel, else half-blocks).
+    /// Show images: inline in the post view (kitty/iTerm2/sixel, else half-blocks), plus list
+    /// thumbnails and subreddit icons with a graphics protocol.
     pub image_preview: bool,
     /// Command offered when Redlib is down, e.g. `["docker", "start", "redlib"]`.
     pub redlib_start_command: Option<Vec<String>>,
     pub filters: Filters,
     pub highlight: Highlight,
     pub commands: Commands,
+    /// The file this config came from; names it in errors.
+    #[serde(skip)]
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -52,7 +56,7 @@ pub struct Highlight {
 pub struct Commands {
     /// Opens Reddit links and external URLs.
     pub browser: Vec<String>,
-    /// Plays videos; receives the stream URL.
+    /// Plays videos in a window (`m`); receives the stream URL.
     pub video: Vec<String>,
     /// Opens full-size images; receives one or more local image file paths.
     pub image: Vec<String>,
@@ -89,6 +93,7 @@ impl Default for Config {
             filters: Filters::default(),
             highlight: Highlight::default(),
             commands: Commands::default(),
+            path: PathBuf::new(),
         }
     }
 }
@@ -134,42 +139,80 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => Config::default(),
             Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
         };
-        config.subscriptions_file = config.subscriptions_file.as_deref().map(expand_tilde);
+        // A relative subscriptions file sits next to the config file.
+        config.subscriptions_file = config.subscriptions_file.as_deref().map(|p| {
+            let p = expand_tilde(p);
+            match path.parent() {
+                Some(dir) if p.is_relative() => dir.join(p),
+                _ => p,
+            }
+        });
         config.home_posts_per_group = config.home_posts_per_group.clamp(1, 10);
+        config
+            .validate()
+            .with_context(|| format!("invalid config {}", path.display()))?;
+        config.path = path;
         Ok(config)
+    }
+
+    /// Catch values that would only fail later, with a vaguer message.
+    fn validate(&self) -> Result<()> {
+        if !(self.redlib_url.starts_with("http://") || self.redlib_url.starts_with("https://")) {
+            bail!("redlib_url must start with http:// or https://");
+        }
+        if self
+            .redlib_start_command
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+        {
+            bail!("redlib_start_command is empty; remove it or name a program");
+        }
+        for (key, argv) in [
+            ("browser", &self.commands.browser),
+            ("video", &self.commands.video),
+            ("image", &self.commands.image),
+        ] {
+            if argv.is_empty() {
+                bail!("commands.{key} is empty; remove it to use the default");
+            }
+        }
+        Ok(())
     }
 
     /// Inline subscriptions followed by the subscriptions file, deduplicated.
     pub fn subscriptions(&self) -> Result<Vec<String>> {
         let (path, required) = match &self.subscriptions_file {
             Some(p) => (p.clone(), true),
-            None => (config_dir().join("subscriptions"), false),
+            // Next to the loaded config; a config built in code (no file) uses the XDG dir.
+            None if self.path.as_os_str().is_empty() => (config_dir().join("subscriptions"), false),
+            None => (
+                self.path
+                    .parent()
+                    .unwrap_or(Path::new(""))
+                    .join("subscriptions"),
+                false,
+            ),
         };
         let file_text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => String::new(),
             Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
         };
+        let inline = self.subscriptions.iter().map(|n| (n.as_str(), true));
+        let from_file = file_text.lines().map(|n| (n, false));
         let mut names = Vec::new();
-        for raw in self
-            .subscriptions
-            .iter()
-            .map(String::as_str)
-            .chain(file_text.lines())
-        {
-            let name = raw.split('#').next().unwrap_or_default().trim();
-            let name = name
-                .strip_prefix("r/")
-                .or_else(|| name.strip_prefix("/r/"))
-                .unwrap_or(name);
+        for (raw, is_inline) in inline.chain(from_file) {
+            let name = normalize_subreddit(raw);
             if name.is_empty() {
                 continue;
             }
             if !is_subreddit_name(name) {
-                bail!(
-                    "{}: {name:?} is not a subreddit name (letters, digits, _ only)",
-                    path.display()
-                );
+                let source = if is_inline {
+                    format!("{} (subscriptions)", self.path.display())
+                } else {
+                    path.display().to_string()
+                };
+                bail!("{source}: {name:?} is not a subreddit name (letters, digits, _ only)");
             }
             if !names.iter().any(|n: &String| n.eq_ignore_ascii_case(name)) {
                 names.push(name.to_string());
@@ -205,6 +248,23 @@ impl Config {
     }
 }
 
+/// A subreddit name as people write it: `/r/vim/`, `R/rust`, `r/tmux # note`,
+/// with a byte order mark or spaces around; the name itself comes back.
+pub fn normalize_subreddit(raw: &str) -> &str {
+    let name = raw
+        .trim_start_matches('\u{feff}')
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches('/');
+    let name = name.strip_prefix('/').unwrap_or(name);
+    match name.get(..2) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("r/") => &name[2..],
+        _ => name,
+    }
+}
+
 pub fn is_subreddit_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 50
@@ -231,6 +291,7 @@ mod tests {
             media: Media::None,
             stickied: false,
             nsfw: false,
+            spoiler: false,
         }
     }
 
@@ -257,6 +318,76 @@ mod tests {
             config.subscriptions().unwrap(),
             ["rust", "neovim", "tmux", "vim"]
         );
+    }
+
+    #[test]
+    fn subscriptions_accept_common_spellings() {
+        let (_dir, config) = config_with_file("\u{feff}neovim\n/r/vim/\nR/rust\nr/tmux/\n", &[]);
+
+        assert_eq!(
+            config.subscriptions().unwrap(),
+            ["neovim", "vim", "rust", "tmux"]
+        );
+    }
+
+    #[test]
+    fn a_bad_inline_subscription_names_the_config_file() {
+        let config = Config {
+            subscriptions: vec!["bad-name".into()],
+            path: PathBuf::from("/etc/redtab.toml"),
+            ..Config::default()
+        };
+
+        let err = config.subscriptions().unwrap_err().to_string();
+
+        assert!(err.starts_with("/etc/redtab.toml"), "{err}");
+    }
+
+    /// With `-c`, the subscriptions file (default or a relative `subscriptions_file`)
+    /// is next to that config, not in the default config directory.
+    #[test]
+    fn the_subscriptions_file_sits_next_to_a_given_config() {
+        let dir = tempdir::Dir::new();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(dir.path().join("subscriptions"), "rust\n").unwrap();
+        std::fs::write(dir.path().join("subs"), "neovim\n").unwrap();
+        let subscriptions = |config: &str| {
+            std::fs::write(&config_path, config).unwrap();
+            Config::load(Some(&config_path))
+                .unwrap()
+                .subscriptions()
+                .unwrap()
+        };
+
+        assert_eq!(subscriptions(""), ["rust"]);
+        assert_eq!(subscriptions("subscriptions_file = \"subs\"\n"), ["neovim"]);
+    }
+
+    #[test]
+    fn config_values_that_would_fail_later_are_rejected_at_load() {
+        let dir = tempdir::Dir::new();
+        let config_path = dir.path().join("config.toml");
+        let load = |text: &str| {
+            std::fs::write(&config_path, text).unwrap();
+            Config::load(Some(&config_path)).map_err(|e| format!("{e:#}"))
+        };
+
+        assert!(
+            load("redlib_url = \"localhost:8080\"\n")
+                .unwrap_err()
+                .contains("http://")
+        );
+        assert!(
+            load("redlib_start_command = []\n")
+                .unwrap_err()
+                .contains("redlib_start_command")
+        );
+        assert!(
+            load("[commands]\nimage = []\n")
+                .unwrap_err()
+                .contains("commands.image")
+        );
+        assert!(load("redlib_url = \"https://r.example\"\n").is_ok());
     }
 
     #[test]

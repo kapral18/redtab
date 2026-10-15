@@ -2352,9 +2352,12 @@ name = "redtab"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "crossterm",
+ "flate2",
  "image",
+ "libc",
  "nucleo-matcher",
  "ratatui",
  "ratatui-image",
@@ -2364,6 +2367,7 @@ dependencies = [
  "signal-hook 0.4.5",
  "textwrap",
  "toml",
+ "unicode-segmentation",
  "unicode-width",
  "ureq",
  "url",

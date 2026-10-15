@@ -7,7 +7,9 @@ use anyhow::{Result, bail};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use scraper::{ElementRef, Html, Node, Selector};
 
-use crate::model::{Comment, Listing, Media, MoreReplies, Post, PostPage};
+use crate::model::{
+    Comment, Listing, Media, MoreReplies, Post, PostPage, SPOILER_END, SPOILER_START,
+};
 
 fn sel(css: &str) -> Selector {
     Selector::parse(css).expect("static selector")
@@ -34,7 +36,12 @@ static SPAN: LazyLock<Selector> = LazyLock::new(|| sel("span"));
 static BODY_MD: LazyLock<Selector> = LazyLock::new(|| sel(".post_body .md"));
 static POST_LINK: LazyLock<Selector> = LazyLock::new(|| sel("a#post_url"));
 static NEXT: LazyLock<Selector> = LazyLock::new(|| sel(r#"a[accesskey="N"]"#));
+static SUB_ICON: LazyLock<Selector> = LazyLock::new(|| sel("img#sub_icon"));
 static PAGE_TITLE: LazyLock<Selector> = LazyLock::new(|| sel("title"));
+static ERROR_H1: LazyLock<Selector> = LazyLock::new(|| sel("div#error > h1"));
+static POLL: LazyLock<Selector> = LazyLock::new(|| sel("div.post_poll"));
+static POLL_OPTION: LazyLock<Selector> = LazyLock::new(|| sel(".poll_option"));
+static SPOILER_TAG: LazyLock<Selector> = LazyLock::new(|| sel(".post_title small.spoiler"));
 static COMMENT_COUNT: LazyLock<Selector> = LazyLock::new(|| sel("#comment_count"));
 static THREAD_COMMENT: LazyLock<Selector> = LazyLock::new(|| sel(".thread > .comment"));
 static NSFW: LazyLock<Selector> = LazyLock::new(|| sel(".nsfw"));
@@ -64,7 +71,12 @@ pub fn parse_listing(html: &str) -> Result<Listing> {
     let after = doc
         .select(&NEXT)
         .find_map(|a| a.attr("href").and_then(query_param_after));
-    Ok(Listing { posts, after })
+    let icon = doc
+        .select(&SUB_ICON)
+        .find_map(|img| img.attr("src"))
+        .filter(|src| !src.is_empty())
+        .map(str::to_string);
+    Ok(Listing { posts, after, icon })
 }
 
 /// Parse a post page: the post, its full selftext, and the comment tree.
@@ -101,11 +113,19 @@ pub fn parse_post_page(html: &str) -> Result<PostPage> {
     {
         post.comments = count;
     }
-    let body = el
+    let mut body = el
         .select(&BODY_MD)
         .next()
         .map(md_to_text)
         .unwrap_or_default();
+    if let Some(poll) = el.select(&POLL).next() {
+        let poll = poll_text(poll);
+        body = if body.is_empty() {
+            poll
+        } else {
+            format!("{body}\n\n{poll}")
+        };
+    }
     let comments = doc.select(&THREAD_COMMENT).map(parse_comment).collect();
     Ok(PostPage {
         post,
@@ -125,16 +145,57 @@ pub fn parse_more_replies(html: &str) -> Result<Vec<Comment>> {
     })
 }
 
+/// Redlib error pages carry `div#error`; post and listing pages title themselves
+/// with the post or subreddit title, which may start with "Error" too.
 fn check_error(doc: &Html) -> Result<()> {
+    if let Some(h1) = doc.select(&ERROR_H1).next() {
+        bail!(
+            "Redlib error: {}",
+            collapse_ws(&h1.text().collect::<String>())
+        );
+    }
     let title = doc
         .select(&PAGE_TITLE)
         .next()
         .map(|t| collapse_ws(&t.text().collect::<String>()))
         .unwrap_or_default();
-    if let Some(rest) = title.strip_prefix("Error") {
-        bail!("Redlib error{}", rest.trim_end_matches(" - Redlib"));
+    if title == "NSFW content gated" {
+        bail!("this is NSFW; set show_nsfw = true in config.toml to see it");
     }
     Ok(())
+}
+
+/// Text from Reddit with the spoiler marker characters removed: they mean something
+/// only where the parser adds them.
+fn without_markers(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains([SPOILER_START, SPOILER_END]) {
+        text.replace([SPOILER_START, SPOILER_END], "").into()
+    } else {
+        text.into()
+    }
+}
+
+/// A poll as text: "N votes · time left", then one bullet per option.
+fn poll_text(poll: ElementRef<'_>) -> String {
+    let head: Vec<String> = poll
+        .children()
+        .filter_map(ElementRef::wrap)
+        .filter(|e| e.value().name() == "span")
+        .map(|s| collapse_ws(&s.text().collect::<String>()))
+        .map(|s| s.trim_end_matches(',').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut lines = vec![format!("Poll: {}", head.join(" · "))];
+    for option in poll.select(&POLL_OPTION) {
+        let text = option
+            .select(&SPAN)
+            .map(|s| collapse_ws(&s.text().collect::<String>()))
+            .filter(|s| !s.is_empty())
+            .last()
+            .unwrap_or_default();
+        lines.push(format!("• {text}"));
+    }
+    without_markers(&lines.join("\n")).into_owned()
 }
 
 fn parse_post(el: ElementRef<'_>) -> Option<Post> {
@@ -207,6 +268,7 @@ fn parse_post(el: ElementRef<'_>) -> Option<Post> {
         media: parse_media(el),
         stickied: has_class(&el, "stickied"),
         nsfw: el.select(&NSFW).next().is_some(),
+        spoiler: el.select(&SPOILER_TAG).next().is_some(),
     })
 }
 
@@ -217,7 +279,10 @@ fn parse_media(el: ElementRef<'_>) -> Media {
         .map(str::to_string)
         .collect();
     if !gallery.is_empty() {
-        return Media::Gallery { images: gallery };
+        return Media::Gallery {
+            images: gallery,
+            thumb: None,
+        };
     }
     if let Some(a) = el.select(&MEDIA_IMAGE).next()
         && let Some(href) = a.attr("href")
@@ -253,7 +318,10 @@ fn parse_media(el: ElementRef<'_>) -> Media {
             .unwrap_or_default();
         if label == "gallery" {
             // Listings only show a thumbnail; the post page lists the images.
-            return Media::Gallery { images: Vec::new() };
+            return Media::Gallery {
+                images: Vec::new(),
+                thumb: thumb_img,
+            };
         }
         if href.starts_with("http") {
             return Media::Link {
@@ -370,6 +438,24 @@ fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Tabs to spaces at 4-column stops: the terminal renderer drops control characters,
+/// so tab-indented code would lose its indentation.
+fn expand_tabs(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut col = 0;
+    for c in line.chars() {
+        if c == '\t' {
+            let n = 4 - col % 4;
+            out.extend(std::iter::repeat_n(' ', n));
+            col += n;
+        } else {
+            out.push(c);
+            col += 1;
+        }
+    }
+    out
+}
+
 /// Convert Reddit's rendered markdown HTML into readable plain text.
 pub fn md_to_text(el: ElementRef<'_>) -> String {
     let mut out = String::new();
@@ -381,10 +467,11 @@ fn render_children(el: ElementRef<'_>, out: &mut String, pre: bool) {
     for child in el.children() {
         match child.value() {
             Node::Text(t) => {
+                let t = without_markers(t);
                 if pre {
-                    out.push_str(t);
+                    out.push_str(&t);
                 } else {
-                    push_inline(out, t);
+                    push_inline(out, &t);
                 }
             }
             Node::Element(_) => {
@@ -400,6 +487,12 @@ fn render_children(el: ElementRef<'_>, out: &mut String, pre: bool) {
 fn render_element(el: ElementRef<'_>, out: &mut String, pre: bool) {
     let name = el.value().name();
     match name {
+        // Marked, so the post view can mask it until revealed.
+        "span" if has_class(&el, "md-spoiler-text") => {
+            out.push(SPOILER_START);
+            render_children(el, out, pre);
+            out.push(SPOILER_END);
+        }
         "br" => out.push('\n'),
         "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "ul" | "ol" | "table" | "hr" => {
             block_break(out);
@@ -436,7 +529,7 @@ fn render_element(el: ElementRef<'_>, out: &mut String, pre: bool) {
             render_children(el, &mut inner, true);
             for line in inner.trim_end_matches('\n').lines() {
                 out.push_str("    ");
-                out.push_str(line);
+                out.push_str(&expand_tabs(line));
                 out.push('\n');
             }
             block_break(out);
@@ -450,10 +543,26 @@ fn render_element(el: ElementRef<'_>, out: &mut String, pre: bool) {
             block_break(out);
             let mut inner = String::new();
             render_children(el, &mut inner, pre);
+            // A spoiler that spans lines is closed before each quote bar and reopened
+            // after it, so the bars stay visible while the text is masked.
+            let mut in_spoiler = false;
             for line in tidy_blank_lines(&inner).lines() {
-                out.push_str("│ ");
+                if in_spoiler {
+                    out.push(SPOILER_END);
+                    out.push_str("│ ");
+                    out.push(SPOILER_START);
+                } else {
+                    out.push_str("│ ");
+                }
                 out.push_str(line);
                 out.push('\n');
+                for c in line.chars() {
+                    match c {
+                        SPOILER_START => in_spoiler = true,
+                        SPOILER_END => in_spoiler = false,
+                        _ => {}
+                    }
+                }
             }
             block_break(out);
         }
@@ -461,9 +570,10 @@ fn render_element(el: ElementRef<'_>, out: &mut String, pre: bool) {
             let before = out.len();
             render_children(el, out, pre);
             let text = out[before..].trim().to_string();
-            if let Some(href) = el.attr("href")
+            // The URL is page text too: it must not carry a spoiler marker.
+            if let Some(href) = el.attr("href").map(without_markers)
                 && href.starts_with("http")
-                && text != href
+                && text != *href
                 && !text.is_empty()
             {
                 out.push_str(&format!(" <{href}>"));
@@ -471,7 +581,7 @@ fn render_element(el: ElementRef<'_>, out: &mut String, pre: bool) {
         }
         "img" => {
             if let Some(alt) = el.attr("alt").filter(|a| !a.is_empty()) {
-                out.push_str(&format!("[{alt}]"));
+                out.push_str(&format!("[{}]", without_markers(alt)));
             }
         }
         "script" | "style" => {}
@@ -535,6 +645,12 @@ fn tidy_blank_lines(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn code_block_tabs_become_spaces() {
+        assert_eq!(expand_tabs("\tfmt.Println(1)"), "    fmt.Println(1)");
+        assert_eq!(expand_tabs("ab\tc"), "ab  c");
+    }
+
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(format!(
             "{}/tests/fixtures/{name}",
@@ -567,6 +683,12 @@ mod tests {
             parse_redlib_time("Sep 15 2026, 01:00:35 UTC"),
         );
         assert!(first.age.ends_with("ago"));
+        assert_eq!(
+            listing.icon.as_deref(),
+            Some(
+                "/style/t5_30kix/styles/communityIcon_n2hvyn96zwk81.png?width=256&s=b2cd2f9dcc0cfbf94eee5a640f115dfca33dee1d"
+            )
+        );
     }
 
     #[test]
@@ -587,11 +709,20 @@ mod tests {
         assert!(poster.is_some());
 
         let maps = parse_listing(&fixture("maps.html")).unwrap();
+        let gallery = maps
+            .posts
+            .iter()
+            .find(|p| matches!(p.media, Media::Gallery { .. }))
+            .unwrap();
+        let Media::Gallery { images, thumb } = &gallery.media else {
+            unreachable!()
+        };
+        assert!(images.is_empty());
         assert!(
-            maps.posts
-                .iter()
-                .any(|p| p.media == Media::Gallery { images: Vec::new() })
+            thumb.as_deref().unwrap().starts_with("/preview/"),
+            "{thumb:?}"
         );
+        assert_eq!(gallery.media.list_thumb(), thumb.as_deref());
 
         let neovim = parse_listing(&fixture("sub.html")).unwrap();
         let link = neovim.posts.iter().find(|p| p.id == "1x4v4sn").unwrap();
@@ -606,6 +737,8 @@ mod tests {
 
         assert!(!listing.posts.is_empty());
         assert_eq!(listing.after.as_deref(), Some("t3_1vlgboo"));
+        // Search pages carry no subreddit icon.
+        assert_eq!(listing.icon, None);
     }
 
     #[test]
@@ -618,12 +751,88 @@ mod tests {
 
     #[test]
     fn redlib_error_page_is_an_error() {
-        let html = "<html><head><title>Error: Reddit error 404 \"null\": \"Not Found\" | /x - Redlib</title></head></html>";
+        let html = "<html><head><title>Error: Reddit error 404 - Redlib</title></head>\
+            <body><div id=\"error\"><h1>Reddit error 404 \"null\": \"Not Found\" | /x</h1></div></body></html>";
 
         let err = parse_listing(html).unwrap_err().to_string();
 
         assert!(err.starts_with("Redlib error"), "{err}");
         assert!(err.contains("404"), "{err}");
+    }
+
+    #[test]
+    fn a_post_titled_error_is_not_an_error_page() {
+        let html = r#"<html><head><title>Error with Neovim and Tree Sitter - r/neovim</title></head><body>
+            <div class="post highlighted" id="abc"><p class="post_header"><a class="post_subreddit">r/neovim</a></p>
+            <h1 class="post_title">Error with Neovim and Tree Sitter</h1>
+            <div class="post_poll"><span>61 votes,</span> <span>6d left</span>
+              <div class="poll_option"><div class="poll_chart"></div><span></span><span>Yes</span></div>
+              <div class="poll_option"><div class="poll_chart"></div><span></span><span>No</span></div>
+            </div></div></body></html>"#;
+
+        let page = parse_post_page(html).unwrap();
+
+        assert_eq!(page.post.title, "Error with Neovim and Tree Sitter");
+        assert_eq!(page.body, "Poll: 61 votes · 6d left\n• Yes\n• No");
+    }
+
+    #[test]
+    fn a_spoiler_across_quoted_lines_keeps_each_quote_bar_outside_it() {
+        let el = Html::parse_fragment(
+            r#"<blockquote><p><span class="md-spoiler-text">line one<br/>line two</span></p></blockquote>"#,
+        );
+
+        let text = md_to_text(el.root_element());
+
+        assert_eq!(
+            text,
+            format!(
+                "│ {SPOILER_START}line one\n{SPOILER_END}│ {SPOILER_START}line two{SPOILER_END}"
+            )
+        );
+    }
+
+    #[test]
+    fn marker_characters_in_reddit_text_are_dropped() {
+        let el = Html::parse_fragment(&format!(
+            "<p>odd {SPOILER_START}glyph{SPOILER_END} here \
+             <a href=\"http://x.test/&#xFDD0;\">link</a> after</p>"
+        ));
+
+        assert_eq!(
+            md_to_text(el.root_element()),
+            "odd glyph here link <http://x.test/> after"
+        );
+    }
+
+    #[test]
+    fn spoiler_tag_and_inline_spoiler_text_are_marked() {
+        let html = r#"<html><head><title>x</title></head><body>
+            <div class="post highlighted" id="abc"><p class="post_header"><a class="post_subreddit">r/tv</a></p>
+            <h1 class="post_title">Finale thoughts <small class="spoiler">Spoiler</small></h1>
+            <div class="post_body"><div class="md"><p>He was <span class="md-spoiler-text">the killer</span> all along.</p></div></div>
+            </div></body></html>"#;
+
+        let page = parse_post_page(html).unwrap();
+
+        assert!(page.post.spoiler);
+        assert_eq!(
+            page.post.title, "Finale thoughts",
+            "the tag is not part of the title"
+        );
+        assert_eq!(
+            page.body,
+            format!("He was {SPOILER_START}the killer{SPOILER_END} all along.")
+        );
+    }
+
+    #[test]
+    fn nsfw_gate_says_how_to_see_it() {
+        let html = "<html><head><title>NSFW content gated</title></head><body></body></html>";
+
+        let err = parse_listing(html).unwrap_err().to_string();
+
+        assert!(err.contains("show_nsfw"), "{err}");
     }
 
     #[test]
@@ -664,7 +873,7 @@ mod tests {
     #[test]
     fn post_page_media_variants() {
         let gallery = parse_post_page(&fixture("gallery.html")).unwrap();
-        assert!(matches!(&gallery.post.media, Media::Gallery { images } if images.len() > 1));
+        assert!(matches!(&gallery.post.media, Media::Gallery { images, .. } if images.len() > 1));
 
         let video = parse_post_page(&fixture("videopost.html")).unwrap();
         assert!(

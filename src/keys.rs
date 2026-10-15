@@ -1,4 +1,6 @@
-//! Key bindings. Overlays get keys first, then the post view, then lists.
+//! Key bindings. Overlays get keys first, then the focused sidebar, then the
+//! post view, then lists. `h` climbs one level per press: comment → post →
+//! list → sidebar; `l` goes back down.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -7,17 +9,76 @@ use crate::model::Sort;
 
 const PAGE: isize = 10;
 
-pub fn handle(app: &mut App, key: KeyEvent) {
+pub fn handle(app: &mut App, mut key: KeyEvent) {
     if key.kind == KeyEventKind::Release {
         return;
+    }
+    // Terminals that send ^H for Backspace, and readline's Ctrl+H: Backspace
+    // everywhere. With Alt (Esc first) it stays Alt+Backspace.
+    if key.code == KeyCode::Char('h')
+        && key.modifiers.difference(KeyModifiers::ALT) == KeyModifiers::CONTROL
+    {
+        key = KeyEvent::new(
+            KeyCode::Backspace,
+            key.modifiers.intersection(KeyModifiers::ALT),
+        );
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     if ctrl && key.code == KeyCode::Char('c') {
         app.quit = true;
         return;
     }
+    // Esc followed quickly by a key arrives as Alt+key: act on both, so Esc still
+    // closes what it should and the key is not typed or run in the wrong place.
+    if key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(
+            key.code,
+            KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace
+        )
+    {
+        // In a text box Alt+letter is a readline motion (Alt+b, Alt+f): closing
+        // the box would lose the query and run the letter in the list. Ignore it;
+        // Alt+Enter submits, as Enter does, and Alt+Backspace deletes a word.
+        if let Some(Overlay::Picker(PickerState { input, .. }) | Overlay::Search { input }) =
+            &mut app.overlay
+        {
+            match key.code {
+                KeyCode::Enter => {
+                    handle(app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
+                KeyCode::Backspace => {
+                    delete_word(input);
+                    if let Some(Overlay::Picker(picker)) = &mut app.overlay {
+                        picker.selected = 0;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        handle(app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let mut plain = key;
+        plain.modifiers.remove(KeyModifiers::ALT);
+        handle(app, plain);
+        return;
+    }
     if let Some(overlay) = app.overlay.take() {
         app.overlay = handle_overlay(app, overlay, key);
+        return;
+    }
+    // Letter bindings are plain keys: Ctrl+letter runs only the bindings that name
+    // Ctrl (Ctrl+X must not close a tab, Ctrl+B must not bookmark).
+    if ctrl && let KeyCode::Char(c) = key.code {
+        match (app.post_view.is_some(), c) {
+            (true, 'd' | 'u' | 'e' | 'y') => {
+                handle_post(app, key);
+            }
+            (false, 'd' | 'u') => handle_global(app, key),
+            _ => {}
+        }
+        return;
+    }
+    if app.sidebar_focused && app.post_view.is_none() && handle_sidebar(app, key) {
         return;
     }
     if app.post_view.is_some() && handle_post(app, key) {
@@ -26,13 +87,66 @@ pub fn handle(app: &mut App, key: KeyEvent) {
     handle_global(app, key);
 }
 
+/// Keys while the sidebar has focus. Returns true when handled; others act globally.
+fn handle_sidebar(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => app.move_sidebar(1),
+        KeyCode::Char('k') | KeyCode::Up => app.move_sidebar(-1),
+        KeyCode::Char('g') | KeyCode::Home => app.sidebar_edge(false),
+        KeyCode::Char('G') | KeyCode::End => app.sidebar_edge(true),
+        KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter | KeyCode::Esc => app.focus_main(),
+        // Already at the top of the ladder.
+        KeyCode::Char('h') | KeyCode::Left => {}
+        _ => return false,
+    }
+    true
+}
+
+/// Readline's Alt+Backspace: drop the last word and the spaces after it.
+fn delete_word(input: &mut String) {
+    let kept = input
+        .trim_end()
+        .trim_end_matches(|c: char| !c.is_whitespace())
+        .len();
+    input.truncate(kept);
+}
+
+/// Pasted text goes into the picker or search input; elsewhere it is ignored, so
+/// a paste's letters and newlines never run commands. In a search a line break or
+/// tab becomes a space, so the words of a pasted phrase stay apart; a subreddit
+/// name has no spaces.
+pub fn paste(app: &mut App, text: &str) {
+    match &mut app.overlay {
+        Some(Overlay::Picker(picker)) => {
+            picker
+                .input
+                .extend(text.chars().filter(|c| !c.is_control()));
+            picker.selected = 0;
+        }
+        Some(Overlay::Search { input }) => {
+            for c in text.chars() {
+                let c = if c.is_control() { ' ' } else { c };
+                if c != ' ' || !input.ends_with(' ') {
+                    input.push(c);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Returns the overlay to keep open, or `None` to close it.
 fn handle_overlay(app: &mut App, overlay: Overlay, key: KeyEvent) -> Option<Overlay> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    // Esc followed quickly by a key can arrive as Alt+key; never type it.
-    let typing = !ctrl && !key.modifiers.contains(KeyModifiers::ALT);
+    let typing = !ctrl;
     match overlay {
-        Overlay::Help => None,
+        Overlay::Help { scroll } => match key.code {
+            KeyCode::Char('j') | KeyCode::Down => Some(Overlay::Help { scroll: scroll + 1 }),
+            KeyCode::Char('k') | KeyCode::Up => Some(Overlay::Help {
+                scroll: scroll.saturating_sub(1),
+            }),
+            _ => None,
+        },
         Overlay::Picker(mut picker) => {
             let count = app.picker_entries(&picker.input).len();
             match key.code {
@@ -117,21 +231,29 @@ fn handle_overlay(app: &mut App, overlay: Overlay, key: KeyEvent) -> Option<Over
 fn handle_post(app: &mut App, key: KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
-        KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h' | 'q') => {
-            app.close_post()
+        KeyCode::Char('h') | KeyCode::Left => {
+            if !app.leave_comment() {
+                app.close_post()
+            }
         }
+        KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => app.close_post(),
         KeyCode::Char('j') | KeyCode::Down => app.move_comment_cursor(1),
         KeyCode::Char('k') | KeyCode::Up => app.move_comment_cursor(-1),
-        KeyCode::Char('d') if ctrl => app.scroll_post(PAGE * 2),
-        KeyCode::Char('u') if ctrl => app.scroll_post(-PAGE * 2),
-        KeyCode::Char('e') if ctrl => app.scroll_post(3),
-        KeyCode::Char('y') if ctrl => app.scroll_post(-3),
-        KeyCode::PageDown | KeyCode::Char(' ') => app.scroll_post(PAGE * 3),
-        KeyCode::PageUp => app.scroll_post(-PAGE * 3),
+        KeyCode::Char('d') if ctrl => app.page_post(1, 2),
+        KeyCode::Char('u') if ctrl => app.page_post(-1, 2),
+        KeyCode::Char('e') if ctrl => app.scroll_post(1),
+        KeyCode::Char('y') if ctrl => app.scroll_post(-1),
+        KeyCode::PageDown | KeyCode::Char(' ') => app.page_post(1, 1),
+        KeyCode::PageUp => app.page_post(-1, 1),
         KeyCode::Char('g') | KeyCode::Home => app.post_top(),
         KeyCode::Char('G') | KeyCode::End => app.post_bottom(),
         KeyCode::Char('n') => app.jump_top_level(true),
+        KeyCode::Char('v') => app.toggle_spoilers(),
         KeyCode::Char('N') => app.jump_top_level(false),
+        KeyCode::Char('P') => app.toggle_video_pause(),
+        KeyCode::Char('a') => app.toggle_video_sound(),
+        KeyCode::Char(',') => app.seek_video(false),
+        KeyCode::Char('.') => app.seek_video(true),
         KeyCode::Char('c') | KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
             app.activate_comment()
         }
@@ -148,7 +270,7 @@ fn handle_global(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('q') if !in_post => app.quit = true,
         KeyCode::Esc if !(on_sub && app.clear_search()) => app.status = None,
-        KeyCode::Char('?') => app.overlay = Some(Overlay::Help),
+        KeyCode::Char('?') => app.overlay = Some(Overlay::Help { scroll: 0 }),
         KeyCode::Char('p') => app.overlay = Some(Overlay::Picker(PickerState::default())),
         KeyCode::Tab | KeyCode::Char(']') => app.cycle_tab(true),
         KeyCode::BackTab | KeyCode::Char('[') => app.cycle_tab(false),
@@ -172,6 +294,7 @@ fn handle_global(app: &mut App, key: KeyEvent) {
         KeyCode::Char('g') | KeyCode::Home => app.select_edge(false),
         KeyCode::Char('G') | KeyCode::End => app.select_edge(true),
         KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => app.open_current_post(),
+        KeyCode::Char('h') | KeyCode::Left => app.focus_sidebar(),
         KeyCode::Char('J') if kind == TabKind::Home => app.move_home_group(1),
         KeyCode::Char('K') if kind == TabKind::Home => app.move_home_group(-1),
         KeyCode::Char(' ') if kind == TabKind::Home => app.open_home_group_tab(),

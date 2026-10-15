@@ -2,7 +2,7 @@
 name = "redtab"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.90"
 description = "Terminal Reddit reader with tabs, built on a local Redlib instance"
 license = "MIT"
 repository = "https://github.com/kapral18/redtab"
@@ -10,8 +10,11 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+libc = "0.2"
 crossterm = "0.29"
+flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 nucleo-matcher = "0.3"
 ratatui = "0.30"
@@ -20,6 +23,7 @@ scraper = "0.27"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
+unicode-segmentation = "1"
 unicode-width = "0.2"
 textwrap = "0.16"
 signal-hook = "0.4"

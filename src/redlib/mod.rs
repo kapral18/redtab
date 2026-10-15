@@ -10,8 +10,11 @@ use ureq::Agent;
 use crate::model::{Comment, Listing, PostPage, Sort, TimeRange};
 
 /// Redlib settings are cookies. HLS makes Reddit-hosted videos playable;
-/// the notification cookie hides Redlib's "Enable HLS" banner.
-const BASE_COOKIES: &str = "use_hls=on; hide_hls_notification=on";
+/// the notification cookie hides Redlib's "Enable HLS" banner. The layout and
+/// sidebar are pinned: an instance defaulting to the compact layout drops media
+/// blocks, and a hidden sidebar drops the subreddit icon.
+const BASE_COOKIES: &str =
+    "use_hls=on; hide_hls_notification=on; layout=card; hide_sidebar_and_summary=off";
 const PAGE_LIMIT: u64 = 16 * 1024 * 1024;
 const IMAGE_LIMIT: u64 = 64 * 1024 * 1024;
 
@@ -43,14 +46,17 @@ impl Redlib {
     }
 
     /// Absolute URL for a Redlib-relative path; absolute URLs pass through.
+    /// Non-ASCII in the path (post slugs) is percent-encoded: Redlib answers
+    /// raw UTF-8 bytes with HTTP 400.
     pub fn absolute(&self, path: &str) -> String {
-        if path.starts_with("http://") || path.starts_with("https://") {
+        let joined = if path.starts_with("http://") || path.starts_with("https://") {
             path.to_string()
         } else if path.starts_with('/') {
             format!("{}{path}", self.base)
         } else {
             format!("{}/{path}", self.base)
-        }
+        };
+        url::Url::parse(&joined).map_or(joined, String::from)
     }
 
     pub fn listing(
@@ -141,9 +147,32 @@ impl Redlib {
             .with_config()
             .limit(PAGE_LIMIT)
             .read_to_string()?;
-        if !status.is_success() && !body.contains("<title>Error") {
+        // Redlib's own error and NSFW-gate pages come with an error status; the
+        // parser turns them into a readable message.
+        let redlib_page =
+            body.contains("<div id=\"error\">") || body.contains("<title>NSFW content gated");
+        if !status.is_success() && !redlib_page {
             bail!("GET {url}: HTTP {status}");
         }
         Ok(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_ascii_post_paths_are_percent_encoded() {
+        let redlib = Redlib::new("http://127.0.0.1:8085/", false);
+
+        assert_eq!(
+            redlib.absolute("/r/pokemon/comments/1x/every_pokémon/"),
+            "http://127.0.0.1:8085/r/pokemon/comments/1x/every_pok%C3%A9mon/"
+        );
+        assert_eq!(
+            redlib.absolute("/preview/pre/a.jpg?width=140&s=abc"),
+            "http://127.0.0.1:8085/preview/pre/a.jpg?width=140&s=abc"
+        );
     }
 }
