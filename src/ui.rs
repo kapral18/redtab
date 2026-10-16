@@ -2,9 +2,11 @@
 //! right. Takes `&mut App` to keep scroll offsets in sync with what fits and
 //! to load the thumbnails it draws.
 
+use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -92,6 +94,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
     }
     draw_footer(f, app, footer);
+    app.status_drawn();
     draw_spots(f, app, &spots);
     if let Some(Overlay::Help { scroll }) = &mut app.overlay {
         draw_help(f, scroll);
@@ -123,7 +126,7 @@ fn draw_spots(f: &mut Frame, app: &mut App, spots: &[ImageSpot]) {
     // sixel and iTerm2 would keep stale overlay pixels. Draw them once it closes.
     if app.overlay.is_none() {
         for spot in spots {
-            if let Some(ImageSlot::Ready(protocol)) = app.thumbs.get_mut(&spot.url) {
+            if let Some(ImageSlot::Ready { protocol, .. }) = app.thumbs.get_mut(&spot.url) {
                 f.render_stateful_widget(StatefulImage::default(), spot.area, protocol.as_mut());
             }
         }
@@ -835,6 +838,17 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
         title.push(chip(format!("{badge} new"), CRUST, ACCENT));
         title.push(Span::raw(" "));
     }
+    if let Some(freshness) = group.freshness {
+        title.push(Span::styled(
+            freshness.label(
+                crate::app::now(),
+                group.loading,
+                group.error.is_some(),
+                app.redlib_up == Some(false),
+            ),
+            Style::new().fg(OVERLAY),
+        ));
+    }
     // A failed refresh keeps the posts you can still act on; it only marks the card.
     if group.error.is_some() && !group.posts.is_empty() {
         title.push(chip("✗ refresh failed", RED, SURFACE0));
@@ -933,9 +947,9 @@ fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
     if feed.loading {
         chips.push(chip("⋯ loading", OVERLAY, SURFACE0));
     }
-    if feed.error.is_some() && !feed.posts.is_empty() {
+    if feed.error().is_some() && !feed.posts.is_empty() {
         chips.push(chip(
-            if feed.page_failed {
+            if feed.page_failed() {
                 "✗ next page failed · L retries"
             } else {
                 "✗ reload failed · r retries"
@@ -944,9 +958,21 @@ fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
             SURFACE0,
         ));
     }
+    if let Some(freshness) = feed.freshness {
+        chips.push(chip(
+            freshness.label(
+                crate::app::now(),
+                feed.loading || feed.refreshing(),
+                feed.error().is_some(),
+                app.redlib_up == Some(false),
+            ),
+            OVERLAY,
+            SURFACE0,
+        ));
+    }
     let title = tab.title();
     let seen_key = tab.subreddit().map(str::to_string);
-    let error = feed.error.clone();
+    let error = feed.error().map(str::to_owned);
     let posts: Vec<Post> = app.visible(&feed.posts).into_iter().cloned().collect();
     let selected = feed.selected;
     let loaded = feed.loaded;
@@ -1173,7 +1199,20 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::new().fg(SURFACE1))
-                .padding(Padding::horizontal(1)),
+                .padding(Padding::horizontal(1))
+                .title_bottom(Line::styled(
+                    view.freshness
+                        .map(|freshness| {
+                            freshness.label(
+                                now.timestamp(),
+                                view.loading,
+                                view.error.is_some(),
+                                app.redlib_up == Some(false),
+                            )
+                        })
+                        .unwrap_or_default(),
+                    Style::new().fg(OVERLAY),
+                )),
         ),
         head_area,
     );
@@ -1210,13 +1249,58 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(view) = app.post_view.as_mut() else {
         return;
     };
-    let (lines, spans) = post_document(view, width);
+    let mut more_lines = std::mem::take(&mut view.rendered_more);
+    let PostDocument { lines, spans } = post_document(view, width, now, Some(&mut more_lines));
     view.row_starts = spans.iter().map(|(s, _)| *s).collect();
+    let requested_scroll = view.scroll;
     // Replies loaded above the text being read: put it back where it was.
-    if let Some((row, offset)) = view.take_reading_anchor()
+    let reading_anchor = view.take_reading_anchor();
+    if let Some((row, offset)) = reading_anchor
         && let Some(&(start, _)) = spans.get(row)
     {
         view.scroll = start.saturating_add_signed(offset);
+    }
+    if view.content_changed {
+        let handoff = std::mem::take(&mut view.more_handoff);
+        if handoff && reading_anchor.is_some() {
+            // The semantic row already accounts for spoiler reflow above it.
+            view.rewrapped = None;
+        }
+        let held = view
+            .hold_view
+            .filter(|hold| !view.free_scroll && hold.row == view.cursor && !hold.top);
+        // Text matching must not override a More → first-new-reply handoff by
+        // finding unchanged text in a later sibling.
+        let anchor_row = if !view.free_scroll {
+            Some(view.cursor)
+        } else if handoff {
+            reading_anchor.map(|(row, _)| row)
+        } else {
+            None
+        };
+        let bounds = anchor_row
+            .and_then(|row| spans.get(row))
+            .map_or(0..lines.len(), |&(start, end)| start..end);
+        if requested_scroll != 0
+            && (view.free_scroll || held.is_some())
+            && let Some((was, target)) = edit_anchor(
+                &view.rendered_document,
+                requested_scroll,
+                &lines,
+                view.page_height,
+                bounds,
+            )
+        {
+            view.scroll = target.saturating_sub(was - requested_scroll);
+            if let Some(hold) = &mut view.hold_view
+                && let Some((start, _)) = spans.get(hold.row)
+            {
+                hold.offset = view.scroll as isize - *start as isize;
+            }
+            // The retained document already represents the pre-toggle display.
+            view.rewrapped = None;
+        }
+        view.content_changed = false;
     }
     // `v` while reading: only spoiler lines changed, so the line that was on top
     // is in the new wrapping too. Keys in the same batch move on from it; a jump to
@@ -1226,10 +1310,10 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
         && view.reveal_spoilers != was
         && (view.scroll != 0 || pinned == 0)
     {
-        let now = view.reveal_spoilers;
+        let shown = view.reveal_spoilers;
         view.reveal_spoilers = was;
-        let (old_lines, _) = post_document(view, width);
-        view.reveal_spoilers = now;
+        let old_lines = post_document(view, width, now, None).lines;
+        view.reveal_spoilers = shown;
         if let Some(at) = same_line(&old_lines, pinned, &lines) {
             let moved = view.scroll as isize - pinned as isize;
             view.scroll = at.saturating_add_signed(moved);
@@ -1280,8 +1364,12 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
     let height = doc_area.height as usize;
     view.page_height = height;
     let total = lines.len();
-    let visible: Vec<Line> = lines.into_iter().skip(scroll).take(height).collect();
-    f.render_widget(Paragraph::new(visible), doc_area);
+    for (row, line) in lines.iter().skip(scroll).take(height).enumerate() {
+        f.buffer_mut()
+            .set_line(doc_area.x, doc_area.y + row as u16, line, doc_area.width);
+    }
+    view.rendered_document = lines;
+    view.rendered_more = more_lines;
     draw_scrollbar(f, doc_area, scroll, height, total);
     if let Some(still) = image {
         let area = img_area.inner(margin);
@@ -1291,6 +1379,62 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
             draw_inline_image(f, app, &url, area);
         }
     }
+}
+
+/// Text comparison ignores styling and the selected-comment bar.
+fn line_text<'a>(line: &'a Line<'_>) -> impl Iterator<Item = char> + 'a {
+    line.spans
+        .iter()
+        .flat_map(|span| span.content.chars())
+        .enumerate()
+        .map(|(i, c)| if i == 0 && c == '▌' { ' ' } else { c })
+}
+
+fn line_hash(line: &Line) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for c in line_text(line) {
+        c.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Find an unambiguous unchanged line within the old viewport, preserving its
+/// distance from the top. Repeated punctuation never selects a different passage.
+fn edit_anchor(
+    old: &[Line],
+    at: usize,
+    new: &[Line],
+    height: usize,
+    bounds: std::ops::Range<usize>,
+) -> Option<(usize, usize)> {
+    let mut occurrences: HashMap<u64, (usize, usize, usize)> = HashMap::with_capacity(old.len());
+    for line in old {
+        occurrences.entry(line_hash(line)).or_default().0 += 1;
+    }
+    for (index, line) in new.iter().enumerate() {
+        if let Some((_, count, target)) = occurrences.get_mut(&line_hash(line)) {
+            *count += 1;
+            *target = index;
+        }
+    }
+    old.iter()
+        .enumerate()
+        .skip(at)
+        .take(height)
+        .find_map(|(was, line)| {
+            if !line_text(line).any(|c| !c.is_whitespace() && c != '│') {
+                return None;
+            }
+            let &(1, 1, target) = occurrences.get(&line_hash(line))? else {
+                return None;
+            };
+            if !bounds.contains(&target) {
+                return None;
+            }
+            line_text(line)
+                .eq(line_text(&new[target]))
+                .then_some((was, target))
+        })
 }
 
 /// Where line `at` of `old` is in `new`: the same line, counted among its equals
@@ -1343,22 +1487,45 @@ fn settle_scroll(
     (scroll.min(total.saturating_sub(height)), held)
 }
 
-/// Selftext, then comments. Returns the lines and each comment row's line span.
-fn post_document(view: &PostView, width: usize) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
+#[derive(Default)]
+struct PostDocument {
+    lines: Vec<Line<'static>>,
+    spans: Vec<(usize, usize)>,
+}
+
+/// Selftext, comment spans and More-row geometry for the displayed document.
+fn post_document(
+    view: &PostView,
+    width: usize,
+    now: DateTime<Utc>,
+    mut more_lines: Option<&mut Vec<(String, usize)>>,
+) -> PostDocument {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    if let Some(e) = &view.error {
+    // Early-return documents contain no More rows.
+    if (view.page.is_none() || view.spoiler_hidden())
+        && let Some(rows) = &mut more_lines
+    {
+        rows.clear();
+    }
+    if let Some(e) = view.error.as_ref().filter(|_| view.page.is_none()) {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             format!("✗ Could not load the post: {e}"),
             Style::new().fg(RED),
         ));
         lines.push(Line::styled("press r to retry", Style::new().fg(OVERLAY)));
-        return (lines, Vec::new());
+        return PostDocument {
+            lines,
+            ..PostDocument::default()
+        };
     }
     let Some(page) = &view.page else {
         lines.push(Line::raw(""));
         lines.push(Line::styled("⋯ loading post", Style::new().fg(OVERLAY)));
-        return (lines, Vec::new());
+        return PostDocument {
+            lines,
+            ..PostDocument::default()
+        };
     };
     lines.push(Line::raw(""));
     let reveal = view.reveal_spoilers;
@@ -1373,7 +1540,10 @@ fn post_document(view: &PostView, width: usize) -> (Vec<Line<'static>>, Vec<(usi
             format!("⚠ Spoiler · v reveals the post{comments}"),
             Style::new().fg(YELLOW).add_modifier(Modifier::BOLD),
         ));
-        return (lines, Vec::new());
+        return PostDocument {
+            lines,
+            ..PostDocument::default()
+        };
     } else if !page.body.is_empty() {
         let body = spoiler_text(&page.body, reveal);
         wrap_into(&mut lines, &body, width, &[], Style::new().fg(TEXT));
@@ -1392,6 +1562,7 @@ fn post_document(view: &PostView, width: usize) -> (Vec<Line<'static>>, Vec<(usi
         lines.push(Line::styled("   no comments yet", Style::new().fg(OVERLAY)));
     }
     let mut spans = Vec::with_capacity(rows.len());
+    let mut more_count = 0;
     for (i, row) in rows.iter().enumerate() {
         let start = lines.len();
         let selected = i == view.cursor && !view.free_scroll;
@@ -1436,7 +1607,10 @@ fn post_document(view: &PostView, width: usize) -> (Vec<Line<'static>>, Vec<(usi
                     format!("  ▲ {}", comment.score.map_or("•".into(), format_count)),
                     bg.fg(score_color(comment.score)),
                 ));
-                head.push(Span::styled(format!(" · {}", comment.age), bg.fg(OVERLAY)));
+                head.push(Span::styled(
+                    format!(" · {}", comment.age_at(now)),
+                    bg.fg(OVERLAY),
+                ));
                 if *hidden > 0 {
                     head.push(Span::styled("  ", bg));
                     head.push(chip(format!("+{hidden} folded"), YELLOW, SURFACE1));
@@ -1477,6 +1651,18 @@ fn post_document(view: &PostView, width: usize) -> (Vec<Line<'static>>, Vec<(usi
                 }
             }
             RowKind::More { parent, more } => {
+                if let Some(rows) = &mut more_lines {
+                    if let Some((id, line)) = rows.get_mut(more_count) {
+                        if id.as_str() != *parent {
+                            id.clear();
+                            id.push_str(parent);
+                        }
+                        *line = start;
+                    } else {
+                        rows.push(((*parent).to_owned(), start));
+                    }
+                    more_count += 1;
+                }
                 let mut line = prefix.clone();
                 let text = if view.loading_more.contains(*parent) {
                     "⋯ loading replies".to_string()
@@ -1500,7 +1686,10 @@ fn post_document(view: &PostView, width: usize) -> (Vec<Line<'static>>, Vec<(usi
         lines.push(Line::raw(""));
         spans.push((start, end));
     }
-    (lines, spans)
+    if let Some(rows) = more_lines {
+        rows.truncate(more_count);
+    }
+    PostDocument { lines, spans }
 }
 
 /// The post's video under the header: the current frame (the poster until the
@@ -1617,8 +1806,8 @@ fn draw_inline_image(f: &mut Frame, app: &mut App, url: &str, area: Rect) {
     // stale pixels (sixel, iTerm2), so it waits for the overlay to close.
     let covered = app.overlay.is_some();
     match app.images.get_mut(url) {
-        Some(ImageSlot::Ready(_)) if covered => {}
-        Some(ImageSlot::Ready(protocol)) => {
+        Some(ImageSlot::Ready { .. }) if covered => {}
+        Some(ImageSlot::Ready { protocol, .. }) => {
             f.render_stateful_widget(StatefulImage::default(), area, protocol.as_mut());
         }
         Some(ImageSlot::Failed(e)) => {
@@ -2049,7 +2238,7 @@ mod tests {
 
     fn app(subscriptions: &[&str]) -> App {
         let redlib = Redlib::new("http://127.0.0.1:9", false);
-        let (pool, _rx) = Pool::start(redlib.clone(), 3);
+        let (pool, _rx) = Pool::start(redlib.clone(), 3, None);
         let state = std::env::temp_dir().join(format!(
             "redtab-ui-test-{}-{:?}.json",
             std::process::id(),
@@ -2135,6 +2324,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n\n");
         let comment = Comment {
+            sources: None,
+            created: None,
             id: "c".into(),
             author: "x".into(),
             flair: None,
@@ -3553,8 +3744,13 @@ mod tests {
         let p1_row = s.lines().position(|l| l.contains("p1 x")).unwrap() as u16;
         let image = image::DynamicImage::new_rgb8(256, 256);
         let protocol = app.image_picker.new_resize_protocol(image);
-        app.thumbs
-            .insert("/img/p1.jpeg".into(), ImageSlot::Ready(Box::new(protocol)));
+        app.thumbs.insert(
+            "/img/p1.jpeg".into(),
+            ImageSlot::Ready {
+                protocol: Box::new(protocol),
+                refresh: crate::app::ImageRefresh::Idle,
+            },
+        );
         let cells = placeholder_cells(&mut app, 100, 20);
 
         // Sidebar 24 + margin 1: the list starts at x 25 with the selection bar,
@@ -3573,6 +3769,7 @@ mod tests {
         app.image_picker = kitty();
         app.show_images = true;
         app.on_msg(Msg::Group {
+            generation: 0,
             subreddit: "s".into(),
             result: Ok(crate::model::Listing {
                 posts: vec![post_with("p1", Media::None)],
@@ -3601,8 +3798,13 @@ mod tests {
         assert!(app.thumbs.contains_key("/icon/s.png"));
         let image = image::DynamicImage::new_rgb8(16, 16);
         let protocol = app.image_picker.new_resize_protocol(image);
-        app.thumbs
-            .insert("/icon/s.png".into(), ImageSlot::Ready(Box::new(protocol)));
+        app.thumbs.insert(
+            "/icon/s.png".into(),
+            ImageSlot::Ready {
+                protocol: Box::new(protocol),
+                refresh: crate::app::ImageRefresh::Idle,
+            },
+        );
         let cells = placeholder_cells(&mut app, 120, 30);
 
         let sidebar_row = s
@@ -3638,7 +3840,10 @@ mod tests {
 
     fn ready(app: &App, w: u32, h: u32) -> ImageSlot {
         let image = image::DynamicImage::new_rgb8(w, h);
-        ImageSlot::Ready(Box::new(app.image_picker.new_resize_protocol(image)))
+        ImageSlot::Ready {
+            protocol: Box::new(app.image_picker.new_resize_protocol(image)),
+            refresh: crate::app::ImageRefresh::Idle,
+        }
     }
 
     #[test]
@@ -3777,6 +3982,69 @@ mod tests {
             app.thumbs.get("/img/p1.jpeg"),
             Some(ImageSlot::Loading)
         ));
+    }
+
+    #[test]
+    fn a_skipped_refresh_keeps_a_loaded_thumbnail() {
+        let mut app = feed_app(kitty());
+        screen(&mut app, 100, 20);
+        app.on_msg(Msg::Thumb {
+            url: "/img/p1.jpeg".into(),
+            result: Ok(image::DynamicImage::new_rgb8(4, 4)),
+        });
+
+        app.on_msg(Msg::ThumbSkipped {
+            url: "/img/p1.jpeg".into(),
+        });
+
+        assert!(matches!(
+            app.thumbs.get("/img/p1.jpeg"),
+            Some(ImageSlot::Ready { .. })
+        ));
+    }
+
+    #[test]
+    fn a_cache_warning_is_repeated_until_a_draw_shows_it() {
+        let mut app = app(&[]);
+        let warning = || Msg::CacheWarning("Could not save cache: disk full".into());
+        // Replaced by a load error before any draw: never seen, so it comes back.
+        app.on_msg(warning());
+        app.error("r/x: connection refused");
+        screen(&mut app, 100, 20);
+        app.on_msg(warning());
+        let shown = screen(&mut app, 100, 20);
+        assert!(shown.contains("disk full"), "{shown}");
+
+        app.status = None;
+        app.on_msg(warning());
+
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn cached_comments_show_their_age_now_not_at_fetch_time() {
+        let (mut app, _) = open_long_post(|_| {});
+        let comment = &mut app
+            .post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .comments[0];
+        comment.age = "1h ago".into();
+        comment.created = Some(Utc::now() - chrono::Duration::days(3));
+        let view = app.post_view.as_mut().unwrap();
+        view.scroll = usize::MAX / 2;
+
+        let shown = screen(&mut app, 100, 30);
+        let header = shown
+            .lines()
+            .find(|l| l.contains("u/x"))
+            .unwrap_or_default()
+            .to_owned();
+
+        assert!(header.contains("3d ago"), "{header}");
     }
 
     fn press(app: &mut App, c: char) {
@@ -4172,5 +4440,619 @@ mod tests {
         assert_eq!(sends(&mut app), 0, "a redraw repeats the cells only");
         app.video.as_mut().unwrap().show(frame());
         assert_eq!(sends(&mut app), 1, "the next frame goes out");
+    }
+
+    #[test]
+    fn edited_selftext_keeps_the_unchanged_passage_being_read() {
+        let (mut app, _) = open_long_post(|_| {});
+        let original = (1..=60)
+            .map(|i| format!("body passage {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        app.post_view.as_mut().unwrap().page.as_mut().unwrap().body = original.clone();
+        screen(&mut app, 100, 30);
+        app.post_view.as_mut().unwrap().scroll = 26; // A blank line before unchanged text.
+        let passage = |text: String| {
+            text.lines().enumerate().find_map(|(row, line)| {
+                line.split("body passage ")
+                    .nth(1)
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .map(|rest| (row, rest.to_owned()))
+            })
+        };
+        let before = passage(screen(&mut app, 100, 30));
+        assert!(before.is_some());
+        for body in [
+            format!("inserted one\n\ninserted two\n\n{original}"),
+            original,
+        ] {
+            let view = app.post_view.as_ref().unwrap();
+            let generation = view.generation;
+            let mut page = view.page.as_ref().unwrap().clone();
+            page.body = body;
+            app.on_msg(Msg::Post {
+                generation,
+                result: Ok(Box::new(page)),
+            });
+            assert_eq!(passage(screen(&mut app, 100, 30)), before);
+        }
+    }
+
+    #[test]
+    fn edited_selftext_anchor_respects_batched_spoiler_and_scroll_keys() {
+        let run = |edit_body: bool, draw_between: bool, before: &[char], after: &[char]| {
+            let mut app = post_with_rewrapping_spoilers(40);
+            let view = app.post_view.as_mut().unwrap();
+            view.scroll = view.row_starts[0] - 30;
+            screen(&mut app, 100, 30);
+            for &key in before {
+                press(&mut app, key);
+                if draw_between {
+                    screen(&mut app, 100, 30);
+                }
+            }
+            if edit_body {
+                let view = app.post_view.as_ref().unwrap();
+                let generation = view.generation;
+                let mut page = view.page.as_ref().unwrap().clone();
+                page.body = format!("inserted one\n\ninserted two\n\n{}", page.body);
+                app.on_msg(Msg::Post {
+                    generation,
+                    result: Ok(Box::new(page)),
+                });
+            }
+            if draw_between {
+                screen(&mut app, 100, 30);
+            }
+            for &key in after {
+                press(&mut app, key);
+            }
+            let shown = screen(&mut app, 100, 30);
+            let passage = shown.lines().enumerate().find_map(|(row, line)| {
+                line.split("body ")
+                    .nth(1)
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .map(|rest| (row, rest.to_owned()))
+            });
+            (app.post_view.as_ref().unwrap().scroll, passage)
+        };
+        for (before, after) in [
+            (&[][..], &['v', ' '][..]),
+            (&['v'][..], &[][..]),
+            (&[][..], &['g'][..]),
+        ] {
+            let batched = run(true, false, before, after);
+            assert_eq!(batched, run(true, true, before, after));
+            if after.contains(&'g') {
+                assert_eq!(batched.0, 0);
+            } else {
+                let unchanged = run(false, false, before, after);
+                assert!(unchanged.1.is_some());
+                assert_eq!(batched.1, unchanged.1);
+            }
+        }
+    }
+
+    #[test]
+    fn edited_comments_keep_the_passage_read_or_held_across_post_and_more_updates() {
+        for more in [false, true] {
+            for held in [0, 1, 2] {
+                let (mut app, _) = open_long_post(|_| {});
+                let original = (1..=60)
+                    .map(|i| format!("comment passage {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                let view = app.post_view.as_mut().unwrap();
+                let page = view.page.as_mut().unwrap();
+                page.body.clear();
+                page.comments[0].body = original.clone();
+                if more {
+                    let child = page.comments.remove(0);
+                    let mut parent = child.clone();
+                    parent.id = "parent".into();
+                    parent.body = "parent".into();
+                    parent.replies = vec![child];
+                    page.comments.push(parent);
+                }
+                screen(&mut app, 100, 30);
+                let view = app.post_view.as_mut().unwrap();
+                view.scroll = view.row_starts[usize::from(more)] + 26;
+                screen(&mut app, 100, 30);
+                let passage = |text: String| {
+                    text.lines().enumerate().find_map(|(row, line)| {
+                        line.split("comment passage ")
+                            .nth(1)
+                            .and_then(|text| text.split_whitespace().next())
+                            .map(|text| (row, text.to_owned()))
+                    })
+                };
+                let before = passage(screen(&mut app, 100, 30));
+                assert!(before.is_some());
+                if held != 0 {
+                    press(&mut app, 'l');
+                    if held == 1 {
+                        screen(&mut app, 100, 30);
+                    }
+                }
+                for body in [
+                    format!("new paragraph\n\nanother paragraph\n\n{original}"),
+                    original,
+                ] {
+                    let view = app.post_view.as_ref().unwrap();
+                    let generation = view.generation;
+                    let mut page = view.page.as_ref().unwrap().clone();
+                    let child = if more {
+                        &mut page.comments[0].replies[0]
+                    } else {
+                        &mut page.comments[0]
+                    };
+                    child.body = body;
+                    let msg = if more {
+                        Msg::MoreReplies {
+                            generation,
+                            comment_id: "parent".into(),
+                            result: Ok(std::mem::take(&mut page.comments[0].replies)),
+                        }
+                    } else {
+                        Msg::Post {
+                            generation,
+                            result: Ok(Box::new(page)),
+                        }
+                    };
+                    app.on_msg(msg);
+                    assert_eq!(
+                        passage(screen(&mut app, 100, 30)),
+                        before,
+                        "more={more} held={held}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spoiler_then_comment_refresh_in_one_batch_keeps_the_old_passage() {
+        for more in [false, true] {
+            let (mut app, _) = open_long_post(|_| {});
+            let original = (1..=60)
+                .map(|i| format!("unchanged comment passage {i}"))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let original = format!("{original}\n\n{SPOILER_START}short spoiler{SPOILER_END}");
+            let view = app.post_view.as_mut().unwrap();
+            let page = view.page.as_mut().unwrap();
+            page.body.clear();
+            page.comments[0].body = original;
+            if more {
+                let child = page.comments.remove(0);
+                let mut parent = child.clone();
+                parent.id = "parent".into();
+                parent.body = "parent".into();
+                parent.replies = vec![child];
+                page.comments.push(parent);
+            }
+            screen(&mut app, 100, 30);
+            let view = app.post_view.as_mut().unwrap();
+            view.scroll = view.row_starts[usize::from(more)] + 26;
+            let passage = |text: String| {
+                text.lines().enumerate().find_map(|(row, line)| {
+                    line.split("unchanged comment passage ")
+                        .nth(1)
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .map(|rest| (row, rest.to_owned()))
+                })
+            };
+            let before = passage(screen(&mut app, 100, 30));
+            assert!(before.is_some());
+            press(&mut app, 'v');
+            let view = app.post_view.as_ref().unwrap();
+            let generation = view.generation;
+            let mut page = view.page.as_ref().unwrap().clone();
+            let child = if more {
+                &mut page.comments[0].replies[0]
+            } else {
+                &mut page.comments[0]
+            };
+            child.body = format!("inserted\n\nalso inserted\n\n{}", child.body);
+            app.on_msg(if more {
+                Msg::MoreReplies {
+                    generation,
+                    comment_id: "parent".into(),
+                    result: Ok(std::mem::take(&mut page.comments[0].replies)),
+                }
+            } else {
+                Msg::Post {
+                    generation,
+                    result: Ok(Box::new(page)),
+                }
+            });
+            assert_eq!(passage(screen(&mut app, 100, 30)), before, "more={more}");
+        }
+    }
+
+    #[test]
+    fn a_top_jump_discards_the_old_comment_hold_before_an_edit() {
+        let (mut app, _) = open_long_post(|_| {});
+        let view = app.post_view.as_mut().unwrap();
+        let page = view.page.as_mut().unwrap();
+        page.body.clear();
+        page.comments[0].body = (1..=60)
+            .map(|i| format!("passage {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        screen(&mut app, 100, 30);
+        let view = app.post_view.as_mut().unwrap();
+        view.scroll = view.row_starts[0] + 26;
+        screen(&mut app, 100, 30);
+        press(&mut app, 'l');
+        screen(&mut app, 100, 30);
+        press(&mut app, 'g');
+        let view = app.post_view.as_ref().unwrap();
+        let generation = view.generation;
+        let mut page = view.page.as_ref().unwrap().clone();
+        page.comments[0].body = format!("inserted\n\n{}", page.comments[0].body);
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(page)),
+        });
+        screen(&mut app, 100, 30);
+        assert_eq!(app.post_view.as_ref().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn a_new_hold_takes_precedence_over_the_previously_drawn_comment() {
+        let run = |edited: bool| {
+            let (mut app, _) = open_long_post(|_| {});
+            let view = app.post_view.as_mut().unwrap();
+            let page = view.page.as_mut().unwrap();
+            page.body.clear();
+            page.comments[0].body = "short first comment".into();
+            let mut next = page.comments[0].clone();
+            next.id = "next".into();
+            next.body = (1..=60)
+                .map(|i| format!("second passage {i}"))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            page.comments.push(next);
+            screen(&mut app, 100, 30);
+            press(&mut app, 'j');
+            screen(&mut app, 100, 30);
+            for key in ['h', ' ', 'l'] {
+                press(&mut app, key);
+            }
+            if edited {
+                let view = app.post_view.as_ref().unwrap();
+                let generation = view.generation;
+                let mut page = view.page.as_ref().unwrap().clone();
+                page.comments[1].body =
+                    format!("inserted\n\nalso inserted\n\n{}", page.comments[1].body);
+                app.on_msg(Msg::Post {
+                    generation,
+                    result: Ok(Box::new(page)),
+                });
+            }
+            screen(&mut app, 100, 30)
+                .lines()
+                .enumerate()
+                .find_map(|(row, line)| {
+                    line.split("second passage ")
+                        .nth(1)
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .map(|rest| (row, rest.to_owned()))
+                })
+        };
+        let before = run(false);
+        assert!(before.is_some());
+        assert_eq!(run(true), before);
+    }
+
+    #[test]
+    fn repeated_braces_do_not_move_an_edit_anchor_to_another_passage() {
+        for comment in [false, true] {
+            let (mut app, _) = open_long_post(|_| {});
+            let original = format!(
+                "opening\n\n}}\n\nFIRST unique passage\n\n}}\n\nSECOND unique passage\n\n{}",
+                (1..=40)
+                    .map(|i| format!("tail {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            );
+            let view = app.post_view.as_mut().unwrap();
+            let page = view.page.as_mut().unwrap();
+            if comment {
+                page.body.clear();
+                page.comments[0].body = original.clone();
+            } else {
+                page.body = original.clone();
+            }
+            screen(&mut app, 100, 30);
+            let view = app.post_view.as_mut().unwrap();
+            view.scroll = if comment { view.row_starts[0] + 7 } else { 7 };
+            let second = |shown: String| {
+                shown
+                    .lines()
+                    .position(|line| line.contains("SECOND unique passage"))
+            };
+            let before = second(screen(&mut app, 100, 30));
+            assert!(before.is_some());
+            let view = app.post_view.as_ref().unwrap();
+            let generation = view.generation;
+            let mut page = view.page.as_ref().unwrap().clone();
+            if comment {
+                page.comments[0].body = format!("}}\n\n{original}");
+            } else {
+                page.body = format!("}}\n\n{original}");
+            }
+            app.on_msg(Msg::Post {
+                generation,
+                result: Ok(Box::new(page)),
+            });
+            assert_eq!(
+                second(screen(&mut app, 100, 30)),
+                before,
+                "comment={comment}"
+            );
+        }
+    }
+
+    #[test]
+    fn spoiler_then_selftext_edit_keeps_the_unchanged_comment_passage() {
+        let (mut app, _) = open_long_post(|_| {});
+        let view = app.post_view.as_mut().unwrap();
+        let page = view.page.as_mut().unwrap();
+        page.body = "short selftext".into();
+        page.comments[0].body = format!(
+            "{}\n\n{SPOILER_START}short spoiler{SPOILER_END}",
+            (1..=60)
+                .map(|i| format!("stable passage {i}"))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        );
+        screen(&mut app, 100, 30);
+        let view = app.post_view.as_mut().unwrap();
+        view.scroll = view.row_starts[0] + 26;
+        let passage = |shown: String| {
+            shown.lines().enumerate().find_map(|(row, line)| {
+                line.split("stable passage ")
+                    .nth(1)
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .map(|rest| (row, rest.to_owned()))
+            })
+        };
+        let before = passage(screen(&mut app, 100, 30));
+        assert!(before.is_some());
+        press(&mut app, 'v');
+        let view = app.post_view.as_ref().unwrap();
+        let generation = view.generation;
+        let mut page = view.page.as_ref().unwrap().clone();
+        page.body = format!("inserted\n\nalso inserted\n\n{}", page.body);
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(page)),
+        });
+        assert_eq!(passage(screen(&mut app, 100, 30)), before);
+    }
+
+    #[test]
+    fn spoiler_then_paging_anchors_the_comment_actually_being_read() {
+        let run = |edited: bool, held: bool| {
+            let (mut app, _) = open_long_post(|_| {});
+            let view = app.post_view.as_mut().unwrap();
+            let page = view.page.as_mut().unwrap();
+            page.body.clear();
+            page.comments[0].body = format!(
+                "{}\n{SPOILER_START}short spoiler{SPOILER_END}",
+                (1..=10)
+                    .map(|i| format!("first passage {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            );
+            let mut next = page.comments[0].clone();
+            next.id = "next".into();
+            next.body = (1..=60)
+                .map(|i| format!("next passage {i}"))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            page.comments.push(next);
+            screen(&mut app, 100, 30);
+            let view = app.post_view.as_mut().unwrap();
+            view.scroll = view.row_starts[0] + 8;
+            screen(&mut app, 100, 30);
+            if held {
+                press(&mut app, 'l');
+                screen(&mut app, 100, 30);
+            }
+            press(&mut app, 'v');
+            press(&mut app, ' ');
+            if edited {
+                let view = app.post_view.as_ref().unwrap();
+                let generation = view.generation;
+                let mut page = view.page.as_ref().unwrap().clone();
+                page.comments[1].body =
+                    format!("inserted\n\nalso inserted\n\n{}", page.comments[1].body);
+                app.on_msg(Msg::Post {
+                    generation,
+                    result: Ok(Box::new(page)),
+                });
+            }
+            screen(&mut app, 100, 30)
+                .lines()
+                .enumerate()
+                .find_map(|(row, line)| {
+                    line.split("next passage ")
+                        .nth(1)
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .map(|rest| (row, rest.to_owned()))
+                })
+        };
+        for held in [false, true] {
+            let before = run(false, held);
+            assert!(before.is_some());
+            assert_eq!(run(true, held), before, "held={held}");
+        }
+    }
+
+    #[test]
+    fn reading_a_more_slot_follows_new_replies_not_a_following_sibling() {
+        let mut wrong = Vec::new();
+        for (toggle, preceding_blank, twice) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let (mut app, _) = open_long_post(|_| {});
+            let view = app.post_view.as_mut().unwrap();
+            let page = view.page.as_mut().unwrap();
+            page.body.clear();
+            page.comments[0].body = format!("parent {SPOILER_START}short spoiler{SPOILER_END}");
+            page.comments[0].more = Some(crate::model::MoreReplies {
+                path: "/more".into(),
+                count: Some(10),
+            });
+            let mut sibling = page.comments[0].clone();
+            sibling.id = "sibling".into();
+            sibling.more = None;
+            sibling.body = (1..=30)
+                .map(|i| format!("unique sibling passage {i}"))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            page.comments.push(sibling);
+            screen(&mut app, 100, 30);
+            let view = app.post_view.as_mut().unwrap();
+            view.cursor = 1;
+            view.free_scroll = false;
+            view.scroll = view.row_starts[1] - usize::from(preceding_blank);
+            screen(&mut app, 100, 30);
+            app.activate_comment();
+            press(&mut app, 'h');
+            screen(&mut app, 100, 30);
+            if toggle {
+                press(&mut app, 'v');
+            }
+            let view = app.post_view.as_ref().unwrap();
+            let generation = view.generation;
+            let mut reply = view.page.as_ref().unwrap().comments[0].clone();
+            reply.more = None;
+            let replies: Vec<_> = (0..10)
+                .map(|i| Comment {
+                    id: format!("new-{i}"),
+                    body: format!("new reply {i}"),
+                    ..reply.clone()
+                })
+                .collect();
+            for _ in 0..if twice { 2 } else { 1 } {
+                app.on_msg(Msg::MoreReplies {
+                    generation,
+                    comment_id: "c".into(),
+                    result: Ok(replies.clone()),
+                });
+            }
+            screen(&mut app, 100, 30);
+            let view = app.post_view.as_ref().unwrap();
+            let expected = view.row_starts[1] - usize::from(preceding_blank);
+            if view.scroll != expected {
+                wrong.push((toggle, preceding_blank, twice, view.scroll, expected));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "toggle/blank/twice/actual/expected: {wrong:?}"
+        );
+    }
+    #[test]
+    fn removed_parent_more_follows_a_recovered_descendant_before_drawing() {
+        let (mut app, _) = open_long_post(|_| {});
+        let source = |sequence, cached| crate::cache::Source {
+            order: Some(crate::cache::RequestOrder {
+                generation: [1; 16],
+                sequence,
+            }),
+            observed: Some((sequence, sequence)),
+            cached,
+        };
+        let view = app.post_view.as_mut().unwrap();
+        let page = view.page.as_mut().unwrap();
+        page.body.clear();
+        let mut child = page.comments[0].clone();
+        child.id = "child".into();
+        child.more = Some(crate::model::MoreReplies {
+            path: "/child".into(),
+            count: None,
+        });
+        child.sources = Some(crate::model::CommentSources {
+            content: source(1, true),
+            more: source(1, true),
+            from_expansion: false,
+        });
+        let mut parent = child.clone();
+        parent.id = "parent".into();
+        parent.more.as_mut().unwrap().path = "/parent".into();
+        parent.replies = vec![child.clone()];
+        let mut sibling = child.clone();
+        sibling.id = "sibling".into();
+        sibling.more = None;
+        sibling.body = (0..30)
+            .map(|i| format!("unique following passage {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        page.comments = vec![parent, sibling];
+        screen(&mut app, 100, 30);
+        let view = app.post_view.as_mut().unwrap();
+        let more = view
+            .rows()
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.kind,
+                    RowKind::More {
+                        parent: "parent",
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        view.cursor = more;
+        view.free_scroll = false;
+        view.scroll = view.row_starts[more];
+        screen(&mut app, 100, 30);
+        app.activate_comment();
+        press(&mut app, 'h');
+        screen(&mut app, 100, 30);
+        let view = app.post_view.as_ref().unwrap();
+        let generation = view.generation;
+        let mut fresh = view.page.as_ref().unwrap().clone();
+        fresh.comments[0].more = None;
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Post {
+                generation,
+                result: Ok(Box::new(fresh)),
+            }),
+            fetched_at: 1000,
+            source: source(3, false),
+            refreshing: false,
+        });
+        let mut recovered = child.clone();
+        recovered.id = "recovered".into();
+        recovered.more = None;
+        child.replies.push(recovered);
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::MoreReplies {
+                generation,
+                comment_id: "parent".into(),
+                result: Ok(vec![child]),
+            }),
+            fetched_at: 1000,
+            source: source(2, true),
+            refreshing: false,
+        });
+        screen(&mut app, 100, 30);
+        let view = app.post_view.as_ref().unwrap();
+        let reply = view.rows().iter().position(|row|
+            matches!(row.kind, RowKind::Comment { comment, .. } if comment.id == "recovered")).unwrap();
+        assert_eq!(
+            view.scroll, view.row_starts[reply],
+            "follow the reply, not its sibling"
+        );
     }
 }

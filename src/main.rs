@@ -1,4 +1,5 @@
 mod app;
+mod cache;
 mod config;
 mod keys;
 mod media;
@@ -146,7 +147,8 @@ fn main() -> Result<()> {
     } else {
         Picker::halfblocks()
     };
-    let (pool, messages) = Pool::start(redlib.clone(), WORKER_THREADS);
+    let cache = cache::Cache::new(config::cache_dir());
+    let (pool, messages) = Pool::start(redlib.clone(), WORKER_THREADS, Some(cache));
     // The terminal may have closed during the probe (up to 2 s): quit before
     // touching it, as for any other quit signal.
     if quit_signal.load(Ordering::Relaxed) {

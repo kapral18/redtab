@@ -106,6 +106,10 @@ pub fn state_dir() -> PathBuf {
     xdg_dir("XDG_STATE_HOME", ".local/state").join("redtab")
 }
 
+pub fn cache_dir() -> PathBuf {
+    xdg_dir("XDG_CACHE_HOME", ".cache").join("redtab")
+}
+
 fn xdg_dir(var: &str, fallback: &str) -> PathBuf {
     std::env::var_os(var)
         .map(PathBuf::from)

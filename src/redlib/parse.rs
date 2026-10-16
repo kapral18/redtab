@@ -356,7 +356,9 @@ fn parse_comment(el: ElementRef<'_>) -> Comment {
             .and_then(|n| n.trim().parse().ok());
         Some(MoreReplies { path, count })
     });
+    let created_el = el.select(&COMMENT_CREATED).next();
     Comment {
+        sources: None,
         id: el.attr("id").unwrap_or_default().to_string(),
         author,
         flair: el
@@ -371,11 +373,12 @@ fn parse_comment(el: ElementRef<'_>) -> Comment {
             .next()
             .and_then(|s| s.attr("title"))
             .and_then(|t| t.trim().parse().ok()),
-        age: el
-            .select(&COMMENT_CREATED)
-            .next()
+        age: created_el
             .map(|c| collapse_ws(&c.text().collect::<String>()))
             .unwrap_or_default(),
+        created: created_el
+            .and_then(|c| c.attr("title"))
+            .and_then(parse_redlib_time),
         body: el
             .select(&COMMENT_BODY)
             .next()
@@ -850,6 +853,7 @@ mod tests {
         assert_eq!(top.flair.as_deref(), Some("Plugin author"));
         assert_eq!(top.score, Some(47));
         assert!(top.body.starts_with("TL;DR:"));
+        assert_eq!(top.created, parse_redlib_time("Oct 13 2026, 12:22:54 UTC"));
         assert!(top.body.contains("• Today is five years"));
         assert_eq!(top.replies[0].id, "pggxkm7");
         assert_eq!(top.replies[0].replies[0].id, "pgh2tkd");

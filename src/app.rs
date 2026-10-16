@@ -9,10 +9,12 @@ use ratatui::layout::Rect;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 
+use crate::cache::{Freshness, Source};
 use crate::config::{Config, is_subreddit_name, normalize_subreddit};
 use crate::media;
 use crate::model::{
-    Comment, Listing, Media, MoreReplies, Post, PostPage, SPOILER_START, Sort, TimeRange,
+    Comment, CommentSources, Listing, Media, MoreReplies, Post, PostPage, SPOILER_START, Sort,
+    TimeRange,
 };
 use crate::redlib::Redlib;
 use crate::state::State;
@@ -45,7 +47,7 @@ pub struct Feed {
     pub time: TimeRange,
     pub search: Option<String>,
     pub loading: bool,
-    pub error: Option<String>,
+    failures: HashMap<Option<String>, FeedFailure>,
     pub generation: u64,
     pub selected: usize,
     pub loaded: bool,
@@ -54,23 +56,142 @@ pub struct Feed {
     /// The query `posts` came from. A failed load of a different query clears them;
     /// a failed reload of the same query keeps them.
     shown_query: Option<FeedQuery>,
-    /// The last error came from loading a further page (`L` retries it), not page 1.
-    pub page_failed: bool,
+    pub freshness: Option<Freshness>,
+    pages: Vec<FeedPage>,
+    request_query: Option<FeedQuery>,
+    requests: HashMap<u64, Option<String>>,
+    pending: HashSet<u64>,
+    refreshing: HashSet<u64>,
+}
+
+#[derive(Debug)]
+struct FeedFailure {
+    error: String,
+    source: Source,
+}
+
+#[derive(Debug)]
+struct FeedPage {
+    cursor: Option<String>,
+    len: usize,
+    after: Option<String>,
+    source: Source,
 }
 
 impl Feed {
     fn query(&self) -> FeedQuery {
         match &self.search {
             Some(q) => FeedQuery::Search { query: q.clone() },
+            // Sorts without a time range send none; the kept range must not split them.
             None => FeedQuery::Listing {
                 sort: self.sort,
-                time: self.time,
+                time: if self.sort.takes_time() {
+                    self.time
+                } else {
+                    TimeRange::Day
+                },
             },
         }
     }
 
     pub fn is_default_view(&self) -> bool {
         self.search.is_none() && self.sort == Sort::Hot
+    }
+
+    pub fn refreshing(&self) -> bool {
+        !self.refreshing.is_empty()
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.failures
+            .get(&self.after)
+            .or_else(|| self.failures.get(&None))
+            .or_else(|| self.failures.values().next())
+            .map(|failure| failure.error.as_str())
+    }
+
+    pub fn page_failed(&self) -> bool {
+        self.after.is_some()
+            && self.failures.contains_key(&self.after)
+            && !self.pages.iter().any(|page| page.cursor == self.after)
+    }
+
+    fn accepts(&self, generation: u64) -> bool {
+        generation == self.generation || self.requests.contains_key(&generation)
+    }
+
+    /// Replace this cursor's page, not the entire feed or an append-only union.
+    fn replace_page(
+        &mut self,
+        cursor: Option<String>,
+        mut posts: Vec<Post>,
+        after: Option<String>,
+        source: Source,
+    ) -> bool {
+        let index = self
+            .pages
+            .iter()
+            .position(|page| page.cursor == cursor)
+            .unwrap_or(self.pages.len());
+        if self
+            .pages
+            .get(index)
+            .is_some_and(|page| !source.may_replace(page.source))
+        {
+            return false;
+        }
+        let mut protected = HashSet::new();
+        let mut start = 0;
+        for (i, page) in self.pages.iter().enumerate() {
+            if i != index
+                && (!source.may_replace(page.source)
+                    || (page.source.compare(source) == Some(std::cmp::Ordering::Equal)
+                        && source.cached
+                        && i < index))
+            {
+                protected.extend(
+                    self.posts[start..start + page.len]
+                        .iter()
+                        .map(|post| post.id.as_str()),
+                );
+            }
+            start += page.len;
+        }
+        posts.retain(|post| !protected.contains(post.id.as_str()));
+        let incoming_ids: HashSet<_> = posts.iter().map(|post| post.id.as_str()).collect();
+        // Newer refreshed records own their positions; older cached pages cannot move them back.
+        let mut pages = self.pages.iter_mut().enumerate();
+        let mut current = pages.next();
+        let mut remaining = current.as_ref().map_or(0, |(_, page)| page.len);
+        self.posts.retain(|post| {
+            while remaining == 0 && current.is_some() {
+                current = pages.next();
+                remaining = current.as_ref().map_or(0, |(_, page)| page.len);
+            }
+            remaining = remaining.saturating_sub(1);
+            let keep = current.as_ref().is_some_and(|(i, _)| *i == index)
+                || !incoming_ids.contains(post.id.as_str());
+            if !keep && let Some((_, page)) = current.as_mut() {
+                page.len -= 1;
+            }
+            keep
+        });
+        let start: usize = self.pages[..index].iter().map(|page| page.len).sum();
+        let end = start + self.pages.get(index).map_or(0, |page| page.len);
+        let page = FeedPage {
+            cursor,
+            len: posts.len(),
+            after,
+            source,
+        };
+        self.posts.splice(start..end, posts);
+        if index == self.pages.len() {
+            self.pages.push(page);
+        } else {
+            self.pages[index] = page;
+        }
+        self.after = self.pages.last().and_then(|page| page.after.clone());
+        true
     }
 }
 
@@ -119,6 +240,8 @@ pub struct Group {
     pub posts: Vec<Post>,
     pub loading: bool,
     pub error: Option<String>,
+    pub freshness: Option<Freshness>,
+    pub generation: u64,
 }
 
 #[derive(Debug, Default)]
@@ -136,6 +259,7 @@ pub struct PostView {
     pub page: Option<PostPage>,
     pub loading: bool,
     pub error: Option<String>,
+    pub freshness: Option<Freshness>,
     pub generation: u64,
     pub collapsed: HashSet<String>,
     pub loading_more: HashSet<String>,
@@ -161,6 +285,14 @@ pub struct PostView {
     /// `v` while reading: the spoiler state the last draw showed and the scroll
     /// then. The next draw finds the line that was on top in the new wrapping.
     pub rewrapped: Option<(bool, usize)>,
+    /// Last rendered document: owned lines move here after drawing, without copies.
+    pub rendered_document: Vec<ratatui::text::Line<'static>>,
+    /// A successful content update arrived since that document was drawn.
+    pub content_changed: bool,
+    /// More rows in the last displayed geometry, even after spoiler invalidation.
+    pub rendered_more: Vec<(String, usize)>,
+    /// This update redirects a read More row to its first newly inserted reply.
+    pub more_handoff: bool,
     /// The inline image was scrolled away. It stays away, even when a short post
     /// clamps the scroll back to 0, until a key goes back to the top.
     pub image_away: bool,
@@ -416,11 +548,19 @@ impl PostView {
     /// Put the cursor back on the same row after rows changed above it. A "more
     /// replies" row that just loaded is gone: its index now holds its first new reply.
     fn reselect(&mut self, key: Option<RowKey>) {
+        let count = self.rows().len();
+        if count == 0 {
+            self.cursor = 0;
+            self.free_scroll = true;
+            self.hold_view = None;
+            self.keep_reading = None;
+            self.drawn_cursor = None;
+            self.left = None;
+            return;
+        }
         let found = key.and_then(|key| self.row_index(&key));
         let held = self.hold_view.is_some_and(|h| h.row == self.cursor);
-        self.cursor = found
-            .unwrap_or(self.cursor)
-            .min(self.rows().len().saturating_sub(1));
+        self.cursor = found.unwrap_or(self.cursor).min(count.saturating_sub(1));
         // The comment `l` selected moved: its hold on the view moves with it.
         if held && let Some(hold) = &mut self.hold_view {
             hold.row = self.cursor;
@@ -510,9 +650,22 @@ pub enum Overlay {
     },
 }
 
+/// Cached pixels stay usable independently of their next network request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageRefresh {
+    Idle,
+    Loading,
+    Failed,
+    /// Skipped work or an explicit retry waits until the URL is drawn.
+    Needed,
+}
+
 pub enum ImageSlot {
     Loading,
-    Ready(Box<StatefulProtocol>),
+    Ready {
+        protocol: Box<StatefulProtocol>,
+        refresh: ImageRefresh,
+    },
     Failed(String),
 }
 
@@ -520,6 +673,8 @@ pub struct Status {
     pub text: String,
     pub error: bool,
     pub at: Instant,
+    /// A cache warning: once a draw shows it, the same text is not repeated.
+    pub cache_warning: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -560,6 +715,8 @@ pub struct App {
     /// Subreddit icon URLs, keyed by lowercase subreddit name.
     icons: HashMap<String, String>,
     pending_media: HashSet<String>,
+    /// Cache warnings a draw has shown; a broken or busy cache repeats them per job.
+    cache_warnings: HashSet<String>,
     /// The open post's inline video while it plays (or loads, or failed).
     pub video: Option<Player>,
     /// `a` turned the sound on: later videos start with it too.
@@ -614,6 +771,7 @@ impl App {
             thumbs: HashMap::new(),
             icons: HashMap::new(),
             pending_media: HashSet::new(),
+            cache_warnings: HashSet::new(),
             video: None,
             video_sound_on: false,
             video_area: None,
@@ -641,7 +799,10 @@ impl App {
             .collect();
         app.check_health();
         for name in subscriptions {
-            app.pool.submit(Job::Group { subreddit: name });
+            app.pool.submit(Job::Group {
+                subreddit: name,
+                generation: 0,
+            });
         }
         if let Some(w) = warning {
             app.error(w);
@@ -673,6 +834,7 @@ impl App {
             text: text.into(),
             error: false,
             at: Instant::now(),
+            cache_warning: false,
         });
     }
 
@@ -681,7 +843,16 @@ impl App {
             text: text.into(),
             error: true,
             at: Instant::now(),
+            cache_warning: false,
         });
+    }
+
+    /// After a draw: a cache warning the footer showed is not repeated this session.
+    pub fn status_drawn(&mut self) {
+        if let Some(status) = self.status.as_mut().filter(|s| s.cache_warning) {
+            status.cache_warning = false;
+            self.cache_warnings.insert(status.text.clone());
+        }
     }
 
     /// Timers: status expiry, health checks, periodic saves, video frames. Returns
@@ -1029,39 +1200,81 @@ impl App {
 
     fn ensure_feed_loaded(&mut self, index: usize) {
         let tab = &self.tabs[index];
-        if tab.subreddit().is_some() && !tab.feed.loaded && !tab.feed.loading {
+        if tab.subreddit().is_some()
+            && !tab.feed.loading
+            && !(tab.feed.request_query.as_ref() == Some(&tab.feed.query())
+                && tab.feed.requests.iter().any(|(id, cursor)| {
+                    cursor.is_none()
+                        && (tab.feed.pending.contains(id) || tab.feed.refreshing.contains(id))
+                }))
+            && (!tab.feed.loaded
+                || tab.feed.freshness.is_some_and(|f| {
+                    now().saturating_sub(f.fetched_at) >= crate::cache::CONTENT_TTL
+                }))
+        {
             self.load_feed(index, false);
         }
     }
 
     pub fn load_feed(&mut self, index: usize, more: bool) {
+        let feed = &self.tabs[index].feed;
+        if more && (feed.loading || feed.after.is_none()) {
+            return;
+        }
+        let after = if more { feed.after.clone() } else { None };
+        self.fetch_feed(index, after, false);
+    }
+
+    fn fetch_feed(&mut self, index: usize, after: Option<String>, force: bool) {
         let generation = self.generation();
         let tab = &mut self.tabs[index];
         let Some(subreddit) = tab.subreddit().map(str::to_string) else {
             return;
         };
         let feed = &mut tab.feed;
-        if more && (feed.loading || feed.after.is_none()) {
-            return;
+        let query = feed.query();
+        if feed.request_query.as_ref() != Some(&query) {
+            feed.requests.clear();
+            feed.pending.clear();
+            feed.refreshing.clear();
+            feed.failures.clear();
+            feed.request_query = Some(query.clone());
         }
         feed.loading = true;
-        feed.error = None;
         feed.generation = generation;
-        let after = if more { feed.after.clone() } else { None };
+        feed.failures.remove(&after);
+        feed.requests.retain(|_, cursor| *cursor != after);
+        feed.pending.retain(|id| feed.requests.contains_key(id));
+        feed.refreshing.retain(|id| feed.requests.contains_key(id));
+        feed.requests.insert(generation, after.clone());
+        feed.pending.insert(generation);
         let job = Job::Feed {
             tab: tab.id,
             generation,
             subreddit,
-            query: feed.query(),
+            query,
             after,
         };
-        self.pool.submit(job);
+        if force {
+            self.pool.refresh(job);
+        } else {
+            self.pool.submit(job);
+        }
+    }
+
+    fn retry_failed_thumbs(&mut self) {
+        self.thumbs.retain(|_, slot| match slot {
+            ImageSlot::Failed(_) => false,
+            ImageSlot::Ready { refresh, .. } if *refresh == ImageRefresh::Failed => {
+                *refresh = ImageRefresh::Needed;
+                true
+            }
+            _ => true,
+        });
     }
 
     pub fn reload(&mut self) {
-        // Thumbnails that failed (Redlib down, rate limit) get another try.
-        self.thumbs
-            .retain(|_, slot| !matches!(slot, ImageSlot::Failed(_)));
+        self.retry_failed_thumbs();
         if let Some(view) = &self.post_view {
             let post = view.post.clone();
             for url in post.media.preview_image().into_iter() {
@@ -1069,8 +1282,7 @@ impl App {
                     self.images.remove(url);
                 }
             }
-            let permalink = post.permalink.clone();
-            self.open_post_permalink(post, permalink);
+            self.refresh_post();
             return;
         }
         match self.active_tab().kind {
@@ -1078,46 +1290,75 @@ impl App {
                 for g in &mut self.home.groups {
                     g.loading = true;
                     g.error = None;
-                    self.pool.submit(Job::Group {
+                    g.generation += 1;
+                    self.pool.refresh(Job::Group {
                         subreddit: g.subreddit.clone(),
+                        generation: g.generation,
                     });
                 }
             }
             TabKind::Bookmarks => {}
             TabKind::Subreddit { .. } => {
-                self.load_feed(self.active, false);
+                let feed = &self.tabs[self.active].feed;
+                let failed_pages: Vec<_> = feed
+                    .pages
+                    .iter()
+                    .filter(|page| {
+                        page.cursor.is_some() && feed.failures.contains_key(&page.cursor)
+                    })
+                    .map(|page| page.cursor.clone())
+                    .collect();
+                self.fetch_feed(self.active, None, true);
+                for cursor in failed_pages {
+                    self.fetch_feed(self.active, cursor, true);
+                }
             }
         }
         self.check_health();
     }
 
+    fn refresh_post(&mut self) {
+        let generation = self.generation();
+        let Some(view) = &mut self.post_view else {
+            return;
+        };
+        view.generation = generation;
+        view.loading = true;
+        view.error = None;
+        view.loading_more.clear();
+        self.pool.refresh(Job::Post {
+            generation,
+            permalink: view.post.permalink.clone(),
+        });
+    }
+
     /// After `S` started Redlib: reload only what failed or never loaded, so the
     /// screen you are reading keeps its place.
     fn reload_failed(&mut self) {
-        self.thumbs
-            .retain(|_, slot| !matches!(slot, ImageSlot::Failed(_)));
+        self.retry_failed_thumbs();
         if let Some(view) = &self.post_view
             && view.error.is_some()
         {
-            let post = view.post.clone();
-            let permalink = post.permalink.clone();
-            self.open_post_permalink(post, permalink);
+            self.refresh_post();
         }
         for g in &mut self.home.groups {
             if g.error.is_some() || (g.posts.is_empty() && !g.loading) {
                 g.loading = true;
                 g.error = None;
-                self.pool.submit(Job::Group {
+                g.generation += 1;
+                self.pool.refresh(Job::Group {
                     subreddit: g.subreddit.clone(),
+                    generation: g.generation,
                 });
             }
         }
         for i in 0..self.tabs.len() {
             let feed = &self.tabs[i].feed;
-            if self.tabs[i].subreddit().is_some() && feed.error.is_some() && !feed.loading {
-                // A failed next page is retried as a next page: the pages above stay.
-                let more = feed.page_failed;
-                self.load_feed(i, more);
+            if self.tabs[i].subreddit().is_some() && feed.error().is_some() {
+                let failed: Vec<_> = feed.failures.keys().cloned().collect();
+                for cursor in failed {
+                    self.fetch_feed(i, cursor, true);
+                }
             }
         }
     }
@@ -1184,7 +1425,7 @@ impl App {
                 if feed.selected + PREFETCH_MARGIN >= len
                     && feed.after.is_some()
                     && !feed.loading
-                    && feed.error.is_none()
+                    && !feed.page_failed()
                 {
                     self.load_feed(self.active, true);
                 }
@@ -1312,16 +1553,12 @@ impl App {
         }
         let generation = self.generation();
         self.state.mark_read(&post, now());
-        // The image is queued after the post: the text must not wait behind a download.
-        let image = self
-            .inline_images_on()
-            .then(|| post.media.preview_image().map(str::to_string))
-            .flatten();
         self.post_view = Some(PostView {
             post,
             page: None,
             loading: true,
             error: None,
+            freshness: None,
             generation,
             collapsed: HashSet::new(),
             loading_more: HashSet::new(),
@@ -1334,6 +1571,10 @@ impl App {
             keep_reading: None,
             drawn_cursor: None,
             rewrapped: None,
+            rendered_document: Vec::new(),
+            content_changed: false,
+            rendered_more: Vec::new(),
+            more_handoff: false,
             image_away: false,
             image_shown: false,
             row_starts: Vec::new(),
@@ -1344,9 +1585,6 @@ impl App {
             generation,
             permalink,
         });
-        if let Some(url) = image {
-            self.request_image(&url);
-        }
     }
 
     /// `v` in a post: show or hide its spoilers.
@@ -1600,10 +1838,17 @@ impl App {
                 let first_request = view.loading_more.insert(parent.clone());
                 let generation = view.generation;
                 if first_request {
+                    let minimum = view
+                        .page
+                        .as_mut()
+                        .and_then(|page| find_comment_mut(&mut page.comments, &parent))
+                        .and_then(|comment| comment.sources.map(|sources| sources.more))
+                        .or_else(|| view.freshness.map(|freshness| freshness.source));
                     self.pool.submit(Job::MoreReplies {
                         generation,
                         comment_id: parent,
                         path,
+                        minimum,
                     });
                 }
             }
@@ -1623,18 +1868,15 @@ impl App {
         self.show_images = !self.show_images;
         if self.inline_images_on()
             && let Some(view) = &mut self.post_view
+            && let Some(page) = &view.page
         {
             // Turned on at the post's top: show the image there now. Until the next
             // draw, changes in the same key pass treat the top as showing it.
-            let media = view
-                .page
-                .as_ref()
-                .map_or(&view.post.media, |p| &p.post.media);
+            let media = &page.post.media;
             let url = media.preview_image().map(str::to_string);
             if view.scroll == 0 {
                 view.image_away = false;
-                view.image_shown =
-                    media.shows_inline() && view.page.is_some() && !view.spoiler_hidden();
+                view.image_shown = media.shows_inline() && !view.spoiler_hidden();
             }
             if let Some(url) = url {
                 self.request_image(&url);
@@ -1744,12 +1986,22 @@ impl App {
     }
 
     /// After a frame: load the thumbnails it drew, let queued off-screen ones be skipped,
-    /// and bound the cache (past the limit, keep only what is on screen or loading).
+    /// and bound the cache (past the limit, keep what is on screen or in flight).
     pub fn thumbs_drawn(&mut self, urls: &[&str]) {
         self.pool.set_on_screen(urls);
         for url in urls {
-            if !self.thumbs.contains_key(*url) {
-                self.thumbs.insert(url.to_string(), ImageSlot::Loading);
+            let submit = match self.thumbs.get_mut(*url) {
+                None => {
+                    self.thumbs.insert(url.to_string(), ImageSlot::Loading);
+                    true
+                }
+                Some(ImageSlot::Ready { refresh, .. }) if *refresh == ImageRefresh::Needed => {
+                    *refresh = ImageRefresh::Loading;
+                    true
+                }
+                _ => false,
+            };
+            if submit {
                 self.pool.submit(Job::Thumb {
                     url: url.to_string(),
                 });
@@ -1758,7 +2010,14 @@ impl App {
         if self.thumbs.len() > THUMB_CACHE_MAX {
             let drawn: HashSet<&str> = urls.iter().copied().collect();
             self.thumbs.retain(|url, slot| {
-                matches!(slot, ImageSlot::Loading) || drawn.contains(url.as_str())
+                matches!(
+                    slot,
+                    ImageSlot::Loading
+                        | ImageSlot::Ready {
+                            refresh: ImageRefresh::Loading,
+                            ..
+                        }
+                ) || drawn.contains(url.as_str())
             });
         }
     }
@@ -1961,14 +2220,55 @@ impl App {
     // ----- worker results -----------------------------------------------------
 
     pub fn on_msg(&mut self, msg: Msg) {
+        self.on_result(msg, Source::default(), false);
+    }
+
+    fn on_result(&mut self, msg: Msg, source: Source, refreshing: bool) {
         match msg {
+            Msg::Snapshot {
+                message,
+                fetched_at,
+                refreshing,
+                source,
+            } => {
+                self.on_snapshot(*message, Freshness { fetched_at, source }, refreshing);
+            }
+            Msg::CacheWarning(warning) => {
+                if !self.cache_warnings.contains(&warning) {
+                    self.error(warning);
+                    if let Some(status) = &mut self.status {
+                        status.cache_warning = true;
+                    }
+                }
+            }
             Msg::Feed {
                 tab,
                 generation,
                 append,
                 result,
-            } => self.on_feed(tab, generation, append, result),
-            Msg::Group { subreddit, result } => self.on_group(&subreddit, result),
+            } => self.on_feed(
+                tab,
+                generation,
+                append,
+                result,
+                Freshness {
+                    fetched_at: now(),
+                    source,
+                },
+            ),
+            Msg::Group {
+                subreddit,
+                generation,
+                result,
+            } => self.on_group(
+                &subreddit,
+                generation,
+                result,
+                Freshness {
+                    fetched_at: now(),
+                    source,
+                },
+            ),
             Msg::Post { generation, result } => {
                 let Some(view) = &mut self.post_view else {
                     return;
@@ -1980,6 +2280,14 @@ impl App {
                 match result {
                     Ok(page) => {
                         let mut page = *page;
+                        let selected = view.cursor_key();
+                        view.content_changed = true;
+                        view.pin_view();
+                        if let Some(old) = &mut view.page {
+                            merge_comments(&mut page.comments, &mut old.comments, source, false);
+                        } else {
+                            merge_comments(&mut page.comments, &mut Vec::new(), source, false);
+                        }
                         // A link post's page has no thumbnail; keep the listing's.
                         if let (
                             Media::Link {
@@ -2002,6 +2310,8 @@ impl App {
                             self.state.mark_bookmark_spoiler(&page.post.id);
                         }
                         view.page = Some(page);
+                        view.error = None;
+                        view.reselect(selected);
                         view.row_starts.clear();
                         if self.inline_images_on()
                             && let Some(url) = image
@@ -2026,30 +2336,95 @@ impl App {
                 view.loading_more.remove(&comment_id);
                 match result {
                     Ok(replies) => {
+                        view.content_changed = true;
                         // Rows above the cursor may grow: keep the selected comment
                         // selected, and the text being read where it is.
-                        let selected = view.cursor_key();
+                        let mut selected = view.cursor_key();
+                        if !view.more_handoff
+                            && view.free_scroll
+                            && let Some((_, start)) =
+                                view.rendered_more.iter().find(|(id, start)| {
+                                    id == &comment_id
+                                        && (*start == view.scroll
+                                            || *start == view.scroll.saturating_add(1))
+                                })
+                        {
+                            let offset = view.scroll as isize - *start as isize;
+                            view.keep_reading =
+                                Some((RowKey::More(comment_id.clone()), offset, view.scroll));
+                            view.more_handoff = true;
+                        }
                         view.pin_view();
                         let more_at = view.row_index(&RowKey::More(comment_id.clone()));
+                        let selected_more =
+                            matches!(&selected, Some(RowKey::More(id)) if *id == comment_id);
+                        let reading_more = matches!(&view.keep_reading, Some((RowKey::More(id), _, _)) if *id == comment_id);
+                        let mut first_added = None;
                         if let Some(page) = &mut view.page
                             && let Some(c) = find_comment_mut(&mut page.comments, &comment_id)
                         {
-                            for reply in replies {
-                                if !c.replies.iter().any(|r| r.id == reply.id) {
-                                    c.replies.push(reply);
-                                }
+                            let allow_new = !replies_superseded(c, source);
+                            if selected_more || reading_more {
+                                first_added = first_new_reply(
+                                    &replies,
+                                    &c.replies,
+                                    source,
+                                    allow_new,
+                                    &view.collapsed,
+                                )
+                                .map(|id| RowKey::Comment(id.to_owned()));
                             }
-                            c.more = None;
+                            merge_replies(
+                                &mut c.replies,
+                                replies,
+                                source,
+                                allow_new,
+                                ReplyMerge::Expansion {
+                                    reorder: c
+                                        .sources
+                                        .is_none_or(|old| source.may_replace(old.more)),
+                                },
+                            );
+                            let mut sources = c.sources.unwrap_or(CommentSources {
+                                content: source,
+                                more: source,
+                                from_expansion: false,
+                            });
+                            if source.may_replace(sources.more) {
+                                // An empty preview has no replacement row: keep
+                                // the active More target until terminal delivery.
+                                if !refreshing {
+                                    c.more = None;
+                                }
+                                sources.more = source;
+                                c.sources = Some(sources);
+                            }
+                        }
+                        if selected_more {
+                            selected = if reading_more {
+                                first_added.clone().or(selected)
+                            } else {
+                                first_added.take().or(selected)
+                            };
                         }
                         view.reselect(selected);
                         view.row_starts.clear();
-                        // Reading at this "more replies" row: it is gone, and its index
-                        // now holds its first new reply, as in `reselect`.
+                        // A selected or read More row follows its first inserted reply,
+                        // even while a newer continuation remains pending.
                         let reading = view.keep_reading.take();
                         view.keep_reading =
                             reading.map(|(key, offset, scroll)| match (&key, more_at) {
-                                (RowKey::More(id), Some(i)) if *id == comment_id => {
-                                    (view.rows().get(i).map_or(key, RowKey::of), offset, scroll)
+                                (RowKey::More(id), index) if *id == comment_id => {
+                                    let next = first_added.take().unwrap_or_else(|| {
+                                        if view.row_index(&key).is_some() {
+                                            key
+                                        } else {
+                                            index
+                                                .and_then(|i| view.rows().get(i).map(RowKey::of))
+                                                .unwrap_or(key)
+                                        }
+                                    });
+                                    (next, offset, scroll)
                                 }
                                 _ => (key, offset, scroll),
                             });
@@ -2061,9 +2436,10 @@ impl App {
                 // A post closed since the request cleared its entry: drop the image.
                 if self.images.contains_key(&url) {
                     let slot = match result {
-                        Ok(img) => {
-                            ImageSlot::Ready(Box::new(self.image_picker.new_resize_protocol(img)))
-                        }
+                        Ok(img) => ImageSlot::Ready {
+                            protocol: Box::new(self.image_picker.new_resize_protocol(img)),
+                            refresh: ImageRefresh::Idle,
+                        },
                         Err(e) => ImageSlot::Failed(e),
                     };
                     self.images.insert(url, slot);
@@ -2073,16 +2449,36 @@ impl App {
             Msg::ImageSkipped => {}
             Msg::Thumb { url, result } => {
                 let slot = match result {
-                    Ok(img) => {
-                        ImageSlot::Ready(Box::new(self.image_picker.new_resize_protocol(img)))
+                    Ok(img) => ImageSlot::Ready {
+                        protocol: Box::new(self.image_picker.new_resize_protocol(img)),
+                        refresh: if refreshing {
+                            ImageRefresh::Loading
+                        } else {
+                            ImageRefresh::Idle
+                        },
+                    },
+                    Err(e) => {
+                        if let Some(ImageSlot::Ready { refresh, .. }) = self.thumbs.get_mut(&url) {
+                            *refresh = if refreshing {
+                                ImageRefresh::Loading
+                            } else {
+                                ImageRefresh::Failed
+                            };
+                            return;
+                        }
+                        ImageSlot::Failed(e)
                     }
-                    Err(e) => ImageSlot::Failed(e),
                 };
                 self.thumbs.insert(url, slot);
             }
-            // Forget it, so the row loads it again if it scrolls back into view.
+            // Forget it, so the row loads it again if it scrolls back into view. A
+            // skipped refresh of a shown image keeps it.
             Msg::ThumbSkipped { url } => {
-                self.thumbs.remove(&url);
+                if let Some(ImageSlot::Ready { refresh, .. }) = self.thumbs.get_mut(&url) {
+                    *refresh = ImageRefresh::Needed;
+                } else {
+                    self.thumbs.remove(&url);
+                }
             }
             Msg::MediaResolved { permalink, result } => {
                 if !self.pending_media.remove(&permalink) {
@@ -2141,33 +2537,187 @@ impl App {
         }
     }
 
+    fn on_snapshot(&mut self, message: Msg, freshness: Freshness, refreshing: bool) {
+        match message {
+            Msg::Feed {
+                tab,
+                generation,
+                append,
+                result,
+            } => {
+                self.on_feed(tab, generation, append, result, freshness);
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab)
+                    && tab.feed.accepts(generation)
+                    && refreshing
+                {
+                    tab.feed.refreshing.insert(generation);
+                }
+            }
+            Msg::Group {
+                subreddit,
+                generation,
+                result,
+            } => {
+                if !self
+                    .home
+                    .groups
+                    .iter()
+                    .any(|g| g.subreddit == subreddit && g.generation == generation)
+                {
+                    return;
+                }
+                self.on_group(&subreddit, generation, result, freshness);
+                if let Some(group) = self
+                    .home
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.subreddit == subreddit)
+                {
+                    group.freshness = Some(freshness);
+                    group.loading = refreshing;
+                }
+            }
+            Msg::Post { generation, result } => {
+                self.on_result(
+                    Msg::Post { generation, result },
+                    freshness.source,
+                    refreshing,
+                );
+                if let Some(view) = &mut self.post_view
+                    && view.generation == generation
+                {
+                    view.freshness = Some(freshness);
+                    view.loading = refreshing;
+                }
+            }
+            Msg::MoreReplies {
+                generation,
+                comment_id,
+                result,
+            } => {
+                // The post may have refreshed after this expansion was submitted.
+                let revalidate = if freshness.source.cached && !refreshing {
+                    self.post_view
+                        .as_mut()
+                        .filter(|view| view.generation == generation)
+                        .and_then(|view| view.page.as_mut())
+                        .and_then(|page| find_comment_mut(&mut page.comments, &comment_id))
+                        .and_then(|comment| {
+                            let minimum = comment.sources?.more;
+                            let more = comment.more.as_ref()?;
+                            (!freshness.source.may_replace(minimum))
+                                .then(|| (more.path.clone(), minimum))
+                        })
+                } else {
+                    None
+                };
+                let refreshing = refreshing || revalidate.is_some();
+                if let Some((path, minimum)) = revalidate {
+                    self.pool.refresh(Job::MoreReplies {
+                        generation,
+                        comment_id: comment_id.clone(),
+                        path,
+                        minimum: Some(minimum),
+                    });
+                }
+                self.on_result(
+                    Msg::MoreReplies {
+                        generation,
+                        comment_id: comment_id.clone(),
+                        result,
+                    },
+                    freshness.source,
+                    refreshing,
+                );
+                if refreshing
+                    && let Some(view) = &mut self.post_view
+                    && view.generation == generation
+                {
+                    view.loading_more.insert(comment_id);
+                }
+            }
+            other => self.on_result(other, freshness.source, refreshing),
+        }
+    }
+
     fn on_feed(
         &mut self,
         tab_id: u64,
         generation: u64,
         append: bool,
         result: Result<Listing, String>,
+        freshness: Freshness,
     ) {
         let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) else {
             return;
         };
         let feed = &mut tab.feed;
-        if feed.generation != generation {
+        if !feed.accepts(generation) {
             return;
         }
-        feed.loading = false;
+        feed.pending.remove(&generation);
+        feed.refreshing.remove(&generation);
+        feed.loading = !feed.pending.is_empty();
+        let cursor = if append {
+            feed.requests
+                .get(&generation)
+                .cloned()
+                .flatten()
+                .or_else(|| feed.after.clone())
+        } else {
+            None
+        };
         match result {
+            // Cached and refreshed pages enter through the same transition.
             Ok(listing) => {
-                if append {
-                    let known: HashSet<String> = feed.posts.iter().map(|p| p.id.clone()).collect();
-                    feed.posts
-                        .extend(listing.posts.into_iter().filter(|p| !known.contains(&p.id)));
-                } else {
-                    feed.posts = listing.posts;
-                    feed.selected = 0;
-                    feed.offset = 0;
+                let failed_next = feed.page_failed().then(|| feed.after.clone()).flatten();
+                let same_query = feed.shown_query.as_ref() == Some(&feed.query());
+                let selected = same_query
+                    .then(|| {
+                        feed.posts
+                            .iter()
+                            .filter(|p| !self.config.hides(p))
+                            .nth(feed.selected)
+                            .map(|p| p.id.clone())
+                    })
+                    .flatten();
+                let screen_row = feed.selected.saturating_sub(feed.offset);
+                if !same_query {
+                    feed.posts.clear();
+                    feed.pages.clear();
                 }
-                feed.after = listing.after;
+                if !feed.replace_page(
+                    cursor.clone(),
+                    listing.posts,
+                    listing.after,
+                    freshness.source,
+                ) {
+                    return;
+                }
+                if !feed.failures.get(&cursor).is_some_and(|failure| {
+                    failure.source.compare_requests(freshness.source)
+                        == Some(std::cmp::Ordering::Greater)
+                }) {
+                    feed.failures.remove(&cursor);
+                }
+                if let Some(failed) = failed_next
+                    && feed.after.as_ref() != Some(&failed)
+                {
+                    feed.failures.remove(&Some(failed));
+                }
+                if !append {
+                    feed.freshness = Some(freshness);
+                }
+                let visible: Vec<_> = feed
+                    .posts
+                    .iter()
+                    .filter(|p| !self.config.hides(p))
+                    .collect();
+                feed.selected = selected
+                    .and_then(|id| visible.iter().position(|p| p.id == id))
+                    .unwrap_or(if same_query { feed.selected } else { 0 })
+                    .min(visible.len().saturating_sub(1));
+                feed.offset = feed.selected.saturating_sub(screen_row);
                 feed.loaded = true;
                 feed.shown_query = Some(feed.query());
                 let baseline = feed.is_default_view().then(|| feed.posts.clone());
@@ -2179,8 +2729,26 @@ impl App {
                 }
             }
             Err(e) => {
-                feed.error = Some(e.clone());
-                feed.page_failed = append;
+                // Suppress only when comparable reservations or observed starts
+                // prove this failure predates the page already shown.
+                if feed
+                    .pages
+                    .iter()
+                    .find(|page| page.cursor == cursor)
+                    .is_some_and(|page| {
+                        page.source.compare_requests(freshness.source)
+                            == Some(std::cmp::Ordering::Greater)
+                    })
+                {
+                    return;
+                }
+                feed.failures.insert(
+                    cursor,
+                    FeedFailure {
+                        error: e.clone(),
+                        source: freshness.source,
+                    },
+                );
                 // A failed load of a new sort, time range or search must not leave the
                 // previous query's posts and cursor behind: `L` would append the new
                 // query's next page to them. A failed reload of the same query keeps them.
@@ -2190,6 +2758,8 @@ impl App {
                     feed.selected = 0;
                     feed.offset = 0;
                     feed.shown_query = None;
+                    feed.freshness = None;
+                    feed.pages.clear();
                 }
                 let title = tab.title();
                 self.error(format!("{title}: {e}"));
@@ -2197,15 +2767,28 @@ impl App {
         }
     }
 
-    fn on_group(&mut self, subreddit: &str, result: Result<Listing, String>) {
+    fn on_group(
+        &mut self,
+        subreddit: &str,
+        generation: u64,
+        result: Result<Listing, String>,
+        freshness: Freshness,
+    ) {
         let Some(index) = self
             .home
             .groups
             .iter()
-            .position(|g| g.subreddit == subreddit)
+            .position(|g| g.subreddit == subreddit && g.generation == generation)
         else {
             return;
         };
+        let selected = (index == self.home.group)
+            .then(|| {
+                self.home_group_posts(&self.home.groups[index])
+                    .get(self.home.post)
+                    .map(|p| p.id.clone())
+            })
+            .flatten();
         let group = &mut self.home.groups[index];
         group.loading = false;
         match result {
@@ -2218,32 +2801,248 @@ impl App {
                 self.state.baseline(subreddit, &listing.posts, now());
                 // A refresh can return fewer posts: keep the selection on one.
                 if index == self.home.group {
-                    let shown = self.home_group_posts(&self.home.groups[index]).len();
-                    self.home.post = self.home.post.min(shown.saturating_sub(1));
+                    let shown = self.home_group_posts(&self.home.groups[index]);
+                    self.home.post = selected
+                        .and_then(|id| shown.iter().position(|p| p.id == id))
+                        .unwrap_or(self.home.post)
+                        .min(shown.len().saturating_sub(1));
                 }
-                // Keep the subreddit's tab in step (instant to open, current
-                // badge), unless you are on it or browsing another view of it.
-                let active_id = self.tabs[self.active].id;
-                if let Some(tab) = self
-                    .tabs
-                    .iter_mut()
-                    .find(|t| t.subreddit().is_some_and(|s| s == subreddit))
-                    && tab.id != active_id
-                    && !tab.feed.loading
-                    && tab.feed.is_default_view()
-                {
-                    tab.feed.posts = listing.posts;
-                    tab.feed.after = listing.after;
-                    tab.feed.loaded = true;
-                    tab.feed.shown_query = Some(tab.feed.query());
-                    tab.feed.selected = 0;
-                    tab.feed.offset = 0;
-                    tab.feed.error = None;
+                // Home and the default first page share a cache key and response ordering.
+                let query = FeedQuery::Listing {
+                    sort: Sort::Hot,
+                    time: TimeRange::Day,
+                };
+                if let Some(i) = self.tabs.iter().position(|tab| {
+                    let feed = &tab.feed;
+                    tab.subreddit() == Some(subreddit)
+                        && feed.query() == query
+                        && (feed.shown_query.as_ref() != Some(&query)
+                            || feed
+                                .pages
+                                .first()
+                                .is_none_or(|page| freshness.source.may_replace(page.source)))
+                }) {
+                    let generation = self.generation();
+                    let tab = &mut self.tabs[i];
+                    let feed = &mut tab.feed;
+                    // Pending first pages stay: one that started after this response
+                    // is newer and replaces it; an older one is rejected by its source.
+                    feed.requests.retain(|id, cursor| {
+                        cursor.is_some()
+                            || feed.pending.contains(id)
+                            || feed.refreshing.contains(id)
+                    });
+                    feed.pending.retain(|id| match feed.requests.get(id) {
+                        Some(None) => {
+                            feed.refreshing.insert(*id);
+                            false
+                        }
+                        Some(Some(_)) => true,
+                        None => false,
+                    });
+                    feed.generation = generation;
+                    feed.requests.insert(generation, None);
+                    feed.request_query = Some(query);
+                    let tab_id = tab.id;
+                    self.on_feed(tab_id, generation, false, Ok(listing), freshness);
                 }
             }
             Err(e) => group.error = Some(e),
         }
     }
+}
+
+/// Merge partial trees without letting older snapshots replace newer fields or continuations.
+fn merge_comments(
+    incoming: &mut Vec<Comment>,
+    previous: &mut Vec<Comment>,
+    source: Source,
+    keep_missing: bool,
+) {
+    for comment in incoming.iter_mut() {
+        let old = previous.iter_mut().find(|old| old.id == comment.id);
+        merge_comment(comment, old, source);
+    }
+    if previous.is_empty() {
+        return;
+    }
+    let known: HashSet<_> = incoming.iter().map(|comment| comment.id.as_str()).collect();
+    previous.retain(|comment| {
+        !known.contains(comment.id.as_str())
+            && (keep_missing || comment_newer_than(comment, source))
+    });
+    drop(known);
+    incoming.append(previous);
+}
+
+fn merge_comment(incoming: &mut Comment, previous: Option<&mut Comment>, source: Source) {
+    let Some(previous) = previous else {
+        incoming.sources = Some(CommentSources {
+            content: source,
+            more: source,
+            from_expansion: false,
+        });
+        for child in &mut incoming.replies {
+            merge_comment(child, None, source);
+        }
+        return;
+    };
+    let old = previous.sources.unwrap_or_default();
+    let keep_content = !source.may_replace(old.content);
+    let keep_more = !source.may_replace(old.more);
+    let keep_children = replies_superseded(previous, source);
+    let incoming_children = std::mem::take(&mut incoming.replies);
+    let mut previous_children = std::mem::take(&mut previous.replies);
+    let incoming_more = incoming.more.take();
+    let previous_more = previous.more.take();
+    let more = if keep_more {
+        previous_more
+    } else {
+        incoming_more
+    };
+    if keep_content {
+        std::mem::swap(incoming, previous);
+    }
+    if keep_children || keep_content {
+        incoming.replies = previous_children;
+        merge_replies(
+            &mut incoming.replies,
+            incoming_children,
+            source,
+            !keep_children,
+            ReplyMerge::ParentSnapshot,
+        );
+    } else {
+        incoming.replies = incoming_children;
+        merge_comments(
+            &mut incoming.replies,
+            &mut previous_children,
+            source,
+            more.is_some(),
+        );
+    }
+    incoming.more = more;
+    incoming.sources = Some(CommentSources {
+        content: if keep_content { old.content } else { source },
+        more: if keep_more { old.more } else { source },
+        from_expansion: false,
+    });
+}
+
+enum ReplyMerge {
+    ParentSnapshot,
+    Expansion { reorder: bool },
+}
+
+fn merge_replies(
+    existing: &mut Vec<Comment>,
+    replies: Vec<Comment>,
+    source: Source,
+    allow_new: bool,
+    kind: ReplyMerge,
+) {
+    let expansion = matches!(kind, ReplyMerge::Expansion { .. });
+    let reorder = matches!(kind, ReplyMerge::Expansion { reorder: true });
+    // A More response replaces its previous contributions, not children already
+    // supplied by the parent page. Independently newer content still wins.
+    if expansion {
+        existing.retain(|old| {
+            !old.sources.is_some_and(|sources| sources.from_expansion)
+                || replies.iter().any(|reply| reply.id == old.id)
+                || comment_newer_than(old, source)
+        });
+    }
+    let mut next_slot = 0;
+    let mut replies = replies.into_iter();
+    while let Some(mut reply) = replies.next() {
+        let at = if let Some(at) = existing.iter().position(|old| old.id == reply.id) {
+            let old = &mut existing[at];
+            let from_expansion =
+                expansion && old.sources.is_some_and(|sources| sources.from_expansion);
+            merge_comment(&mut reply, Some(old), source);
+            reply
+                .sources
+                .as_mut()
+                .expect("merged comment provenance")
+                .from_expansion = from_expansion;
+            *old = reply;
+            at
+        } else if allow_new {
+            merge_comment(&mut reply, None, source);
+            reply
+                .sources
+                .as_mut()
+                .expect("merged comment provenance")
+                .from_expansion = expansion;
+            existing.push(reply);
+            existing.len() - 1
+        } else {
+            continue;
+        };
+        if reorder && allow_new && existing[at].sources.is_some_and(|old| old.from_expansion) {
+            // Only this parent list establishes sibling rank. Nested freshness
+            // protects fields, not position. Leave absent/parent-owned slots alone.
+            if let Some(slot) = (next_slot..existing.len()).find(|&i| {
+                existing[i].sources.is_some_and(|old| old.from_expansion)
+                    && (i == at
+                        || replies
+                            .as_slice()
+                            .iter()
+                            .any(|reply| reply.id == existing[i].id))
+            }) {
+                existing.swap(slot, at);
+                next_slot = slot + 1;
+            }
+        }
+    }
+}
+
+/// Completeness applies to this direct child list, not the entire subtree.
+fn replies_superseded(parent: &Comment, source: Source) -> bool {
+    parent.more.is_none()
+        && parent
+            .sources
+            .is_some_and(|old| !source.may_replace(old.more))
+}
+
+/// Find a new visible reply without copying the existing tree's identifiers.
+fn first_new_reply<'a>(
+    replies: &'a [Comment],
+    previous: &[Comment],
+    source: Source,
+    allow_new: bool,
+    collapsed: &HashSet<String>,
+) -> Option<&'a str> {
+    for reply in replies {
+        let Some(old) = previous.iter().find(|old| old.id == reply.id) else {
+            if allow_new {
+                return Some(&reply.id);
+            }
+            continue;
+        };
+        if !collapsed.contains(&old.id)
+            && let Some(id) = first_new_reply(
+                &reply.replies,
+                &old.replies,
+                source,
+                !replies_superseded(old, source),
+                collapsed,
+            )
+        {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn comment_newer_than(comment: &Comment, source: Source) -> bool {
+    comment
+        .sources
+        .is_some_and(|old| !source.may_replace(old.content) || !source.may_replace(old.more))
+        || comment
+            .replies
+            .iter()
+            .any(|child| comment_newer_than(child, source))
 }
 
 /// Move `current` by `delta` within `0..len`, clamping at the ends.
@@ -2267,7 +3066,7 @@ mod tests {
     /// so every network job fails quickly and no test touches the network.
     fn app_with_messages(subscriptions: &[&str]) -> (App, std::sync::mpsc::Receiver<Msg>) {
         let redlib = Redlib::new("http://127.0.0.1:9", false);
-        let (pool, messages) = Pool::start(redlib.clone(), 3);
+        let (pool, messages) = Pool::start(redlib.clone(), 3, None);
         let state = std::env::temp_dir().join(format!(
             "redtab-app-test-{}-{:?}.json",
             std::process::id(),
@@ -2313,6 +3112,8 @@ mod tests {
 
     fn comment(id: &str, replies: Vec<Comment>, more: Option<&str>) -> Comment {
         Comment {
+            sources: None,
+            created: None,
             id: id.into(),
             author: "a".into(),
             flair: None,
@@ -2530,7 +3331,12 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         let append = loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            match messages.recv_timeout(left).expect("the retry's reply") {
+            let msg = messages.recv_timeout(left).expect("the retry's reply");
+            let msg = match msg {
+                Msg::Snapshot { message, .. } => *message,
+                other => other,
+            };
+            match msg {
                 Msg::Feed {
                     generation, append, ..
                 } if generation == retry => break append,
@@ -2600,7 +3406,7 @@ mod tests {
             resorted.after, None,
             "L must not page New from a hot cursor"
         );
-        assert_eq!(resorted.error.as_deref(), Some("timeout"));
+        assert_eq!(resorted.error(), Some("timeout"));
     }
 
     #[test]
@@ -2711,12 +3517,14 @@ mod tests {
     fn a_home_refresh_with_fewer_posts_keeps_a_post_selected() {
         let mut app = app_with(&["a"]);
         app.on_msg(Msg::Group {
+            generation: 0,
             subreddit: "a".into(),
             result: Ok(listing("a", &["a1", "a2", "a3"], None)),
         });
         app.home.post = 2;
 
         app.on_msg(Msg::Group {
+            generation: 0,
             subreddit: "a".into(),
             result: Ok(listing("a", &["a1"], None)),
         });
@@ -2728,11 +3536,13 @@ mod tests {
     fn passing_through_a_tab_keeps_its_new_badge_but_engaging_clears_it() {
         let mut app = app_with(&["a", "b", "c"]);
         app.on_msg(Msg::Group {
+            generation: 0,
             subreddit: "b".into(),
             result: Ok(listing("b", &["b1"], None)),
         });
         // New posts appear in r/b after the baseline.
         app.on_msg(Msg::Group {
+            generation: 0,
             subreddit: "b".into(),
             result: Ok(listing("b", &["b1", "b2", "b3"], None)),
         });
@@ -2754,42 +3564,17 @@ mod tests {
     }
 
     #[test]
-    fn home_refresh_updates_inactive_tabs_but_not_the_one_you_read() {
-        let mut app = app_with(&["a", "b"]);
-        app.on_msg(Msg::Group {
-            subreddit: "a".into(),
-            result: Ok(listing("a", &["a1"], None)),
-        });
-        app.on_msg(Msg::Group {
-            subreddit: "b".into(),
-            result: Ok(listing("b", &["b1"], None)),
-        });
-        let a = tab_index(&app, "a");
-        app.switch_tab(a);
-
-        app.on_msg(Msg::Group {
-            subreddit: "a".into(),
-            result: Ok(listing("a", &["a2", "a1"], None)),
-        });
-        app.on_msg(Msg::Group {
-            subreddit: "b".into(),
-            result: Ok(listing("b", &["b2", "b1"], None)),
-        });
-
-        assert_eq!(app.tabs[a].feed.posts[0].id, "a1");
-        assert_eq!(app.tabs[tab_index(&app, "b")].feed.posts[0].id, "b2");
-    }
-
-    #[test]
     fn home_navigation_flows_across_groups_and_skips_pinned_posts() {
         let mut app = app_with(&["a", "b"]);
         let mut pinned = listing("a", &["pin", "a1", "a2"], None);
         pinned.posts[0].stickied = true;
         app.on_msg(Msg::Group {
+            generation: 0,
             subreddit: "a".into(),
             result: Ok(pinned),
         });
         app.on_msg(Msg::Group {
+            generation: 0,
             subreddit: "b".into(),
             result: Ok(listing("b", &["b1"], None)),
         });
@@ -3178,6 +3963,7 @@ mod tests {
         app.engage();
         app.open_subreddit("b");
         app.on_msg(Msg::Group {
+            generation: 0,
             subreddit: "a".into(),
             result: Ok(listing("a", &["a2", "a1"], None)),
         });
@@ -3195,5 +3981,2188 @@ mod tests {
             app.picker_entries("r/home")
                 .contains(&PickerEntry::Open("home".into()))
         );
+    }
+
+    #[test]
+    fn cache_refresh_keeps_the_selected_post_and_screen_row() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &["a", "b", "c"], None)),
+        });
+        app.tabs[i].feed.selected = 1;
+        app.tabs[i].feed.offset = 1;
+        app.reload();
+
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &["new", "a", "b", "c"], None)),
+        });
+
+        assert_eq!(app.current_post().unwrap().id, "b");
+        assert_eq!(app.tabs[i].feed.selected - app.tabs[i].feed.offset, 0);
+    }
+
+    #[test]
+    fn cache_refresh_keeps_post_content_visible_while_loading() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        app.on_msg(Msg::Post {
+            generation: app.post_view.as_ref().unwrap().generation,
+            result: Ok(Box::new(PostPage {
+                post: post("p", "s"),
+                body: "saved body".into(),
+                comments: vec![comment("c1", vec![], None), comment("c2", vec![], None)],
+            })),
+        });
+        let view = app.post_view.as_mut().unwrap();
+        view.scroll = 12;
+        view.cursor = 1;
+        view.free_scroll = false;
+        view.collapsed.insert("c1".into());
+
+        app.reload();
+
+        let view = app.post_view.as_ref().unwrap();
+        assert_eq!(view.page.as_ref().unwrap().body, "saved body");
+        assert_eq!((view.scroll, view.cursor, view.free_scroll), (12, 1, false));
+        assert!(view.collapsed.contains("c1"));
+        assert!(view.loading);
+    }
+
+    #[test]
+    fn cached_post_refresh_failure_still_renders_the_saved_body() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(PostPage {
+                post: post("p", "s"),
+                body: "offline reading works".into(),
+                comments: vec![],
+            })),
+        });
+        app.on_msg(Msg::Post {
+            generation,
+            result: Err("connection refused".into()),
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 30)).unwrap();
+
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("offline reading works"), "{text}");
+    }
+
+    #[test]
+    fn cached_refresh_keeps_loaded_later_pages_and_their_cursor() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        let generation = app.tabs[i].feed.generation;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation,
+            append: false,
+            result: Ok(listing("vim", &["a", "b"], Some("t3_b"))),
+        });
+        app.on_msg(Msg::Feed {
+            tab,
+            generation,
+            append: true,
+            result: Ok(listing("vim", &["c", "d"], Some("t3_d"))),
+        });
+        app.tabs[i].feed.selected = 3;
+        app.reload();
+
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &["new", "a"], Some("t3_a"))),
+        });
+
+        assert_eq!(app.current_post().unwrap().id, "d");
+        assert_eq!(app.tabs[i].feed.after.as_deref(), Some("t3_d"));
+        assert_eq!(
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["new", "a", "c", "d"]
+        );
+    }
+
+    #[test]
+    fn cached_post_refresh_preserves_expanded_replies_and_comment_anchor() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(PostPage {
+                post: post("p", "s"),
+                body: String::new(),
+                comments: vec![
+                    comment("c1", vec![comment("reply", vec![], None)], None),
+                    comment("c2", vec![], None),
+                ],
+            })),
+        });
+        let view = app.post_view.as_mut().unwrap();
+        view.cursor = 2;
+        view.free_scroll = false;
+        view.row_starts = vec![5, 10, 20];
+        view.drawn_cursor = Some(2);
+        view.scroll = 21;
+
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(PostPage {
+                post: post("p", "s"),
+                body: String::new(),
+                comments: vec![
+                    comment("new", vec![], None),
+                    comment("c1", vec![], Some("/more")),
+                    comment("c2", vec![], None),
+                ],
+            })),
+        });
+
+        let view = app.post_view.as_mut().unwrap();
+        assert!(matches!(view.cursor_key(), Some(RowKey::Comment(id)) if id == "c2"));
+        assert_eq!(view.take_reading_anchor(), Some((4, 1)));
+        assert_eq!(
+            view.page.as_ref().unwrap().comments[1].replies[0].id,
+            "reply"
+        );
+    }
+
+    #[test]
+    fn a_late_home_snapshot_cannot_replace_a_forced_refresh() {
+        let mut app = app_with(&["vim"]);
+        app.reload();
+        app.on_msg(Msg::Group {
+            subreddit: "vim".into(),
+            generation: 1,
+            result: Ok(listing("vim", &["new"], None)),
+        });
+
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Group {
+                subreddit: "vim".into(),
+                generation: 0,
+                result: Ok(listing("vim", &["old"], None)),
+            }),
+            fetched_at: 1,
+            refreshing: true,
+            source: Source {
+                cached: true,
+                ..Source::default()
+            },
+        });
+
+        assert_eq!(app.home.groups[0].posts[0].id, "new");
+        assert!(!app.home.groups[0].loading);
+    }
+
+    #[test]
+    fn refreshed_cached_replies_update_text_without_losing_expanded_children() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(PostPage {
+                post: post("p", "s"),
+                body: String::new(),
+                comments: vec![comment(
+                    "parent",
+                    vec![comment("reply", vec![comment("child", vec![], None)], None)],
+                    None,
+                )],
+            })),
+        });
+        let mut updated = comment("reply", vec![], Some("/more"));
+        updated.body = "edited reply".into();
+
+        app.on_msg(Msg::MoreReplies {
+            generation,
+            comment_id: "parent".into(),
+            result: Ok(vec![updated]),
+        });
+
+        let reply = &app
+            .post_view
+            .as_ref()
+            .unwrap()
+            .page
+            .as_ref()
+            .unwrap()
+            .comments[0]
+            .replies[0];
+        assert_eq!(reply.body, "edited reply");
+        assert_eq!(reply.replies[0].id, "child");
+    }
+
+    #[test]
+    fn a_refreshed_spoiler_post_can_be_revealed_without_a_stale_selection() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        let generation = app.post_view.as_ref().unwrap().generation;
+        let mut page = PostPage {
+            post: post("p", "s"),
+            body: "secret body".into(),
+            comments: vec![comment("secret reply", vec![], None)],
+        };
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(page.clone())),
+        });
+        app.post_view.as_mut().unwrap().free_scroll = false;
+        page.post.spoiler = true;
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(page)),
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+
+        app.toggle_spoilers();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("secret reply"), "{text}");
+        assert!(app.post_view.as_ref().unwrap().free_scroll);
+    }
+
+    #[test]
+    fn a_leaf_gaining_replies_keeps_the_new_continuation_on_refresh() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(PostPage {
+                post: post("p", "s"),
+                body: String::new(),
+                comments: vec![comment("leaf", vec![], None)],
+            })),
+        });
+
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(PostPage {
+                post: post("p", "s"),
+                body: String::new(),
+                comments: vec![comment("leaf", vec![], Some("/new-replies"))],
+            })),
+        });
+
+        assert!(matches!(app.post_view.as_ref().unwrap().rows()[1].kind,
+            RowKind::More { more, .. } if more.path == "/new-replies"));
+    }
+
+    #[test]
+    fn revalidating_a_cached_next_page_replaces_that_page() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &["a", "b"], Some("t3_b"))),
+        });
+        app.load_feed(i, true);
+        let generation = app.tabs[i].feed.generation;
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Feed {
+                tab,
+                generation,
+                append: true,
+                result: Ok(listing("vim", &["c", "d"], Some("t3_d"))),
+            }),
+            fetched_at: 1,
+            refreshing: true,
+            source: Source {
+                cached: true,
+                ..Source::default()
+            },
+        });
+        app.tabs[i].feed.selected = 2;
+
+        app.on_msg(Msg::Feed {
+            tab,
+            generation,
+            append: true,
+            result: Ok(listing("vim", &["x", "c"], Some("t3_c"))),
+        });
+
+        assert_eq!(
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "x", "c"]
+        );
+        assert_eq!(app.current_post().unwrap().id, "c");
+        assert_eq!(app.tabs[i].feed.after.as_deref(), Some("t3_c"));
+    }
+
+    #[test]
+    fn stale_first_page_refresh_does_not_block_loading_the_next_page() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        let first = app.tabs[i].feed.generation;
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Feed {
+                tab,
+                generation: first,
+                append: false,
+                result: Ok(listing("vim", &["a", "b"], Some("t3_b"))),
+            }),
+            fetched_at: 1,
+            refreshing: true,
+            source: Source {
+                cached: true,
+                ..Source::default()
+            },
+        });
+
+        app.load_feed(i, true);
+        let next = app.tabs[i].feed.generation;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: next,
+            append: true,
+            result: Ok(listing("vim", &["c"], None)),
+        });
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: first,
+            append: false,
+            result: Ok(listing("vim", &["new", "a"], Some("t3_a"))),
+        });
+
+        assert_ne!(next, first);
+        assert_eq!(
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["new", "a", "c"]
+        );
+    }
+
+    #[test]
+    fn cache_refresh_keeps_updated_posts_that_move_across_pages() {
+        let mut feed = Feed::default();
+        feed.replace_page(
+            None,
+            listing("vim", &["a", "b"], None).posts,
+            Some("b".into()),
+            ordered_source(1, false),
+        );
+        feed.replace_page(
+            Some("b".into()),
+            listing("vim", &["c", "d"], None).posts,
+            None,
+            ordered_source(2, false),
+        );
+        let mut updated = post("c", "vim");
+        updated.title = "updated title".into();
+
+        feed.replace_page(
+            None,
+            vec![updated, post("a", "vim")],
+            Some("a".into()),
+            ordered_source(3, false),
+        );
+
+        assert_eq!(
+            feed.posts.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["c", "a", "d"]
+        );
+        assert_eq!(feed.posts[0].title, "updated title");
+        // The moved item no longer belongs to the second page's replacement range.
+        feed.replace_page(
+            Some("b".into()),
+            listing("vim", &["x", "d"], None).posts,
+            None,
+            ordered_source(4, false),
+        );
+        assert_eq!(
+            feed.posts.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["c", "a", "x", "d"]
+        );
+    }
+
+    #[test]
+    fn cached_paging_cannot_undo_a_newer_live_refresh() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        let mut fresh = listing("vim", &["b", "x"], Some("x"));
+        fresh.posts[0].title = "updated title".into();
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Ok(fresh),
+            }),
+            fetched_at: now(),
+            refreshing: false,
+            source: Source {
+                cached: false,
+                ..Source::default()
+            },
+        });
+        app.load_feed(i, true);
+        let generation = app.tabs[i].feed.generation;
+
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Feed {
+                tab,
+                generation,
+                append: true,
+                result: Ok(listing("vim", &["b", "c"], None)),
+            }),
+            fetched_at: now() - 1,
+            refreshing: false,
+            source: Source {
+                cached: true,
+                ..Source::default()
+            },
+        });
+
+        assert_eq!(
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "x", "c"]
+        );
+        assert_eq!(app.tabs[i].feed.posts[0].title, "updated title");
+        let mut newer = listing("vim", &["b", "c"], None);
+        newer.posts[0].title = "newest title".into();
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Feed {
+                tab,
+                generation,
+                append: true,
+                result: Ok(newer),
+            }),
+            fetched_at: now() + 1,
+            refreshing: false,
+            source: Source {
+                cached: false,
+                ..Source::default()
+            },
+        });
+        assert_eq!(
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["x", "b", "c"]
+        );
+        assert_eq!(app.tabs[i].feed.posts[1].title, "newest title");
+    }
+
+    #[test]
+    fn clock_rollback_does_not_suppress_a_live_page_update() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Ok(listing("vim", &["a", "b"], Some("b"))),
+            }),
+            fetched_at: 1000,
+            refreshing: false,
+            source: Source {
+                cached: false,
+                ..Source::default()
+            },
+        });
+        app.load_feed(i, true);
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: true,
+                result: Ok(listing("vim", &["c", "d"], None)),
+            }),
+            fetched_at: 1000,
+            refreshing: false,
+            source: Source {
+                cached: false,
+                ..Source::default()
+            },
+        });
+        app.reload();
+        let mut updated = listing("vim", &["c", "a"], Some("a"));
+        updated.posts[0].title = "updated after clock correction".into();
+
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Ok(updated),
+            }),
+            fetched_at: 900,
+            refreshing: false,
+            source: Source {
+                cached: false,
+                ..Source::default()
+            },
+        });
+
+        assert_eq!(
+            app.tabs[i].feed.posts[0].title,
+            "updated after clock correction"
+        );
+        assert_eq!(
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["c", "a", "d"]
+        );
+    }
+
+    fn ordered_source(order: u64, cached: bool) -> Source {
+        Source {
+            order: Some(crate::cache::RequestOrder {
+                generation: [1; 16],
+                sequence: order,
+            }),
+            observed: Some((order, order)),
+            cached,
+        }
+    }
+
+    fn ordered_snapshot(message: Msg, order: u64, cached: bool, refreshing: bool) -> Msg {
+        Msg::Snapshot {
+            message: Box::new(message),
+            fetched_at: 1000,
+            source: ordered_source(order, cached),
+            refreshing,
+        }
+    }
+
+    #[test]
+    fn newer_cached_page_updates_an_overlapping_post_after_restart() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Ok(listing("vim", &["a", "b"], Some("b"))),
+            },
+            1,
+            true,
+            false,
+        ));
+        app.load_feed(i, true);
+        let mut later = listing("vim", &["a", "c"], None);
+        later.posts[0].title = "newer cached title".into();
+
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: true,
+                result: Ok(later),
+            },
+            2,
+            true,
+            false,
+        ));
+
+        assert_eq!(app.current_post().unwrap().title, "newer cached title");
+        assert_eq!(
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "a", "c"]
+        );
+    }
+
+    #[test]
+    fn older_cached_replies_add_missing_children_without_undoing_edits() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        let generation = app.post_view.as_ref().unwrap().generation;
+        let mut edited = comment("child", vec![], None);
+        edited.body = "edited live reply".into();
+        app.on_msg(ordered_snapshot(
+            Msg::Post {
+                generation,
+                result: Ok(Box::new(PostPage {
+                    post: post("p", "s"),
+                    body: String::new(),
+                    comments: vec![comment("parent", vec![edited], Some("/more"))],
+                })),
+            },
+            2,
+            false,
+            false,
+        ));
+
+        app.on_msg(ordered_snapshot(
+            Msg::MoreReplies {
+                generation,
+                comment_id: "parent".into(),
+                result: Ok(vec![
+                    comment("child", vec![comment("removed", vec![], None)], None),
+                    comment("missing", vec![], None),
+                ]),
+            },
+            1,
+            true,
+            false,
+        ));
+
+        let parent = &app
+            .post_view
+            .as_ref()
+            .unwrap()
+            .page
+            .as_ref()
+            .unwrap()
+            .comments[0];
+        assert_eq!(parent.replies[0].body, "edited live reply");
+        assert!(
+            parent.replies[0].replies.is_empty(),
+            "an older branch must not restore removed descendants"
+        );
+        assert_eq!(parent.replies[1].id, "missing");
+        assert!(parent.more.is_some());
+    }
+
+    #[test]
+    fn a_home_refresh_supersedes_an_older_feed_revalidation() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        let first = app.tabs[i].feed.generation;
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation: first,
+                append: false,
+                result: Ok(listing("vim", &["cached"], None)),
+            },
+            1,
+            true,
+            true,
+        ));
+        app.switch_tab(0);
+        app.reload();
+        app.on_msg(ordered_snapshot(
+            Msg::Group {
+                subreddit: "vim".into(),
+                generation: 1,
+                result: Ok(listing("vim", &["new"], None)),
+            },
+            3,
+            false,
+            false,
+        ));
+
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation: first,
+                append: false,
+                result: Ok(listing("vim", &["old"], None)),
+            },
+            2,
+            false,
+            false,
+        ));
+
+        assert_eq!(app.tabs[i].feed.posts[0].id, "new");
+    }
+
+    #[test]
+    fn a_first_page_refresh_does_not_retry_a_failed_next_page() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        let first = app.tabs[i].feed.generation;
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation: first,
+                append: false,
+                result: Ok(listing("vim", &["a"], Some("a"))),
+            },
+            1,
+            true,
+            true,
+        ));
+        app.load_feed(i, true);
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: true,
+            result: Err("offline".into()),
+        });
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation: first,
+                append: false,
+                result: Ok(listing("vim", &["a"], Some("a"))),
+            },
+            2,
+            false,
+            false,
+        ));
+
+        app.move_selection(1);
+
+        assert!(
+            !app.tabs[i].feed.loading,
+            "navigation must not retry the failed cursor"
+        );
+        app.load_feed(i, true);
+        assert!(app.tabs[i].feed.loading, "L still explicitly retries");
+    }
+
+    fn thread_message(generation: u64, comments: Vec<Comment>) -> Msg {
+        Msg::Post {
+            generation,
+            result: Ok(Box::new(PostPage {
+                post: post("p", "s"),
+                body: String::new(),
+                comments,
+            })),
+        }
+    }
+
+    #[test]
+    fn reload_recovers_a_failed_revalidation_of_a_loaded_page() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Ok(listing("vim", &["a"], Some("a"))),
+            },
+            1,
+            false,
+            false,
+        ));
+        app.load_feed(i, true);
+        let page_generation = app.tabs[i].feed.generation;
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation: page_generation,
+                append: true,
+                result: Ok(listing("vim", &["b"], Some("b"))),
+            },
+            2,
+            true,
+            true,
+        ));
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: page_generation,
+            append: true,
+            result: Err("offline".into()),
+        });
+
+        app.reload();
+        let requests: Vec<_> = app.tabs[i]
+            .feed
+            .requests
+            .iter()
+            .filter(|(id, _)| app.tabs[i].feed.pending.contains(id))
+            .map(|(id, cursor)| (*id, cursor.clone()))
+            .collect();
+        for (generation, cursor) in requests {
+            let response = if cursor.is_none() {
+                listing("vim", &["a"], Some("a"))
+            } else {
+                let mut response = listing("vim", &["b"], Some("b"));
+                response.posts[0].title = "recovered page".into();
+                response
+            };
+            app.on_msg(ordered_snapshot(
+                Msg::Feed {
+                    tab,
+                    generation,
+                    append: cursor.is_some(),
+                    result: Ok(response),
+                },
+                generation + 10,
+                false,
+                false,
+            ));
+        }
+
+        let feed = &app.tabs[i].feed;
+        assert_eq!(feed.error(), None);
+        assert_eq!(
+            feed.posts
+                .iter()
+                .map(|post| post.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(feed.posts[1].title, "recovered page");
+    }
+
+    #[test]
+    fn cached_replies_revalidate_when_the_parent_changes_after_submission() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(ordered_snapshot(
+            thread_message(generation, vec![comment("parent", vec![], Some("/more"))]),
+            10,
+            true,
+            true,
+        ));
+        let view = app.post_view.as_mut().unwrap();
+        view.cursor = 1;
+        view.free_scroll = false;
+        app.activate_comment();
+        app.on_msg(ordered_snapshot(
+            thread_message(
+                generation,
+                vec![comment(
+                    "parent",
+                    vec![comment("edited", vec![], None)],
+                    Some("/more"),
+                )],
+            ),
+            21,
+            false,
+            false,
+        ));
+
+        app.on_msg(ordered_snapshot(
+            Msg::MoreReplies {
+                generation,
+                comment_id: "parent".into(),
+                result: Ok(vec![comment("missing", vec![], None)]),
+            },
+            20,
+            true,
+            false,
+        ));
+
+        let view = app.post_view.as_ref().unwrap();
+        assert!(
+            view.loading_more.contains("parent"),
+            "the newly stale expansion must keep refreshing"
+        );
+        assert_eq!(
+            view.page.as_ref().unwrap().comments[0]
+                .replies
+                .iter()
+                .map(|reply| reply.id.as_str())
+                .collect::<Vec<_>>(),
+            ["edited", "missing"]
+        );
+    }
+
+    #[test]
+    fn cached_reply_expansion_keeps_selection_on_new_replies_through_revalidation() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(ordered_snapshot(
+            thread_message(
+                generation,
+                vec![
+                    comment(
+                        "parent",
+                        vec![comment("child", vec![], None)],
+                        Some("/more"),
+                    ),
+                    comment("sibling", vec![], None),
+                ],
+            ),
+            2,
+            true,
+            false,
+        ));
+        let view = app.post_view.as_mut().unwrap();
+        view.cursor = 2;
+        view.free_scroll = false;
+        app.activate_comment();
+        app.on_msg(ordered_snapshot(
+            Msg::MoreReplies {
+                generation,
+                comment_id: "parent".into(),
+                result: Ok(vec![
+                    comment("child", vec![], None),
+                    comment("missing", vec![], None),
+                ]),
+            },
+            1,
+            true,
+            true,
+        ));
+        app.on_msg(ordered_snapshot(
+            Msg::MoreReplies {
+                generation,
+                comment_id: "parent".into(),
+                result: Ok(vec![
+                    comment("child", vec![], None),
+                    comment("missing", vec![], None),
+                ]),
+            },
+            3,
+            false,
+            false,
+        ));
+
+        assert!(matches!(app.post_view.as_ref().unwrap().cursor_key(),
+            Some(RowKey::Comment(id)) if id == "missing"));
+    }
+
+    #[test]
+    fn live_expansion_reorders_cached_replies_without_losing_selection() {
+        for nested in [false, true] {
+            let mut app = app_with(&[]);
+            app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+            let generation = app.post_view.as_ref().unwrap().generation;
+            app.on_msg(ordered_snapshot(
+                thread_message(
+                    generation,
+                    vec![comment(
+                        "parent",
+                        vec![comment("confirmed", vec![], None)],
+                        Some("/more"),
+                    )],
+                ),
+                2,
+                true,
+                false,
+            ));
+            let more = |ids: &[&str]| Msg::MoreReplies {
+                generation,
+                comment_id: "parent".into(),
+                result: Ok(ids
+                    .iter()
+                    .map(|id| comment(id, vec![], (*id == "a").then_some("/nested")))
+                    .collect()),
+            };
+            app.on_msg(ordered_snapshot(more(&["a", "b"]), 1, true, true));
+            let view = app.post_view.as_mut().unwrap();
+            view.cursor = view.row_index(&RowKey::Comment("b".into())).unwrap();
+            view.free_scroll = false;
+            if nested {
+                app.on_msg(ordered_snapshot(
+                    Msg::MoreReplies {
+                        generation,
+                        comment_id: "a".into(),
+                        result: Ok(vec![comment("nested", vec![], None)]),
+                    },
+                    4,
+                    false,
+                    false,
+                ));
+            }
+            app.on_msg(ordered_snapshot(more(&["b", "c", "a"]), 3, false, false));
+            let view = app.post_view.as_ref().unwrap();
+            assert_eq!(
+                view.page.as_ref().unwrap().comments[0]
+                    .replies
+                    .iter()
+                    .map(|c| c.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["confirmed", "b", "c", "a"]
+            );
+            assert!(matches!(view.cursor_key(), Some(RowKey::Comment(id)) if id == "b"));
+            // An older response arriving afterward cannot roll the refreshed order back.
+            app.on_msg(ordered_snapshot(more(&["a", "b"]), 1, true, false));
+            let view = app.post_view.as_ref().unwrap();
+            assert_eq!(
+                view.page.as_ref().unwrap().comments[0]
+                    .replies
+                    .iter()
+                    .map(|c| c.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["confirmed", "b", "c", "a"]
+            );
+            assert!(matches!(view.cursor_key(), Some(RowKey::Comment(id)) if id == "b"));
+            if nested {
+                let a = view.page.as_ref().unwrap().comments[0]
+                    .replies
+                    .iter()
+                    .find(|c| c.id == "a")
+                    .unwrap();
+                assert_eq!(a.replies[0].id, "nested");
+                assert!(a.more.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn a_newly_complete_parent_rejects_an_older_cached_expansion() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(ordered_snapshot(
+            thread_message(generation, vec![comment("parent", vec![], Some("/more"))]),
+            10,
+            true,
+            true,
+        ));
+        let view = app.post_view.as_mut().unwrap();
+        view.cursor = 1;
+        view.free_scroll = false;
+        app.activate_comment();
+        app.on_msg(ordered_snapshot(
+            thread_message(
+                generation,
+                vec![comment(
+                    "parent",
+                    vec![comment("current", vec![], Some("/child-more"))],
+                    None,
+                )],
+            ),
+            21,
+            false,
+            false,
+        ));
+
+        app.on_msg(ordered_snapshot(
+            Msg::MoreReplies {
+                generation,
+                comment_id: "parent".into(),
+                result: Ok(vec![
+                    comment("removed", vec![], None),
+                    comment("current", vec![comment("recovered", vec![], None)], None),
+                ]),
+            },
+            20,
+            true,
+            false,
+        ));
+
+        let view = app.post_view.as_ref().unwrap();
+        assert_eq!(
+            view.page.as_ref().unwrap().comments[0]
+                .replies
+                .iter()
+                .map(|reply| reply.id.as_str())
+                .collect::<Vec<_>>(),
+            ["current"]
+        );
+        assert_eq!(
+            view.page.as_ref().unwrap().comments[0].replies[0]
+                .replies
+                .iter()
+                .map(|reply| reply.id.as_str())
+                .collect::<Vec<_>>(),
+            ["recovered"],
+        );
+        assert!(!view.loading_more.contains("parent"));
+    }
+
+    #[test]
+    fn home_seed_preserves_a_newer_pending_request_without_discarding_newer_data() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Ok(listing("vim", &["old"], None)),
+            },
+            1,
+            false,
+            false,
+        ));
+        app.load_feed(i, false);
+        let pending = app.tabs[i].feed.generation;
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Group {
+                subreddit: "vim".into(),
+                generation: 0,
+                result: Ok(listing("vim", &["home-newer"], Some("A"))),
+            }),
+            fetched_at: now(),
+            refreshing: false,
+            source: ordered_source(2, false),
+        });
+        assert_eq!(app.tabs[i].feed.posts[0].id, "home-newer");
+        let before = app.tabs[i].feed.generation;
+        app.load_feed(i, true);
+        let next = app.tabs[i].feed.generation;
+        assert_ne!(
+            next, before,
+            "Home supplies the first page while HTTP remains pending"
+        );
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation: next,
+                append: true,
+                result: Ok(listing("vim", &["tail"], None)),
+            },
+            2,
+            true,
+            false,
+        ));
+        assert!(app.tabs[i].feed.posts.iter().any(|post| post.id == "tail"));
+
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation: pending,
+                append: false,
+                result: Ok(listing("vim", &["old"], None)),
+            },
+            1,
+            true,
+            true,
+        ));
+        assert_eq!(app.tabs[i].feed.posts[0].id, "home-newer");
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation: pending,
+                append: false,
+                result: Ok(listing("vim", &["feed-newest"], None)),
+            },
+            3,
+            false,
+            false,
+        ));
+        assert_eq!(app.tabs[i].feed.posts[0].id, "feed-newest");
+    }
+
+    #[test]
+    fn home_seed_compares_only_the_query_currently_being_requested() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        app.set_sort(Sort::New);
+        let tab = app.tabs[i].id;
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Ok(listing("vim", &["new-sort"], None)),
+            },
+            9,
+            false,
+            false,
+        ));
+        app.set_sort(Sort::Hot);
+        let pending = app.tabs[i].feed.generation;
+
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Group {
+                subreddit: "vim".into(),
+                generation: 0,
+                result: Ok(listing("vim", &["home-hot"], None)),
+            }),
+            fetched_at: now(),
+            refreshing: false,
+            source: ordered_source(4, false),
+        });
+        assert_eq!(app.tabs[i].feed.posts[0].id, "home-hot");
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation: pending,
+                append: false,
+                result: Ok(listing("vim", &["old-hot"], None)),
+            },
+            3,
+            true,
+            false,
+        ));
+        assert_eq!(app.tabs[i].feed.posts[0].id, "home-hot");
+    }
+
+    #[test]
+    fn older_expansion_recovers_incomplete_descendants_beneath_complete_children() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(ordered_snapshot(
+            thread_message(
+                generation,
+                vec![comment(
+                    "parent",
+                    vec![comment(
+                        "complete",
+                        vec![comment("incomplete", vec![], Some("/nested-more"))],
+                        None,
+                    )],
+                    Some("/more"),
+                )],
+            ),
+            2,
+            true,
+            false,
+        ));
+        let view = app.post_view.as_mut().unwrap();
+        view.cursor = 4;
+        view.free_scroll = false;
+        app.activate_comment();
+        app.on_msg(ordered_snapshot(
+            Msg::MoreReplies {
+                generation,
+                comment_id: "parent".into(),
+                result: Ok(vec![comment(
+                    "complete",
+                    vec![
+                        comment("removed", vec![], None),
+                        comment("incomplete", vec![comment("recovered", vec![], None)], None),
+                    ],
+                    None,
+                )]),
+            },
+            1,
+            true,
+            true,
+        ));
+        let view = app.post_view.as_ref().unwrap();
+        let complete = &view.page.as_ref().unwrap().comments[0].replies[0];
+        assert_eq!(
+            complete
+                .replies
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            ["incomplete"]
+        );
+        assert_eq!(
+            complete.replies[0]
+                .replies
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            ["recovered"]
+        );
+        assert!(matches!(view.cursor_key(), Some(RowKey::Comment(id)) if id == "recovered"));
+    }
+
+    #[test]
+    fn completing_reply_revalidation_removes_disappeared_direct_replies() {
+        for keep_b in [true, false] {
+            let mut app = app_with(&[]);
+            app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+            let generation = app.post_view.as_ref().unwrap().generation;
+            app.on_msg(ordered_snapshot(
+                thread_message(generation, vec![comment("parent", vec![], Some("/more"))]),
+                2,
+                true,
+                false,
+            ));
+            let view = app.post_view.as_mut().unwrap();
+            view.cursor = 1;
+            view.free_scroll = false;
+            app.activate_comment();
+            app.on_msg(ordered_snapshot(
+                Msg::MoreReplies {
+                    generation,
+                    comment_id: "parent".into(),
+                    result: Ok(vec![
+                        comment("a", vec![], None),
+                        comment("b", vec![comment("expanded", vec![], None)], None),
+                    ]),
+                },
+                1,
+                true,
+                true,
+            ));
+            let replies = if keep_b {
+                vec![comment("b", vec![], Some("/b-more"))]
+            } else {
+                vec![]
+            };
+            app.on_msg(ordered_snapshot(
+                Msg::MoreReplies {
+                    generation,
+                    comment_id: "parent".into(),
+                    result: Ok(replies),
+                },
+                3,
+                false,
+                false,
+            ));
+            let parent = &app
+                .post_view
+                .as_ref()
+                .unwrap()
+                .page
+                .as_ref()
+                .unwrap()
+                .comments[0];
+            assert_eq!(
+                parent
+                    .replies
+                    .iter()
+                    .map(|c| c.id.as_str())
+                    .collect::<Vec<_>>(),
+                if keep_b { vec!["b"] } else { vec![] }
+            );
+            assert!(parent.more.is_none());
+            if keep_b {
+                assert_eq!(parent.replies[0].replies[0].id, "expanded");
+            }
+        }
+    }
+
+    #[test]
+    fn reply_revalidation_keeps_children_confirmed_by_a_parent_refresh() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(ordered_snapshot(
+            thread_message(generation, vec![comment("parent", vec![], Some("/more"))]),
+            1,
+            true,
+            false,
+        ));
+        app.on_msg(ordered_snapshot(
+            Msg::MoreReplies {
+                generation,
+                comment_id: "parent".into(),
+                result: Ok(vec![
+                    comment("confirmed", vec![], None),
+                    comment("removed", vec![], None),
+                ]),
+            },
+            2,
+            true,
+            false,
+        ));
+        app.on_msg(ordered_snapshot(
+            thread_message(
+                generation,
+                vec![comment(
+                    "parent",
+                    vec![comment("confirmed", vec![], None)],
+                    Some("/more"),
+                )],
+            ),
+            3,
+            false,
+            false,
+        ));
+        app.on_msg(ordered_snapshot(
+            Msg::MoreReplies {
+                generation,
+                comment_id: "parent".into(),
+                result: Ok(vec![
+                    comment("confirmed", vec![], None),
+                    comment("removed", vec![], None),
+                ]),
+            },
+            2,
+            true,
+            true,
+        ));
+        app.on_msg(ordered_snapshot(
+            Msg::MoreReplies {
+                generation,
+                comment_id: "parent".into(),
+                result: Ok(vec![comment("new", vec![], None)]),
+            },
+            4,
+            false,
+            false,
+        ));
+        let parent = &app
+            .post_view
+            .as_ref()
+            .unwrap()
+            .page
+            .as_ref()
+            .unwrap()
+            .comments[0];
+        assert_eq!(
+            parent
+                .replies
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            ["confirmed", "new"]
+        );
+    }
+
+    #[test]
+    fn an_older_parent_response_confirms_children_without_undoing_newer_content() {
+        for already_expanded in [false, true] {
+            let mut app = app_with(&[]);
+            app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+            let generation = app.post_view.as_ref().unwrap().generation;
+            app.on_msg(ordered_snapshot(
+                thread_message(
+                    generation,
+                    vec![comment(
+                        "ancestor",
+                        vec![comment("parent", vec![], Some("/parent-more"))],
+                        Some("/ancestor-more"),
+                    )],
+                ),
+                1,
+                true,
+                false,
+            ));
+            app.reload();
+            let generation = app.post_view.as_ref().unwrap().generation;
+            app.on_msg(ordered_snapshot(
+                Msg::MoreReplies {
+                    generation,
+                    comment_id: "ancestor".into(),
+                    result: Ok(vec![comment("parent", vec![], Some("/parent-more"))]),
+                },
+                3,
+                false,
+                false,
+            ));
+            if already_expanded {
+                let mut child = comment("confirmed", vec![], None);
+                child.body = "newer expansion text".into();
+                app.on_msg(ordered_snapshot(
+                    Msg::MoreReplies {
+                        generation,
+                        comment_id: "parent".into(),
+                        result: Ok(vec![child]),
+                    },
+                    4,
+                    true,
+                    true,
+                ));
+            }
+            let mut child = comment("confirmed", vec![], None);
+            child.body = "older parent text".into();
+            app.on_msg(ordered_snapshot(
+                thread_message(
+                    generation,
+                    vec![comment(
+                        "ancestor",
+                        vec![comment("parent", vec![child], Some("/parent-more"))],
+                        Some("/ancestor-more"),
+                    )],
+                ),
+                2,
+                false,
+                false,
+            ));
+            app.on_msg(ordered_snapshot(
+                Msg::MoreReplies {
+                    generation,
+                    comment_id: "parent".into(),
+                    result: Ok(vec![comment("new", vec![], None)]),
+                },
+                5,
+                false,
+                false,
+            ));
+            let parent = &app
+                .post_view
+                .as_ref()
+                .unwrap()
+                .page
+                .as_ref()
+                .unwrap()
+                .comments[0]
+                .replies[0];
+            assert_eq!(
+                parent
+                    .replies
+                    .iter()
+                    .map(|c| c.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["confirmed", "new"]
+            );
+            assert_eq!(
+                parent.replies[0].body,
+                if already_expanded {
+                    "newer expansion text"
+                } else {
+                    "older parent text"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn home_seeding_keeps_a_feed_request_that_started_later() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.load_feed(i, false);
+        let feed_request = app.tabs[i].feed.generation;
+        // Home's request was submitted later but started first (lower sequence).
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Group {
+                subreddit: "vim".into(),
+                generation: 0,
+                result: Ok(listing("vim", &["home-earlier-start"], None)),
+            }),
+            fetched_at: now(),
+            refreshing: false,
+            source: ordered_source(2, false),
+        });
+        assert_eq!(app.tabs[i].feed.posts[0].id, "home-earlier-start");
+
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Feed {
+                tab,
+                generation: feed_request,
+                append: false,
+                result: Ok(listing("vim", &["feed-later-start"], None)),
+            }),
+            fetched_at: now(),
+            refreshing: false,
+            source: ordered_source(3, false),
+        });
+
+        assert_eq!(app.tabs[i].feed.posts[0].id, "feed-later-start");
+    }
+
+    #[test]
+    fn orderless_home_completion_cannot_undo_a_later_disk_snapshot() {
+        for (retired, overlap) in [(false, false), (true, false), (true, true)] {
+            let mut app = app_with(&["vim"]);
+            let i = tab_index(&app, "vim");
+            app.switch_tab(i);
+            let tab = app.tabs[i].id;
+            app.load_feed(i, false);
+            let generation = app.tabs[i].feed.generation;
+            let mut disk = ordered_source(5, true);
+            disk.observed = Some(if overlap { (0, 3) } else { (2, 3) });
+            if retired {
+                disk.order.as_mut().unwrap().generation = [2; 16];
+            }
+            app.on_msg(Msg::Snapshot {
+                message: Box::new(Msg::Feed {
+                    tab,
+                    generation,
+                    append: false,
+                    result: Ok(listing("vim", &["newer-disk"], None)),
+                }),
+                fetched_at: now(),
+                refreshing: false,
+                source: disk,
+            });
+            app.on_msg(Msg::Snapshot {
+                message: Box::new(Msg::Group {
+                    subreddit: "vim".into(),
+                    generation: 0,
+                    result: Ok(listing("vim", &["older-orderless-live"], None)),
+                }),
+                fetched_at: now(),
+                refreshing: false,
+                source: Source {
+                    observed: Some((1, 1)),
+                    ..Source::default()
+                },
+            });
+            assert_eq!(
+                app.tabs[i].feed.posts[0].id, "newer-disk",
+                "retired={retired}"
+            );
+            app.fetch_feed(i, None, true);
+            app.on_msg(Msg::Snapshot {
+                message: Box::new(Msg::Feed {
+                    tab,
+                    generation: app.tabs[i].feed.generation,
+                    append: false,
+                    result: Ok(listing("vim", &["later-unreserved-refresh"], None)),
+                }),
+                fetched_at: now(),
+                refreshing: false,
+                source: Source {
+                    observed: Some((4, 4)),
+                    ..Source::default()
+                },
+            });
+            assert_eq!(app.tabs[i].feed.posts[0].id, "later-unreserved-refresh");
+        }
+    }
+
+    #[test]
+    fn a_kept_request_that_started_earlier_cannot_mark_a_newer_page_failed() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.load_feed(i, false);
+        let feed_request = app.tabs[i].feed.generation;
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Group {
+                subreddit: "vim".into(),
+                generation: 0,
+                result: Ok(listing("vim", &["home-later-start"], None)),
+            }),
+            fetched_at: now(),
+            refreshing: false,
+            source: ordered_source(3, false),
+        });
+
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Feed {
+                tab,
+                generation: feed_request,
+                append: false,
+                result: Err("timeout".into()),
+            }),
+            fetched_at: now(),
+            refreshing: false,
+            source: ordered_source(2, false),
+        });
+
+        let feed = &app.tabs[i].feed;
+        assert_eq!(feed.posts[0].id, "home-later-start");
+        assert_eq!(feed.error(), None);
+        assert!(app.status.as_ref().is_none_or(|s| !s.error));
+    }
+
+    #[test]
+    fn home_reaches_a_hot_tab_that_kept_an_earlier_time_range() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        app.set_sort(Sort::Top);
+        app.cycle_time();
+        app.set_sort(Sort::Hot);
+
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Group {
+                subreddit: "vim".into(),
+                generation: 0,
+                result: Ok(listing("vim", &["home"], None)),
+            }),
+            fetched_at: now(),
+            refreshing: false,
+            source: ordered_source(4, false),
+        });
+
+        assert_eq!(app.tabs[i].feed.posts[0].id, "home");
+    }
+
+    #[test]
+    fn unorderable_feed_failures_remain_visible_after_home_seeding() {
+        let variants = [
+            (None, None),
+            (ordered_source(3, false).order, None),
+            (None, ordered_source(2, false).order),
+            (
+                ordered_source(3, false).order,
+                Some(crate::cache::RequestOrder {
+                    generation: [99; 16],
+                    sequence: 2,
+                }),
+            ),
+        ];
+        for (home_order, failure_order) in variants {
+            let mut app = app_with(&["vim"]);
+            let i = tab_index(&app, "vim");
+            app.switch_tab(i);
+            app.load_feed(i, false);
+            let generation = app.tabs[i].feed.generation;
+            app.on_msg(Msg::Snapshot {
+                message: Box::new(Msg::Group {
+                    subreddit: "vim".into(),
+                    generation: 0,
+                    result: Ok(listing("vim", &["home"], None)),
+                }),
+                fetched_at: now(),
+                refreshing: false,
+                source: Source {
+                    order: home_order,
+                    observed: None,
+                    cached: false,
+                },
+            });
+            app.on_msg(Msg::Snapshot {
+                message: Box::new(Msg::Feed {
+                    tab: app.tabs[i].id,
+                    generation,
+                    append: false,
+                    result: Err("later-started request failed".into()),
+                }),
+                fetched_at: now(),
+                refreshing: false,
+                source: Source {
+                    order: failure_order,
+                    observed: None,
+                    cached: false,
+                },
+            });
+            assert_eq!(
+                app.tabs[i].feed.error(),
+                Some("later-started request failed")
+            );
+            assert_eq!(app.tabs[i].feed.posts[0].id, "home");
+            assert!(!app.tabs[i].feed.refreshing());
+        }
+    }
+
+    #[test]
+    fn later_started_live_feed_wins_when_cache_ordering_is_unavailable() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        app.load_feed(i, false);
+        let generation = app.tabs[i].feed.generation;
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Group {
+                subreddit: "vim".into(),
+                generation: 0,
+                result: Ok(listing("vim", &["home"], None)),
+            }),
+            fetched_at: now(),
+            refreshing: false,
+            source: Source {
+                order: None,
+                observed: Some((1, 1)),
+                cached: false,
+            },
+        });
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Feed {
+                tab: app.tabs[i].id,
+                generation,
+                append: false,
+                result: Ok(listing("vim", &["later-started-feed"], None)),
+            }),
+            fetched_at: now(),
+            refreshing: false,
+            source: Source {
+                order: None,
+                observed: Some((2, 2)),
+                cached: false,
+            },
+        });
+        assert_eq!(app.tabs[i].feed.posts[0].id, "later-started-feed");
+    }
+
+    #[test]
+    fn revisiting_a_stale_tab_does_not_duplicate_its_head_revalidation() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let generation = app.tabs[i].feed.generation;
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab: app.tabs[i].id,
+                generation,
+                append: false,
+                result: Ok(listing("vim", &["cached"], Some("next"))),
+            },
+            1,
+            true,
+            true,
+        ));
+        for _ in 0..3 {
+            app.switch_tab(0);
+            app.switch_tab(i);
+        }
+        assert_eq!(app.tabs[i].feed.generation, generation);
+        app.load_feed(i, true);
+        assert_ne!(
+            app.tabs[i].feed.generation, generation,
+            "paging stays independent"
+        );
+    }
+
+    #[test]
+    fn an_older_home_success_keeps_a_newer_feed_failure_visible_and_retryable() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab: app.tabs[i].id,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Ok(listing("vim", &["initial"], None)),
+            },
+            1,
+            false,
+            false,
+        ));
+        app.reload();
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab: app.tabs[i].id,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Err("newer request failed".into()),
+            },
+            3,
+            false,
+            false,
+        ));
+        app.on_msg(ordered_snapshot(
+            Msg::Group {
+                subreddit: "vim".into(),
+                generation: 0,
+                result: Ok(listing("vim", &["useful-older-success"], None)),
+            },
+            2,
+            false,
+            false,
+        ));
+        assert_eq!(app.tabs[i].feed.posts[0].id, "useful-older-success");
+        assert_eq!(app.tabs[i].feed.error(), Some("newer request failed"));
+        let generation = app.tabs[i].feed.generation;
+        app.reload_failed();
+        assert_ne!(app.tabs[i].feed.generation, generation);
+    }
+    #[test]
+    fn an_interim_expansion_without_new_replies_keeps_its_target() {
+        for (empty, navigate) in [(true, false), (false, false), (true, true)] {
+            let mut app = app_with(&[]);
+            app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+            let generation = app.post_view.as_ref().unwrap().generation;
+            app.on_msg(ordered_snapshot(
+                thread_message(
+                    generation,
+                    vec![
+                        comment(
+                            "parent",
+                            vec![comment("child", vec![], None)],
+                            Some("/more"),
+                        ),
+                        comment("sibling", vec![], None),
+                    ],
+                ),
+                1,
+                true,
+                false,
+            ));
+            let view = app.post_view.as_mut().unwrap();
+            view.cursor = 2;
+            view.free_scroll = false;
+            app.activate_comment();
+            app.on_msg(ordered_snapshot(
+                Msg::MoreReplies {
+                    generation,
+                    comment_id: "parent".into(),
+                    result: Ok(if empty {
+                        vec![]
+                    } else {
+                        vec![comment("child", vec![], None)]
+                    }),
+                },
+                2,
+                true,
+                true,
+            ));
+            assert!(matches!(app.post_view.as_ref().unwrap().cursor_key(),
+                Some(RowKey::More(id)) if id == "parent"));
+            if navigate {
+                app.move_comment_cursor(1);
+            }
+            app.on_msg(ordered_snapshot(
+                Msg::MoreReplies {
+                    generation,
+                    comment_id: "parent".into(),
+                    result: Ok(vec![
+                        comment("child", vec![], None),
+                        comment("new", vec![], None),
+                    ]),
+                },
+                4,
+                false,
+                false,
+            ));
+            let view = app.post_view.as_ref().unwrap();
+            assert!(matches!(view.cursor_key(), Some(RowKey::Comment(id))
+                if id == if navigate { "sibling" } else { "new" }));
+            assert!(!view.loading_more.contains("parent"));
+        }
+    }
+
+    #[test]
+    fn incomparable_live_fields_survive_a_later_cached_expansion() {
+        for retired in [false, true] {
+            let mut app = app_with(&[]);
+            app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+            let generation = app.post_view.as_ref().unwrap().generation;
+            let mut child = comment("child", vec![], None);
+            child.body = "new live text".into();
+            app.on_msg(Msg::Snapshot {
+                message: Box::new(thread_message(
+                    generation,
+                    vec![comment("parent", vec![child], Some("/more"))],
+                )),
+                fetched_at: now(),
+                refreshing: false,
+                source: Source {
+                    observed: Some((4, 4)),
+                    order: if retired {
+                        ordered_source(1, false).order
+                    } else {
+                        None
+                    },
+                    ..Source::default()
+                },
+            });
+            let mut old = comment("child", vec![], Some("/obsolete-continuation"));
+            old.body = "old cached text".into();
+            app.on_msg(Msg::Snapshot {
+                message: Box::new(Msg::MoreReplies {
+                    generation,
+                    comment_id: "parent".into(),
+                    result: Ok(vec![old]),
+                }),
+                fetched_at: now(),
+                refreshing: false,
+                source: Source {
+                    observed: Some((5, 6)),
+                    order: Some(crate::cache::RequestOrder {
+                        generation: [2; 16],
+                        sequence: 2,
+                    }),
+                    ..ordered_source(2, true)
+                },
+            });
+            let view = app.post_view.as_ref().unwrap();
+            let child = &view.page.as_ref().unwrap().comments[0].replies[0];
+            assert_eq!(child.body, "new live text");
+            assert!(child.more.is_none());
+            assert!(
+                view.loading_more.contains("parent"),
+                "uncertain cached replies must revalidate"
+            );
+            let mut new = comment("child", vec![], None);
+            new.body = "revalidated text".into();
+            app.on_msg(Msg::Snapshot {
+                message: Box::new(Msg::MoreReplies {
+                    generation,
+                    comment_id: "parent".into(),
+                    result: Ok(vec![new]),
+                }),
+                fetched_at: now(),
+                refreshing: false,
+                source: Source {
+                    observed: Some((7, 7)),
+                    order: Some(crate::cache::RequestOrder {
+                        generation: [2; 16],
+                        sequence: 3,
+                    }),
+                    ..ordered_source(3, false)
+                },
+            });
+            assert_eq!(
+                app.post_view
+                    .as_ref()
+                    .unwrap()
+                    .page
+                    .as_ref()
+                    .unwrap()
+                    .comments[0]
+                    .replies[0]
+                    .body,
+                "revalidated text"
+            );
+        }
+    }
+    #[test]
+    fn stale_thumbnail_refresh_survives_eviction_and_revisit_until_terminal_delivery() {
+        for terminal in 0..3 {
+            let mut app = app_with(&[]);
+            let url = "/image.png";
+            app.thumbs_drawn(&[url]);
+            app.on_msg(Msg::Snapshot {
+                message: Box::new(Msg::Thumb {
+                    url: url.into(),
+                    result: Ok(image::DynamicImage::ImageRgba8(
+                        image::ImageBuffer::from_pixel(2, 2, image::Rgba([255, 0, 0, 255])),
+                    )),
+                }),
+                fetched_at: now(),
+                refreshing: true,
+                source: Source {
+                    cached: true,
+                    ..Source::default()
+                },
+            });
+            for i in 0..THUMB_CACHE_MAX {
+                app.thumbs
+                    .insert(format!("/old/{i}"), ImageSlot::Failed("unused".into()));
+            }
+            app.thumbs_drawn(&[]);
+            assert!(
+                matches!(app.thumbs.get(url), Some(ImageSlot::Ready { .. })),
+                "the offscreen cached preview must survive while HTTP is outstanding"
+            );
+            app.thumbs_drawn(&[url]);
+            assert!(
+                matches!(app.thumbs.get(url), Some(ImageSlot::Ready { .. })),
+                "revisiting must reuse the preview, not replace it with another Loading request"
+            );
+            app.on_msg(match terminal {
+                0 => Msg::Thumb {
+                    url: url.into(),
+                    result: Ok(image::DynamicImage::new_rgb8(2, 2)),
+                },
+                1 => Msg::Thumb {
+                    url: url.into(),
+                    result: Err("offline".into()),
+                },
+                _ => Msg::ThumbSkipped { url: url.into() },
+            });
+            assert!(matches!(app.thumbs.get(url), Some(ImageSlot::Ready { .. })));
+            for i in 0..THUMB_CACHE_MAX {
+                app.thumbs
+                    .insert(format!("/old/{i}"), ImageSlot::Failed("unused".into()));
+            }
+            app.thumbs_drawn(&[]);
+            assert!(
+                !app.thumbs.contains_key(url),
+                "terminal delivery must release the eviction pin"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_thumbnail_retries_keep_pixels_after_failure_or_skipped_work() {
+        for retry in ["reload", "started", "revisit"] {
+            let mut app = app_with(&[]);
+            let url = "/image.png";
+            app.thumbs_drawn(&[url]);
+            app.on_msg(Msg::Snapshot {
+                message: Box::new(Msg::Thumb {
+                    url: url.into(),
+                    result: Ok(image::DynamicImage::ImageRgba8(
+                        image::ImageBuffer::from_pixel(2, 2, image::Rgba([255, 0, 0, 255])),
+                    )),
+                }),
+                fetched_at: now(),
+                refreshing: true,
+                source: Source {
+                    cached: true,
+                    ..Source::default()
+                },
+            });
+            let render = |app: &mut App| {
+                let Some(ImageSlot::Ready { protocol, .. }) = app.thumbs.get_mut(url) else {
+                    panic!("cached pixels must remain usable");
+                };
+                let area = ratatui::layout::Rect::new(0, 0, 2, 1);
+                let mut buffer = ratatui::buffer::Buffer::empty(area);
+                ratatui::widgets::StatefulWidget::render(
+                    ratatui_image::StatefulImage::default(),
+                    area,
+                    &mut buffer,
+                    protocol.as_mut(),
+                );
+                buffer
+            };
+            let cached_pixels = render(&mut app);
+            app.on_msg(if retry == "revisit" {
+                Msg::ThumbSkipped { url: url.into() }
+            } else {
+                Msg::Thumb {
+                    url: url.into(),
+                    result: Err("offline".into()),
+                }
+            });
+            app.thumbs_drawn(&[]);
+            match retry {
+                "reload" => app.reload(),
+                "started" => app.reload_failed(),
+                _ => {}
+            }
+            app.thumbs_drawn(&[url]);
+            assert!(
+                matches!(
+                    app.thumbs.get(url),
+                    Some(ImageSlot::Ready {
+                        refresh: ImageRefresh::Loading,
+                        ..
+                    })
+                ),
+                "{retry} must restart the refresh without losing usable pixels"
+            );
+            assert_eq!(
+                render(&mut app),
+                cached_pixels,
+                "{retry} must keep rendering the same cached image"
+            );
+        }
     }
 }

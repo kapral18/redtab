@@ -110,21 +110,26 @@ impl Post {
 
     /// Age relative to `now`, falling back to Redlib's text when the time is unknown.
     pub fn age_at(&self, now: DateTime<Utc>) -> String {
-        let Some(created) = self.created else {
-            return self.age.clone();
-        };
-        let secs = (now - created).num_seconds().max(0);
-        match secs {
-            0..60 => "just now".into(),
-            60..3_600 => format!("{}m ago", secs / 60),
-            3_600..86_400 => format!("{}h ago", secs / 3_600),
-            86_400..2_592_000 => format!("{}d ago", secs / 86_400),
-            _ => created.format("%b %d '%y").to_string(),
-        }
+        age_at(self.created, &self.age, now)
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+/// `created` relative to `now`; Redlib's fetch-time text when the time is unknown.
+fn age_at(created: Option<DateTime<Utc>>, fetched: &str, now: DateTime<Utc>) -> String {
+    let Some(created) = created else {
+        return fetched.to_owned();
+    };
+    let secs = (now - created).num_seconds().max(0);
+    match secs {
+        0..60 => "just now".into(),
+        60..3_600 => format!("{}m ago", secs / 60),
+        3_600..86_400 => format!("{}h ago", secs / 3_600),
+        86_400..2_592_000 => format!("{}d ago", secs / 86_400),
+        _ => created.format("%b %d '%y").to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Listing {
     pub posts: Vec<Post>,
     /// Cursor for the next page (`t3_…`), absent on the last page.
@@ -133,7 +138,7 @@ pub struct Listing {
     pub icon: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Comment {
     pub id: String,
     pub author: String,
@@ -141,21 +146,43 @@ pub struct Comment {
     pub is_op: bool,
     pub is_mod: bool,
     pub score: Option<i64>,
+    /// Redlib's relative age ("1h ago") at fetch time; display uses `created` when known.
     pub age: String,
+    /// Absolute creation time, so cached comments age with the clock.
+    #[serde(default)]
+    pub created: Option<DateTime<Utc>>,
     pub body: String,
     pub replies: Vec<Comment>,
     /// "More replies" link Redlib renders instead of deeper levels.
     pub more: Option<MoreReplies>,
+    /// In-memory response provenance; cached JSON never serializes it.
+    #[serde(skip)]
+    pub sources: Option<CommentSources>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl Comment {
+    /// Age relative to `now`, so a cached comment ages with the clock.
+    pub fn age_at(&self, now: DateTime<Utc>) -> String {
+        age_at(self.created, &self.age, now)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CommentSources {
+    pub content: crate::cache::Source,
+    pub more: crate::cache::Source,
+    /// A direct More contribution, not also supplied by a parent snapshot.
+    pub from_expansion: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MoreReplies {
     /// Redlib path of the thread rooted at the parent comment.
     pub path: String,
     pub count: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PostPage {
     pub post: Post,
     /// Full selftext as plain text.

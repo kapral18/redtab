@@ -1,16 +1,20 @@
 //! Background fetching. Three queues feed a few threads: jobs the user is
 //! waiting for (and health checks) never queue behind the Home wall's bulk
-//! subreddit fetches, and neither waits behind list thumbnails. Results go back
-//! to the UI loop, which ignores responses for outdated requests.
+//! subreddit fetches, and neither waits behind list thumbnails. Cacheable jobs
+//! first pass one disk reader, which only reads; the worker that runs a job
+//! reserves its cache order. Results go back to the UI loop, which ignores
+//! responses for outdated requests.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use image::DynamicImage;
 
+use crate::cache::{CONTENT_TTL, Cache, IMAGE_TTL, Source};
 use crate::model::{Comment, Listing, Media, PostPage, Sort, TimeRange};
 use crate::redlib::Redlib;
 
@@ -20,10 +24,12 @@ const MAX_IMAGE_EDGE: u32 = 1600;
 const MAX_THUMB_EDGE: u32 = 128;
 /// Threads reserved for jobs the user waits on.
 const PRIORITY_THREADS: usize = 2;
+/// Shared logical clock for disk-read windows and HTTP starts in this process.
+static NEXT_EVENT: AtomicU64 = AtomicU64::new(1);
 /// Threads for list thumbnails and subreddit icons, apart from the other queues.
 const THUMB_THREADS: usize = 2;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum FeedQuery {
     Listing { sort: Sort, time: TimeRange },
     Search { query: String },
@@ -41,6 +47,7 @@ pub enum Job {
     /// First page of a subreddit for the Home wall (also seeds its tab).
     Group {
         subreddit: String,
+        generation: u64,
     },
     Post {
         generation: u64,
@@ -50,6 +57,7 @@ pub enum Job {
         generation: u64,
         comment_id: String,
         path: String,
+        minimum: Option<Source>,
     },
     Image {
         url: String,
@@ -90,7 +98,11 @@ impl Job {
                 append: after.is_some(),
                 result: Err(e),
             },
-            Job::Group { subreddit } => Msg::Group {
+            Job::Group {
+                subreddit,
+                generation,
+            } => Msg::Group {
+                generation: *generation,
                 subreddit: subreddit.clone(),
                 result: Err(e),
             },
@@ -133,6 +145,14 @@ impl Job {
 }
 
 pub enum Msg {
+    /// Cached or freshly fetched content, with its original fetch time.
+    Snapshot {
+        message: Box<Msg>,
+        fetched_at: i64,
+        refreshing: bool,
+        source: Source,
+    },
+    CacheWarning(String),
     Feed {
         tab: u64,
         generation: u64,
@@ -141,6 +161,7 @@ pub enum Msg {
     },
     Group {
         subreddit: String,
+        generation: u64,
         result: Result<Listing, String>,
     },
     Post {
@@ -182,13 +203,35 @@ pub enum Msg {
 }
 
 pub struct Pool {
-    priority: Sender<Job>,
-    background: Sender<Job>,
-    thumbs: Sender<Job>,
+    queues: Queues,
+    cache_reads: Option<Sender<Work>>,
     wanted: Arc<Wanted>,
 }
 
-type SharedRx = Arc<Mutex<Receiver<Job>>>;
+#[derive(Clone)]
+struct Queues {
+    priority: Sender<Work>,
+    background: Sender<Work>,
+    thumbs: Sender<Work>,
+}
+
+struct Work {
+    job: Job,
+    force: bool,
+}
+
+impl Queues {
+    fn submit(&self, work: Work) {
+        let queue = match work.job {
+            Job::Thumb { .. } => &self.thumbs,
+            Job::Group { .. } => &self.background,
+            _ => &self.priority,
+        };
+        let _ = queue.send(work);
+    }
+}
+
+type SharedRx = Arc<Mutex<Receiver<Work>>>;
 
 /// URLs whose queued fetches are still worth running; others are skipped.
 #[derive(Default)]
@@ -200,12 +243,19 @@ struct Wanted {
 }
 
 impl Pool {
-    pub fn start(redlib: Redlib, threads: usize) -> (Self, Receiver<Msg>) {
-        let (priority_tx, priority_rx) = channel::<Job>();
-        let (background_tx, background_rx) = channel::<Job>();
-        let (thumbs_tx, thumbs_rx) = channel::<Job>();
+    pub fn start(redlib: Redlib, threads: usize, cache: Option<Cache>) -> (Self, Receiver<Msg>) {
+        let (priority_tx, priority_rx) = channel::<Work>();
+        let (background_tx, background_rx) = channel::<Work>();
+        let (thumbs_tx, thumbs_rx) = channel::<Work>();
         let (msg_tx, msg_rx) = channel::<Msg>();
         let wanted = Arc::<Wanted>::default();
+        let cache = cache.map(Arc::new);
+        let namespace: Arc<str> = redlib.cache_namespace().into();
+        let queues = Queues {
+            priority: priority_tx,
+            background: background_tx,
+            thumbs: thumbs_tx,
+        };
         let background_threads = threads.saturating_sub(PRIORITY_THREADS).max(1);
         for (rx, count) in [
             (priority_rx, PRIORITY_THREADS),
@@ -219,14 +269,62 @@ impl Pool {
                     msg_tx.clone(),
                     redlib.clone(),
                     Arc::clone(&wanted),
+                    cache.clone(),
+                    Arc::clone(&namespace),
                 );
             }
         }
+        let cache_reads = cache.map(|cache| {
+            let (tx, rx) = channel::<Work>();
+            let queues = queues.clone();
+            let wanted = Arc::clone(&wanted);
+            thread::Builder::new()
+                .name("redtab-cache".into())
+                .spawn(move || {
+                    while let Ok(work) = rx.recv() {
+                        let job = &work.job;
+                        if let Some(msg) = skipped_image(job, &wanted) {
+                            let _ = msg_tx.send(msg);
+                            continue;
+                        }
+                        let now = crate::app::now();
+                        let key = job.cache_key(&namespace);
+                        if !work.force && let Some((key, ttl)) = &key {
+                            let read_start = NEXT_EVENT.fetch_add(1, Ordering::Relaxed);
+                            if let Some(entry) = cache.load(key, now)
+                            // Media resolution triggers a viewer: stale entries must not deliver twice.
+                            && (!matches!(job, Job::ResolveMedia { .. })
+                                || now.saturating_sub(entry.fetched_at) < *ttl)
+                            && let Some(message) = job.cached_message(&entry.bytes)
+                        {
+                            let source = Source {
+                                order: Some(entry.order),
+                                observed: Some((read_start, NEXT_EVENT.fetch_add(1, Ordering::Relaxed))),
+                                cached: true,
+                            };
+                            let refreshing = now.saturating_sub(entry.fetched_at) >= *ttl
+                                || matches!(job, Job::MoreReplies { minimum: Some(minimum), .. } if !source.may_replace(*minimum));
+                            let _ = msg_tx.send(Msg::Snapshot {
+                                message: Box::new(message),
+                                fetched_at: entry.fetched_at,
+                                refreshing,
+                                source,
+                            });
+                            if !refreshing {
+                                continue;
+                            }
+                        }
+                        }
+                        queues.submit(work);
+                    }
+                })
+                .expect("cannot start cache reader");
+            tx
+        });
         (
             Self {
-                priority: priority_tx,
-                background: background_tx,
-                thumbs: thumbs_tx,
+                queues,
+                cache_reads,
                 wanted,
             },
             msg_rx,
@@ -234,13 +332,22 @@ impl Pool {
     }
 
     pub fn submit(&self, job: Job) {
-        let queue = match job {
-            Job::Thumb { .. } => &self.thumbs,
-            Job::Group { .. } => &self.background,
-            _ => &self.priority,
-        };
-        // A send error means the workers are gone because the app is exiting.
-        let _ = queue.send(job);
+        self.enqueue(job, false)
+    }
+
+    fn enqueue(&self, job: Job, force: bool) {
+        let work = Work { job, force };
+        match &self.cache_reads {
+            Some(tx) if work.job.uses_cache() => {
+                let _ = tx.send(work);
+            }
+            _ => self.queues.submit(work),
+        }
+    }
+
+    /// Explicit reload bypasses cached content, leaving the displayed view in place.
+    pub fn refresh(&self, job: Job) {
+        self.enqueue(job, true)
     }
 
     /// Record the thumbnails on screen now, so scrolled-away ones are not fetched.
@@ -277,22 +384,60 @@ impl Pool {
 /// every thread but main; a worker catches its own panic.
 const WORKER_THREAD: &str = "redtab-worker";
 
-fn spawn_worker(rx: SharedRx, tx: Sender<Msg>, redlib: Redlib, wanted: Arc<Wanted>) {
+fn spawn_worker(
+    rx: SharedRx,
+    tx: Sender<Msg>,
+    redlib: Redlib,
+    wanted: Arc<Wanted>,
+    cache: Option<Arc<Cache>>,
+    namespace: Arc<str>,
+) {
     thread::Builder::new()
         .name(WORKER_THREAD.into())
         .spawn(move || {
             loop {
-                let job = {
+                let Work { job, .. } = {
                     let Ok(guard) = rx.lock() else { return };
                     match guard.recv() {
                         Ok(job) => job,
                         Err(_) => return,
                     }
                 };
+                if let Some(msg) = skipped_image(&job, &wanted) {
+                    if tx.send(msg).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                // Reserved as the request starts, so a later start orders after it.
+                let request_order = cache
+                    .as_deref()
+                    .filter(|_| job.uses_cache() && !matches!(job, Job::ResolveMedia { .. }))
+                    .and_then(|cache| match cache.reserve_request() {
+                        Ok(order) => Some(order),
+                        Err(e) => {
+                            let _ =
+                                tx.send(Msg::CacheWarning(format!("Could not prepare cache: {e}")));
+                            None
+                        }
+                    });
+                let started = NEXT_EVENT.fetch_add(1, Ordering::Relaxed);
                 // A bug in one job (a parser or decoder panic) must not kill this worker
                 // or leave its caller waiting: it becomes that job's error.
                 let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run(&redlib, &job, &wanted)
+                    let msg = run(&redlib, &job, &wanted);
+                    cache_result(
+                        msg,
+                        &job,
+                        cache.as_deref(),
+                        &namespace,
+                        &tx,
+                        Source {
+                            order: request_order,
+                            observed: Some((started, started)),
+                            cached: false,
+                        },
+                    )
                 }))
                 .unwrap_or_else(|_| {
                     // "panicked at file:line:col:\nmessage" → one status line.
@@ -327,6 +472,181 @@ fn err_string(e: anyhow::Error) -> String {
     format!("{e:#}")
 }
 
+impl Job {
+    /// Whether disk holds snapshots of this job's response.
+    fn uses_cache(&self) -> bool {
+        matches!(
+            self,
+            Job::Feed { .. }
+                | Job::Group { .. }
+                | Job::Post { .. }
+                | Job::ResolveMedia { .. }
+                | Job::MoreReplies { .. }
+                | Job::Thumb { .. }
+        )
+    }
+
+    fn cache_key(&self, namespace: &str) -> Option<(String, i64)> {
+        let (request, ttl) = match self {
+            Job::Feed {
+                subreddit,
+                query,
+                after,
+                ..
+            } => (
+                serde_json::to_string(&("feed", subreddit.to_lowercase(), query, after)).ok()?,
+                CONTENT_TTL,
+            ),
+            Job::Group { subreddit, .. } => (
+                serde_json::to_string(&(
+                    "feed",
+                    subreddit.to_lowercase(),
+                    FeedQuery::Listing {
+                        sort: Sort::Hot,
+                        time: TimeRange::Day,
+                    },
+                    None::<String>,
+                ))
+                .ok()?,
+                CONTENT_TTL,
+            ),
+            Job::Post { permalink, .. } | Job::ResolveMedia { permalink } => (
+                serde_json::to_string(&("post", permalink)).ok()?,
+                CONTENT_TTL,
+            ),
+            Job::MoreReplies { path, .. } => {
+                (serde_json::to_string(&("replies", path)).ok()?, CONTENT_TTL)
+            }
+            Job::Thumb { url } => (serde_json::to_string(&("thumb", url)).ok()?, IMAGE_TTL),
+            _ => return None,
+        };
+        Some((Cache::key(namespace, &request), ttl))
+    }
+
+    fn cached_message(&self, bytes: &[u8]) -> Option<Msg> {
+        Some(match self {
+            Job::Feed {
+                tab,
+                generation,
+                after,
+                ..
+            } => Msg::Feed {
+                tab: *tab,
+                generation: *generation,
+                append: after.is_some(),
+                result: Ok(serde_json::from_slice(bytes).ok()?),
+            },
+            Job::Group {
+                subreddit,
+                generation,
+            } => Msg::Group {
+                generation: *generation,
+                subreddit: subreddit.clone(),
+                result: Ok(serde_json::from_slice(bytes).ok()?),
+            },
+            Job::Post { generation, .. } => Msg::Post {
+                generation: *generation,
+                result: Ok(serde_json::from_slice(bytes).ok()?),
+            },
+            Job::MoreReplies {
+                generation,
+                comment_id,
+                ..
+            } => Msg::MoreReplies {
+                generation: *generation,
+                comment_id: comment_id.clone(),
+                result: Ok(serde_json::from_slice(bytes).ok()?),
+            },
+            Job::ResolveMedia { permalink } => Msg::MediaResolved {
+                permalink: permalink.clone(),
+                result: Ok(serde_json::from_slice::<PostPage>(bytes).ok()?.post.media),
+            },
+            Job::Thumb { url } => Msg::Thumb {
+                url: url.clone(),
+                result: Ok(image::load_from_memory(bytes).ok()?),
+            },
+            _ => return None,
+        })
+    }
+}
+
+fn skipped_image(job: &Job, wanted: &Wanted) -> Option<Msg> {
+    match job {
+        Job::Thumb { url } if !wanted.thumbs.lock().is_ok_and(|set| set.contains(url)) => {
+            Some(Msg::ThumbSkipped { url: url.clone() })
+        }
+        Job::Image { url } if !wanted.images.lock().is_ok_and(|set| set.contains(url)) => {
+            Some(Msg::ImageSkipped)
+        }
+        _ => None,
+    }
+}
+
+fn cache_result(
+    msg: Msg,
+    job: &Job,
+    cache: Option<&Cache>,
+    namespace: &str,
+    tx: &Sender<Msg>,
+    source: Source,
+) -> Msg {
+    let ok = matches!(
+        &msg,
+        Msg::Feed { result: Ok(_), .. }
+            | Msg::Group { result: Ok(_), .. }
+            | Msg::Post { result: Ok(_), .. }
+            | Msg::MoreReplies { result: Ok(_), .. }
+            | Msg::Thumb { result: Ok(_), .. }
+    );
+    // Feed failures keep their request order too, so a failure that started before
+    // the page on screen cannot mark it failed.
+    if !ok && !matches!(msg, Msg::Feed { .. }) {
+        return msg;
+    }
+    let fetched_at = crate::app::now();
+    if ok
+        && let Some(cache) = cache
+        && let Some(order) = source.order
+        && let Some((key, _)) = job.cache_key(namespace)
+    {
+        let bytes = match &msg {
+            Msg::Feed {
+                result: Ok(value), ..
+            }
+            | Msg::Group {
+                result: Ok(value), ..
+            } => serde_json::to_vec(value).ok(),
+            Msg::Post {
+                result: Ok(value), ..
+            } => serde_json::to_vec(value).ok(),
+            Msg::MoreReplies {
+                result: Ok(value), ..
+            } => serde_json::to_vec(value).ok(),
+            Msg::Thumb {
+                result: Ok(value), ..
+            } => {
+                let mut bytes = std::io::Cursor::new(Vec::new());
+                value
+                    .write_to(&mut bytes, image::ImageFormat::Png)
+                    .ok()
+                    .map(|()| bytes.into_inner())
+            }
+            _ => None,
+        };
+        if let Some(bytes) = bytes
+            && let Err(e) = cache.store(&key, &bytes, fetched_at, order)
+        {
+            let _ = tx.send(Msg::CacheWarning(format!("Could not save cache: {e}")));
+        }
+    }
+    Msg::Snapshot {
+        message: Box::new(msg),
+        fetched_at,
+        refreshing: false,
+        source,
+    }
+}
+
 fn run(redlib: &Redlib, job: &Job, wanted: &Wanted) -> Msg {
     match job {
         Job::Feed {
@@ -349,7 +669,11 @@ fn run(redlib: &Redlib, job: &Job, wanted: &Wanted) -> Msg {
                 result: result.map_err(err_string),
             }
         }
-        Job::Group { subreddit } => Msg::Group {
+        Job::Group {
+            subreddit,
+            generation,
+        } => Msg::Group {
+            generation: *generation,
             subreddit: subreddit.clone(),
             result: redlib
                 .listing(subreddit, Sort::Hot, TimeRange::Day, None)
@@ -366,6 +690,7 @@ fn run(redlib: &Redlib, job: &Job, wanted: &Wanted) -> Msg {
             generation,
             comment_id,
             path,
+            ..
         } => Msg::MoreReplies {
             generation: *generation,
             comment_id: comment_id.clone(),
@@ -732,5 +1057,290 @@ mod tests {
         let err = start_command(&argv).unwrap().result.unwrap_err();
 
         assert!(err.len() < 66000, "captured {} bytes", err.len());
+    }
+
+    struct CacheDir(PathBuf);
+    impl CacheDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "redtab-worker-cache-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for CacheDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn next_message(messages: &Receiver<Msg>) -> Msg {
+        messages
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker response")
+    }
+
+    #[test]
+    fn a_warm_feed_is_readable_after_the_server_shuts_down() {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = CacheDir::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let redlib = Redlib::new(&format!("http://{}", listener.local_addr().unwrap()), false);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() != 0 {
+                if line == "\r\n" {
+                    break;
+                }
+                line.clear();
+            }
+            let html = include_str!("../tests/fixtures/sub.html");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+                html.len()
+            )
+            .unwrap();
+        });
+        let job = || Job::Group {
+            subreddit: "rust".into(),
+            generation: 0,
+        };
+        let (cold, messages) = Pool::start(redlib.clone(), 3, Some(Cache::new(dir.0.clone())));
+        cold.submit(job());
+        let Msg::Snapshot {
+            message,
+            source: Source { cached: false, .. },
+            ..
+        } = next_message(&messages)
+        else {
+            panic!("network snapshot")
+        };
+        let Msg::Group {
+            result: Ok(expected),
+            ..
+        } = *message
+        else {
+            panic!("parsed listing")
+        };
+        server.join().unwrap();
+        drop(cold);
+        let (warm, messages) = Pool::start(redlib, 3, Some(Cache::new(dir.0.clone())));
+
+        warm.submit(job());
+
+        let Msg::Snapshot {
+            message,
+            source: Source { cached: true, .. },
+            refreshing: false,
+            ..
+        } = next_message(&messages)
+        else {
+            panic!("fresh disk snapshot")
+        };
+        let Msg::Group {
+            result: Ok(actual), ..
+        } = *message
+        else {
+            panic!("cached listing")
+        };
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn stale_content_arrives_before_a_failed_refresh() {
+        let dir = CacheDir::new();
+        let redlib = Redlib::new("http://127.0.0.1:9", false);
+        let job = Job::Group {
+            subreddit: "rust".into(),
+            generation: 0,
+        };
+        let cache = Cache::new(dir.0.clone());
+        let (key, _) = job.cache_key(&redlib.cache_namespace()).unwrap();
+        let listing =
+            crate::redlib::parse::parse_listing(include_str!("../tests/fixtures/sub.html"))
+                .unwrap();
+        cache
+            .store(
+                &key,
+                &serde_json::to_vec(&listing).unwrap(),
+                crate::app::now() - CONTENT_TTL,
+                cache.reserve_request().unwrap(),
+            )
+            .unwrap();
+        let (pool, messages) = Pool::start(redlib, 3, Some(cache));
+
+        pool.submit(job);
+
+        let Msg::Snapshot {
+            message,
+            source: Source { cached: true, .. },
+            refreshing: true,
+            ..
+        } = next_message(&messages)
+        else {
+            panic!("stale disk snapshot first")
+        };
+        let Msg::Group {
+            result: Ok(actual), ..
+        } = *message
+        else {
+            panic!("cached listing")
+        };
+        assert_eq!(actual, listing);
+        assert!(matches!(
+            next_message(&messages),
+            Msg::Group { result: Err(_), .. }
+        ));
+    }
+
+    #[test]
+    fn force_refresh_does_not_accept_a_fresh_disk_snapshot() {
+        let dir = CacheDir::new();
+        let redlib = Redlib::new("http://127.0.0.1:9", false);
+        let job = Job::Post {
+            generation: 1,
+            permalink: "/r/rust/comments/p/title/".into(),
+        };
+        let cache = Cache::new(dir.0.clone());
+        let (key, _) = job.cache_key(&redlib.cache_namespace()).unwrap();
+        let page =
+            crate::redlib::parse::parse_post_page(include_str!("../tests/fixtures/post.html"))
+                .unwrap();
+        cache
+            .store(
+                &key,
+                &serde_json::to_vec(&page).unwrap(),
+                crate::app::now(),
+                cache.reserve_request().unwrap(),
+            )
+            .unwrap();
+        let (pool, messages) = Pool::start(redlib, 3, Some(cache));
+
+        pool.refresh(job);
+
+        assert!(matches!(
+            next_message(&messages),
+            Msg::Post { result: Err(_), .. }
+        ));
+    }
+
+    #[test]
+    fn cached_thumbnail_arrives_before_a_failed_background_refresh() {
+        let dir = CacheDir::new();
+        let redlib = Redlib::new("http://127.0.0.1:9", false);
+        let job = Job::Thumb {
+            url: "/img/cached.png".into(),
+        };
+        let cache = Cache::new(dir.0.clone());
+        let (key, _) = job.cache_key(&redlib.cache_namespace()).unwrap();
+        let image =
+            DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2, 2, image::Rgb([10, 20, 30])));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        cache
+            .store(
+                &key,
+                bytes.get_ref(),
+                crate::app::now() - IMAGE_TTL,
+                cache.reserve_request().unwrap(),
+            )
+            .unwrap();
+        let (pool, messages) = Pool::start(redlib, 3, Some(cache));
+        pool.set_on_screen(&["/img/cached.png"]);
+
+        pool.submit(job);
+
+        let Msg::Snapshot {
+            message,
+            source: Source { cached: true, .. },
+            ..
+        } = next_message(&messages)
+        else {
+            panic!("cached thumbnail")
+        };
+        let Msg::Thumb {
+            result: Ok(actual), ..
+        } = *message
+        else {
+            panic!("decoded thumbnail")
+        };
+        assert_eq!(actual.to_rgb8().get_pixel(0, 0).0, [10, 20, 30]);
+        assert!(matches!(
+            next_message(&messages),
+            Msg::Thumb { result: Err(_), .. }
+        ));
+    }
+
+    #[test]
+    fn stale_media_resolution_does_not_trigger_a_cached_viewer_action() {
+        let dir = CacheDir::new();
+        let redlib = Redlib::new("http://127.0.0.1:9", false);
+        let job = Job::ResolveMedia {
+            permalink: "/r/pics/comments/p/gallery/".into(),
+        };
+        let cache = Cache::new(dir.0.clone());
+        let (key, _) = job.cache_key(&redlib.cache_namespace()).unwrap();
+        let page =
+            crate::redlib::parse::parse_post_page(include_str!("../tests/fixtures/gallery.html"))
+                .unwrap();
+        cache
+            .store(
+                &key,
+                &serde_json::to_vec(&page).unwrap(),
+                crate::app::now() - CONTENT_TTL,
+                cache.reserve_request().unwrap(),
+            )
+            .unwrap();
+        let (pool, messages) = Pool::start(redlib, 3, Some(cache));
+
+        pool.submit(job);
+
+        assert!(matches!(
+            next_message(&messages),
+            Msg::MediaResolved { result: Err(_), .. }
+        ));
+    }
+    #[test]
+    fn fresh_cached_replies_revalidate_when_the_parent_is_newer() {
+        let dir = CacheDir::new();
+        let cache = Cache::new(dir.0.clone());
+        let older = cache.reserve_request().unwrap();
+        let newer = cache.reserve_request().unwrap();
+        let redlib = Redlib::new("http://127.0.0.1:9", false);
+        let job = Job::MoreReplies {
+            generation: 1,
+            comment_id: "parent".into(),
+            path: "/r/rust/comments/post/title/parent/".into(),
+            minimum: Some(Source {
+                order: Some(newer),
+                ..Source::default()
+            }),
+        };
+        let (key, _) = job.cache_key(&redlib.cache_namespace()).unwrap();
+        cache.store(&key, b"[]", crate::app::now(), older).unwrap();
+        let (pool, messages) = Pool::start(redlib, 3, Some(cache));
+
+        pool.submit(job);
+
+        assert!(matches!(
+            next_message(&messages),
+            Msg::Snapshot {
+                refreshing: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            next_message(&messages),
+            Msg::MoreReplies { result: Err(_), .. }
+        ));
     }
 }

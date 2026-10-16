@@ -45,6 +45,11 @@ impl Redlib {
         &self.base
     }
 
+    /// All response-affecting instance settings participate in disk-cache identity.
+    pub fn cache_namespace(&self) -> String {
+        format!("{}\n{}", self.base, self.cookies)
+    }
+
     /// Absolute URL for a Redlib-relative path; absolute URLs pass through.
     /// Non-ASCII in the path (post slugs) is percent-encoded: Redlib answers
     /// raw UTF-8 bytes with HTTP 400.

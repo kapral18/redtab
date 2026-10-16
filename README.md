@@ -17,6 +17,9 @@ account or API key.
   posts you opened are dimmed.
 - **Local bookmarks** (`b`), stored on your machine and shared safely between several
   running redtab instances.
+- **Persistent cache**: repeat launches show saved feeds, posts/comments, thumbnails and
+  subreddit icons. Stale content stays readable while it refreshes; failed refreshes keep
+  the saved copy. Headers show its age and whether it is cached, refreshing or offline.
 - **Spoilers**: spoiler-tagged posts list with a chip and no thumbnail, and open with their
   body, image and comments hidden; `>!spoiler!<` text in posts and comments shows as `▒`.
   `v` reveals.
@@ -104,6 +107,45 @@ then stays running after redtab quits. Startup errors include at most the first
 
 Reading state (seen and opened posts, bookmarks) lives in
 `$XDG_STATE_HOME/redtab/state.json` (default `~/.local/state/redtab/state.json`).
+
+Disposable content lives in `$XDG_CACHE_HOME/redtab` (default `~/.cache/redtab`),
+separate from reading state. Listings (including searches and fetched pages), post
+bodies/comments and expanded-reply responses are reused for up to five minutes; thumbnails
+and icons for seven days. Older entries display immediately and refresh in the
+background when loaded. Health checks still contact Redlib even when content is fresh.
+Cached thumbnails stay available during refresh, even after scrolling away and back.
+`r` and a successful `S` retry failed thumbnail refreshes without hiding cached pixels.
+Post and comment ages count from their creation time, so cached threads stay accurate.
+
+`r` forces a content refresh without blanking the view. The selected post/comment,
+reading position, folds and already loaded later pages stay in place when that item
+still exists. It also retries failed refreshes of already loaded pages; `L` retries a
+failed next page. Cached content remains usable if a refresh fails, and background
+revalidation does not block opening an already cached next page. Only previously
+fetched pages and replies are available offline.
+Selftext and comment refreshes anchor unambiguous unchanged text from the visible
+passage, keeping the previous position when no reliable match remains.
+
+The cache uses versioned, atomic files with checksummed metadata, keyed by Redlib
+instance, response settings and request parameters. Older overlapping requests cannot
+overwrite a newer saved response.
+The same ordering keeps older cached pages and expanded replies from undoing newer
+content; refreshed expansions follow the server's reply order. Several redtab instances
+can share the cache: lock acquisition waits up to 100 ms for a writer in this or another
+process. If it times out, or the cache directory is unusable, browsing continues without
+saving those responses, and each distinct cache warning shows once.
+Live responses remain ordered by request start even when persistence is unavailable.
+An older pending response cannot replace a newer saved snapshot after a cache-lock
+failure or counter reset. When comparisons cannot establish freshness, redtab keeps
+the content already displayed; a later refresh can replace it.
+
+Writes remove abandoned temporary files and evict the oldest entries to stay within
+256 MiB and 4,096 files; entries older than 30 days are not served. Individual entries
+over 32 MiB are not cached. Corrupt or incompatible entries are fetched again. Full-size
+images and video streams are not cached. Cache data is disposable, not a permanent offline archive:
+removing the cache directory does not remove bookmarks or read state.
+If a write runs out of space, it reclaims recognized abandoned temporary files and
+retries once when cleanup freed space.
 
 `redtab --check` prints the config file, the Redlib URL and whether it answers, how many
 subscriptions it read, and the state file. It exits with status 1 when Redlib does not answer.
