@@ -2356,6 +2356,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "flate2",
+ "gif",
  "image",
  "libc",
  "nucleo-matcher",

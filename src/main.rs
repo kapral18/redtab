@@ -41,11 +41,10 @@ Options:
 Press ? inside redtab for key bindings.";
 
 const WORKER_THREADS: usize = 6;
-/// Hidden flag: the child process that asks the terminal for its image protocol.
+/// Hidden flag for the child that queries the terminal's image protocol.
 const PROBE_ARG: &str = "--probe-image-protocol";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-/// The probe child's own wait for terminal replies inside tmux. It stays under
-/// `PROBE_TIMEOUT`, so a silent terminal still yields a report instead of a killed child.
+/// The child's reply wait in tmux; shorter than `PROBE_TIMEOUT` so it reports before being killed.
 const PROBE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct Args {
@@ -60,7 +59,7 @@ fn parse_args() -> Result<Option<Args>> {
         subreddit: None,
         check: false,
     };
-    // OS strings: a non-UTF-8 path is an error message, not a panic.
+    // OS strings: a non-UTF-8 argument errors instead of panicking.
     let mut it = std::env::args_os().skip(1);
     while let Some(arg) = it.next() {
         match arg.to_str() {
@@ -126,8 +125,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Closing the terminal (SIGHUP), `kill` (SIGTERM) or SIGINT quit like `q`,
-    // saving state. Registered first, so a signal during the probe is not fatal.
+    // Download folders of exited redtabs; off the UI thread, as $TMPDIR can be large.
+    std::thread::spawn(worker::remove_stale_media_dirs);
+
+    // SIGHUP, SIGTERM and SIGINT quit like `q`; registered before the probe.
     let quit_signal = Arc::new(AtomicBool::new(false));
     for signal in [
         signal_hook::consts::SIGTERM,
@@ -136,11 +137,9 @@ fn main() -> Result<()> {
     ] {
         signal_hook::flag::register(signal, Arc::clone(&quit_signal))?;
     }
-    // Enter raw mode before the probe: crossterm records the terminal settings on the
-    // first enable only, so exit restores these settings rather than whatever a
-    // timed-out probe child leaves behind (no echo, no line mode).
+    // crossterm saves termios on the first raw-mode enable, so enabling before the
+    // probe makes exit restore the original, not what a killed probe left.
     crossterm::terminal::enable_raw_mode()?;
-    // From here every exit, early error or panic included, restores the terminal.
     let guard = TerminalGuard;
     let image_picker = if config.image_preview {
         detect_image_picker()
@@ -149,16 +148,13 @@ fn main() -> Result<()> {
     };
     let cache = cache::Cache::new(config::cache_dir());
     let (pool, messages) = Pool::start(redlib.clone(), WORKER_THREADS, Some(cache));
-    // The terminal may have closed during the probe (up to 2 s): quit before
-    // touching it, as for any other quit signal.
+    // The terminal may have closed during the probe.
     if quit_signal.load(Ordering::Relaxed) {
         return Ok(());
     }
     let mut terminal = ratatui::try_init()?;
-    // ratatui's panic hook reports a failed restore with `eprintln!`, which panics
-    // again on a dead tty and aborts before the state is saved. Restore quietly, and
-    // only for the main thread: a worker's panic is caught and shown as that job's
-    // error, so it must not tear down the screen or print over it.
+    // ratatui's hook `eprintln!`s, which panics again on a dead tty before state is
+    // saved. Restore quietly, and only on main: worker panics become job errors.
     let _ratatui_hook = std::panic::take_hook();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -166,22 +162,20 @@ fn main() -> Result<()> {
             let _ = ratatui::try_restore();
             default_hook(info);
         } else {
-            // Workers and the input thread catch their panics and report this text.
+            // The panicking thread catches it and reports this text.
             worker::note_panic(info.to_string());
         }
     }));
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
-    // NO_COLOR is honored by clearing colors in each frame (`ui::strip_colors`), not by
-    // crossterm: its NO_COLOR output resets bold too and drops the colors kitty
-    // placeholders use as image ids.
+    // NO_COLOR is applied per frame (`ui::strip_colors`): crossterm's version also
+    // drops bold and the colors kitty placeholders use as image ids.
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
     if no_color {
         crossterm::style::force_color_output(true);
     }
     let (input, input_failure) = spawn_input_reader();
-    // A terminal can answer the probe late; drop those bytes so they are not read as
-    // keys. Bounded: a held key or a resize drag must not keep the screen blank.
-    // Read through the input thread: a terminal closing now must not stall us.
+    // Drop late probe replies so they aren't read as keys. Bounded, and through the
+    // input thread so a closing terminal can't stall startup.
     let drain_until = Instant::now() + Duration::from_millis(300);
     while let Some(left) = drain_until.checked_duration_since(Instant::now()) {
         if quit_signal.load(Ordering::Relaxed)
@@ -224,20 +218,15 @@ fn main() -> Result<()> {
             match input.recv_timeout(app.wake_in()) {
                 Ok(first) => {
                     for ev in std::iter::once(first).chain(input.try_iter()) {
-                        // Keys typed after a quit key must not act any more.
+                        // Keys after a quit key do nothing.
                         if app.quit {
                             break;
                         }
-                        match ev {
-                            Event::Key(key) => keys::handle(&mut app, key),
-                            Event::Paste(text) => keys::paste(&mut app, &text),
-                            _ => {}
-                        }
+                        handle_event(&mut app, ev);
                     }
                     dirty = true;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
-                // The terminal is gone or unreadable.
                 Err(RecvTimeoutError::Disconnected) => {
                     if let Some(why) = input_failure.lock().ok().and_then(|mut w| w.take()) {
                         app.error(format!("terminal input stopped: {why}"));
@@ -253,11 +242,10 @@ fn main() -> Result<()> {
         }
         Ok(())
     }));
-    // Save first: it does not touch the terminal, which may be gone (closed pane),
-    // so nothing below can stop it. Saved after a panic too.
+    // Save first: it never touches the terminal, which may be gone. Runs after a panic too.
     app.save_state();
     drop(guard);
-    // The guard showed the cursor; Terminal's drop would only report a dead tty.
+    // The guard restored the terminal; Terminal's drop would only error on a dead tty.
     std::mem::forget(terminal);
     if let Some(status) = app.status.as_ref().filter(|s| s.error) {
         use std::io::Write;
@@ -269,8 +257,17 @@ fn main() -> Result<()> {
     }
 }
 
-/// Restores the terminal when dropped, on every exit path. Errors are ignored:
-/// after a closed terminal every write fails, and a failed `eprintln!` panics.
+fn handle_event(app: &mut App, event: Event) {
+    match event {
+        Event::Key(key) => keys::handle(app, key),
+        Event::Paste(text) => keys::paste(app, &text),
+        Event::Resize(width, _) => app.resize(width),
+        _ => {}
+    }
+}
+
+/// Restores the terminal on drop. Errors are ignored: on a closed tty writes fail
+/// and `eprintln!` panics.
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
@@ -284,10 +281,9 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Terminal input on its own thread. crossterm 0.29 spins inside `poll`/`read`
-/// once the tty reports end of file (its read loop only stops on WouldBlock), so
-/// a closed terminal must not stall the loop that watches for SIGHUP and quits.
-/// Also returns where the thread leaves its panic message, if it panics.
+/// Reads terminal input on its own thread: crossterm 0.29 spins in `poll`/`read`
+/// after tty EOF, which would stall the loop that handles SIGHUP. The returned slot
+/// receives the thread's panic message.
 fn spawn_input_reader() -> (Receiver<Event>, Arc<std::sync::Mutex<Option<String>>>) {
     let (tx, rx) = std::sync::mpsc::channel();
     let failure = Arc::new(std::sync::Mutex::new(None));
@@ -305,19 +301,17 @@ fn spawn_input_reader() -> (Receiver<Event>, Arc<std::sync::Mutex<Option<String>
         {
             *slot = Some(worker::take_panic().unwrap_or_else(|| "a bug in redtab".into()));
         }
-        // `tx` drops here, after the report: the main loop then sees the input end.
+        // `tx` drops only after the report is stored.
     });
     (rx, failure)
 }
 
-/// Child side: query the terminal and report `<protocol> <font width> <font height>` on stderr
-/// (stdout stays on the terminal, where the query escapes go).
+/// Child side: prints `<protocol> <font width> <font height>` to stderr; stdout is the terminal.
 fn probe_image_protocol() {
     use ratatui_image::picker::ProtocolType;
     use ratatui_image::picker::cap_parser::QueryStdioOptions;
 
-    // Inside tmux the terminal's replies may never reach the pane: answer before the
-    // parent's kill so its tmux fallback still runs. Elsewhere keep the library's wait.
+    // In tmux replies may never arrive: answer before the parent's kill so its fallback runs.
     let mut options = QueryStdioOptions::default();
     if Picker::halfblocks().tmux_detected() {
         options.timeout = PROBE_QUERY_TIMEOUT;
@@ -334,9 +328,8 @@ fn probe_image_protocol() {
     }
 }
 
-/// Parent side. The terminal query runs in a child process: when a terminal
-/// never answers, the query's stdin reader would otherwise stay blocked
-/// inside redtab and swallow the first key press. A hung child is killed.
+/// Parent side. Querying in a child means a terminal that never answers can't leave a
+/// blocked stdin reader in redtab that swallows the first key.
 fn detect_image_picker() -> Picker {
     use std::io::Read;
     use std::process::{Command, Stdio};
@@ -392,13 +385,13 @@ fn detect_image_picker() -> Picker {
     #[allow(deprecated)]
     let mut picker = Picker::from_fontsize(FontSize::new(width, height));
     match protocol {
-        // tmux answers for sixel itself, yet draws sixel only on terminals that take
-        // it; Ghostty and kitty do not, while kitty graphics pass through to them.
+        // tmux answers sixel itself, but Ghostty and kitty can't draw it; kitty graphics
+        // pass through.
         Some(ProtocolType::Sixel) if picker.tmux_detected() && tmux_pane_gets_kitty() => {
             picker.set_protocol_type(ProtocolType::Kitty)
         }
         Some(protocol) => picker.set_protocol_type(protocol),
-        // A real cell size is needed to scale images; the probe reports a guess without one.
+        // Scaling needs a real cell size; without one the probe only guesses.
         None if picker.tmux_detected()
             && crossterm::terminal::window_size().is_ok_and(|s| s.width > 0 && s.height > 0)
             && tmux_pane_gets_kitty() =>
@@ -410,12 +403,9 @@ fn detect_image_picker() -> Picker {
     picker
 }
 
-/// Inside tmux the probe can get no kitty-graphics reply even when the outer terminal
-/// supports it. Then the tmux clients decide: every client attached to a session that
-/// holds redtab's window (grouped and linked sessions too) must be a Ghostty or kitty
-/// terminal, because any of them can show the pane. redtab must also draw straight into
-/// its pane: a terminal nested in the pane (an editor's terminal) inherits the tmux
-/// environment but drops passthrough.
+/// In tmux the probe may get no kitty reply even when the outer terminal supports it.
+/// Use kitty only if redtab draws straight into its pane (a nested terminal drops
+/// passthrough) and every client of every session showing the window is Ghostty or kitty.
 fn tmux_pane_gets_kitty() -> bool {
     use std::os::unix::fs::MetadataExt;
     use std::process::{Command, Stdio};

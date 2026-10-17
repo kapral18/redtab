@@ -1,5 +1,4 @@
-//! Parsers for Redlib HTML pages. Redlib renders Reddit as server-side HTML
-//! with stable class names (`div.post`, `.post_title`, `div.comment`, …).
+//! Parsers for Redlib's server-rendered HTML pages.
 
 use std::sync::LazyLock;
 
@@ -8,7 +7,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use scraper::{ElementRef, Html, Node, Selector};
 
 use crate::model::{
-    Comment, Listing, Media, MoreReplies, Post, PostPage, SPOILER_END, SPOILER_START,
+    Comment, Listing, Media, MoreReplies, PICTURE, Post, PostPage, SPOILER_END, SPOILER_START,
 };
 
 fn sel(css: &str) -> Selector {
@@ -99,18 +98,10 @@ pub fn parse_post_page(html: &str) -> Result<PostPage> {
     if post.id.is_empty() {
         post.id = id_from_permalink(&post.permalink).unwrap_or_default();
     }
-    if let Some(count) = doc
-        .select(&COMMENT_COUNT)
-        .next()
-        .and_then(|c| {
-            c.text()
-                .collect::<String>()
-                .split_whitespace()
-                .next()
-                .map(str::to_string)
-        })
-        .and_then(|n| parse_count(&n))
-    {
+    if let Some(count) = doc.select(&COMMENT_COUNT).next().and_then(|c| {
+        let text = c.text().collect::<String>();
+        parse_count(text.split_whitespace().next()?)
+    }) {
         post.comments = count;
     }
     let mut body = el
@@ -134,8 +125,7 @@ pub fn parse_post_page(html: &str) -> Result<PostPage> {
     })
 }
 
-/// Parse a "More replies" page. Redlib roots it at the parent comment, so the
-/// replies to graft are that comment's replies (or all roots if several).
+/// Parse a "More replies" page: the replies of its root comment, or all roots if several.
 pub fn parse_more_replies(html: &str) -> Result<Vec<Comment>> {
     let mut roots = parse_post_page(html)?.comments;
     Ok(match roots.len() {
@@ -145,8 +135,7 @@ pub fn parse_more_replies(html: &str) -> Result<Vec<Comment>> {
     })
 }
 
-/// Redlib error pages carry `div#error`; post and listing pages title themselves
-/// with the post or subreddit title, which may start with "Error" too.
+/// Redlib error pages carry `div#error`; a title starting with "Error" may be a real post.
 fn check_error(doc: &Html) -> Result<()> {
     if let Some(h1) = doc.select(&ERROR_H1).next() {
         bail!(
@@ -165,11 +154,11 @@ fn check_error(doc: &Html) -> Result<()> {
     Ok(())
 }
 
-/// Text from Reddit with the spoiler marker characters removed: they mean something
-/// only where the parser adds them.
+/// Strips spoiler and picture markers from Reddit text; only the parser may add them.
 fn without_markers(text: &str) -> std::borrow::Cow<'_, str> {
-    if text.contains([SPOILER_START, SPOILER_END]) {
-        text.replace([SPOILER_START, SPOILER_END], "").into()
+    const MARKERS: [char; 3] = [SPOILER_START, SPOILER_END, PICTURE];
+    if text.contains(MARKERS) {
+        text.replace(MARKERS, "").into()
     } else {
         text.into()
     }
@@ -411,10 +400,10 @@ fn query_param_after(href: &str) -> Option<String> {
 pub fn parse_count(text: &str) -> Option<u64> {
     let t = text.trim().replace(',', "").to_lowercase();
     let (number, scale) = match t.strip_suffix('k') {
-        Some(n) => (n.to_string(), 1_000.0),
+        Some(n) => (n, 1_000.0),
         None => match t.strip_suffix('m') {
-            Some(n) => (n.to_string(), 1_000_000.0),
-            None => (t.clone(), 1.0),
+            Some(n) => (n, 1_000_000.0),
+            None => (t.as_str(), 1.0),
         },
     };
     let value: f64 = number.parse().ok()?;
@@ -520,6 +509,18 @@ fn render_element(el: ElementRef<'_>, out: &mut String, pre: bool) {
                 .map(|cell| {
                     let mut s = String::new();
                     render_children(cell, &mut s, false);
+                    // A row is one line: a picture in it can't have its own, so it's named.
+                    let s = s
+                        .split('\n')
+                        .map(|line| {
+                            if line.contains(PICTURE) {
+                                "[image]"
+                            } else {
+                                line
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     collapse_ws(&s)
                 })
                 .collect();
@@ -572,19 +573,35 @@ fn render_element(el: ElementRef<'_>, out: &mut String, pre: bool) {
         "a" => {
             let before = out.len();
             render_children(el, out, pre);
-            let text = out[before..].trim().to_string();
+            let text = out[before..].trim();
             // The URL is page text too: it must not carry a spoiler marker.
             if let Some(href) = el.attr("href").map(without_markers)
                 && href.starts_with("http")
-                && text != *href
+                && text != href.as_ref()
                 && !text.is_empty()
             {
                 out.push_str(&format!(" <{href}>"));
             }
         }
         "img" => {
-            if let Some(alt) = el.attr("alt").filter(|a| !a.is_empty()) {
-                out.push_str(&format!("[{}]", without_markers(alt)));
+            // Pictures Redlib serves (pasted images, GIFs) get a line of their own;
+            // other images, such as emotes, stay as their alt text.
+            match el.attr("src").map(without_markers) {
+                Some(src) if src.starts_with("/preview/") || src.starts_with("/img/") => {
+                    // A picture opening a list item stays on its bullet's line.
+                    let line_start = out.rfind('\n').map_or(0, |n| n + 1);
+                    if &out[line_start..] != "• " {
+                        line_break(out);
+                    }
+                    out.push(PICTURE);
+                    out.push_str(&src);
+                    out.push('\n');
+                }
+                _ => {
+                    if let Some(alt) = el.attr("alt").filter(|a| !a.is_empty()) {
+                        out.push_str(&format!("[{}]", without_markers(alt)));
+                    }
+                }
             }
         }
         "script" | "style" => {}
@@ -805,6 +822,65 @@ mod tests {
         assert_eq!(
             md_to_text(el.root_element()),
             "odd glyph here link <http://x.test/> after"
+        );
+    }
+
+    #[test]
+    fn a_picture_in_reddit_text_should_get_its_own_line_and_other_images_their_alt_text() {
+        let el = Html::parse_fragment(
+            "<p>look:</p>\
+             <figure><a href=\"/preview/pre/a.png?width=500&amp;s=x\">\
+             <img loading=\"lazy\" src=\"/preview/pre/a.png?width=500&amp;s=x\"></a></figure>\
+             <p>a <a href=\"https://giphy.com/gifs/x\"><img src=\"/preview/external-pre/g.gif?width=300\"></a></p>\
+             <p>and <img src=\"https://emoji.test/e.png\" alt=\"smile\"> &#xFDD2;done</p>",
+        );
+
+        assert_eq!(
+            md_to_text(el.root_element()),
+            format!(
+                "look:\n\n{PICTURE}/preview/pre/a.png?width=500&s=x\n\na\n\
+                 {PICTURE}/preview/external-pre/g.gif?width=300\n <https://giphy.com/gifs/x>\n\n\
+                 and [smile] done"
+            )
+        );
+    }
+
+    #[test]
+    fn a_picture_opening_a_list_item_should_stay_on_its_bullets_line() {
+        let el = Html::parse_fragment("<ul><li><img src=\"/preview/pre/a.png\"></li></ul>");
+
+        assert_eq!(
+            md_to_text(el.root_element()),
+            format!("• {PICTURE}/preview/pre/a.png")
+        );
+    }
+
+    #[test]
+    fn a_picture_in_a_table_cell_should_be_named_and_keep_the_row_whole() {
+        let el = Html::parse_fragment(
+            "<table><tr><td>a</td><td><img src=\"/preview/pre/x.png\"></td><td>c</td></tr></table>",
+        );
+
+        assert_eq!(md_to_text(el.root_element()), "a │ [image] │ c");
+    }
+
+    #[test]
+    fn a_comment_that_is_only_a_picture_should_not_come_out_empty() {
+        fn find<'a>(comments: &'a [Comment], id: &str) -> Option<&'a Comment> {
+            comments
+                .iter()
+                .find_map(|c| (c.id == id).then_some(c).or_else(|| find(&c.replies, id)))
+        }
+        let page = parse_post_page(include_str!("../../tests/fixtures/bigpost.html")).unwrap();
+
+        let comment = find(&page.comments, "pggqxd4").unwrap();
+
+        assert_eq!(
+            comment.body,
+            format!(
+                "{PICTURE}/preview/pre/ifg5wxxk58vh1.png?width=500&format=png&auto=webp\
+                 &s=67c7c38aa0b1b40b18cee243dca32196cd393073"
+            )
         );
     }
 

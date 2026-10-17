@@ -1,9 +1,6 @@
-//! Background fetching. Three queues feed a few threads: jobs the user is
-//! waiting for (and health checks) never queue behind the Home wall's bulk
-//! subreddit fetches, and neither waits behind list thumbnails. Cacheable jobs
-//! first pass one disk reader, which only reads; the worker that runs a job
-//! reserves its cache order. Results go back to the UI loop, which ignores
-//! responses for outdated requests.
+//! Background fetching. Separate queues keep jobs the user waits on ahead of Home's
+//! bulk fetches, and both ahead of thumbnails. Cacheable jobs pass a read-only disk
+//! reader first; the worker that runs a job reserves its cache order.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -20,19 +17,42 @@ use crate::redlib::Redlib;
 
 /// Largest image edge sent to the terminal; bigger images only cost bandwidth.
 const MAX_IMAGE_EDGE: u32 = 1600;
-/// Largest list-thumbnail edge: a few cells wide, so this keeps the cache small.
+/// Largest list-thumbnail edge; keeps the cache small.
 const MAX_THUMB_EDGE: u32 = 128;
 /// Threads reserved for jobs the user waits on.
 const PRIORITY_THREADS: usize = 2;
 /// Shared logical clock for disk-read windows and HTTP starts in this process.
 static NEXT_EVENT: AtomicU64 = AtomicU64::new(1);
-/// Threads for list thumbnails and subreddit icons, apart from the other queues.
+/// Threads for list thumbnails and subreddit icons.
 const THUMB_THREADS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum FeedQuery {
     Listing { sort: Sort, time: TimeRange },
     Search { query: String },
+}
+
+impl FeedQuery {
+    pub const HOME: Self = Self::Listing {
+        sort: Sort::Hot,
+        time: TimeRange::Day,
+    };
+
+    fn cache_request(&self, subreddit: &str, after: Option<&str>) -> Option<String> {
+        serde_json::to_string(&("feed", subreddit.to_lowercase(), self, after)).ok()
+    }
+
+    fn fetch(
+        &self,
+        redlib: &Redlib,
+        subreddit: &str,
+        after: Option<&str>,
+    ) -> anyhow::Result<Listing> {
+        match self {
+            Self::Listing { sort, time } => redlib.listing(subreddit, *sort, *time, after),
+            Self::Search { query } => redlib.search(subreddit, query, after),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -61,6 +81,9 @@ pub enum Job {
     },
     Image {
         url: String,
+        /// A picture in post or comment text: fetched on the background queue, so a
+        /// thread full of them never delays what the reader waits for.
+        background: bool,
     },
     /// Small image for a list row or a subreddit icon.
     Thumb {
@@ -72,7 +95,7 @@ pub enum Job {
     },
     /// Save images to temp files so a desktop viewer can open them.
     DownloadImages {
-        /// The post the images belong to; one download per post at a time.
+        /// One download per post at a time.
         permalink: String,
         urls: Vec<String>,
     },
@@ -83,8 +106,7 @@ pub enum Job {
 }
 
 impl Job {
-    /// The reply this job gives when it fails with `e`; used when it panics, so
-    /// what waits on it (a loading list, a thumbnail) still gets an answer.
+    /// This job's reply for error `e`; used on panic so whatever waits still gets an answer.
     fn failed(&self, e: String) -> Msg {
         match self {
             Job::Feed {
@@ -119,7 +141,7 @@ impl Job {
                 comment_id: comment_id.clone(),
                 result: Err(e),
             },
-            Job::Image { url } => Msg::Image {
+            Job::Image { url, .. } => Msg::Image {
                 url: url.clone(),
                 result: Err(e),
             },
@@ -189,12 +211,15 @@ pub enum Msg {
         permalink: String,
         result: Result<Vec<PathBuf>, String>,
     },
-    /// A queued thumbnail left the screen before its turn; it was not fetched.
+    /// A queued thumbnail left the screen before its turn.
     ThumbSkipped {
         url: String,
     },
-    /// A queued full-size image whose post closed before its turn; not fetched.
-    ImageSkipped,
+    /// A queued image no longer wanted when its turn came (its post closed, or it was
+    /// scrolled far away).
+    ImageSkipped {
+        url: String,
+    },
     Health(bool),
     CommandDone {
         argv: Vec<String>,
@@ -224,7 +249,10 @@ impl Queues {
     fn submit(&self, work: Work) {
         let queue = match work.job {
             Job::Thumb { .. } => &self.thumbs,
-            Job::Group { .. } => &self.background,
+            Job::Group { .. }
+            | Job::Image {
+                background: true, ..
+            } => &self.background,
             _ => &self.priority,
         };
         let _ = queue.send(work);
@@ -288,32 +316,35 @@ impl Pool {
                             continue;
                         }
                         let now = crate::app::now();
-                        let key = job.cache_key(&namespace);
-                        if !work.force && let Some((key, ttl)) = &key {
+                        if !work.force && let Some((key, ttl)) = job.cache_key(&namespace) {
                             let read_start = NEXT_EVENT.fetch_add(1, Ordering::Relaxed);
-                            if let Some(entry) = cache.load(key, now)
-                            // Media resolution triggers a viewer: stale entries must not deliver twice.
-                            && (!matches!(job, Job::ResolveMedia { .. })
-                                || now.saturating_sub(entry.fetched_at) < *ttl)
-                            && let Some(message) = job.cached_message(&entry.bytes)
-                        {
-                            let source = Source {
-                                order: Some(entry.order),
-                                observed: Some((read_start, NEXT_EVENT.fetch_add(1, Ordering::Relaxed))),
-                                cached: true,
-                            };
-                            let refreshing = now.saturating_sub(entry.fetched_at) >= *ttl
-                                || matches!(job, Job::MoreReplies { minimum: Some(minimum), .. } if !source.may_replace(*minimum));
-                            let _ = msg_tx.send(Msg::Snapshot {
-                                message: Box::new(message),
-                                fetched_at: entry.fetched_at,
-                                refreshing,
-                                source,
-                            });
-                            if !refreshing {
-                                continue;
+                            if let Some(entry) = cache.load(&key, now)
+                                // Media resolution triggers a viewer: stale entries must
+                                // not deliver twice.
+                                && (!matches!(job, Job::ResolveMedia { .. })
+                                    || now.saturating_sub(entry.fetched_at) < ttl)
+                                && let Some(message) = job.cached_message(&entry.bytes)
+                            {
+                                let source = Source {
+                                    order: Some(entry.order),
+                                    observed: Some((
+                                        read_start,
+                                        NEXT_EVENT.fetch_add(1, Ordering::Relaxed),
+                                    )),
+                                    cached: true,
+                                };
+                                let refreshing = now.saturating_sub(entry.fetched_at) >= ttl
+                                    || matches!(job, Job::MoreReplies { minimum: Some(minimum), .. } if !source.may_replace(*minimum));
+                                let _ = msg_tx.send(Msg::Snapshot {
+                                    message: Box::new(message),
+                                    fetched_at: entry.fetched_at,
+                                    refreshing,
+                                    source,
+                                });
+                                if !refreshing {
+                                    continue;
+                                }
                             }
-                        }
                         }
                         queues.submit(work);
                     }
@@ -353,8 +384,7 @@ impl Pool {
     /// Record the thumbnails on screen now, so scrolled-away ones are not fetched.
     pub fn set_on_screen(&self, urls: &[&str]) {
         if let Ok(mut set) = self.wanted.thumbs.lock() {
-            // Most frames redraw the same rows: leave the set alone then. Spots can
-            // repeat a URL (an icon in the sidebar and on a card), so compare both ways.
+            // Usually unchanged. Spots can repeat a URL, so compare both ways.
             if urls.iter().all(|u| set.contains(*u))
                 && set.iter().all(|s| urls.contains(&s.as_str()))
             {
@@ -372,6 +402,13 @@ impl Pool {
         }
     }
 
+    /// An image no longer worth fetching: its queued fetch is skipped.
+    pub fn unwant_image(&self, url: &str) {
+        if let Ok(mut set) = self.wanted.images.lock() {
+            set.remove(url);
+        }
+    }
+
     /// The post closed: its queued image fetches are skipped.
     pub fn forget_images(&self) {
         if let Ok(mut set) = self.wanted.images.lock() {
@@ -380,8 +417,7 @@ impl Pool {
     }
 }
 
-/// Name of the worker threads, for debuggers. The panic hook keeps the screen for
-/// every thread but main; a worker catches its own panic.
+/// Worker thread name; the panic hook leaves the screen alone on non-main threads.
 const WORKER_THREAD: &str = "redtab-worker";
 
 fn spawn_worker(
@@ -422,8 +458,7 @@ fn spawn_worker(
                         }
                     });
                 let started = NEXT_EVENT.fetch_add(1, Ordering::Relaxed);
-                // A bug in one job (a parser or decoder panic) must not kill this worker
-                // or leave its caller waiting: it becomes that job's error.
+                // A job's panic becomes its error instead of killing the worker.
                 let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let msg = run(&redlib, &job, &wanted);
                     cache_result(
@@ -453,17 +488,16 @@ fn spawn_worker(
 }
 
 thread_local! {
-    /// The panic message of this thread's last panic, set by the panic hook.
+    /// This thread's last panic message, set by the panic hook.
     static LAST_PANIC: std::cell::Cell<Option<String>> = const { std::cell::Cell::new(None) };
 }
 
-/// Called by the panic hook on a thread other than main: keep the message, so the
-/// job's error can name it instead of printing over the screen.
+/// Panic hook on non-main threads: store the message for the job's error.
 pub fn note_panic(message: String) {
     LAST_PANIC.set(Some(message));
 }
 
-/// This thread's last panic message, for a thread that caught its own panic.
+/// Takes this thread's last panic message.
 pub fn take_panic() -> Option<String> {
     LAST_PANIC.take()
 }
@@ -494,22 +528,12 @@ impl Job {
                 after,
                 ..
             } => (
-                serde_json::to_string(&("feed", subreddit.to_lowercase(), query, after)).ok()?,
+                query.cache_request(subreddit, after.as_deref())?,
                 CONTENT_TTL,
             ),
-            Job::Group { subreddit, .. } => (
-                serde_json::to_string(&(
-                    "feed",
-                    subreddit.to_lowercase(),
-                    FeedQuery::Listing {
-                        sort: Sort::Hot,
-                        time: TimeRange::Day,
-                    },
-                    None::<String>,
-                ))
-                .ok()?,
-                CONTENT_TTL,
-            ),
+            Job::Group { subreddit, .. } => {
+                (FeedQuery::HOME.cache_request(subreddit, None)?, CONTENT_TTL)
+            }
             Job::Post { permalink, .. } | Job::ResolveMedia { permalink } => (
                 serde_json::to_string(&("post", permalink)).ok()?,
                 CONTENT_TTL,
@@ -575,8 +599,8 @@ fn skipped_image(job: &Job, wanted: &Wanted) -> Option<Msg> {
         Job::Thumb { url } if !wanted.thumbs.lock().is_ok_and(|set| set.contains(url)) => {
             Some(Msg::ThumbSkipped { url: url.clone() })
         }
-        Job::Image { url } if !wanted.images.lock().is_ok_and(|set| set.contains(url)) => {
-            Some(Msg::ImageSkipped)
+        Job::Image { url, .. } if !wanted.images.lock().is_ok_and(|set| set.contains(url)) => {
+            Some(Msg::ImageSkipped { url: url.clone() })
         }
         _ => None,
     }
@@ -598,8 +622,7 @@ fn cache_result(
             | Msg::MoreReplies { result: Ok(_), .. }
             | Msg::Thumb { result: Ok(_), .. }
     );
-    // Feed failures keep their request order too, so a failure that started before
-    // the page on screen cannot mark it failed.
+    // Feed failures keep their order too, so an older failure can't mark a newer page failed.
     if !ok && !matches!(msg, Msg::Feed { .. }) {
         return msg;
     }
@@ -648,6 +671,9 @@ fn cache_result(
 }
 
 fn run(redlib: &Redlib, job: &Job, wanted: &Wanted) -> Msg {
+    if let Some(message) = skipped_image(job, wanted) {
+        return message;
+    }
     match job {
         Job::Feed {
             tab,
@@ -655,28 +681,22 @@ fn run(redlib: &Redlib, job: &Job, wanted: &Wanted) -> Msg {
             subreddit,
             query,
             after,
-        } => {
-            let result = match query {
-                FeedQuery::Listing { sort, time } => {
-                    redlib.listing(subreddit, *sort, *time, after.as_deref())
-                }
-                FeedQuery::Search { query } => redlib.search(subreddit, query, after.as_deref()),
-            };
-            Msg::Feed {
-                tab: *tab,
-                generation: *generation,
-                append: after.is_some(),
-                result: result.map_err(err_string),
-            }
-        }
+        } => Msg::Feed {
+            tab: *tab,
+            generation: *generation,
+            append: after.is_some(),
+            result: query
+                .fetch(redlib, subreddit, after.as_deref())
+                .map_err(err_string),
+        },
         Job::Group {
             subreddit,
             generation,
         } => Msg::Group {
             generation: *generation,
             subreddit: subreddit.clone(),
-            result: redlib
-                .listing(subreddit, Sort::Hot, TimeRange::Day, None)
+            result: FeedQuery::HOME
+                .fetch(redlib, subreddit, None)
                 .map_err(err_string),
         },
         Job::Post {
@@ -696,24 +716,14 @@ fn run(redlib: &Redlib, job: &Job, wanted: &Wanted) -> Msg {
             comment_id: comment_id.clone(),
             result: redlib.more_replies(path).map_err(err_string),
         },
-        Job::Image { url } => {
-            if !wanted.images.lock().is_ok_and(|set| set.contains(url)) {
-                return Msg::ImageSkipped;
-            }
-            Msg::Image {
-                url: url.clone(),
-                result: fetch_image(redlib, url, MAX_IMAGE_EDGE),
-            }
-        }
-        Job::Thumb { url } => {
-            if !wanted.thumbs.lock().is_ok_and(|set| set.contains(url)) {
-                return Msg::ThumbSkipped { url: url.clone() };
-            }
-            Msg::Thumb {
-                url: url.clone(),
-                result: fetch_image(redlib, url, MAX_THUMB_EDGE),
-            }
-        }
+        Job::Image { url, .. } => Msg::Image {
+            url: url.clone(),
+            result: fetch_image(redlib, url, MAX_IMAGE_EDGE),
+        },
+        Job::Thumb { url } => Msg::Thumb {
+            url: url.clone(),
+            result: fetch_image(redlib, url, MAX_THUMB_EDGE),
+        },
         Job::ResolveMedia { permalink } => Msg::MediaResolved {
             permalink: permalink.clone(),
             result: redlib
@@ -733,11 +743,11 @@ fn run(redlib: &Redlib, job: &Job, wanted: &Wanted) -> Msg {
     }
 }
 
-/// Download and decode an image, shrunk to fit `max_edge`.
+/// Download and decode an image, shrunk to fit `max_edge`. A GIF gives its first frame
+/// and the rest of the file is never read: animated GIFs play as video and can be huge.
 fn fetch_image(redlib: &Redlib, url: &str, max_edge: u32) -> Result<DynamicImage, String> {
     redlib
-        .image(url)
-        .and_then(|bytes| Ok(image::load_from_memory(&bytes)?))
+        .still_image(url)
         .map(|img| {
             if img.width() > max_edge || img.height() > max_edge {
                 img.thumbnail(max_edge, max_edge)
@@ -748,19 +758,28 @@ fn fetch_image(redlib: &Redlib, url: &str, max_edge: u32) -> Result<DynamicImage
         .map_err(err_string)
 }
 
-/// Private directory for downloaded images, created by this process with mode
-/// 0700. A directory that already exists is never used: a shared, predictable
-/// /tmp path would let another local user plant symlinks that `m` writes through.
+/// Download folders in `$TMPDIR`: `redtab-media-<pid>-<hex>`.
+const MEDIA_PREFIX: &str = "redtab-media-";
+/// Downloads older than this go: a running redtab's own on its next download, and the
+/// folder of an exited redtab once unchanged this long. A viewer opened just before still
+/// has its files.
+const MEDIA_GRACE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Private 0700 directory this process creates for downloads. An existing one is never
+/// reused: a predictable /tmp path would let another user plant symlinks.
 fn media_dir() -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
-    // Both priority threads may download at once: create under the lock so one
-    // directory serves the process. Only a success is stored, so a transient
-    // failure (full disk) is retried on the next `m`.
+    // Created under the lock and replaced if it disappears; only success is stored, so a
+    // failure retries on the next `m`.
     static DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
     let mut cached = DIR
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(dir) = cached.as_ref() {
+    // Reused only while it is still this user's real folder: a tmp cleaner may have
+    // removed it, and someone else may have put a symlink at its name.
+    if let Some(dir) = cached.as_ref()
+        && own_dir(&std::fs::symlink_metadata(dir).ok())
+    {
         return Ok(dir.clone());
     }
     let pid = std::process::id();
@@ -768,7 +787,7 @@ fn media_dir() -> anyhow::Result<PathBuf> {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos());
-        let dir = std::env::temp_dir().join(format!("redtab-media-{pid}-{nanos:x}{attempt}"));
+        let dir = std::env::temp_dir().join(format!("{MEDIA_PREFIX}{pid}-{nanos:x}{attempt}"));
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => return Ok(cached.insert(dir).clone()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -781,8 +800,98 @@ fn media_dir() -> anyhow::Result<PathBuf> {
     )
 }
 
+/// A real directory (not a symlink) owned by this user.
+fn own_dir(meta: &Option<std::fs::Metadata>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    meta.as_ref().is_some_and(|m| m.is_dir() && m.uid() == uid)
+}
+
+/// Removes downloads in this process's own folder older than `MEDIA_GRACE`, so a redtab
+/// left running for days does not keep every image.
+fn remove_old_downloads(dir: &std::path::Path, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= MEDIA_GRACE);
+        if meta.is_file() && old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Removes download folders that redtab processes which have exited left in `$TMPDIR`,
+/// once `MEDIA_GRACE` has passed. Folders of running redtabs stay.
+pub fn remove_stale_media_dirs() {
+    remove_stale_media_dirs_in(
+        &std::env::temp_dir(),
+        std::time::SystemTime::now(),
+        process_running,
+    );
+}
+
+fn remove_stale_media_dirs_in(
+    tmp: &std::path::Path,
+    now: std::time::SystemTime,
+    running: impl Fn(u32) -> bool,
+) {
+    let Ok(entries) = std::fs::read_dir(tmp) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let Some((pid, rest)) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(MEDIA_PREFIX))
+            .and_then(|n| n.split_once('-'))
+        else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        // A real folder of this user only: never through a symlink.
+        let meta = std::fs::symlink_metadata(entry.path()).ok();
+        let unchanged = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .unwrap_or_default();
+        if own_dir(&meta) && unchanged >= MEDIA_GRACE && !running(pid) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Whether `pid` is a live process, whoever owns it.
+fn process_running(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        // Signal 0 to these would address a process group: keep the folder.
+        return true;
+    }
+    // SAFETY: signal 0 only checks that the process exists; nothing is delivered.
+    let exists = unsafe { libc::kill(pid, 0) } == 0;
+    exists || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 fn download_images(redlib: &Redlib, urls: &[String]) -> anyhow::Result<Vec<PathBuf>> {
     let dir = media_dir()?;
+    remove_old_downloads(&dir, std::time::SystemTime::now());
     urls.iter()
         .enumerate()
         .map(|(i, url)| {
@@ -836,8 +945,7 @@ fn download_images(redlib: &Redlib, urls: &[String]) -> anyhow::Result<Vec<PathB
         .collect()
 }
 
-/// How long `S` waits for its command. A command that is the server itself
-/// (`redlib`, `docker compose up`) never exits; past this it counts as started.
+/// How long `S` waits. A command that is the server itself never exits and then counts as started.
 const COMMAND_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// How the start command ended.
@@ -852,8 +960,9 @@ pub enum CommandEnd {
 pub const COMMAND_ARG: &str = "--supervise-start-command";
 const COMMAND_STDERR_LIMIT: usize = 64 * 1024;
 
-/// The supervisor reports startup once, then lives until the server closes stderr
-/// and exits. A reader thread in the TUI would close its pipe when the TUI quits.
+/// Runs `argv` under a supervisor process (`COMMAND_ARG`) that reports startup once, then
+/// drains the server's stderr until it closes; a TUI thread would close the pipe when the
+/// TUI quits.
 fn run_command(argv: &[String]) -> Result<CommandEnd, String> {
     use std::io::{BufRead, BufReader};
     use std::os::unix::process::CommandExt;
@@ -884,8 +993,8 @@ struct StartedCommand {
     result: Result<CommandEnd, String>,
 }
 
-/// Invoked before terminal setup in a separate process. Reporting can fail when
-/// the TUI has already quit; that must not stop the server's stderr reader.
+/// The supervisor process, entered before terminal setup. A failed report (TUI gone) must
+/// not stop the draining.
 pub fn command_process(argv: &[std::ffi::OsString]) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -967,8 +1076,7 @@ fn nonblocking(pipe: &std::io::PipeReader, enabled: bool) -> std::io::Result<()>
     Ok(())
 }
 
-/// Bound both storage and each drain pass: continuous output must not starve the
-/// startup deadline. Bytes after the first 64 KiB are discarded.
+/// Keeps the first 64 KiB, and bounds each pass so steady output can't starve the startup deadline.
 fn capture_stderr(pipe: &mut std::io::PipeReader, captured: &mut Vec<u8>) -> std::io::Result<()> {
     use std::io::{ErrorKind, Read};
 
@@ -995,6 +1103,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pictures_in_text_should_wait_on_the_background_queue_not_the_one_the_reader_waits_on() {
+        let (priority, priority_rx) = channel();
+        let (background, background_rx) = channel();
+        let (thumbs, _thumbs_rx) = channel();
+        let queues = Queues {
+            priority,
+            background,
+            thumbs,
+        };
+        let image = |background| Work {
+            job: Job::Image {
+                url: "/preview/pre/x.png".into(),
+                background,
+            },
+            force: false,
+        };
+
+        queues.submit(image(true));
+        queues.submit(image(false));
+
+        assert!(matches!(
+            background_rx.try_recv(),
+            Ok(Work {
+                job: Job::Image {
+                    background: true,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            priority_rx.try_recv(),
+            Ok(Work {
+                job: Job::Image {
+                    background: false,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(
+            priority_rx.try_recv().is_err(),
+            "the text picture is not on it"
+        );
+    }
+
+    #[test]
     fn fetches_no_longer_wanted_are_skipped() {
         // Nothing listens on port 9: a fetch comes back as a connection error.
         let redlib = Redlib::new("http://127.0.0.1:9", false);
@@ -1004,7 +1159,10 @@ mod tests {
         all.thumbs.lock().unwrap().insert(url.into());
         all.images.lock().unwrap().insert(url.into());
         let thumb = || Job::Thumb { url: url.into() };
-        let image = || Job::Image { url: url.into() };
+        let image = || Job::Image {
+            url: url.into(),
+            background: false,
+        };
 
         let thumb_skipped = run(&redlib, &thumb(), &none);
         let thumb_fetched = run(&redlib, &thumb(), &all);
@@ -1014,7 +1172,7 @@ mod tests {
         assert!(matches!(thumb_skipped, Msg::ThumbSkipped { url: u } if u == url));
         assert!(matches!(thumb_fetched, Msg::Thumb { result: Err(_), .. }));
         assert!(
-            matches!(image_skipped, Msg::ImageSkipped),
+            matches!(image_skipped, Msg::ImageSkipped { url: u } if u == url),
             "a closed post's image is not fetched"
         );
         assert!(
@@ -1075,6 +1233,75 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn when_redtab_starts_it_should_remove_only_old_media_folders_of_exited_processes() {
+        let tmp = CacheDir::new();
+        let folder = |name: &str| {
+            let path = tmp.0.join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("a.jpg"), b"x").unwrap();
+            path
+        };
+        let exited_old = folder("redtab-media-100-1a2b0");
+        let exited_recent = folder("redtab-media-101-1a2b0");
+        let running_old = folder("redtab-media-200-1a2b0");
+        let other_name = folder("redtab-media-102-notes");
+        let target = folder("unrelated");
+        let link = tmp.0.join("redtab-media-103-1a2b0");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let file = tmp.0.join("redtab-media-104-1a2b0");
+        std::fs::write(&file, b"x").unwrap();
+        // Everything above was last changed a day and an hour before `now`; one folder
+        // a minute short of a day.
+        let now = std::time::SystemTime::now() + MEDIA_GRACE + std::time::Duration::from_secs(3600);
+        std::fs::File::open(&exited_recent)
+            .unwrap()
+            .set_modified(now - MEDIA_GRACE + std::time::Duration::from_secs(60))
+            .unwrap();
+
+        remove_stale_media_dirs_in(&tmp.0, now, |pid| pid == 200);
+
+        assert!(
+            !exited_old.exists(),
+            "an old folder of an exited redtab goes"
+        );
+        assert!(exited_recent.exists(), "within the grace period it stays");
+        assert!(running_old.exists(), "a running redtab keeps its folder");
+        assert!(other_name.exists(), "not a name redtab makes");
+        assert!(link.symlink_metadata().is_ok() && target.join("a.jpg").exists());
+        assert!(file.exists(), "not a folder");
+    }
+
+    #[test]
+    fn a_running_process_counts_as_running_and_an_exited_one_does_not() {
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        exited.wait().unwrap();
+
+        assert!(process_running(std::process::id()));
+        assert!(!process_running(exited.id()));
+    }
+
+    #[test]
+    fn when_a_redtab_downloads_again_it_should_drop_its_own_downloads_older_than_a_day() {
+        let dir = CacheDir::new();
+        let old = dir.0.join("old.jpg");
+        let recent = dir.0.join("recent.jpg");
+        std::fs::write(&old, b"x").unwrap();
+        std::fs::write(&recent, b"x").unwrap();
+        let now = std::time::SystemTime::now() + MEDIA_GRACE;
+        std::fs::File::options()
+            .write(true)
+            .open(&recent)
+            .unwrap()
+            .set_modified(now - MEDIA_GRACE + std::time::Duration::from_secs(60))
+            .unwrap();
+
+        remove_old_downloads(&dir.0, now);
+
+        assert!(!old.exists(), "a day old: gone");
+        assert!(recent.exists(), "a minute short of a day: kept");
     }
 
     fn next_message(messages: &Receiver<Msg>) -> Msg {

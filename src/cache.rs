@@ -1,4 +1,4 @@
-//! Disposable, versioned disk cache. Only workers touch disk; reading state lives elsewhere.
+//! Disposable, versioned disk cache; only workers touch it.
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -16,22 +16,23 @@ const RETENTION: i64 = 30 * 86_400;
 const MAGIC: &[u8; 8] = b"REDTAB05";
 const HEADER_FIELDS: usize = 40;
 const HEADER: u64 = (HEADER_FIELDS + 32) as u64;
+const COUNTER: &str = "sequence";
 const ENTRY_LIMIT: u64 = 32 * 1024 * 1024;
 const BYTE_LIMIT: u64 = 256 * 1024 * 1024;
 const FILE_LIMIT: usize = 4096;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-/// Local and cross-process cache-lock contention share this wait window.
+/// One wait window shared by local and cross-process lock contention.
 const LOCK_WAIT: Duration = Duration::from_millis(100);
 
 fn valid_header(header: &[u8; HEADER as usize]) -> bool {
     &header[..8] == MAGIC && header[HEADER_FIELDS..] == Sha256::digest(&header[..HEADER_FIELDS])[..]
 }
 
-/// Snapshot ordering uses persisted reservations and local read/HTTP observations.
+/// Where a snapshot came from, for ordering.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Source {
     pub order: Option<RequestOrder>,
-    /// Run-local event window: disk read interval, or a single HTTP start.
+    /// Local event window: a disk read interval, or an HTTP start.
     pub observed: Option<(u64, u64)>,
     pub cached: bool,
 }
@@ -39,7 +40,7 @@ pub struct Source {
 impl Source {
     pub fn compare(self, other: Self) -> Option<std::cmp::Ordering> {
         self.compare_requests(other).or_else(|| {
-            // No timing metadata is supplied by direct, in-memory messages.
+            // Direct in-memory messages carry no timing.
             (self.observed.is_none() || other.observed.is_none())
                 .then(|| (!self.cached).cmp(&!other.cached))
         })
@@ -69,8 +70,8 @@ impl Source {
             } else {
                 (other, self)
             };
-            // Incomparable reservations include retired generations. Reading a
-            // snapshot later does not prove it was fetched later.
+            // Reservations may come from retired generations; a later read doesn't prove a
+            // later fetch.
             return (disk.observed?.1 < live.observed?.0).then_some(if self.cached {
                 Less
             } else {
@@ -132,6 +133,15 @@ pub struct RequestOrder {
     pub sequence: u64,
 }
 
+impl RequestOrder {
+    fn from_header(header: &[u8; HEADER as usize]) -> Option<Self> {
+        Some(Self {
+            sequence: u64::from_le_bytes(header[16..24].try_into().ok()?),
+            generation: header[24..HEADER_FIELDS].try_into().ok()?,
+        })
+    }
+}
+
 pub struct Cache {
     root: PathBuf,
     byte_limit: u64,
@@ -146,7 +156,7 @@ struct CacheLock<'a> {
 
 impl Drop for CacheLock<'_> {
     fn drop(&mut self) {
-        // Closing alone leaves a lock held by descriptors inherited during a process launch.
+        // Closing isn't enough: descriptors inherited by a spawned process would keep the lock.
         let _ = self._file.unlock();
     }
 }
@@ -173,29 +183,18 @@ impl Cache {
     }
 
     pub fn load(&self, key: &str, now: i64) -> Option<Entry> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(self.path(key))
-            .ok()?;
+        let mut file = self.open_entry(key)?;
         let size = file.metadata().ok()?.len();
         if !(HEADER..=ENTRY_LIMIT).contains(&size) {
             return None;
         }
-        let mut header = [0; HEADER as usize];
-        file.read_exact(&mut header).ok()?;
-        if !valid_header(&header) {
-            return None;
-        }
+        let header = Self::read_header(&mut file)?;
         let fetched_at = i64::from_le_bytes(header[8..16].try_into().ok()?);
         if fetched_at > now || now.saturating_sub(fetched_at) > RETENTION {
             return None;
         }
-        let order = RequestOrder {
-            sequence: u64::from_le_bytes(header[16..24].try_into().ok()?),
-            generation: header[24..40].try_into().ok()?,
-        };
-        let current = self.latest_request("sequence")?;
+        let order = RequestOrder::from_header(&header)?;
+        let current = self.latest_request(COUNTER)?;
         if current.generation != order.generation
             || !(1..=current.sequence).contains(&order.sequence)
         {
@@ -213,29 +212,35 @@ impl Cache {
         })
     }
 
-    fn latest_request(&self, key: &str) -> Option<RequestOrder> {
-        let mut file = OpenOptions::new()
+    fn open_entry(&self, key: &str) -> Option<fs::File> {
+        OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(self.path(key))
-            .ok()?;
+            .ok()
+    }
+
+    fn read_header(file: &mut fs::File) -> Option<[u8; HEADER as usize]> {
         let mut header = [0; HEADER as usize];
         file.read_exact(&mut header).ok()?;
         if !valid_header(&header) {
             return None;
         }
-        Some(RequestOrder {
-            sequence: u64::from_le_bytes(header[16..24].try_into().ok()?),
-            generation: header[24..40].try_into().ok()?,
-        })
+        Some(header)
     }
 
-    /// Reserve before dispatching HTTP, under the same lock as snapshot replacement.
-    /// A persisted sequence orders writers across restarts without relying on wall time.
+    fn latest_request(&self, key: &str) -> Option<RequestOrder> {
+        let mut file = self.open_entry(key)?;
+        let header = Self::read_header(&mut file)?;
+        RequestOrder::from_header(&header)
+    }
+
+    /// Reserve before HTTP, under the replacement lock. A persisted sequence orders
+    /// writers across restarts without wall time.
     pub fn reserve_request(&self) -> std::io::Result<RequestOrder> {
         let _lock = self.lock()?;
         let order = match self
-            .latest_request("sequence")
+            .latest_request(COUNTER)
             .filter(|previous| (1..u64::MAX).contains(&previous.sequence))
         {
             Some(previous) => RequestOrder {
@@ -252,15 +257,15 @@ impl Cache {
                 }
             }
         };
-        self.atomic_replace(&self.path("sequence"), |temp| {
+        self.atomic_replace(&self.path(COUNTER), |temp| {
             self.write_entry(temp, &[], 0, order)
         })?;
         Ok(order)
     }
 
     fn lock(&self) -> std::io::Result<CacheLock<'_>> {
-        // One shared window: threads that queued behind a waiting writer must not
-        // each wait again, or a stuck holder would stall the whole pool.
+        // One shared deadline, so queued threads don't each wait and a stuck holder can't
+        // stall the pool.
         let deadline = std::time::Instant::now() + LOCK_WAIT;
         let writer = self.writers.try_lock_until(deadline).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::TimedOut, "cache writer lock timed out")
@@ -276,8 +281,8 @@ impl Cache {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(self.root.join("cache.lock"))?;
-        // A short bounded wait covers another instance's write; a stuck holder
-        // still falls back to uncached work instead of stalling it.
+        // A short wait covers another instance's write; a stuck holder means uncached
+        // work, not a stall.
         loop {
             match lock.try_lock() {
                 Ok(()) => break,
@@ -305,7 +310,7 @@ impl Cache {
             return Ok(());
         }
         let _lock = self.lock()?;
-        let Some(current) = self.latest_request("sequence") else {
+        let Some(current) = self.latest_request(COUNTER) else {
             return Ok(());
         };
         if request_order.generation != current.generation
@@ -344,8 +349,7 @@ impl Cache {
                 Some(libc::ENOSPC) | Some(libc::EDQUOT)
             );
             let _ = fs::remove_file(&temp);
-            // Reclaim a crashed writer's files even if no new entry can be allocated.
-            // Retry once only when cleanup freed space.
+            // Reclaim crashed writers' files; retry once only if that freed space.
             if no_space && self.remove_abandoned_writes()? {
                 result = write(&temp).and_then(|()| fs::rename(&temp, target));
                 if result.is_err() {
@@ -529,6 +533,103 @@ mod tests {
     }
 
     #[test]
+    fn a_write_removes_entries_past_the_retention_window_but_not_at_it() {
+        let dir = Scratch::new();
+        let cache = Cache::new(dir.0.clone());
+        let now = 10_000_000;
+        let expired = Cache::key("instance", "expired");
+        let at_limit = Cache::key("instance", "at limit");
+        cache
+            .store(
+                &expired,
+                b"expired",
+                now - RETENTION - 1,
+                cache.reserve_request().unwrap(),
+            )
+            .unwrap();
+        cache
+            .store(
+                &at_limit,
+                b"at limit",
+                now - RETENTION,
+                cache.reserve_request().unwrap(),
+            )
+            .unwrap();
+
+        cache
+            .store(
+                &Cache::key("instance", "new"),
+                b"new",
+                now,
+                cache.reserve_request().unwrap(),
+            )
+            .unwrap();
+
+        assert!(!cache.path(&expired).exists());
+        assert!(cache.path(&at_limit).exists());
+    }
+
+    /// `count` entries named like cache files, all written at `now` except entry 7,
+    /// written 10 s earlier.
+    fn entries_with_one_oldest(dir: &Path, count: usize, now: i64) {
+        for i in 0..count {
+            let written = if i == 7 { now - 10 } else { now };
+            fs::File::create(dir.join(format!("{i:064x}.cache")))
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(written as u64))
+                .unwrap();
+        }
+    }
+
+    fn entry_count(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|name| name.len() == 64 + ".cache".len())
+            .count()
+    }
+
+    #[test]
+    fn a_write_past_the_file_limit_removes_the_oldest_entry() {
+        let dir = Scratch::new();
+        let cache = Cache::new(dir.0.clone());
+        let now = 10_000_000;
+        entries_with_one_oldest(&dir.0, FILE_LIMIT, now);
+
+        cache
+            .store(
+                &Cache::key("instance", "new"),
+                b"new",
+                now,
+                cache.reserve_request().unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(entry_count(&dir.0), FILE_LIMIT);
+        assert!(!dir.0.join(format!("{:064x}.cache", 7)).exists());
+    }
+
+    #[test]
+    fn a_write_reaching_the_file_limit_removes_nothing() {
+        let dir = Scratch::new();
+        let cache = Cache::new(dir.0.clone());
+        let now = 10_000_000;
+        entries_with_one_oldest(&dir.0, FILE_LIMIT - 1, now);
+
+        cache
+            .store(
+                &Cache::key("instance", "new"),
+                b"new",
+                now,
+                cache.reserve_request().unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(entry_count(&dir.0), FILE_LIMIT);
+        assert!(dir.0.join(format!("{:064x}.cache", 7)).exists());
+    }
+
+    #[test]
     fn invalid_header_checksums_and_versions_are_cache_misses() {
         let dir = Scratch::new();
         let cache = Cache::new(dir.0.clone());
@@ -610,6 +711,39 @@ mod tests {
 
         assert_eq!(fs::read(target).unwrap(), b"keep me");
         assert_eq!(cache.load(&key, 1000).unwrap().bytes, b"cached body");
+    }
+
+    #[test]
+    fn when_a_fifo_has_no_header_it_should_not_wait_for_data() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = Scratch::new();
+        let cache = Cache::new(dir.0.clone());
+        let path = cache.path("fifo");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is a NUL-terminated path in this test's scratch directory.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let mut held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader =
+            std::thread::spawn(move || tx.send(cache.load("fifo", 1000).is_none()).unwrap());
+
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        // Let even a reader that starts after the timeout open and reject a header.
+        held.write_all(&[0; HEADER as usize]).unwrap();
+        reader.join().unwrap();
+        drop(held);
+
+        assert_eq!(
+            result,
+            Ok(true),
+            "invalid-size entries must be cache misses"
+        );
     }
 
     #[test]

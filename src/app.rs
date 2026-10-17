@@ -1,5 +1,4 @@
-//! Application state and the actions keys trigger. Rendering lives in `ui`,
-//! key dispatch in `keys`.
+//! Application state and key actions; rendering is in `ui`, dispatch in `keys`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -34,9 +33,40 @@ const BOOKMARKS_TAB: usize = 1;
 const THUMB_CACHE_MAX: usize = 400;
 /// A video area that changed size restarts the video once the size holds this long.
 const VIDEO_RESIZE_SETTLE: Duration = Duration::from_millis(250);
+pub const CARD_MIN_WIDTH: u16 = 54;
+/// Pane widths include horizontal margins.
+pub const MAIN_MIN_WIDTH: u16 = CARD_MIN_WIDTH + 2;
+pub const DETAIL_MIN_WIDTH: u16 = 72;
+const SIDEBAR_WIDE: u16 = 30;
+const SIDEBAR_NARROW: u16 = 24;
 
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+/// A list picture cut to its slot's shape, centred, so it fills the slot without
+/// stretching: thumbnails are `THUMB_COLS`×`THUMB_ROWS` cells and icons 2×1, both two
+/// cells across per row.
+fn fill_slot(img: image::DynamicImage, font: ratatui_image::FontSize) -> image::DynamicImage {
+    use crate::ui::{THUMB_COLS, THUMB_ROWS};
+    let (w, h) = (u64::from(img.width()), u64::from(img.height()));
+    let slot_w = u64::from(THUMB_COLS) * u64::from(font.width);
+    let slot_h = u64::from(THUMB_ROWS) * u64::from(font.height);
+    if w == 0 || h == 0 || slot_w == 0 || slot_h == 0 {
+        return img;
+    }
+    // The widest centred part of the slot's shape the picture holds.
+    let (cw, ch) = if w * slot_h > h * slot_w {
+        ((h * slot_w / slot_h).max(1), h)
+    } else {
+        (w, (w * slot_h / slot_w).max(1))
+    };
+    img.crop_imm(
+        ((w - cw) / 2) as u32,
+        ((h - ch) / 2) as u32,
+        cw as u32,
+        ch as u32,
+    )
 }
 
 #[derive(Debug, Default)]
@@ -46,15 +76,14 @@ pub struct Feed {
     pub sort: Sort,
     pub time: TimeRange,
     pub search: Option<String>,
-    pub loading: bool,
     failures: HashMap<Option<String>, FeedFailure>,
     pub generation: u64,
     pub selected: usize,
     pub loaded: bool,
     /// First visible list item; kept in sync by the UI.
     pub offset: usize,
-    /// The query `posts` came from. A failed load of a different query clears them;
-    /// a failed reload of the same query keeps them.
+    /// The query `posts` came from: a failed load of another query clears them, of the
+    /// same keeps them.
     shown_query: Option<FeedQuery>,
     pub freshness: Option<Freshness>,
     pages: Vec<FeedPage>,
@@ -100,6 +129,10 @@ impl Feed {
 
     pub fn refreshing(&self) -> bool {
         !self.refreshing.is_empty()
+    }
+
+    pub fn loading(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -195,7 +228,7 @@ impl Feed {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum TabKind {
     Home,
     Bookmarks,
@@ -265,36 +298,35 @@ pub struct PostView {
     pub loading_more: HashSet<String>,
     /// Index into [`PostView::rows`].
     pub cursor: usize,
-    /// First rendered line of the document.
     pub scroll: usize,
-    /// True while you read by scrolling; the next comment key then selects a
-    /// comment near the screen's top (see [`Anchor`]).
+    /// Reading by scrolling; the next comment key selects near the top (see [`Anchor`]).
     pub free_scroll: bool,
     /// The comment `h` left, which `l` returns to while it is on screen.
     left: Option<RowKey>,
-    /// A comment `l` selected while reading (or `G` inside the last comment):
-    /// draws keep its text where it was while it stays selected and on screen,
-    /// instead of showing its header.
+    /// A comment `l` selected while reading (or `G` inside the last one): draws keep its
+    /// text in place while it stays selected and visible.
     pub hold_view: Option<Hold>,
-    /// The row holding the top line, the offset into it and the scroll then, taken
-    /// before the document changed above it: the next draw puts the text back, and
-    /// keys that scrolled since move on from it (see `take_reading_anchor`).
+    /// Row at the top line, offset into it and scroll, taken before the document changed
+    /// above it; the next draw restores it (see `take_reading_anchor`).
     keep_reading: Option<(RowKey, isize, usize)>,
     /// The selected row the last draw placed on screen; None while reading.
     pub drawn_cursor: Option<usize>,
-    /// `v` while reading: the spoiler state the last draw showed and the scroll
-    /// then. The next draw finds the line that was on top in the new wrapping.
+    /// `v` while reading: spoiler state and scroll of the last draw, to find the top line
+    /// in the new wrap.
     pub rewrapped: Option<(bool, usize)>,
-    /// Last rendered document: owned lines move here after drawing, without copies.
+    /// Last rendered document, moved here after drawing.
     pub rendered_document: Vec<ratatui::text::Line<'static>>,
     /// A successful content update arrived since that document was drawn.
     pub content_changed: bool,
     /// More rows in the last displayed geometry, even after spoiler invalidation.
     pub rendered_more: Vec<(String, usize)>,
+    /// Pictures in the last displayed document: URL, first line, rows. A picture above
+    /// the view that grows when it loads moves the view down by as much.
+    pub rendered_pictures: Vec<(String, usize, usize)>,
     /// This update redirects a read More row to its first newly inserted reply.
     pub more_handoff: bool,
-    /// The inline image was scrolled away. It stays away, even when a short post
-    /// clamps the scroll back to 0, until a key goes back to the top.
+    /// The inline image was scrolled away; it stays away (even if a short post clamps the
+    /// scroll back to 0) until a key returns to the top.
     pub image_away: bool,
     /// The last draw showed the inline image (so the post was at its top).
     pub image_shown: bool,
@@ -323,6 +355,10 @@ pub struct Row<'a> {
 }
 
 impl PostView {
+    pub fn shown_post(&self) -> &Post {
+        self.page.as_ref().map_or(&self.post, |page| &page.post)
+    }
+
     /// A spoiler-tagged post whose body and image stay hidden until `v`.
     pub fn spoiler_hidden(&self) -> bool {
         !self.reveal_spoilers
@@ -342,8 +378,8 @@ impl PostView {
             })
     }
 
-    /// The comment tree flattened in display order, honoring folded threads. A
-    /// hidden spoiler post has none: its comments discuss what the body hides.
+    /// Comment tree in display order, honoring folds. Empty for a hidden spoiler post: its
+    /// comments discuss what the body hides.
     pub fn rows(&self) -> Vec<Row<'_>> {
         let mut rows = Vec::new();
         if let Some(page) = &self.page
@@ -382,9 +418,8 @@ impl PostView {
         }
     }
 
-    /// The comment a key pressed while reading (free scroll) selects; None leaves
-    /// the post as it is. Rows are the comment spans from the last draw. No key
-    /// moves the view against its direction.
+    /// The comment a key selects while reading (free scroll); None leaves the post. Uses
+    /// the last draw's spans; no key moves the view against its direction.
     fn anchor_row(&self, anchor: Anchor) -> Option<usize> {
         let starts = &self.row_starts;
         let bottom = self.scroll + self.page_height.max(1);
@@ -397,8 +432,7 @@ impl PostView {
             Anchor::Down => next_down(),
             Anchor::Select => {
                 let on_screen = |i: usize| {
-                    // A row ends before the blank line under it, which belongs to
-                    // the next row (as in `reading_position`).
+                    // A row's blank line belongs to the next row (as in `reading_position`).
                     let end = starts.get(i + 1).map_or(usize::MAX, |&s| s - 1);
                     starts
                         .get(i)
@@ -413,12 +447,10 @@ impl PostView {
         }
     }
 
-    /// Leave free scroll by selecting the comment `anchor` picks. Returns true
-    /// when it did.
+    /// Leave free scroll by selecting the comment `anchor` picks; true if it did.
     fn anchor_cursor(&mut self, anchor: Anchor) -> bool {
-        // Before the first draw of a loaded post there are no row positions yet:
-        // keep the post in free scroll so it still opens at its top. After a fold in
-        // the same key batch they belong to other rows: wait for the draw.
+        // No positions before a loaded post's first draw (keep it at its top), and stale
+        // ones after a fold in the same batch: wait for the draw.
         if !self.free_scroll || self.row_starts.is_empty() || !self.positions_current() {
             return false;
         }
@@ -433,13 +465,12 @@ impl PostView {
         true
     }
 
-    /// Whether `row_starts` from the last draw still describe [`PostView::rows`]:
-    /// a fold, a reveal or loaded replies since then change the rows.
+    /// Whether the last draw's `row_starts` still describe [`PostView::rows`] (no fold,
+    /// reveal or load since).
     fn positions_current(&self) -> bool {
         self.row_starts.len() == self.rows().len()
     }
 
-    /// Up to the post's top, reading. The inline image there shows again.
     fn go_to_top(&mut self) {
         self.scroll = 0;
         self.free_scroll = true;
@@ -455,16 +486,12 @@ impl PostView {
         }
     }
 
-    /// Before the document changes above what is being read (replies loading,
-    /// spoilers rewrapping): keep the text the last draw showed where it is. Several
-    /// changes before one draw keep the first one's anchor: positions are stale
-    /// after it.
+    /// Before the document changes above what is read (loads, spoiler rewrap), keep the
+    /// last-drawn text in place. Several changes before one draw keep the first anchor.
     fn pin_view(&mut self) {
-        // At the top with the inline image shown, the top stays the top: an anchor
-        // there would move the scroll off 0 and dismiss the image, so a hold keeps
-        // scroll 0 instead of its text, and without one the draw keeps a selected
-        // comment in view. (A key in the same pass may have scrolled already: then
-        // the reading position counts again.)
+        // At the top with the image shown, stay at the top: anchoring would scroll off 0
+        // and dismiss the image, so a hold keeps scroll 0 and a selection stays in view.
+        // If a key in this pass already scrolled, the reading position counts instead.
         if self.image_shown && self.scroll == 0 {
             if let Some(hold) = &mut self.hold_view {
                 hold.top = true;
@@ -476,8 +503,8 @@ impl PostView {
                 self.reading_position()
                     .map(|(key, offset)| (key, offset, self.scroll))
             } else {
-                // The selected row the last draw placed: a key may have moved the
-                // selection since; the draw then brings the new one into view.
+                // The selection the last draw placed; if a key moved it since, the draw
+                // shows the new one.
                 self.drawn_cursor
                     .filter(|&d| self.positions_current() && d < self.row_starts.len())
                     .map(|d| {
@@ -500,17 +527,16 @@ impl PostView {
         }
     }
 
-    /// The comment holding the top line and the top line's offset into it, by
-    /// the last draw's positions. None in the body (loaded replies land below it),
-    /// or when the positions are stale.
+    /// The row holding the top line and the offset into it, by the last draw. None in the
+    /// body (loads land below it) or when positions are stale.
     fn reading_position(&self) -> Option<(RowKey, isize)> {
         let rows = self.rows();
         if !self.free_scroll || self.row_starts.len() != rows.len() {
             return None;
         }
         let mut i = self.row_starts.iter().rposition(|&s| s <= self.scroll)?;
-        // The blank line under a row belongs to the row after it: a "more replies"
-        // row that loads is replaced, so its blank line must not anchor to it.
+        // A row's blank line belongs to the next row, so a loading More row's blank line
+        // can't anchor to it.
         if self.row_starts.get(i + 1) == Some(&(self.scroll + 1)) {
             i += 1;
         }
@@ -520,9 +546,8 @@ impl PostView {
         ))
     }
 
-    /// For the draw: the row and offset to put the top line back at after the
-    /// document changed above it, once. Keys that scrolled since (in the same key
-    /// batch) move on from the kept text; a jump to the post's top (`g`) stays.
+    /// For the draw: where to put the top line back after the document changed above it,
+    /// once. Keys that scrolled since move on from it; `g` stays at the top.
     pub fn take_reading_anchor(&mut self) -> Option<(usize, isize)> {
         let (key, offset, pinned) = self.keep_reading.take()?;
         if self.scroll == 0 && pinned != 0 {
@@ -532,7 +557,6 @@ impl PostView {
         Some((self.row_index(&key)?, offset + moved))
     }
 
-    /// What the cursor is on.
     fn cursor_key(&self) -> Option<RowKey> {
         self.rows().get(self.cursor).map(RowKey::of)
     }
@@ -545,8 +569,8 @@ impl PostView {
         })
     }
 
-    /// Put the cursor back on the same row after rows changed above it. A "more
-    /// replies" row that just loaded is gone: its index now holds its first new reply.
+    /// Keep the cursor on the same row after rows changed above it; a loaded More row's
+    /// index now holds its first new reply.
     fn reselect(&mut self, key: Option<RowKey>) {
         let count = self.rows().len();
         if count == 0 {
@@ -571,10 +595,8 @@ impl PostView {
 /// See [`PostView::hold_view`].
 #[derive(Debug, Clone, Copy)]
 pub struct Hold {
-    /// The held comment's row.
     pub row: usize,
-    /// The top line's distance from the comment's first line when the hold began:
-    /// rows loading above move the comment, and the view moves with it.
+    /// Top line's offset from the comment's first line when the hold began.
     pub offset: isize,
     /// Hold the post's top instead (the inline image is shown there).
     pub top: bool,
@@ -603,9 +625,8 @@ enum Anchor {
     Up,
     /// `j` `n`: the first comment from the top line down.
     Down,
-    /// `l` `c` Enter: the comment `h` left while it is on screen, else the one
-    /// being read: the first starting on screen, the one holding the top line,
-    /// or the next one below.
+    /// `l` `c` Enter: the comment `h` left if on screen, else the one being read (first
+    /// starting on screen, else holding the top line, else the next below).
     Select,
 }
 
@@ -665,6 +686,8 @@ pub enum ImageSlot {
     Ready {
         protocol: Box<StatefulProtocol>,
         refresh: ImageRefresh,
+        /// The picture's size in pixels, which decides its shape in the post view.
+        pixels: (u32, u32),
     },
     Failed(String),
 }
@@ -681,6 +704,13 @@ pub struct Status {
 pub enum PickerEntry {
     Tab { index: usize, title: String },
     Open(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Sidebar,
+    List,
+    Post,
 }
 
 pub struct App {
@@ -704,12 +734,16 @@ pub struct App {
     pub show_sidebar: bool,
     /// NO_COLOR is set: half-block images, which are only colors, are not drawn.
     pub no_color: bool,
-    /// `j`/`k` move through the sidebar's tabs instead of the list.
-    pub sidebar_focused: bool,
+    pub focus: Focus,
+    /// Last drawable terminal width, shared by layout and key dispatch.
+    width: u16,
     /// The sidebar was hidden and is shown only while it has focus.
     sidebar_peek: bool,
     pub image_picker: Picker,
     pub images: HashMap<String, ImageSlot>,
+    /// Image fetches submitted and not yet answered, and whether each went to the
+    /// background queue: wanted again while queued, an image is not fetched twice.
+    queued_images: HashMap<String, bool>,
     /// List-row thumbnails and subreddit icons, keyed by image URL.
     pub thumbs: HashMap<String, ImageSlot>,
     /// Subreddit icon URLs, keyed by lowercase subreddit name.
@@ -721,13 +755,13 @@ pub struct App {
     pub video: Option<Player>,
     /// `a` turned the sound on: later videos start with it too.
     video_sound_on: bool,
-    /// Where the last draw put the video picture; it sizes the decoded frames.
+    /// The box the video decodes for; the drawn picture follows each frame's shape inside.
     pub video_area: Option<Rect>,
-    /// The frame number and cells the last draw sent to the terminal (kitty), so a
-    /// frame goes out once.
+    /// The most rows a video frame not wider than tall may take.
+    pub video_tall_rows: u16,
+    /// Frame number and cells last sent to the terminal (kitty), so a frame goes out once.
     pub video_sent: Option<(u64, Rect)>,
-    /// The new size of the video area and when the draws first showed it: the
-    /// video restarts for it once it holds still.
+    /// The video area's new size and when it first appeared; the video restarts once it holds.
     video_resize: Option<(ratatui::layout::Size, Instant)>,
     command_running: bool,
     pub quit: bool,
@@ -764,10 +798,12 @@ impl App {
             show_images,
             show_sidebar: true,
             no_color: false,
-            sidebar_focused: false,
+            focus: Focus::List,
+            width: 0,
             sidebar_peek: false,
             image_picker,
             images: HashMap::new(),
+            queued_images: HashMap::new(),
             thumbs: HashMap::new(),
             icons: HashMap::new(),
             pending_media: HashSet::new(),
@@ -775,6 +811,7 @@ impl App {
             video: None,
             video_sound_on: false,
             video_area: None,
+            video_tall_rows: 1,
             video_sent: None,
             video_resize: None,
             command_running: false,
@@ -855,8 +892,8 @@ impl App {
         }
     }
 
-    /// Timers: status expiry, health checks, periodic saves, video frames. Returns
-    /// true when something visible changed.
+    /// Timers: status expiry, health checks, saves, video frames. True when something
+    /// visible changed.
     pub fn tick(&mut self) -> bool {
         let mut changed = self.sync_video(Instant::now());
         if self
@@ -879,8 +916,7 @@ impl App {
         changed
     }
 
-    /// How long the main loop may wait for input before `tick` has work: the next
-    /// video frame, a resized video settling, or the timers' pace.
+    /// How long the main loop may wait for input: next video frame, resize settling, or the timers.
     pub fn wake_in(&self) -> Duration {
         const IDLE: Duration = Duration::from_millis(100);
         let now = Instant::now();
@@ -895,24 +931,22 @@ impl App {
             .fold(IDLE, Duration::min)
     }
 
-    /// The stream the open post plays inline: its page has loaded, images are on
-    /// and no spoiler hides it.
+    /// The stream to play inline: page loaded, images on, no spoiler hiding it.
     fn wanted_video(&self) -> Option<String> {
         let view = self.post_view.as_ref()?;
         let page = view.page.as_ref()?;
         if !self.inline_images_on() || view.spoiler_hidden() {
             return None;
         }
-        match &page.post.media {
-            Media::Video { url: Some(url), .. } => Some(self.redlib.absolute(url)),
-            _ => None,
-        }
+        page.post
+            .media
+            .video_url()
+            .map(|url| self.redlib.absolute(url))
     }
 
-    /// Start, stop, pause and advance the inline video to match the post view.
-    /// It starts once a draw placed its area (and starts again, at the same place,
-    /// when the area changes size), and pauses while that area is off screen or
-    /// under an overlay. Returns true when something visible changed.
+    /// Starts, stops, pauses and advances the inline video to match the post view. It
+    /// starts once a draw placed its area (restarting in place on a size change) and
+    /// pauses while off screen or under an overlay. True when something visible changed.
     fn sync_video(&mut self, now: Instant) -> bool {
         let Some(url) = self.wanted_video() else {
             // The next video starts from its own post's draw, not this one's area.
@@ -929,7 +963,7 @@ impl App {
                     self.video_resize = None;
                     false
                 }
-                // A new size: once it holds still, as a window drag passes many.
+                // A new size: wait until it holds still (a window drag passes many).
                 Some(player) if player.url == url => match self.video_resize {
                     Some((size, since)) if size == area => {
                         now.saturating_duration_since(since) >= VIDEO_RESIZE_SETTLE
@@ -953,7 +987,7 @@ impl App {
                 let output = if self.image_picker.protocol_type() == ProtocolType::Kitty {
                     video::Output::Kitty
                 } else {
-                    video::Output::Image(self.image_picker.clone(), area)
+                    video::Output::Image(self.image_picker.clone(), area, self.video_tall_rows)
                 };
                 let font = self.image_picker.font_size();
                 self.video = Some(Player::start(url, area, font, output, resume, now));
@@ -981,7 +1015,6 @@ impl App {
         changed
     }
 
-    /// `P` in a post: pause or play its video.
     pub fn toggle_video_pause(&mut self) {
         match &mut self.video {
             Some(player) => player.toggle_pause(Instant::now()),
@@ -989,8 +1022,7 @@ impl App {
         }
     }
 
-    /// `a` in a post: sound on or off, for this video and the next ones. It turns
-    /// the preference over; a video without sound keeps its own off.
+    /// `a`: toggles sound for this and later videos; a video without sound stays silent.
     pub fn toggle_video_sound(&mut self) {
         let Some(player) = &mut self.video else {
             self.info("No video plays here");
@@ -1016,7 +1048,6 @@ impl App {
         self.video_sound_on
     }
 
-    /// `,` and `.` in a post: seek the video back or forward.
     pub fn seek_video(&mut self, forward: bool) {
         let by = if forward {
             video::SEEK_STEP
@@ -1036,10 +1067,9 @@ impl App {
         self.pool.submit(Job::Health);
     }
 
-    /// Save state. Returns true when something visible changed: merging another
-    /// instance's saves changed the bookmark list (the Bookmarks selection then
-    /// follows its post), or saving failed. `save` merges before it writes, so
-    /// the list can change even when the write fails.
+    /// Save state. True when something visible changed: a merge changed the bookmark
+    /// list (the selection follows its post), or saving failed. The merge happens even
+    /// when the write fails.
     fn persist(&mut self) -> bool {
         self.last_save = Instant::now();
         let before = self.bookmark_ids();
@@ -1074,18 +1104,16 @@ impl App {
             .map(|b| b.post.id.clone())
     }
 
-    /// After the bookmark list changed: keep the Bookmarks selection on its post,
-    /// or clamp it when that post is gone.
+    /// Keep the Bookmarks selection on its post after the list changed, else clamp it.
     fn reselect_bookmark(&mut self, id: Option<String>) {
-        let ids = self.bookmark_ids();
+        let bookmarks = self.state.bookmarks();
         let feed = &mut self.tabs[BOOKMARKS_TAB].feed;
         feed.selected = id
-            .and_then(|id| ids.iter().position(|a| *a == id))
+            .and_then(|id| bookmarks.iter().position(|b| b.post.id == id))
             .unwrap_or(feed.selected)
-            .min(ids.len().saturating_sub(1));
+            .min(bookmarks.len().saturating_sub(1));
     }
 
-    /// Final save on quit.
     pub fn save_state(&mut self) {
         self.mark_active_seen();
         self.persist();
@@ -1109,7 +1137,6 @@ impl App {
         self.enter_tab(index);
     }
 
-    /// Make `index` the active tab and start its visit.
     fn enter_tab(&mut self, index: usize) {
         self.active = index;
         let tab = &mut self.tabs[index];
@@ -1161,9 +1188,8 @@ impl App {
         }
     }
 
-    /// Listed posts count as seen when you leave a subreddit tab you actually
-    /// looked at: you moved or opened something, or stayed a moment. Passing
-    /// through with Tab keeps its "new" badges.
+    /// Mark listed posts seen when leaving a subreddit tab you looked at (moved, opened,
+    /// or stayed a moment); passing through keeps "new" badges.
     fn mark_active_seen(&mut self) {
         let tab = &self.tabs[self.active];
         let looked = tab.engaged || tab.entered.is_some_and(|t| t.elapsed() >= SEEN_DWELL);
@@ -1171,10 +1197,8 @@ impl App {
             return;
         }
         if let Some(name) = tab.subreddit() {
-            let name = name.to_string();
-            let ids: Vec<String> = tab.feed.posts.iter().map(|p| p.id.clone()).collect();
             self.state
-                .mark_seen(&name, ids.iter().map(String::as_str), now());
+                .mark_seen(name, tab.feed.posts.iter().map(|p| p.id.as_str()), now());
         }
     }
 
@@ -1183,17 +1207,17 @@ impl App {
             return 0;
         };
         if tab.feed.loaded && tab.feed.is_default_view() {
-            return self.state.unseen(name, self.visible(&tab.feed.posts));
+            return self
+                .state
+                .unseen(name, self.config.visible(&tab.feed.posts));
         }
         self.home
             .groups
             .iter()
             .find(|g| g.subreddit.eq_ignore_ascii_case(name))
-            .map_or(0, |g| self.state.unseen(name, self.visible(&g.posts)))
-    }
-
-    pub fn visible<'a>(&self, posts: &'a [Post]) -> Vec<&'a Post> {
-        posts.iter().filter(|p| !self.config.hides(p)).collect()
+            .map_or(0, |g| {
+                self.state.unseen(name, self.config.visible(&g.posts))
+            })
     }
 
     // ----- feeds ------------------------------------------------------------
@@ -1201,12 +1225,13 @@ impl App {
     fn ensure_feed_loaded(&mut self, index: usize) {
         let tab = &self.tabs[index];
         if tab.subreddit().is_some()
-            && !tab.feed.loading
+            && !tab.feed.loading()
             && !(tab.feed.request_query.as_ref() == Some(&tab.feed.query())
-                && tab.feed.requests.iter().any(|(id, cursor)| {
-                    cursor.is_none()
-                        && (tab.feed.pending.contains(id) || tab.feed.refreshing.contains(id))
-                }))
+                && tab
+                    .feed
+                    .requests
+                    .iter()
+                    .any(|(id, cursor)| cursor.is_none() && tab.feed.refreshing.contains(id)))
             && (!tab.feed.loaded
                 || tab.feed.freshness.is_some_and(|f| {
                     now().saturating_sub(f.fetched_at) >= crate::cache::CONTENT_TTL
@@ -1218,7 +1243,7 @@ impl App {
 
     pub fn load_feed(&mut self, index: usize, more: bool) {
         let feed = &self.tabs[index].feed;
-        if more && (feed.loading || feed.after.is_none()) {
+        if more && (feed.loading() || feed.after.is_none()) {
             return;
         }
         let after = if more { feed.after.clone() } else { None };
@@ -1240,7 +1265,6 @@ impl App {
             feed.failures.clear();
             feed.request_query = Some(query.clone());
         }
-        feed.loading = true;
         feed.generation = generation;
         feed.failures.remove(&after);
         feed.requests.retain(|_, cursor| *cursor != after);
@@ -1275,26 +1299,16 @@ impl App {
 
     pub fn reload(&mut self) {
         self.retry_failed_thumbs();
-        if let Some(view) = &self.post_view {
-            let post = view.post.clone();
-            for url in post.media.preview_image().into_iter() {
-                if matches!(self.images.get(url), Some(ImageSlot::Failed(_))) {
-                    self.images.remove(url);
-                }
-            }
+        // Only the open post's pictures are kept: its failed ones load anew.
+        self.retry_failed_pictures();
+        if self.post_focused() && self.post_view.is_some() {
             self.refresh_post();
             return;
         }
         match self.active_tab().kind {
             TabKind::Home => {
                 for g in &mut self.home.groups {
-                    g.loading = true;
-                    g.error = None;
-                    g.generation += 1;
-                    self.pool.refresh(Job::Group {
-                        subreddit: g.subreddit.clone(),
-                        generation: g.generation,
-                    });
+                    Self::refresh_group(&self.pool, g);
                 }
             }
             TabKind::Bookmarks => {}
@@ -1317,6 +1331,16 @@ impl App {
         self.check_health();
     }
 
+    fn refresh_group(pool: &Pool, group: &mut Group) {
+        group.loading = true;
+        group.error = None;
+        group.generation += 1;
+        pool.refresh(Job::Group {
+            subreddit: group.subreddit.clone(),
+            generation: group.generation,
+        });
+    }
+
     fn refresh_post(&mut self) {
         let generation = self.generation();
         let Some(view) = &mut self.post_view else {
@@ -1332,10 +1356,28 @@ impl App {
         });
     }
 
-    /// After `S` started Redlib: reload only what failed or never loaded, so the
-    /// screen you are reading keeps its place.
+    /// The open post's pictures that failed load again: its own image now, pictures in
+    /// its text when next drawn.
+    fn retry_failed_pictures(&mut self) {
+        self.images
+            .retain(|_, slot| !matches!(slot, ImageSlot::Failed(_)));
+        let image = self
+            .post_view
+            .as_ref()
+            .and_then(|view| view.page.as_ref())
+            .and_then(|page| page.post.media.preview_image())
+            .map(str::to_string);
+        if self.inline_images_on()
+            && let Some(url) = image
+        {
+            self.request_image(&url);
+        }
+    }
+
+    /// After `S` started Redlib: reload only what failed or never loaded, keeping your place.
     fn reload_failed(&mut self) {
         self.retry_failed_thumbs();
+        self.retry_failed_pictures();
         if let Some(view) = &self.post_view
             && view.error.is_some()
         {
@@ -1343,13 +1385,7 @@ impl App {
         }
         for g in &mut self.home.groups {
             if g.error.is_some() || (g.posts.is_empty() && !g.loading) {
-                g.loading = true;
-                g.error = None;
-                g.generation += 1;
-                self.pool.refresh(Job::Group {
-                    subreddit: g.subreddit.clone(),
-                    generation: g.generation,
-                });
+                Self::refresh_group(&self.pool, g);
             }
         }
         for i in 0..self.tabs.len() {
@@ -1407,7 +1443,6 @@ impl App {
         true
     }
 
-    /// Move the selection in a list view; `delta` may be negative.
     pub fn move_selection(&mut self, delta: isize) {
         self.engage();
         match self.active_tab().kind {
@@ -1418,13 +1453,16 @@ impl App {
                 feed.selected = step(feed.selected, delta, len);
             }
             TabKind::Subreddit { .. } => {
-                let len = self.visible(&self.tabs[self.active].feed.posts).len();
+                let len = self
+                    .config
+                    .visible(&self.tabs[self.active].feed.posts)
+                    .count();
                 let feed = &mut self.tabs[self.active].feed;
                 feed.selected = step(feed.selected, delta, len);
                 // After a failed page load, wait for L or r instead of retrying on every key.
                 if feed.selected + PREFETCH_MARGIN >= len
                     && feed.after.is_some()
-                    && !feed.loading
+                    && !feed.loading()
                     && !feed.page_failed()
                 {
                     self.load_feed(self.active, true);
@@ -1448,14 +1486,11 @@ impl App {
     }
 
     /// Posts shown in a Home group: the hot listing without pinned mod posts.
-    pub fn home_group_posts<'a>(&self, group: &'a Group) -> Vec<&'a Post> {
-        let mut posts: Vec<&Post> = self
+    pub fn home_group_posts<'a>(&self, group: &'a Group) -> impl Iterator<Item = &'a Post> {
+        self.config
             .visible(&group.posts)
-            .into_iter()
             .filter(|p| !p.stickied)
-            .collect();
-        posts.truncate(self.config.home_posts_per_group);
-        posts
+            .take(self.config.home_posts_per_group)
     }
 
     fn move_home(&mut self, delta: isize) {
@@ -1466,7 +1501,7 @@ impl App {
         while remaining != 0 {
             let count = self
                 .home_group_posts(&self.home.groups[self.home.group])
-                .len();
+                .count();
             if remaining > 0 {
                 if self.home.post + 1 < count {
                     self.home.post += 1;
@@ -1484,7 +1519,7 @@ impl App {
                     self.home.group -= 1;
                     let count = self
                         .home_group_posts(&self.home.groups[self.home.group])
-                        .len();
+                        .count();
                     self.home.post = count.saturating_sub(1);
                 } else {
                     break;
@@ -1494,7 +1529,6 @@ impl App {
         }
     }
 
-    /// Jump between Home groups; `delta` counts groups.
     pub fn move_home_group(&mut self, delta: isize) {
         self.home.group = step(self.home.group, delta, self.home.groups.len());
         self.home.post = 0;
@@ -1509,20 +1543,16 @@ impl App {
 
     /// The post under the cursor in whatever view is active.
     pub fn current_post(&self) -> Option<Post> {
-        if let Some(view) = &self.post_view {
-            return Some(
-                view.page
-                    .as_ref()
-                    .map_or_else(|| view.post.clone(), |p| p.post.clone()),
-            );
+        if self.post_focused()
+            && let Some(view) = &self.post_view
+        {
+            return Some(view.shown_post().clone());
         }
         let tab = self.active_tab();
         match tab.kind {
             TabKind::Home => {
                 let group = self.home.groups.get(self.home.group)?;
-                self.home_group_posts(group)
-                    .get(self.home.post)
-                    .map(|p| (*p).clone())
+                self.home_group_posts(group).nth(self.home.post).cloned()
             }
             TabKind::Bookmarks => self
                 .state
@@ -1530,9 +1560,10 @@ impl App {
                 .get(tab.feed.selected)
                 .map(|b| b.post.clone()),
             TabKind::Subreddit { .. } => self
+                .config
                 .visible(&tab.feed.posts)
-                .get(tab.feed.selected)
-                .map(|p| (*p).clone()),
+                .nth(tab.feed.selected)
+                .cloned(),
         }
     }
 
@@ -1542,7 +1573,17 @@ impl App {
         self.engage();
         if let Some(post) = self.current_post() {
             let permalink = post.permalink.clone();
+            if self
+                .post_view
+                .as_ref()
+                .is_some_and(|view| view.post.permalink == permalink)
+            {
+                self.focus = Focus::Post;
+                return;
+            }
             self.open_post_permalink(post, permalink);
+        } else if self.post_view.is_some() {
+            self.focus = Focus::Post;
         }
     }
 
@@ -1551,6 +1592,8 @@ impl App {
             self.error("This post has no comments link");
             return;
         }
+        self.close_post();
+        self.focus = Focus::Post;
         let generation = self.generation();
         self.state.mark_read(&post, now());
         self.post_view = Some(PostView {
@@ -1574,6 +1617,7 @@ impl App {
             rendered_document: Vec::new(),
             content_changed: false,
             rendered_more: Vec::new(),
+            rendered_pictures: Vec::new(),
             more_handoff: false,
             image_away: false,
             image_shown: false,
@@ -1587,7 +1631,6 @@ impl App {
         });
     }
 
-    /// `v` in a post: show or hide its spoilers.
     pub fn toggle_spoilers(&mut self) {
         let Some(view) = &mut self.post_view else {
             return;
@@ -1596,8 +1639,8 @@ impl App {
             self.info("No spoilers in this post");
             return;
         }
-        // Masking changes how lines wrap: keep the text being read in place. While
-        // reading, the draw finds the top line again; a selection holds its text.
+        // Masking rewraps lines: keep the text being read in place (reading: the draw
+        // finds the top line again; a selection holds its text).
         if view.free_scroll {
             let (was, scroll) = (view.reveal_spoilers, view.scroll);
             view.rewrapped.get_or_insert((was, scroll));
@@ -1608,8 +1651,8 @@ impl App {
         view.row_starts.clear();
         let shown = view.reveal_spoilers;
         if view.spoiler_hidden() {
-            // The comments went away with the post: read again from the top. Their
-            // positions are stale until the next draw.
+            // The comments went away with the post: read from the top; positions are stale
+            // until the next draw.
             view.go_to_top();
             view.keep_reading = None;
             view.hold_view = None;
@@ -1624,13 +1667,15 @@ impl App {
 
     pub fn close_post(&mut self) {
         self.post_view = None;
+        if self.focus == Focus::Post {
+            self.focus = Focus::List;
+        }
         // Full-size previews are megabytes each: keep them only while their post is open.
         self.images.clear();
         self.pool.forget_images();
     }
 
-    /// `h` in a post: a selected comment first goes back to reading the post.
-    /// Returns false when there is no comment selection to leave.
+    /// `h` in a post: leave a comment selection for reading; false if there is none.
     pub fn leave_comment(&mut self) -> bool {
         match &mut self.post_view {
             Some(view) if !view.free_scroll => {
@@ -1647,15 +1692,14 @@ impl App {
             return;
         };
         if view.free_scroll {
-            // At the post's top nothing is above: `k` stays. Anchoring would select
-            // the first comment, a jump down, so held `k` flipped between the two.
+            // At the top `k` stays: anchoring would select the first comment, so held `k`
+            // would flip.
             if delta < 0 && view.scroll == 0 {
                 view.go_to_top();
                 return;
             }
-            // Before the post loads and draws, nothing is known: the post stays at
-            // its top; after a fold in the same key batch, the positions are stale.
-            // A post without comments reads by line.
+            // Before the post draws, or with positions stale after a fold in this batch, stay
+            // put. A post without comments reads by line.
             if view.page.is_none() || !view.positions_current() {
                 return;
             }
@@ -1663,7 +1707,6 @@ impl App {
             // With no comment that way, read on by a line, like C-y / C-e.
             if !view.anchor_cursor(anchor) {
                 if delta < 0 && view.scroll <= 1 {
-                    // Up to the top, as C-y does: the image there shows again.
                     view.go_to_top();
                 } else {
                     view.scroll = view.scroll.saturating_add_signed(delta.signum());
@@ -1694,21 +1737,18 @@ impl App {
                 view.cursor = len - 1;
                 view.free_scroll = false;
                 view.left = None;
-                // Already reading inside the last comment: stay there instead of
-                // jumping up to its header. Otherwise the draw scrolls down to it.
-                // Positions from before a fold or a reveal in the same key batch
-                // do not count.
+                // Already reading inside the last comment: stay rather than jump to its header;
+                // otherwise the draw scrolls to it. Positions from before a fold or reveal in
+                // this batch don't count.
                 let inside = view.row_starts.len() == len && view.row_starts[len - 1] < view.scroll;
                 view.hold_view = inside.then(|| view.hold(len - 1));
             }
         }
     }
 
-    /// Scroll the post by `delta` lines.
     pub fn scroll_post(&mut self, delta: isize) {
         if let Some(view) = &mut self.post_view {
             if delta < 0 && view.scroll <= delta.unsigned_abs() {
-                // Up to the top: the image there shows again.
                 view.go_to_top();
             } else {
                 view.scroll = view.scroll.saturating_add_signed(delta);
@@ -1717,8 +1757,7 @@ impl App {
         }
     }
 
-    /// Scroll by `num/den` of the visible document, keeping one line of context on
-    /// a full page so nothing is skipped.
+    /// Scroll by `num/den` of the visible document; a full page keeps one line of context.
     pub fn page_post(&mut self, num: isize, den: isize) {
         let height = self.post_view.as_ref().map_or(0, |v| v.page_height) as isize;
         let step = if num.abs() == den {
@@ -1739,8 +1778,7 @@ impl App {
             view.go_to_top();
             return;
         }
-        // As with `j`/`k`: before the post loads and draws, or with positions from
-        // before a fold in the same key batch, wait for the draw.
+        // As with `j`/`k`: wait for the draw before the post loads or after a fold in this batch.
         if was_free && (view.page.is_none() || !view.positions_current()) {
             return;
         }
@@ -1748,8 +1786,7 @@ impl App {
         let reading = was_free.then(|| (view.cursor, view.left.clone()));
         let anchor = if forward { Anchor::Down } else { Anchor::Up };
         if was_free && !view.anchor_cursor(anchor) {
-            // With the top line in the body, the thread before is the post. With
-            // the screen inside the last comment, no thread follows.
+            // From the body the previous thread is the post; inside the last comment none follows.
             if !forward {
                 view.go_to_top();
             }
@@ -1759,16 +1796,14 @@ impl App {
             let rows = view.rows();
             let mut indexed = rows.iter().enumerate();
             if forward {
-                // Right after anchoring, a top-level comment under the cursor is
-                // the "next" one: it was not selected before.
+                // Right after anchoring, a top-level comment under the cursor counts as next.
                 let stay = was_free && rows.get(view.cursor).is_some_and(|r| r.depth == 0);
                 let from = if stay { view.cursor } else { view.cursor + 1 };
                 indexed
                     .find(|(i, r)| *i >= from && r.depth == 0)
                     .map(|(i, _)| i)
             } else {
-                // Right after anchoring below a comment's header, that header is the
-                // "previous" one: the thread itself, or the reply's thread.
+                // Right after anchoring below a header, that header's thread counts as previous.
                 let stay = was_free && view.row_starts.get(view.cursor) < Some(&view.scroll);
                 let before = if stay { view.cursor + 1 } else { view.cursor };
                 indexed
@@ -1779,8 +1814,8 @@ impl App {
         };
         match (target, reading) {
             (Some(i), _) => view.cursor = i,
-            // No thread that way: keep reading. Going up from the first thread, the
-            // thread before is the post, as with `k` on the first comment.
+            // No thread that way: keep reading. Up from the first thread, the previous one
+            // is the post.
             (None, Some((cursor, left))) => {
                 view.cursor = cursor;
                 view.left = left;
@@ -1794,8 +1829,8 @@ impl App {
         }
     }
 
-    /// Fold/unfold the comment under the cursor, or load "more replies". While
-    /// reading the post it only selects a comment (see [`Anchor::Select`]).
+    /// Fold or unfold the comment under the cursor, or load more replies; while reading
+    /// it only selects (see [`Anchor::Select`]).
     pub fn activate_comment(&mut self) {
         enum Action {
             Toggle(String),
@@ -1870,8 +1905,8 @@ impl App {
             && let Some(view) = &mut self.post_view
             && let Some(page) = &view.page
         {
-            // Turned on at the post's top: show the image there now. Until the next
-            // draw, changes in the same key pass treat the top as showing it.
+            // Turned on at the post's top: show the image now; same-pass changes treat the
+            // top as showing it.
             let media = &page.post.media;
             let url = media.preview_image().map(str::to_string);
             if view.scroll == 0 {
@@ -1889,10 +1924,38 @@ impl App {
         });
     }
 
+    pub fn post_focused(&self) -> bool {
+        self.focus == Focus::Post && self.post_view.is_some()
+    }
+
+    pub fn sidebar_width(&self) -> u16 {
+        if !self.show_sidebar {
+            0
+        } else if self.width >= 110 {
+            SIDEBAR_WIDE
+        } else {
+            SIDEBAR_NARROW
+        }
+    }
+
+    pub fn detail_fits(&self) -> bool {
+        self.width.saturating_sub(self.sidebar_width()) >= MAIN_MIN_WIDTH + DETAIL_MIN_WIDTH
+    }
+
+    pub fn resize(&mut self, width: u16) {
+        self.width = width;
+        if self.focus == Focus::List && self.post_view.is_some() && !self.detail_fits() {
+            self.focus = Focus::Post;
+        }
+    }
+
     pub fn toggle_sidebar(&mut self) {
         self.show_sidebar = !self.show_sidebar;
-        self.sidebar_focused = false;
+        if self.focus == Focus::Sidebar {
+            self.focus_main();
+        }
         self.sidebar_peek = false;
+        self.resize(self.width);
     }
 
     /// Tab indexes in sidebar order: Home, Bookmarks, subscriptions, opened tabs.
@@ -1913,15 +1976,16 @@ impl App {
             self.show_sidebar = true;
             self.sidebar_peek = true;
         }
-        self.sidebar_focused = true;
+        self.focus = Focus::Sidebar;
     }
 
     pub fn focus_main(&mut self) {
-        self.sidebar_focused = false;
+        self.focus = Focus::List;
         if self.sidebar_peek {
             self.show_sidebar = false;
             self.sidebar_peek = false;
         }
+        self.resize(self.width);
     }
 
     /// Switch to the tab `delta` rows away in the sidebar, stopping at the ends.
@@ -1940,13 +2004,44 @@ impl App {
         self.move_sidebar(if last { isize::MAX } else { isize::MIN });
     }
 
+    /// The open post's image or video poster, fetched ahead of everything else queued.
     fn request_image(&mut self, url: &str) {
+        self.fetch_image(url, false);
+    }
+
+    /// A picture in post or comment text, fetched in the background once: a failed one
+    /// waits for `r` or `S`.
+    pub fn request_text_picture(&mut self, url: &str) {
+        if !self.images.contains_key(url) {
+            self.fetch_image(url, true);
+        }
+    }
+
+    /// A picture in post or comment text now far from view: let it go, loaded or still
+    /// queued (the fetch is skipped), so the ones in view come first. Asked for again
+    /// when near.
+    pub fn drop_text_picture(&mut self, url: &str) {
+        if !matches!(self.images.get(url), Some(ImageSlot::Failed(_))) {
+            self.images.remove(url);
+            self.pool.unwant_image(url);
+        }
+    }
+
+    fn fetch_image(&mut self, url: &str, background: bool) {
         if matches!(self.images.get(url), None | Some(ImageSlot::Failed(_))) {
             self.images.insert(url.to_string(), ImageSlot::Loading);
             self.pool.want_image(url);
-            self.pool.submit(Job::Image {
-                url: url.to_string(),
-            });
+            // A fetch still queued for it runs now that it is wanted again.
+            if self
+                .queued_images
+                .insert(url.to_string(), background)
+                .is_none()
+            {
+                self.pool.submit(Job::Image {
+                    url: url.to_string(),
+                    background,
+                });
+            }
         }
     }
 
@@ -1960,13 +2055,11 @@ impl App {
         self.show_images && !self.no_images_possible()
     }
 
-    /// NO_COLOR with half-blocks: half-block images are nothing but colors.
     fn no_images_possible(&self) -> bool {
         self.no_color && self.image_picker.protocol_type() == ProtocolType::Halfblocks
     }
 
-    /// A thumbnail or icon URL to draw: not one that failed to load. (Row slots are
-    /// reserved by the list either way; a failed image leaves its slot blank.)
+    /// A thumbnail or icon URL to draw, unless it failed; its row slot is reserved regardless.
     pub fn usable_thumb<'a>(&self, url: Option<&'a str>) -> Option<&'a str> {
         url.filter(|u| !matches!(self.thumbs.get(*u), Some(ImageSlot::Failed(_))))
     }
@@ -1985,8 +2078,8 @@ impl App {
         self.usable_thumb(icon.map(String::as_str))
     }
 
-    /// After a frame: load the thumbnails it drew, let queued off-screen ones be skipped,
-    /// and bound the cache (past the limit, keep what is on screen or in flight).
+    /// After a frame: load drawn thumbnails, let off-screen queued ones be skipped, and past
+    /// `THUMB_CACHE_MAX` keep only what is on screen or in flight.
     pub fn thumbs_drawn(&mut self, urls: &[&str]) {
         self.pool.set_on_screen(urls);
         for url in urls {
@@ -2028,8 +2121,7 @@ impl App {
         let Some(post) = self.current_post() else {
             return;
         };
-        let browser = self.config.commands.browser.clone();
-        match media::spawn_detached(&browser, &[post.reddit_url()]) {
+        match media::spawn_detached(&self.config.commands.browser, &[post.reddit_url()]) {
             Ok(()) => self.info("Opened on reddit.com"),
             Err(e) => self.error(format!("{e:#}")),
         }
@@ -2057,8 +2149,7 @@ impl App {
         } else {
             "Bookmark removed"
         });
-        // Bookmarks are deliberate; never lose one to a crash or closed terminal.
-        // Saved after the message so a save error replaces it.
+        // Persist bookmarks at once; after the message so a save error replaces it.
         self.persist();
     }
 
@@ -2066,45 +2157,45 @@ impl App {
         let Some(post) = self.current_post() else {
             return;
         };
-        let media = post.media.clone();
-        self.hand_off_media(&post.permalink, media);
+        self.hand_off_media(&post.permalink, post.media);
     }
 
     fn hand_off_media(&mut self, permalink: &str, media: Media) {
-        let commands = self.config.commands.clone();
-        let result = match media {
-            Media::None => {
-                self.info("This post has no media");
-                return;
+        let commands = &self.config.commands;
+        let result = if let Some(url) = media.video_url() {
+            let started = media::spawn_detached(&commands.video, &[self.redlib.absolute(url)]);
+            // The window plays it now: the inline copy waits, so two do not sound.
+            if started.is_ok()
+                && let Some(player) = &mut self.video
+                && !player.paused()
+            {
+                player.toggle_pause(Instant::now());
             }
-            Media::Image { url } => {
-                self.download_images(permalink, vec![url]);
-                return;
-            }
-            Media::Gallery { images, .. } if !images.is_empty() => {
-                self.download_images(permalink, images);
-                return;
-            }
-            Media::Video { url: Some(url), .. } => {
-                let started = media::spawn_detached(&commands.video, &[self.redlib.absolute(&url)]);
-                // The window plays it now: the inline copy waits, so two do not sound.
-                if started.is_ok()
-                    && let Some(player) = &mut self.video
-                    && !player.paused()
-                {
-                    player.toggle_pause(Instant::now());
+            started
+        } else {
+            match media {
+                Media::None => {
+                    self.info("This post has no media");
+                    return;
                 }
-                started
-            }
-            Media::Link { url, .. } => media::spawn_detached(&commands.browser, &[url]),
-            Media::Gallery { .. } | Media::Video { url: None, .. } => {
-                if self.pending_media.insert(permalink.to_string()) {
-                    self.pool.submit(Job::ResolveMedia {
-                        permalink: permalink.to_string(),
-                    });
+                Media::Image { url } => {
+                    self.download_images(permalink, vec![url]);
+                    return;
                 }
-                self.info("Fetching media…");
-                return;
+                Media::Gallery { images, .. } if !images.is_empty() => {
+                    self.download_images(permalink, images);
+                    return;
+                }
+                Media::Link { url, .. } => media::spawn_detached(&commands.browser, &[url]),
+                Media::Gallery { .. } | Media::Video { .. } => {
+                    if self.pending_media.insert(permalink.to_string()) {
+                        self.pool.submit(Job::ResolveMedia {
+                            permalink: permalink.to_string(),
+                        });
+                    }
+                    self.info("Fetching media…");
+                    return;
+                }
             }
         };
         match result {
@@ -2113,8 +2204,8 @@ impl App {
         }
     }
 
-    /// Download images for the viewer once per post; a second `m` while the first
-    /// download runs would open the viewer twice.
+    /// One image download per post at a time, so a second `m` while it runs can't open
+    /// the viewer twice.
     fn download_images(&mut self, permalink: &str, urls: Vec<String>) {
         if !self.pending_media.insert(permalink.to_string()) {
             self.info("Already downloading…");
@@ -2147,10 +2238,9 @@ impl App {
 
     // ----- picker -----------------------------------------------------------
 
-    /// Picker rows for the typed text: tabs whose name starts with it, then
-    /// "open r/<text>" for a new subreddit, then tabs that merely contain it,
-    /// then fuzzy matches. Row 0 is the default, so a new name is never
-    /// hijacked by a longer subscription that happens to contain it.
+    /// Picker rows: tabs starting with the input, then "open r/<input>", then tabs
+    /// containing it, then fuzzy matches. Row 0 is the default, so a new name isn't
+    /// hijacked by a longer subscription containing it.
     pub fn picker_entries(&self, input: &str) -> Vec<PickerEntry> {
         use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
         use nucleo_matcher::{Config as MatcherConfig, Matcher};
@@ -2174,11 +2264,10 @@ impl App {
                 inside.push((i, t));
             }
         }
-        // Exact name first among prefix matches.
         prefix.sort_by_key(|(_, t)| name_of(t) != lower);
         let mut entries: Vec<PickerEntry> = prefix.into_iter().map(tab_entry).collect();
-        // Only a subreddit tab with this exact name makes "open r/<query>" redundant;
-        // Home and Bookmarks are not subreddits.
+        // Only an exact subreddit tab makes "open r/<query>" redundant; Home and Bookmarks
+        // aren't subreddits.
         let exact = self
             .tabs
             .iter()
@@ -2304,8 +2393,7 @@ impl App {
                             *thumb = Some(listing_thumb.clone());
                         }
                         let image = page.post.media.preview_image().map(str::to_string);
-                        // A bookmark learns a spoiler tag the post page has and the
-                        // listing it was saved from may predate.
+                        // The bookmark learns a spoiler tag its saved listing may lack.
                         if page.post.spoiler {
                             self.state.mark_bookmark_spoiler(&page.post.id);
                         }
@@ -2337,8 +2425,7 @@ impl App {
                 match result {
                     Ok(replies) => {
                         view.content_changed = true;
-                        // Rows above the cursor may grow: keep the selected comment
-                        // selected, and the text being read where it is.
+                        // Rows above may grow: keep the selection and the text being read in place.
                         let mut selected = view.cursor_key();
                         if !view.more_handoff
                             && view.free_scroll
@@ -2391,8 +2478,8 @@ impl App {
                                 from_expansion: false,
                             });
                             if source.may_replace(sources.more) {
-                                // An empty preview has no replacement row: keep
-                                // the active More target until terminal delivery.
+                                // An empty preview has no replacement row: keep the More
+                                // target until terminal delivery.
                                 if !refreshing {
                                     c.more = None;
                                 }
@@ -2410,7 +2497,7 @@ impl App {
                         view.reselect(selected);
                         view.row_starts.clear();
                         // A selected or read More row follows its first inserted reply,
-                        // even while a newer continuation remains pending.
+                        // even with a newer continuation pending.
                         let reading = view.keep_reading.take();
                         view.keep_reading =
                             reading.map(|(key, offset, scroll)| match (&key, more_at) {
@@ -2433,10 +2520,13 @@ impl App {
                 }
             }
             Msg::Image { url, result } => {
-                // A post closed since the request cleared its entry: drop the image.
-                if self.images.contains_key(&url) {
+                self.queued_images.remove(&url);
+                // Only a picture still waiting takes it: one dropped or closed since, or
+                // already loaded by an earlier fetch, does not.
+                if matches!(self.images.get(&url), Some(ImageSlot::Loading)) {
                     let slot = match result {
                         Ok(img) => ImageSlot::Ready {
+                            pixels: (img.width(), img.height()),
                             protocol: Box::new(self.image_picker.new_resize_protocol(img)),
                             refresh: ImageRefresh::Idle,
                         },
@@ -2445,18 +2535,29 @@ impl App {
                     self.images.insert(url, slot);
                 }
             }
-            // Its post closed: nothing waits for it.
-            Msg::ImageSkipped => {}
+            // Skipped as unwanted; wanted again since (the slot waits), it goes back in.
+            Msg::ImageSkipped { url } => {
+                if let Some(background) = self.queued_images.remove(&url)
+                    && matches!(self.images.get(&url), Some(ImageSlot::Loading))
+                {
+                    self.queued_images.insert(url.clone(), background);
+                    self.pool.submit(Job::Image { url, background });
+                }
+            }
             Msg::Thumb { url, result } => {
                 let slot = match result {
-                    Ok(img) => ImageSlot::Ready {
-                        protocol: Box::new(self.image_picker.new_resize_protocol(img)),
-                        refresh: if refreshing {
-                            ImageRefresh::Loading
-                        } else {
-                            ImageRefresh::Idle
-                        },
-                    },
+                    Ok(img) => {
+                        let img = fill_slot(img, self.image_picker.font_size());
+                        ImageSlot::Ready {
+                            pixels: (img.width(), img.height()),
+                            protocol: Box::new(self.image_picker.new_resize_protocol(img)),
+                            refresh: if refreshing {
+                                ImageRefresh::Loading
+                            } else {
+                                ImageRefresh::Idle
+                            },
+                        }
+                    }
                     Err(e) => {
                         if let Some(ImageSlot::Ready { refresh, .. }) = self.thumbs.get_mut(&url) {
                             *refresh = if refreshing {
@@ -2471,8 +2572,8 @@ impl App {
                 };
                 self.thumbs.insert(url, slot);
             }
-            // Forget it, so the row loads it again if it scrolls back into view. A
-            // skipped refresh of a shown image keeps it.
+            // Forget it so it reloads if it scrolls back; a skipped refresh of a shown
+            // image keeps it.
             Msg::ThumbSkipped { url } => {
                 if let Some(ImageSlot::Ready { refresh, .. }) = self.thumbs.get_mut(&url) {
                     *refresh = ImageRefresh::Needed;
@@ -2495,20 +2596,20 @@ impl App {
                     Err(e) => self.error(format!("media: {e}")),
                 }
             }
-            Msg::ImagesDownloaded { permalink, result } => match result {
-                Ok(paths) => {
-                    self.pending_media.remove(&permalink);
-                    let args: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-                    match media::spawn_detached(&self.config.commands.image, &args) {
-                        Ok(()) => self.info("Opened media"),
-                        Err(e) => self.error(format!("{e:#}")),
+            Msg::ImagesDownloaded { permalink, result } => {
+                self.pending_media.remove(&permalink);
+                match result {
+                    Ok(paths) => {
+                        let args: Vec<String> =
+                            paths.iter().map(|p| p.display().to_string()).collect();
+                        match media::spawn_detached(&self.config.commands.image, &args) {
+                            Ok(()) => self.info("Opened media"),
+                            Err(e) => self.error(format!("{e:#}")),
+                        }
                     }
+                    Err(e) => self.error(format!("image download: {e}")),
                 }
-                Err(e) => {
-                    self.pending_media.remove(&permalink);
-                    self.error(format!("image download: {e}"))
-                }
-            },
+            }
             Msg::Health(up) => {
                 let was = self.redlib_up;
                 self.redlib_up = Some(up);
@@ -2525,8 +2626,8 @@ impl App {
                             CommandEnd::Running => "is running",
                         };
                         self.info(format!("{} {done}; reloading what failed", argv.join(" ")));
-                        // Unknown until the check answers, so it does not report
-                        // "Redlib is back; press r" for what was just reloaded.
+                        // Unknown until the check answers, so a reload doesn't announce
+                        // "Redlib is back".
                         self.redlib_up = None;
                         self.check_health();
                         self.reload_failed();
@@ -2657,7 +2758,6 @@ impl App {
         }
         feed.pending.remove(&generation);
         feed.refreshing.remove(&generation);
-        feed.loading = !feed.pending.is_empty();
         let cursor = if append {
             feed.requests
                 .get(&generation)
@@ -2668,15 +2768,13 @@ impl App {
             None
         };
         match result {
-            // Cached and refreshed pages enter through the same transition.
             Ok(listing) => {
                 let failed_next = feed.page_failed().then(|| feed.after.clone()).flatten();
                 let same_query = feed.shown_query.as_ref() == Some(&feed.query());
                 let selected = same_query
                     .then(|| {
-                        feed.posts
-                            .iter()
-                            .filter(|p| !self.config.hides(p))
+                        self.config
+                            .visible(&feed.posts)
                             .nth(feed.selected)
                             .map(|p| p.id.clone())
                     })
@@ -2708,11 +2806,7 @@ impl App {
                 if !append {
                     feed.freshness = Some(freshness);
                 }
-                let visible: Vec<_> = feed
-                    .posts
-                    .iter()
-                    .filter(|p| !self.config.hides(p))
-                    .collect();
+                let visible: Vec<_> = self.config.visible(&feed.posts).collect();
                 feed.selected = selected
                     .and_then(|id| visible.iter().position(|p| p.id == id))
                     .unwrap_or(if same_query { feed.selected } else { 0 })
@@ -2720,17 +2814,19 @@ impl App {
                 feed.offset = feed.selected.saturating_sub(screen_row);
                 feed.loaded = true;
                 feed.shown_query = Some(feed.query());
-                let baseline = feed.is_default_view().then(|| feed.posts.clone());
-                if let (Some(name), Some(posts)) = (tab.subreddit().map(str::to_string), baseline) {
-                    self.state.baseline(&name, &posts, now());
+                let feed = &tab.feed;
+                if feed.is_default_view()
+                    && let Some(name) = tab.subreddit()
+                {
+                    self.state.baseline(name, &feed.posts, now());
                 }
                 if let (Some(name), Some(icon)) = (tab.subreddit(), listing.icon) {
                     self.icons.insert(name.to_lowercase(), icon);
                 }
             }
             Err(e) => {
-                // Suppress only when comparable reservations or observed starts
-                // prove this failure predates the page already shown.
+                // Suppress only when reservations or observed starts prove this failure
+                // predates the shown page.
                 if feed
                     .pages
                     .iter()
@@ -2749,9 +2845,8 @@ impl App {
                         source: freshness.source,
                     },
                 );
-                // A failed load of a new sort, time range or search must not leave the
-                // previous query's posts and cursor behind: `L` would append the new
-                // query's next page to them. A failed reload of the same query keeps them.
+                // A failed load of a new query must not leave the old query's posts and cursor
+                // (`L` would append to them); a failed reload of the same query keeps them.
                 if !append && feed.shown_query.as_ref() != Some(&feed.query()) {
                     feed.posts.clear();
                     feed.after = None;
@@ -2785,34 +2880,17 @@ impl App {
         let selected = (index == self.home.group)
             .then(|| {
                 self.home_group_posts(&self.home.groups[index])
-                    .get(self.home.post)
+                    .nth(self.home.post)
                     .map(|p| p.id.clone())
             })
             .flatten();
         let group = &mut self.home.groups[index];
         group.loading = false;
         match result {
-            Ok(listing) => {
-                group.posts = listing.posts.clone();
-                group.error = None;
-                if let Some(icon) = &listing.icon {
-                    self.icons.insert(subreddit.to_lowercase(), icon.clone());
-                }
-                self.state.baseline(subreddit, &listing.posts, now());
-                // A refresh can return fewer posts: keep the selection on one.
-                if index == self.home.group {
-                    let shown = self.home_group_posts(&self.home.groups[index]);
-                    self.home.post = selected
-                        .and_then(|id| shown.iter().position(|p| p.id == id))
-                        .unwrap_or(self.home.post)
-                        .min(shown.len().saturating_sub(1));
-                }
+            Ok(mut listing) => {
                 // Home and the default first page share a cache key and response ordering.
-                let query = FeedQuery::Listing {
-                    sort: Sort::Hot,
-                    time: TimeRange::Day,
-                };
-                if let Some(i) = self.tabs.iter().position(|tab| {
+                let query = FeedQuery::HOME;
+                let seeded_tab = self.tabs.iter().position(|tab| {
                     let feed = &tab.feed;
                     tab.subreddit() == Some(subreddit)
                         && feed.query() == query
@@ -2821,12 +2899,32 @@ impl App {
                                 .pages
                                 .first()
                                 .is_none_or(|page| freshness.source.may_replace(page.source)))
-                }) {
+                });
+                // Only a seeded tab needs its own copy of the first page.
+                group.posts = if seeded_tab.is_some() {
+                    listing.posts.clone()
+                } else {
+                    std::mem::take(&mut listing.posts)
+                };
+                group.error = None;
+                if let Some(icon) = &listing.icon {
+                    self.icons.insert(subreddit.to_lowercase(), icon.clone());
+                }
+                self.state.baseline(subreddit, &group.posts, now());
+                // A refresh can return fewer posts: keep the selection on one.
+                if index == self.home.group {
+                    let shown: Vec<_> = self.home_group_posts(&self.home.groups[index]).collect();
+                    self.home.post = selected
+                        .and_then(|id| shown.iter().position(|p| p.id == id))
+                        .unwrap_or(self.home.post)
+                        .min(shown.len().saturating_sub(1));
+                }
+                if let Some(i) = seeded_tab {
                     let generation = self.generation();
                     let tab = &mut self.tabs[i];
                     let feed = &mut tab.feed;
-                    // Pending first pages stay: one that started after this response
-                    // is newer and replaces it; an older one is rejected by its source.
+                    // Pending first pages stay: a newer one replaces this response; an
+                    // older one is rejected by its source.
                     feed.requests.retain(|id, cursor| {
                         cursor.is_some()
                             || feed.pending.contains(id)
@@ -2943,8 +3041,8 @@ fn merge_replies(
 ) {
     let expansion = matches!(kind, ReplyMerge::Expansion { .. });
     let reorder = matches!(kind, ReplyMerge::Expansion { reorder: true });
-    // A More response replaces its previous contributions, not children already
-    // supplied by the parent page. Independently newer content still wins.
+    // A More response replaces its own earlier contributions, not children from the
+    // parent page; newer content still wins.
     if expansion {
         existing.retain(|old| {
             !old.sources.is_some_and(|sources| sources.from_expansion)
@@ -2980,8 +3078,8 @@ fn merge_replies(
             continue;
         };
         if reorder && allow_new && existing[at].sources.is_some_and(|old| old.from_expansion) {
-            // Only this parent list establishes sibling rank. Nested freshness
-            // protects fields, not position. Leave absent/parent-owned slots alone.
+            // Only this parent list sets sibling rank; nested freshness protects fields,
+            // not position. Leave absent or parent-owned slots alone.
             if let Some(slot) = (next_slot..existing.len()).find(|&i| {
                 existing[i].sources.is_some_and(|old| old.from_expansion)
                     && (i == at
@@ -3057,6 +3155,74 @@ fn step(current: usize, delta: isize, len: usize) -> usize {
 mod tests {
     use super::*;
     use crate::model::Media;
+
+    #[test]
+    fn when_a_list_picture_arrives_it_should_be_cut_to_the_slots_shape_around_its_middle() {
+        // 8×16 px cells: a 4×2-cell slot is 32×32 px, square.
+        let font = ratatui_image::FontSize::new(8, 16);
+        // A wide picture whose middle third is red: the crop keeps exactly that.
+        let wide = image::RgbImage::from_fn(300, 100, |x, _| {
+            if (100..200).contains(&x) {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            }
+        });
+
+        let cut = fill_slot(image::DynamicImage::ImageRgb8(wide), font).to_rgb8();
+        let tall = fill_slot(image::DynamicImage::new_rgb8(100, 300), font);
+
+        assert_eq!(cut.dimensions(), (100, 100));
+        assert!(
+            cut.pixels().all(|p| p.0 == [255, 0, 0]),
+            "the middle, not an edge"
+        );
+        assert_eq!((tall.width(), tall.height()), (100, 100));
+    }
+
+    #[test]
+    fn a_second_fetch_of_a_loaded_picture_should_not_replace_it() {
+        let mut app = app_with(&[]);
+        let url = "/preview/pre/twice.png";
+        app.request_text_picture(url);
+        let image = |side| Ok(image::DynamicImage::new_rgb8(side, side));
+
+        app.on_msg(Msg::Image {
+            url: url.into(),
+            result: image(10),
+        });
+        app.on_msg(Msg::Image {
+            url: url.into(),
+            result: image(20),
+        });
+
+        assert!(matches!(
+            app.images.get(url),
+            Some(ImageSlot::Ready {
+                pixels: (10, 10),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_picture_asked_for_again_while_still_queued_should_be_fetched_once() {
+        let (mut app, messages) = app_with_messages(&[]);
+        let url = "/preview/pre/once.png";
+        app.request_text_picture(url);
+        app.drop_text_picture(url);
+        app.request_text_picture(url);
+
+        let mut fetched = 0;
+        while let Ok(msg) = messages.recv_timeout(std::time::Duration::from_secs(1)) {
+            if matches!(&msg, Msg::Image { url: u, .. } if u == url) {
+                fetched += 1;
+            }
+            app.on_msg(msg);
+        }
+
+        assert_eq!(fetched, 1);
+    }
 
     fn app_with(subscriptions: &[&str]) -> App {
         app_with_messages(subscriptions).0
@@ -3296,7 +3462,7 @@ mod tests {
         );
         app.move_selection(1);
         assert!(
-            !app.tabs[i].feed.loading,
+            !app.tabs[i].feed.loading(),
             "must not retry on every key after a failure"
         );
     }
@@ -3442,18 +3608,14 @@ mod tests {
         let mut app = app_with(&[]);
         app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
         let generation = app.post_view.as_ref().unwrap().generation;
-        app.on_msg(Msg::Post {
+        app.on_msg(thread_message(
             generation,
-            result: Ok(Box::new(PostPage {
-                post: post("p", "s"),
-                body: String::new(),
-                comments: vec![
-                    comment("c1", vec![], Some("/r/s/comments/p/x/c1")),
-                    comment("c2", vec![], None),
-                    comment("c3", vec![], None),
-                ],
-            })),
-        });
+            vec![
+                comment("c1", vec![], Some("/r/s/comments/p/x/c1")),
+                comment("c2", vec![], None),
+                comment("c3", vec![], None),
+            ],
+        ));
         let view = app.post_view.as_mut().unwrap();
         view.free_scroll = false;
         view.cursor = 3; // rows: c1, more, c2, c3
@@ -3481,17 +3643,13 @@ mod tests {
         let mut app = app_with(&[]);
         app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
         let generation = app.post_view.as_ref().unwrap().generation;
-        app.on_msg(Msg::Post {
+        app.on_msg(thread_message(
             generation,
-            result: Ok(Box::new(PostPage {
-                post: post("p", "s"),
-                body: String::new(),
-                comments: vec![
-                    comment("c1", vec![], Some("/r/s/comments/p/x/c1")),
-                    comment("c2", vec![], Some("/r/s/comments/p/x/c2")),
-                ],
-            })),
-        });
+            vec![
+                comment("c1", vec![], Some("/r/s/comments/p/x/c1")),
+                comment("c2", vec![], Some("/r/s/comments/p/x/c2")),
+            ],
+        ));
         let view = app.post_view.as_mut().unwrap();
         view.free_scroll = false;
         view.cursor = 3; // rows: c1, more(c1), c2, more(c2)
@@ -3638,14 +3796,10 @@ mod tests {
         let mut app = app_with(&[]);
         app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
         let generation = app.post_view.as_ref().unwrap().generation;
-        app.on_msg(Msg::Post {
+        app.on_msg(thread_message(
             generation,
-            result: Ok(Box::new(PostPage {
-                post: post("p", "s"),
-                body: String::new(),
-                comments: vec![comment("c1", vec![], None), comment("c2", vec![], None)],
-            })),
-        });
+            vec![comment("c1", vec![], None), comment("c2", vec![], None)],
+        ));
         app.post_view.as_mut().unwrap().row_starts = vec![4, 8];
 
         app.jump_top_level(true);
@@ -3659,14 +3813,10 @@ mod tests {
         let mut app = app_with(&[]);
         app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
         let generation = app.post_view.as_ref().unwrap().generation;
-        app.on_msg(Msg::Post {
+        app.on_msg(thread_message(
             generation,
-            result: Ok(Box::new(PostPage {
-                post: post("p", "s"),
-                body: String::new(),
-                comments: vec![comment("c1", vec![], None), comment("c2", vec![], None)],
-            })),
-        });
+            vec![comment("c1", vec![], None), comment("c2", vec![], None)],
+        ));
         app.post_view.as_mut().unwrap().row_starts = vec![4, 8];
         let at_top = |app: &App| {
             let view = app.post_view.as_ref().unwrap();
@@ -3702,16 +3852,12 @@ mod tests {
         let mut app = app_with(&[]);
         app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
         let generation = app.post_view.as_ref().unwrap().generation;
-        app.on_msg(Msg::Post {
+        app.on_msg(thread_message(
             generation,
-            result: Ok(Box::new(PostPage {
-                post: post("p", "s"),
-                body: String::new(),
-                comments: ["c1", "c2", "c3"]
-                    .map(|id| comment(id, vec![], None))
-                    .into(),
-            })),
-        });
+            ["c1", "c2", "c3"]
+                .map(|id| comment(id, vec![], None))
+                .into(),
+        ));
         // A long body, then comments at lines 100-139 (tall), 140-149 and 150 on
         // (the last, tall); 20 lines show.
         let press_at = |app: &mut App, scroll: usize, key: fn(&mut App)| {
@@ -3771,18 +3917,14 @@ mod tests {
         let mut app = app_with(&[]);
         app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
         let generation = app.post_view.as_ref().unwrap().generation;
-        app.on_msg(Msg::Post {
+        app.on_msg(thread_message(
             generation,
-            result: Ok(Box::new(PostPage {
-                post: post("p", "s"),
-                body: String::new(),
-                comments: vec![comment(
-                    "c",
-                    vec![comment("r1", vec![], None), comment("r2", vec![], None)],
-                    None,
-                )],
-            })),
-        });
+            vec![comment(
+                "c",
+                vec![comment("r1", vec![], None), comment("r2", vec![], None)],
+                None,
+            )],
+        ));
         // Rows c, r1, r2 at lines 100 (tall), 125 and 135; the screen shows 120-139.
         let view = app.post_view.as_mut().unwrap();
         view.row_starts = vec![100, 125, 135];
@@ -3811,16 +3953,12 @@ mod tests {
         let mut app = app_with(&[]);
         app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
         let generation = app.post_view.as_ref().unwrap().generation;
-        app.on_msg(Msg::Post {
+        app.on_msg(thread_message(
             generation,
-            result: Ok(Box::new(PostPage {
-                post: post("p", "s"),
-                body: String::new(),
-                comments: ["c0", "c1", "c2", "c3"]
-                    .map(|id| comment(id, vec![], None))
-                    .into(),
-            })),
-        });
+            ["c0", "c1", "c2", "c3"]
+                .map(|id| comment(id, vec![], None))
+                .into(),
+        ));
         // Rows of 6 lines plus a blank line; `h` left c1 (lines 12-17).
         let view = app.post_view.as_mut().unwrap();
         view.row_starts = vec![5, 12, 19, 26];
@@ -3845,18 +3983,14 @@ mod tests {
         let replies = ["a1", "a2", "a3"]
             .map(|id| comment(id, vec![], None))
             .into();
-        app.on_msg(Msg::Post {
+        app.on_msg(thread_message(
             generation,
-            result: Ok(Box::new(PostPage {
-                post: post("p", "s"),
-                body: String::new(),
-                comments: vec![
-                    comment("a", replies, None),
-                    comment("b", vec![], None),
-                    comment("c", vec![], None),
-                ],
-            })),
-        });
+            vec![
+                comment("a", replies, None),
+                comment("b", vec![], None),
+                comment("c", vec![], None),
+            ],
+        ));
         // Positions of the last draw: a, a1, a2, a3, b, c.
         let view = app.post_view.as_mut().unwrap();
         view.row_starts = vec![10, 14, 18, 22, 26, 30];
@@ -4118,17 +4252,13 @@ mod tests {
         let mut app = app_with(&[]);
         app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
         let generation = app.post_view.as_ref().unwrap().generation;
-        app.on_msg(Msg::Post {
+        app.on_msg(thread_message(
             generation,
-            result: Ok(Box::new(PostPage {
-                post: post("p", "s"),
-                body: String::new(),
-                comments: vec![
-                    comment("c1", vec![comment("reply", vec![], None)], None),
-                    comment("c2", vec![], None),
-                ],
-            })),
-        });
+            vec![
+                comment("c1", vec![comment("reply", vec![], None)], None),
+                comment("c2", vec![], None),
+            ],
+        ));
         let view = app.post_view.as_mut().unwrap();
         view.cursor = 2;
         view.free_scroll = false;
@@ -4136,18 +4266,14 @@ mod tests {
         view.drawn_cursor = Some(2);
         view.scroll = 21;
 
-        app.on_msg(Msg::Post {
+        app.on_msg(thread_message(
             generation,
-            result: Ok(Box::new(PostPage {
-                post: post("p", "s"),
-                body: String::new(),
-                comments: vec![
-                    comment("new", vec![], None),
-                    comment("c1", vec![], Some("/more")),
-                    comment("c2", vec![], None),
-                ],
-            })),
-        });
+            vec![
+                comment("new", vec![], None),
+                comment("c1", vec![], Some("/more")),
+                comment("c2", vec![], None),
+            ],
+        ));
 
         let view = app.post_view.as_mut().unwrap();
         assert!(matches!(view.cursor_key(), Some(RowKey::Comment(id)) if id == "c2"));
@@ -4191,18 +4317,14 @@ mod tests {
         let mut app = app_with(&[]);
         app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
         let generation = app.post_view.as_ref().unwrap().generation;
-        app.on_msg(Msg::Post {
+        app.on_msg(thread_message(
             generation,
-            result: Ok(Box::new(PostPage {
-                post: post("p", "s"),
-                body: String::new(),
-                comments: vec![comment(
-                    "parent",
-                    vec![comment("reply", vec![comment("child", vec![], None)], None)],
-                    None,
-                )],
-            })),
-        });
+            vec![comment(
+                "parent",
+                vec![comment("reply", vec![comment("child", vec![], None)], None)],
+                None,
+            )],
+        ));
         let mut updated = comment("reply", vec![], Some("/more"));
         updated.body = "edited reply".into();
 
@@ -4272,23 +4394,15 @@ mod tests {
         let mut app = app_with(&[]);
         app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
         let generation = app.post_view.as_ref().unwrap().generation;
-        app.on_msg(Msg::Post {
+        app.on_msg(thread_message(
             generation,
-            result: Ok(Box::new(PostPage {
-                post: post("p", "s"),
-                body: String::new(),
-                comments: vec![comment("leaf", vec![], None)],
-            })),
-        });
+            vec![comment("leaf", vec![], None)],
+        ));
 
-        app.on_msg(Msg::Post {
+        app.on_msg(thread_message(
             generation,
-            result: Ok(Box::new(PostPage {
-                post: post("p", "s"),
-                body: String::new(),
-                comments: vec![comment("leaf", vec![], Some("/new-replies"))],
-            })),
-        });
+            vec![comment("leaf", vec![], Some("/new-replies"))],
+        ));
 
         assert!(matches!(app.post_view.as_ref().unwrap().rows()[1].kind,
             RowKind::More { more, .. } if more.path == "/new-replies"));
@@ -4786,11 +4900,11 @@ mod tests {
         app.move_selection(1);
 
         assert!(
-            !app.tabs[i].feed.loading,
+            !app.tabs[i].feed.loading(),
             "navigation must not retry the failed cursor"
         );
         app.load_feed(i, true);
-        assert!(app.tabs[i].feed.loading, "L still explicitly retries");
+        assert!(app.tabs[i].feed.loading(), "L still explicitly retries");
     }
 
     fn thread_message(generation: u64, comments: Vec<Comment>) -> Msg {

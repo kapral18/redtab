@@ -11,24 +11,22 @@ use crate::model::Post;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Base URL of the Redlib instance.
     pub redlib_url: String,
-    /// Subreddits listed inline, in tab order.
+    /// Inline subreddits, in tab order.
     pub subscriptions: Vec<String>,
     /// File with more subreddits; defaults to `subscriptions` next to the config file.
     pub subscriptions_file: Option<PathBuf>,
     /// Posts per subreddit group on the Home wall.
     pub home_posts_per_group: usize,
     pub show_nsfw: bool,
-    /// Show images: inline in the post view (kitty/iTerm2/sixel, else half-blocks), plus list
-    /// thumbnails and subreddit icons with a graphics protocol.
+    /// Inline images, list thumbnails and subreddit icons.
     pub image_preview: bool,
-    /// Command offered when Redlib is down, e.g. `["docker", "start", "redlib"]`.
+    /// Offered when Redlib is down, e.g. `["docker", "start", "redlib"]`.
     pub redlib_start_command: Option<Vec<String>>,
     pub filters: Filters,
     pub highlight: Highlight,
     pub commands: Commands,
-    /// The file this config came from; names it in errors.
+    /// Source file, for error messages.
     #[serde(skip)]
     pub path: PathBuf,
 }
@@ -40,7 +38,6 @@ pub struct Filters {
     pub keywords: Vec<String>,
     /// Hide posts with any of these flairs (case-insensitive, exact).
     pub flairs: Vec<String>,
-    /// Hide posts by these authors.
     pub authors: Vec<String>,
 }
 
@@ -56,9 +53,9 @@ pub struct Highlight {
 pub struct Commands {
     /// Opens Reddit links and external URLs.
     pub browser: Vec<String>,
-    /// Plays videos in a window (`m`); receives the stream URL.
+    /// Plays a stream URL in a window (`m`).
     pub video: Vec<String>,
-    /// Opens full-size images; receives one or more local image file paths.
+    /// Opens local image files.
     pub image: Vec<String>,
 }
 
@@ -229,11 +226,8 @@ impl Config {
         if post.nsfw && !self.show_nsfw {
             return true;
         }
-        let title = post.title.to_lowercase();
         let f = &self.filters;
-        f.keywords
-            .iter()
-            .any(|k| !k.is_empty() && title.contains(&k.to_lowercase()))
+        contains_keyword(&post.title, &f.keywords)
             || post
                 .flair
                 .as_deref()
@@ -244,12 +238,22 @@ impl Config {
     }
 
     pub fn highlights(&self, post: &Post) -> bool {
-        let title = post.title.to_lowercase();
-        self.highlight
-            .keywords
-            .iter()
-            .any(|k| !k.is_empty() && title.contains(&k.to_lowercase()))
+        contains_keyword(&post.title, &self.highlight.keywords)
     }
+
+    pub fn visible<'a>(&self, posts: &'a [Post]) -> impl Iterator<Item = &'a Post> {
+        posts.iter().filter(|p| !self.hides(p))
+    }
+}
+
+fn contains_keyword(text: &str, keywords: &[String]) -> bool {
+    if keywords.is_empty() {
+        return false;
+    }
+    let text = text.to_lowercase();
+    keywords
+        .iter()
+        .any(|k| !k.is_empty() && text.contains(&k.to_lowercase()))
 }
 
 /// A subreddit name as people write it: `/r/vim/`, `R/rust`, `r/tmux # note`,

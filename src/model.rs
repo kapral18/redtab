@@ -1,8 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Media attached to a post, as Redlib renders it. URLs are Redlib-relative
-/// (`/img/…`, `/preview/…`, `/hls/…`) or absolute for external links.
+/// Post media. URLs are Redlib-relative (`/img/…`, `/hls/…`) or absolute for links.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Media {
     #[default]
@@ -11,17 +10,16 @@ pub enum Media {
         url: String,
     },
     Video {
-        /// Direct video or HLS playlist; empty when Redlib serves no playable source.
+        /// File or HLS playlist; `None` when Redlib has no playable source.
         url: Option<String>,
         poster: Option<String>,
     },
     Gallery {
         images: Vec<String>,
-        /// Listing preview; listings carry no image list, only this thumbnail.
+        /// Listing thumbnail; only post pages list the images.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thumb: Option<String>,
     },
-    /// External link post; `thumb` is the preview image when Redlib has one.
     Link {
         url: String,
         thumb: Option<String>,
@@ -29,10 +27,10 @@ pub enum Media {
 }
 
 impl Media {
-    /// Short tag for list views.
     pub fn tag(&self) -> Option<String> {
         match self {
             Media::None => None,
+            Media::Image { .. } if self.video_url().is_some() => Some("gif".into()),
             Media::Image { .. } => Some("image".into()),
             Media::Video { .. } => Some("video".into()),
             Media::Gallery { images, .. } if images.is_empty() => Some("gallery".into()),
@@ -41,32 +39,50 @@ impl Media {
         }
     }
 
-    /// The best still image to preview inline.
-    pub fn preview_image(&self) -> Option<&str> {
+    /// Playable media, including GIFs stored as images in Redlib pages and bookmarks.
+    pub fn video_url(&self) -> Option<&str> {
         match self {
-            Media::Image { url } => Some(url),
-            Media::Video { poster, .. } => poster.as_deref(),
-            Media::Gallery { images, .. } => images.first().map(String::as_str),
-            Media::Link { thumb, .. } => thumb.as_deref(),
-            Media::None => None,
+            Media::Video { url, .. } => url.as_deref(),
+            Media::Image { url } if is_gif(url) => Some(url),
+            _ => None,
         }
     }
 
-    /// Whether a post view shows something under the header: a still image, or a
-    /// video that plays there.
-    pub fn shows_inline(&self) -> bool {
-        self.preview_image().is_some() || matches!(self, Media::Video { url: Some(_), .. })
+    /// The best still image to preview inline. A link's preview picture is not one: shown
+    /// under the post it reads as the post's own image (it stays the list thumbnail).
+    pub fn preview_image(&self) -> Option<&str> {
+        match self {
+            Media::Image { url } => self.video_url().is_none().then_some(url),
+            Media::Video { poster, .. } => poster.as_deref(),
+            Media::Gallery { images, .. } => images.first().map(String::as_str),
+            Media::Link { .. } | Media::None => None,
+        }
     }
 
-    /// The image for a list-row thumbnail.
+    /// Whether the post view shows an image or plays a video under the header.
+    pub fn shows_inline(&self) -> bool {
+        self.preview_image().is_some() || self.video_url().is_some()
+    }
+
+    /// GIF image posts list their first frame (the fetch stops after it).
     pub fn list_thumb(&self) -> Option<&str> {
         match self {
             Media::Gallery { images, thumb } => {
                 thumb.as_deref().or(images.first().map(String::as_str))
             }
+            Media::Image { url } => Some(url),
+            Media::Link { thumb, .. } => thumb.as_deref(),
             _ => self.preview_image(),
         }
     }
+}
+
+/// A `.gif` path, whatever its query or fragment.
+fn is_gif(url: &str) -> bool {
+    url.split(['?', '#']).next().is_some_and(|path| {
+        path.rsplit_once('.')
+            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("gif"))
+    })
 }
 
 pub fn domain_of(url: &str) -> Option<String> {
@@ -85,36 +101,37 @@ pub struct Post {
     pub score: Option<i64>,
     pub comments: u64,
     pub created: Option<DateTime<Utc>>,
-    /// Redlib's relative age ("3h ago") at fetch time; display uses `created` when known.
+    /// Redlib's fetch-time age text; display prefers `created`.
     pub age: String,
-    /// Path of the comments page, e.g. `/r/neovim/comments/abc/title/`.
+    /// e.g. `/r/neovim/comments/abc/title/`.
     pub permalink: String,
     pub media: Media,
     pub stickied: bool,
     pub nsfw: bool,
-    /// Tagged spoiler: its media and body stay hidden until revealed.
+    /// Media and body stay hidden until revealed.
     #[serde(default)]
     pub spoiler: bool,
 }
 
-/// Inline spoiler text (`>!…!<`) in a body is wrapped in these two characters, so
-/// the post view can mask it until you reveal it. Unicode noncharacters: never meant
-/// for interchange, and the parser removes any that arrive in Reddit's text.
+/// Wrap inline `>!spoiler!<` text so the view can mask it. Unicode noncharacters;
+/// the parser strips any that arrive in Reddit text.
 pub const SPOILER_START: char = '\u{FDD0}';
 pub const SPOILER_END: char = '\u{FDD1}';
+/// Starts a line of post or comment text that stands for a picture, its URL after it. A
+/// noncharacter too, stripped from Reddit text like the spoiler marks.
+pub const PICTURE: char = '\u{FDD2}';
 
 impl Post {
     pub fn reddit_url(&self) -> String {
         format!("https://www.reddit.com{}", self.permalink)
     }
 
-    /// Age relative to `now`, falling back to Redlib's text when the time is unknown.
     pub fn age_at(&self, now: DateTime<Utc>) -> String {
         age_at(self.created, &self.age, now)
     }
 }
 
-/// `created` relative to `now`; Redlib's fetch-time text when the time is unknown.
+/// `created` relative to `now`, else Redlib's fetch-time text.
 fn age_at(created: Option<DateTime<Utc>>, fetched: &str, now: DateTime<Utc>) -> String {
     let Some(created) = created else {
         return fetched.to_owned();
@@ -134,7 +151,7 @@ pub struct Listing {
     pub posts: Vec<Post>,
     /// Cursor for the next page (`t3_…`), absent on the last page.
     pub after: Option<String>,
-    /// The subreddit's icon; only subreddit listings carry one.
+    /// Only subreddit listings carry one.
     pub icon: Option<String>,
 }
 
@@ -265,6 +282,45 @@ impl TimeRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn when_image_urls_have_gif_extensions_they_should_play_as_video() {
+        for (url, expected) in [
+            ("/img/a.GIF", Some("/img/a.GIF")),
+            ("/img/a.gif?width=640&s=x", Some("/img/a.gif?width=640&s=x")),
+            ("/img/a.gif#t", Some("/img/a.gif#t")),
+            ("/img/a.gifv", None),
+            ("/img/a.jpeg", None),
+            ("/img/gif", None),
+            ("", None),
+        ] {
+            let media = Media::Image { url: url.into() };
+
+            assert_eq!(media.video_url(), expected, "{url:?}");
+        }
+    }
+
+    #[test]
+    fn when_a_gif_post_lists_it_should_have_a_thumbnail_but_no_still_preview() {
+        let media = Media::Image {
+            url: "/img/a.gif".into(),
+        };
+
+        assert_eq!(media.list_thumb(), Some("/img/a.gif"));
+        assert_eq!(media.preview_image(), None, "it plays as video instead");
+    }
+
+    #[test]
+    fn a_link_post_should_list_its_preview_but_not_show_it_as_the_posts_picture() {
+        let media = Media::Link {
+            url: "https://claude.ai/artifact/x".into(),
+            thumb: Some("/preview/external-pre/t.png".into()),
+        };
+
+        assert_eq!(media.list_thumb(), Some("/preview/external-pre/t.png"));
+        assert_eq!(media.preview_image(), None);
+        assert!(!media.shows_inline());
+    }
 
     #[test]
     fn gallery_media_saved_before_thumbnails_still_loads() {

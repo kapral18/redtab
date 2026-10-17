@@ -4,9 +4,9 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
+use base64::Engine;
 
-/// Start `argv + extra` detached from the TUI (no shared stdio) and reap it
-/// in the background so it never becomes a zombie.
+/// Spawns `argv + extra` with no shared stdio and reaps it in the background.
 pub fn spawn_detached(argv: &[String], extra: &[String]) -> Result<()> {
     let (program, args) = argv.split_first().context("empty command in config")?;
     let mut child = Command::new(program)
@@ -23,8 +23,7 @@ pub fn spawn_detached(argv: &[String], extra: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Copy text with the platform clipboard tool, falling back to OSC 52,
-/// which most modern terminals (Ghostty, kitty, WezTerm, iTerm2) accept.
+/// Copies with the platform clipboard tool, else OSC 52.
 pub fn copy(text: &str) -> Result<&'static str> {
     let candidates: &[(&str, &[&str])] = &[
         ("pbcopy", &[]),
@@ -33,19 +32,7 @@ pub fn copy(text: &str) -> Result<&'static str> {
         ("xsel", &["--clipboard", "--input"]),
     ];
     for (program, args) in candidates {
-        let Ok(mut child) = Command::new(program)
-            .args(*args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        else {
-            continue;
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(text.as_bytes())?;
-        }
-        if child.wait()?.success() {
+        if copy_with(program, args, text) {
             return Ok(program);
         }
     }
@@ -53,35 +40,36 @@ pub fn copy(text: &str) -> Result<&'static str> {
     Ok("OSC 52")
 }
 
+/// Whether `program` took all of `text` and succeeded; always waited for.
+fn copy_with(program: &str, args: &[&str], text: &str) -> bool {
+    let Ok(mut child) = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let wrote = child
+        .stdin
+        .take()
+        .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+    child.wait().is_ok_and(|status| status.success()) && wrote
+}
+
 fn osc52(text: &str) -> Result<()> {
     if text.len() > 74_994 {
         bail!("text too long for OSC 52");
     }
     let mut out = std::io::stdout();
-    write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()))?;
+    write!(
+        out,
+        "\x1b]52;c;{}\x07",
+        base64::engine::general_purpose::STANDARD.encode(text)
+    )?;
     out.flush()?;
     Ok(())
-}
-
-fn base64(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(TABLE[((n >> (18 - 6 * i)) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -89,18 +77,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base64_matches_rfc4648_vectors() {
-        let vectors = [
-            ("", ""),
-            ("f", "Zg=="),
-            ("fo", "Zm8="),
-            ("foo", "Zm9v"),
-            ("foob", "Zm9vYg=="),
-            ("fooba", "Zm9vYmE="),
-            ("foobar", "Zm9vYmFy"),
-        ];
-        for (input, expected) in vectors {
-            assert_eq!(base64(input.as_bytes()), expected, "{input}");
-        }
+    fn when_the_tool_reads_all_input_and_succeeds_the_copy_should_count() {
+        assert!(copy_with(
+            "sh",
+            &["-c", "cat > /dev/null"],
+            &"x".repeat(1 << 22)
+        ));
+    }
+
+    #[test]
+    fn when_the_tool_stops_reading_the_copy_should_fail_so_the_next_way_is_tried() {
+        // More than any default pipe holds, so the write fails.
+        assert!(!copy_with(
+            "sh",
+            &["-c", "exec 0<&-; exit 0"],
+            &"x".repeat(1 << 22)
+        ));
     }
 }

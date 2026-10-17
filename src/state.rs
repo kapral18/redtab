@@ -1,5 +1,4 @@
-//! Local reading state: which posts you have seen or opened, and bookmarks.
-//! Stored as JSON in `$XDG_STATE_HOME/redtab/state.json`.
+//! Reading state (seen and opened posts, bookmarks) in `$XDG_STATE_HOME/redtab/state.json`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -22,8 +21,7 @@ pub struct State {
     read: HashMap<String, i64>,
     #[serde(default)]
     bookmarks: Vec<Bookmark>,
-    /// Removed bookmarks: post id → removal time. Persisted so a merge with
-    /// another instance's older copy does not bring a removed bookmark back.
+    /// Removed bookmarks: id → removal time, so merging an older copy can't resurrect them.
     #[serde(default)]
     removed: HashMap<String, i64>,
     /// Set when the file exists but cannot be read: never overwrite it.
@@ -38,10 +36,9 @@ pub struct Bookmark {
 }
 
 impl State {
-    /// Load state. A file that is not valid state JSON is moved aside; a file
-    /// that cannot be read at all is left alone and saving is turned off.
+    /// Invalid JSON is moved aside; an unreadable file is left alone and saving is disabled.
     pub fn load(path: &Path) -> (Self, Option<String>) {
-        // Work on a symlink's target: a bad file is moved aside there, not the link.
+        // Act on a symlink's target, never the link.
         let path = &resolve_link(path);
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
@@ -63,7 +60,7 @@ impl State {
         match serde_json::from_slice(&bytes) {
             Ok(state) => (state, None),
             Err(e) => {
-                // A second bad file must not replace the first backup: give it a new name.
+                // Never overwrite an earlier backup.
                 let mut aside = path.with_extension("json.bad");
                 if aside.exists() {
                     let stamp = std::time::SystemTime::now()
@@ -94,15 +91,14 @@ impl State {
     }
 }
 
-/// The file a path names: a symlink's target, also when that target does not exist
-/// yet (a dangling link, through any chain of links), so writing never replaces a
-/// link with a regular file.
+/// The file `path` names, following links even to a missing target, so writes never
+/// replace a link.
 fn resolve_link(path: &Path) -> std::path::PathBuf {
     if let Ok(real) = std::fs::canonicalize(path) {
         return real;
     }
     let mut current = path.to_path_buf();
-    // The same cap as the kernel's: a loop of links must not spin.
+    // The kernel's cap, so a link loop can't spin.
     for _ in 0..40 {
         let Ok(target) = std::fs::read_link(&current) else {
             break;
@@ -117,18 +113,15 @@ fn resolve_link(path: &Path) -> std::path::PathBuf {
 
 /// How long a save waits for another instance's save before giving up.
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-/// A directory lock older than this was likely left by a crash (a save takes
-/// milliseconds): the error then tells the user how to clear it.
+/// A lockdir older than this is likely a crash's leftover; the error says how to clear it.
 const STALE_LOCK: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Held while one instance reads, merges and replaces the state file; released on
-/// drop. Saves of several redtab instances take turns, so none drops another's changes.
+/// Held from reading to replacing the state file, so concurrent instances' saves take turns.
 enum SaveLock {
     /// `flock(2)` on `state.json.lock`; the file stays.
     Flock(#[allow(dead_code)] std::fs::File),
-    /// `state.json.lockdir`, for filesystems where `flock` never works (some network
-    /// mounts): creating a directory is atomic everywhere. The two schemes do not see
-    /// each other, so this is safe only when every instance gets the fallback.
+    /// `state.json.lockdir` where `flock` never works (some network mounts). It can't see
+    /// `flock` holders, so it's safe only when every instance falls back.
     Dir(std::path::PathBuf),
 }
 
@@ -143,7 +136,7 @@ impl Drop for SaveLock {
 /// What a failed non-blocking `flock` means for the save.
 #[derive(Debug, PartialEq, Eq)]
 enum FlockFailure {
-    /// Someone holds it, or a signal interrupted: try again until the deadline.
+    /// Held elsewhere or interrupted: retry until the deadline.
     Busy,
     /// This filesystem has no `flock`: use the directory lock.
     Unsupported,
@@ -153,8 +146,7 @@ enum FlockFailure {
 fn flock_failure(errno: Option<i32>) -> FlockFailure {
     match errno {
         Some(libc::EWOULDBLOCK | libc::EINTR) => FlockFailure::Busy,
-        // ENOTSUP and EOPNOTSUPP differ on macOS, are equal on Linux; ENOSYS comes
-        // from filesystems mounted without flock support (Lustre).
+        // ENOTSUP and EOPNOTSUPP differ on macOS; ENOSYS comes from mounts without flock (Lustre).
         Some(code)
             if [libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOLCK, libc::ENOSYS].contains(&code) =>
         {
@@ -177,7 +169,7 @@ fn lock(target: &Path) -> Result<SaveLock> {
         .mode(0o600)
         .open(&path)
         .with_context(|| format!("cannot open {}", path.display()))?;
-    // Polled with a deadline: a stalled instance must not freeze this one's quit.
+    // Bounded: a stalled instance must not freeze this one's quit.
     let deadline = std::time::Instant::now() + LOCK_WAIT;
     loop {
         // SAFETY: flock on a descriptor this function owns; no memory is involved.
@@ -198,10 +190,9 @@ fn lock(target: &Path) -> Result<SaveLock> {
     }
 }
 
-/// The lock for filesystems without `flock`: whoever creates `state.json.lockdir`
-/// holds it, and only the holder removes it. A lock is never broken automatically:
-/// "is it stale?" then "remove it" is not atomic, so a breaker could remove a newer
-/// holder's lock. A lock left by a crash blocks saves, and the error says to delete it.
+/// Lock for filesystems without `flock`: the creator of `state.json.lockdir` holds it and
+/// only it removes it. Never broken automatically (check-then-remove isn't atomic), so a
+/// crash's leftover blocks saves until deleted.
 fn dir_lock(target: &Path) -> Result<SaveLock> {
     let path = target.with_extension("json.lockdir");
     let deadline = std::time::Instant::now() + LOCK_WAIT;
@@ -211,8 +202,7 @@ fn dir_lock(target: &Path) -> Result<SaveLock> {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e).with_context(|| format!("cannot lock {}", path.display())),
         }
-        // A save takes milliseconds: a lock this old is no save to wait for. Saying
-        // so at once spares the UI a 2 s freeze on every save until it is deleted.
+        // A lock this old isn't a save in progress: fail now rather than freeze 2 s per save.
         let age = std::fs::symlink_metadata(&path)
             .and_then(|m| m.modified())
             .ok()
@@ -239,9 +229,8 @@ fn busy(target: &Path) -> anyhow::Error {
 }
 
 impl State {
-    /// Write state, first merging what other redtab instances saved meanwhile.
-    /// Fails without touching the file when it could not be read at start, or when
-    /// it is now unreadable or not valid state: overwriting would lose what only it holds.
+    /// Merges other instances' saves, then writes. Refuses to overwrite a file that was
+    /// or became unreadable or invalid.
     pub fn save(&mut self, path: &Path, now: i64) -> Result<()> {
         use std::io::Write;
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -249,18 +238,16 @@ impl State {
         if self.read_only {
             anyhow::bail!("not saving: {} could not be read at start", path.display());
         }
-        // Write through a symlink to its target, so the link stays a link.
         let target = resolve_link(path);
         if let Some(dir) = target.parent() {
-            // Reading history is private: a new state directory is the owner's only.
+            // Reading history is private.
             std::fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
                 .create(dir)
                 .with_context(|| format!("cannot create {}", dir.display()))?;
         }
-        // Another instance's save between our read and our rename would be lost:
-        // hold the lock from the read until the rename. Released when dropped.
+        // Hold the lock from read to rename, or another instance's save in between is lost.
         let _lock = lock(&target)?;
         match std::fs::read(&target) {
             Ok(bytes) => {
@@ -277,8 +264,7 @@ impl State {
         }
         self.prune(now);
         let json = serde_json::to_vec(self)?;
-        // Every save holds the lock, which is never broken, so one temp name is
-        // safe; the next save removes a crash's leftover.
+        // Saves are serialized, so one temp name suffices; the next save removes a leftover.
         let tmp = target.with_extension("json.tmp");
         let write = || -> std::io::Result<()> {
             let _ = std::fs::remove_file(&tmp);
@@ -292,7 +278,7 @@ impl State {
                 file.set_permissions(meta.permissions())?;
             }
             file.write_all(&json)?;
-            // On disk before the rename, so a crash cannot leave an empty state file.
+            // Durable before the rename, so a crash can't leave an empty file.
             file.sync_all()?;
             std::fs::rename(&tmp, &target)
         };
@@ -325,8 +311,7 @@ impl State {
         for b in disk.bookmarks {
             match self.bookmarks.iter_mut().find(|m| m.post.id == b.post.id) {
                 Some(mine) if b.saved_at > mine.saved_at => *mine = b,
-                // The same save: a spoiler tag one instance learned from the post
-                // page sticks, whichever instance writes last.
+                // Same save: a spoiler tag learned by either instance sticks.
                 Some(mine) if b.saved_at == mine.saved_at => mine.post.spoiler |= b.post.spoiler,
                 Some(_) => {}
                 None => self.bookmarks.push(b),
@@ -350,8 +335,7 @@ impl State {
         self.removed.retain(|_, t| *t >= cutoff);
     }
 
-    /// First time a subreddit loads, its current posts become the baseline,
-    /// so only posts that appear later count as new.
+    /// A subreddit's first load sets the baseline; only later posts count as new.
     pub fn baseline(&mut self, subreddit: &str, posts: &[Post], now: i64) {
         let key = subreddit.to_lowercase();
         if !self.seen.contains_key(&key) {
@@ -359,8 +343,7 @@ impl State {
         }
     }
 
-    /// Record posts as seen; refreshing the time keeps long-pinned posts from
-    /// expiring and later reappearing as new.
+    /// Refreshing the time keeps long-pinned posts from expiring and reappearing as new.
     pub fn mark_seen<'a>(
         &mut self,
         subreddit: &str,
@@ -383,16 +366,17 @@ impl State {
     }
 
     pub fn unseen<'a>(&self, subreddit: &str, posts: impl IntoIterator<Item = &'a Post>) -> usize {
+        let seen = self.seen.get(&subreddit.to_lowercase());
         posts
             .into_iter()
-            .filter(|p| !self.is_seen(subreddit, &p.id))
+            .filter(|p| !self.is_read(&p.id) && seen.is_none_or(|ids| !ids.contains_key(&p.id)))
             .count()
     }
 
     pub fn mark_read(&mut self, post: &Post, now: i64) {
         self.read.insert(post.id.clone(), now);
-        // Seen only where a first load already set the baseline: a list created
-        // here would make that first load skip it and show the rest as new.
+        // Only where a baseline exists: creating the list here would skip the first
+        // load's baseline.
         if let Some(ids) = self.seen.get_mut(&post.subreddit.to_lowercase()) {
             ids.insert(post.id.clone(), now);
         }
@@ -410,19 +394,16 @@ impl State {
         self.bookmarks.iter().any(|b| b.post.id == id)
     }
 
-    /// Mark a bookmarked post spoiler-tagged when its post page says so; the listing
-    /// it was saved from may predate the tag. A tag is only ever added (merges OR
-    /// it), so a removed tag keeps the post hidden behind `v`. The rest of the stored
-    /// copy stays: the listing's small thumbnails are what the Bookmarks list draws.
+    /// Tags a bookmark spoiler when its post page says so; the saved listing may predate
+    /// the tag. Tags are only added (merges OR them); the rest of the copy is kept.
     pub fn mark_bookmark_spoiler(&mut self, id: &str) {
         if let Some(b) = self.bookmarks.iter_mut().find(|b| b.post.id == id) {
             b.post.spoiler = true;
         }
     }
 
-    /// Add or remove a bookmark; returns true when the post is now bookmarked.
-    /// Each event is stamped strictly after the previous one for the post, so
-    /// remove/re-add within one second still orders correctly across instances.
+    /// Adds or removes a bookmark; true when now bookmarked. Each event is stamped after
+    /// the post's previous one, so a same-second remove and re-add still order correctly.
     pub fn toggle_bookmark(&mut self, post: &Post, now: i64) -> bool {
         if let Some(i) = self.bookmarks.iter().position(|b| b.post.id == post.id) {
             let saved_at = self.bookmarks.remove(i).saved_at;

@@ -1,6 +1,5 @@
-//! Rendering: a vertical tab sidebar on the left, the active view on the
-//! right. Takes `&mut App` to keep scroll offsets in sync with what fits and
-//! to load the thumbnails it draws.
+//! Rendering: tab sidebar, the active list and, when it fits, the open post beside it.
+//! Takes `&mut App` to keep scroll offsets in sync and to load the thumbnails it draws.
 
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
@@ -8,17 +7,20 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
 use ratatui_image::picker::ProtocolType;
-use ratatui_image::{Image, StatefulImage};
+use ratatui_image::{Image, Resize, StatefulImage};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Group, ImageSlot, Overlay, PickerEntry, PostView, RowKind, Tab, TabKind};
-use crate::model::{Media, Post, SPOILER_END, SPOILER_START, Sort};
+use crate::app::{
+    App, CARD_MIN_WIDTH, DETAIL_MIN_WIDTH, Focus, Group, ImageSlot, MAIN_MIN_WIDTH, Overlay,
+    PickerEntry, PostView, RowKind, Tab, TabKind,
+};
+use crate::model::{Media, PICTURE, Post, SPOILER_END, SPOILER_START, Sort};
 use crate::video;
 
 /// Catppuccin Mocha, with Reddit orange as the accent.
@@ -45,14 +47,9 @@ mod theme {
 }
 use theme::*;
 
-const SIDEBAR_WIDE: u16 = 30;
-const SIDEBAR_NARROW: u16 = 24;
-const CARD_MIN_WIDTH: u16 = 54;
-const IMAGE_MAX_HEIGHT: u16 = 20;
-/// A post-row thumbnail, after the selection bar. Its third row is the blank
-/// line under the post, so rows keep their height.
-const THUMB_COLS: u16 = 6;
-const THUMB_ROWS: u16 = 3;
+/// Post-row thumbnail after the selection bar, as tall as the post's two lines.
+pub const THUMB_COLS: u16 = 4;
+pub const THUMB_ROWS: u16 = 2;
 /// Columns a thumbnail slot takes from a row's text: the image and a gap.
 const THUMB_RESERVE: usize = THUMB_COLS as usize + 1;
 /// A subreddit icon: one line tall.
@@ -66,13 +63,8 @@ struct ImageSpot {
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let sidebar_width = if !app.show_sidebar {
-        0
-    } else if area.width >= 110 {
-        SIDEBAR_WIDE
-    } else {
-        SIDEBAR_NARROW
-    };
+    app.resize(area.width);
+    let sidebar_width = app.sidebar_width();
     let [sidebar, main] =
         Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(20)]).areas(area);
     let mut spots = Vec::new();
@@ -80,18 +72,41 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_sidebar(f, app, sidebar, &mut spots);
     }
     let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(main);
-    let body = body.inner(Margin {
+    let (main, detail) = if app.post_view.is_some() {
+        if app.detail_fits() {
+            let main_width = (body.width / 5 * 2).max(MAIN_MIN_WIDTH);
+            let [main, detail] = Layout::horizontal([
+                Constraint::Length(main_width),
+                Constraint::Min(DETAIL_MIN_WIDTH),
+            ])
+            .areas(body);
+            f.render_widget(
+                Block::default().borders(Borders::LEFT).border_style(
+                    Style::new().fg(if app.post_focused() { ACCENT } else { SURFACE1 }),
+                ),
+                detail,
+            );
+            (main, Some(detail))
+        } else {
+            (Rect::default(), Some(body))
+        }
+    } else {
+        (body, None)
+    };
+    let margin = Margin {
         horizontal: 1,
         vertical: 0,
-    });
-    if app.post_view.is_some() {
-        draw_post(f, app, body);
-    } else {
+    };
+    if !main.is_empty() {
+        let body = main.inner(margin);
         match app.active_tab().kind {
             TabKind::Home => draw_home(f, app, body, &mut spots),
             TabKind::Bookmarks => draw_bookmarks(f, app, body, &mut spots),
             TabKind::Subreddit { .. } => draw_feed(f, app, body, &mut spots),
         }
+    }
+    if let Some(detail) = detail {
+        draw_post(f, app, detail.inner(margin));
     }
     draw_footer(f, app, footer);
     app.status_drawn();
@@ -108,8 +123,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// NO_COLOR: drop every color the frame set, keeping bold and other modifiers.
-/// Image placeholder cells keep theirs: kitty reads the image id from the color.
+/// NO_COLOR: drop colors, keep modifiers. Image placeholder cells keep theirs: kitty
+/// reads the image id from the color.
 pub fn strip_colors(buf: &mut ratatui::buffer::Buffer) {
     for cell in &mut buf.content {
         if !cell.symbol().contains('\u{10EEEE}') {
@@ -121,13 +136,15 @@ pub fn strip_colors(buf: &mut ratatui::buffer::Buffer) {
 
 /// Draw loaded thumbnails and icons; start loading the missing ones.
 fn draw_spots(f: &mut Frame, app: &mut App, spots: &[ImageSpot]) {
-    // An overlay would cover images drawn under it. kitty gets an image's data
-    // only once, in its first cell, so a covered first cell would lose it for good;
-    // sixel and iTerm2 would keep stale overlay pixels. Draw them once it closes.
+    // Nothing under an overlay: kitty sends image data once, in the first cell, and
+    // sixel and iTerm2 would leave stale pixels.
     if app.overlay.is_none() {
         for spot in spots {
             if let Some(ImageSlot::Ready { protocol, .. }) = app.thumbs.get_mut(&spot.url) {
-                f.render_stateful_widget(StatefulImage::default(), spot.area, protocol.as_mut());
+                // Cut to the slot's shape on arrival (`fill_slot`): scaled, it fills it.
+                let fill = StatefulImage::default()
+                    .resize(Resize::Scale(Some(ratatui_image::FilterType::Triangle)));
+                f.render_stateful_widget(fill, spot.area, protocol.as_mut());
             }
         }
     }
@@ -135,19 +152,17 @@ fn draw_spots(f: &mut Frame, app: &mut App, spots: &[ImageSpot]) {
     app.thumbs_drawn(&urls);
 }
 
-/// The thumbnail a post row shows, when thumbnails are on.
 fn row_thumb<'a>(app: &App, post: &'a Post) -> Option<&'a str> {
-    // A spoiler's picture is the spoiler: its slot stays empty.
+    // A spoiler's picture is the spoiler.
     if !app.thumbnails_on() || post.spoiler {
         return None;
     }
     app.usable_thumb(post.media.list_thumb())
 }
 
-/// The thumbnail slot for a list's rows: every row gets it when any post in the list
-/// has an image, so scores and titles stay in one column; text-only lists keep full width.
+/// Thumbnail slot width for a list: every row gets it if any non-spoiler post has a
+/// thumbnail, so columns align.
 fn thumb_reserve<'a>(app: &App, mut posts: impl Iterator<Item = &'a Post>) -> usize {
-    // Only posts that draw a thumbnail count: a spoiler's slot stays empty.
     if app.thumbnails_on() && posts.any(|p| !p.spoiler && p.media.list_thumb().is_some()) {
         THUMB_RESERVE
     } else {
@@ -155,7 +170,6 @@ fn thumb_reserve<'a>(app: &App, mut posts: impl Iterator<Item = &'a Post>) -> us
     }
 }
 
-/// The icon a subreddit tab shows.
 fn tab_icon<'a>(app: &'a App, tab: &Tab) -> Option<&'a str> {
     match &tab.kind {
         TabKind::Subreddit { name, .. } => app.shown_icon(name),
@@ -183,8 +197,7 @@ fn score_color(score: Option<i64>) -> Color {
     }
 }
 
-/// Cut `s` to `width` columns with an ellipsis. Works on grapheme clusters, so an
-/// emoji sequence or a combining mark is kept whole or dropped whole.
+/// Cut `s` to `width` columns with an ellipsis, on grapheme boundaries.
 fn truncate(s: &str, width: usize) -> String {
     if s.width() <= width {
         return s.to_string();
@@ -203,7 +216,6 @@ fn truncate(s: &str, width: usize) -> String {
     out
 }
 
-/// A rounded label: ` text ` on a colored background.
 fn chip(text: impl Into<String>, fg: Color, bg: Color) -> Span<'static> {
     Span::styled(format!(" {} ", text.into()), Style::new().fg(fg).bg(bg))
 }
@@ -219,7 +231,7 @@ fn key_chip(key: &str) -> Span<'static> {
 }
 
 fn pad_to(spans: &mut Vec<Span<'static>>, width: usize, style: Style) {
-    let used: usize = spans.iter().map(|s| s.content.width()).sum();
+    let used = line_width(spans);
     if used < width {
         spans.push(Span::styled(" ".repeat(width - used), style));
     }
@@ -305,7 +317,6 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect, spots: &mut Vec<ImageSpot>
         brand,
     );
 
-    // Build the row model: Home, Bookmarks, subscriptions, then opened tabs.
     let mut rows = vec![SideRow::Tab(0), SideRow::Tab(1)];
     let (pinned, opened) = app.sidebar_tabs();
     if !pinned.is_empty() {
@@ -397,16 +408,16 @@ fn sidebar_item(app: &App, index: usize, width: usize) -> Line<'static> {
     let tab = &app.tabs[index];
     let active = index == app.active;
     let (icon, name) = match &tab.kind {
-        TabKind::Home => ("⌂", "Home".to_string()),
-        TabKind::Bookmarks => ("★", "Bookmarks".to_string()),
-        TabKind::Subreddit { name, .. } => ("#", name.clone()),
+        TabKind::Home => ("⌂", "Home"),
+        TabKind::Bookmarks => ("★", "Bookmarks"),
+        TabKind::Subreddit { name, .. } => ("#", name.as_str()),
     };
     let badge = match tab.kind {
         TabKind::Bookmarks => app.state.bookmarks().len(),
         _ => app.badge(tab),
     };
     // With focus in the sidebar, its row stands out more than the list's selection.
-    let base = match (active, app.sidebar_focused) {
+    let base = match (active, app.focus == Focus::Sidebar) {
         (true, true) => Style::new().bg(SURFACE1),
         (true, false) => Style::new().bg(SURFACE0),
         (false, _) => Style::new(),
@@ -441,7 +452,7 @@ fn sidebar_item(app: &App, index: usize, width: usize) -> Line<'static> {
     } else {
         base.fg(SUBTEXT)
     };
-    spans.push(Span::styled(truncate(&name, name_width), name_style));
+    spans.push(Span::styled(truncate(name, name_width), name_style));
     pad_to(&mut spans, width.saturating_sub(badge_text.width()), base);
     if !badge_text.is_empty() {
         let (fg, bg) = match tab.kind {
@@ -458,13 +469,7 @@ fn sidebar_item(app: &App, index: usize, width: usize) -> Line<'static> {
 
 // ----- main header ---------------------------------------------------------
 
-fn view_header(
-    f: &mut Frame,
-    area: Rect,
-    title: &str,
-    chips: Vec<Span<'static>>,
-    subtitle: Option<String>,
-) -> Rect {
+fn view_header(f: &mut Frame, area: Rect, title: &str, chips: Vec<Span<'static>>) -> Rect {
     let [head, rest] = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(area);
     let mut spans = vec![Span::styled(
         format!(" {title} "),
@@ -477,11 +482,7 @@ fn view_header(
         spans.push(Span::raw(" "));
         spans.push(c);
     }
-    let mut lines = vec![Line::raw(""), Line::from(spans)];
-    if let Some(sub) = subtitle {
-        lines[0] = Line::styled(sub, Style::new().fg(OVERLAY));
-        lines.swap(0, 1);
-    }
+    let lines = vec![Line::raw(""), Line::from(spans)];
     f.render_widget(Paragraph::new(lines), head);
     rest
 }
@@ -499,16 +500,16 @@ fn sort_chip(sort: Sort) -> Span<'static> {
 
 // ----- post cards ----------------------------------------------------------
 
-struct CardOpts {
+struct CardOpts<'a> {
     selected: bool,
-    seen_key: Option<String>,
+    seen_key: Option<&'a str>,
     show_subreddit: bool,
     /// Columns after the selection bar kept free of text, for a thumbnail.
     reserve: usize,
 }
 
 /// Two lines per post: score gutter + title, comment gutter + meta chips.
-fn post_card(app: &App, post: &Post, width: usize, opts: &CardOpts) -> [Line<'static>; 2] {
+fn post_card(app: &App, post: &Post, width: usize, opts: &CardOpts<'_>) -> [Line<'static>; 2] {
     let now = Utc::now();
     let bg = if opts.selected {
         Style::new().bg(SURFACE0)
@@ -517,11 +518,13 @@ fn post_card(app: &App, post: &Post, width: usize, opts: &CardOpts) -> [Line<'st
     };
     let unseen = opts
         .seen_key
-        .as_deref()
         .is_some_and(|k| !app.state.is_seen(k, &post.id));
     let read = app.state.is_read(&post.id);
-    // The list's selection dims while the sidebar has focus.
-    let bar_color = if app.sidebar_focused { OVERLAY } else { ACCENT };
+    let bar_color = if app.focus == Focus::List {
+        ACCENT
+    } else {
+        OVERLAY
+    };
     let bar = Span::styled(if opts.selected { "▌" } else { " " }, bg.fg(bar_color));
 
     let score = post.score.map_or("•".into(), format_count);
@@ -608,6 +611,7 @@ fn post_card(app: &App, post: &Post, width: usize, opts: &CardOpts) -> [Line<'st
 
 fn media_label(media: &Media, tag: &str) -> String {
     let icon = match media {
+        Media::Image { .. } if media.video_url().is_some() => "▶",
         Media::Image { .. } => "▣",
         Media::Video { .. } => "▶",
         Media::Gallery { .. } => "▦",
@@ -660,7 +664,7 @@ fn draw_post_list(
         }
         let opts = CardOpts {
             selected: i == spec.selected,
-            seen_key: spec.seen_key.map(str::to_string),
+            seen_key: spec.seen_key,
             show_subreddit: spec.show_subreddit,
             reserve,
         };
@@ -702,12 +706,11 @@ fn draw_scrollbar(f: &mut Frame, area: Rect, offset: usize, visible: usize, tota
 // ----- home wall -----------------------------------------------------------
 
 fn card_height(app: &App, group: &Group) -> u16 {
-    let shown = app.home_group_posts(group).len().max(1) as u16;
+    let shown = app.home_group_posts(group).count().max(1) as u16;
     // borders + top/bottom padding + 2 lines per post + a gap between posts
     2 + 2 + shown * 2 + shown.saturating_sub(1)
 }
 
-/// Blank line between rows of cards.
 const CARD_ROW_GAP: u16 = 1;
 
 fn draw_home(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot>) {
@@ -715,7 +718,7 @@ fn draw_home(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
         .home
         .groups
         .iter()
-        .map(|g| app.state.unseen(&g.subreddit, app.visible(&g.posts)))
+        .map(|g| app.state.unseen(&g.subreddit, app.config.visible(&g.posts)))
         .sum();
     let loading = app.home.groups.iter().filter(|g| g.loading).count();
     let mut chips = vec![chip(
@@ -732,7 +735,7 @@ fn draw_home(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
     if loading > 0 {
         chips.push(chip(format!("⋯ loading {loading}"), OVERLAY, SURFACE0));
     }
-    let body = view_header(f, area, "⌂ Home", chips, None);
+    let body = view_header(f, area, "⌂ Home", chips);
     if app.home.groups.is_empty() {
         empty_state(
             f,
@@ -744,17 +747,14 @@ fn draw_home(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
         return;
     }
     let cols = (body.width / CARD_MIN_WIDTH).clamp(1, 3) as usize;
-    let rows: Vec<Vec<usize>> = (0..app.home.groups.len())
-        .collect::<Vec<_>>()
+    let heights: Vec<u16> = app
+        .home
+        .groups
         .chunks(cols)
-        .map(<[usize]>::to_vec)
-        .collect();
-    let heights: Vec<u16> = rows
-        .iter()
-        .map(|r| {
-            let card = r
+        .map(|row| {
+            let card = row
                 .iter()
-                .map(|&g| card_height(app, &app.home.groups[g]))
+                .map(|group| card_height(app, group))
                 .max()
                 .unwrap_or(4);
             card + CARD_ROW_GAP
@@ -772,7 +772,7 @@ fn draw_home(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
     let bottom = body.y + body.height;
     let mut y = body.y;
     let mut shown = 0;
-    for (row_index, row) in rows.iter().enumerate().skip(offset) {
+    for (row_index, row) in app.home.groups.chunks(cols).enumerate().skip(offset) {
         let h = heights[row_index];
         let card = h - CARD_ROW_GAP;
         // Later rows only when whole; the first row always shows, clipped in a short pane.
@@ -789,13 +789,13 @@ fn draw_home(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
         let cells = Layout::horizontal(vec![Constraint::Ratio(1, cols as u32); cols])
             .spacing(2)
             .split(row_area);
-        for (cell, &g) in cells.iter().zip(row) {
-            draw_group_card(f, app, g, *cell, spots);
+        for (column, cell) in cells.iter().take(row.len()).enumerate() {
+            draw_group_card(f, app, row_index * cols + column, *cell, spots);
         }
         y += h;
         shown += 1;
     }
-    draw_scrollbar(f, body, offset, shown.max(1), rows.len());
+    draw_scrollbar(f, body, offset, shown.max(1), heights.len());
 }
 
 fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &mut Vec<ImageSpot>) {
@@ -803,7 +803,7 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
     let selected_card = index == app.home.group;
     let badge = app
         .state
-        .unseen(&group.subreddit, app.visible(&group.posts));
+        .unseen(&group.subreddit, app.config.visible(&group.posts));
     let border = if selected_card {
         Style::new().fg(ACCENT)
     } else {
@@ -849,7 +849,7 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
             Style::new().fg(OVERLAY),
         ));
     }
-    // A failed refresh keeps the posts you can still act on; it only marks the card.
+    // A failed refresh keeps the posts; it only marks the card.
     if group.error.is_some() && !group.posts.is_empty() {
         title.push(chip("✗ refresh failed", RED, SURFACE0));
         title.push(Span::raw(" "));
@@ -868,7 +868,7 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
     let inner = block.inner(area);
     f.render_widget(block, area);
     let width = inner.width as usize;
-    let posts = app.home_group_posts(group);
+    let posts: Vec<_> = app.home_group_posts(group).collect();
     // (line in the card, URL) for each post row with a thumbnail.
     let mut thumbs: Vec<(u16, &str)> = Vec::new();
     let lines: Vec<Line> = if group.loading && group.posts.is_empty() {
@@ -889,7 +889,7 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
             }
             let opts = CardOpts {
                 selected: selected_card && i == app.home.post,
-                seen_key: Some(group.subreddit.clone()),
+                seen_key: Some(&group.subreddit),
                 show_subreddit: false,
                 reserve,
             };
@@ -907,10 +907,9 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
         0
     };
     let scroll = selected_end.saturating_sub(inner.height);
-    // Only thumbnails whose rows are all inside the scrolled card; the last post's
-    // third row may use the card's bottom padding line.
+    // Only thumbnails wholly inside the scrolled card.
     for (line, url) in thumbs {
-        if line >= scroll && line - scroll + THUMB_ROWS <= inner.height + 1 {
+        if line >= scroll && line - scroll + THUMB_ROWS <= inner.height {
             spots.push(ImageSpot {
                 url: url.to_string(),
                 area: Rect {
@@ -944,7 +943,7 @@ fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
     if badge > 0 {
         chips.push(chip(format!("● {badge} new"), CRUST, ACCENT));
     }
-    if feed.loading {
+    if feed.loading() {
         chips.push(chip("⋯ loading", OVERLAY, SURFACE0));
     }
     if feed.error().is_some() && !feed.posts.is_empty() {
@@ -962,7 +961,7 @@ fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
         chips.push(chip(
             freshness.label(
                 crate::app::now(),
-                feed.loading || feed.refreshing(),
+                feed.loading() || feed.refreshing(),
                 feed.error().is_some(),
                 app.redlib_up == Some(false),
             ),
@@ -971,13 +970,13 @@ fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
         ));
     }
     let title = tab.title();
-    let seen_key = tab.subreddit().map(str::to_string);
-    let error = feed.error().map(str::to_owned);
-    let posts: Vec<Post> = app.visible(&feed.posts).into_iter().cloned().collect();
+    let seen_key = tab.subreddit();
+    let error = feed.error();
+    let posts: Vec<&Post> = app.config.visible(&feed.posts).collect();
     let selected = feed.selected;
     let loaded = feed.loaded;
     let mut offset = feed.offset;
-    let body = view_header(f, area, &title, chips, None);
+    let body = view_header(f, area, &title, chips);
     if let Some(e) = error.filter(|_| posts.is_empty()) {
         empty_state(
             f,
@@ -1002,12 +1001,11 @@ fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
         }
         return;
     }
-    let refs: Vec<&Post> = posts.iter().collect();
-    let show_subreddit = matches!(seen_key.as_deref(), Some("all" | "popular"));
+    let show_subreddit = matches!(seen_key, Some("all" | "popular"));
     let spec = ListSpec {
-        posts: &refs,
+        posts: &posts,
         selected,
-        seen_key: seen_key.as_deref(),
+        seen_key,
         show_subreddit,
     };
     draw_post_list(f, app, body, &spec, &mut offset, spots);
@@ -1022,14 +1020,8 @@ fn draw_bookmarks(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<Imag
         area,
         "★ Bookmarks",
         vec![chip(format!("{count} saved"), SUBTEXT, SURFACE0)],
-        None,
     );
-    let posts: Vec<Post> = app
-        .state
-        .bookmarks()
-        .iter()
-        .map(|b| b.post.clone())
-        .collect();
+    let posts: Vec<&Post> = app.state.bookmarks().iter().map(|b| &b.post).collect();
     if posts.is_empty() {
         empty_state(
             f,
@@ -1040,11 +1032,10 @@ fn draw_bookmarks(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<Imag
         );
         return;
     }
-    let refs: Vec<&Post> = posts.iter().collect();
     let selected = app.active_tab().feed.selected.min(posts.len() - 1);
     let mut offset = app.active_tab().feed.offset;
     let spec = ListSpec {
-        posts: &refs,
+        posts: &posts,
         selected,
         seen_key: None,
         show_subreddit: true,
@@ -1056,9 +1047,8 @@ fn draw_bookmarks(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<Imag
 
 // ----- post view -----------------------------------------------------------
 
-/// Text with its `>!…!<` spoilers masked as `▒` (one per column, spaces kept, so
-/// the mask is as wide as the text; lines can still break elsewhere, as at hyphens
-/// or between CJK characters), or shown with their markers removed once revealed.
+/// Masks `>!…!<` spoilers as `▒`, one per column with spaces kept (same width, but break
+/// points still differ, e.g. at hyphens or between CJK), or strips the markers once revealed.
 fn spoiler_text(text: &str, reveal: bool) -> String {
     let mut out = String::with_capacity(text.len());
     let mut inside = false;
@@ -1067,12 +1057,22 @@ fn spoiler_text(text: &str, reveal: bool) -> String {
             out.push_str(segment);
             return;
         }
-        // Whole graphemes, so an emoji sequence masks to the columns it shows in.
-        for g in segment.graphemes(true) {
-            if g.chars().all(char::is_whitespace) {
-                out.push_str(g);
-            } else {
-                out.extend(std::iter::repeat_n('▒', g.width()));
+        for (i, line) in segment.split('\n').enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            // A hidden picture masks as a short bar, not as long as its URL.
+            if line.contains(PICTURE) {
+                out.push_str("▒▒▒▒▒▒");
+                continue;
+            }
+            // Whole graphemes, so an emoji sequence masks to the columns it shows in.
+            for g in line.graphemes(true) {
+                if g.chars().all(char::is_whitespace) {
+                    out.push_str(g);
+                } else {
+                    out.extend(std::iter::repeat_n('▒', g.width()));
+                }
             }
         }
     };
@@ -1117,6 +1117,121 @@ fn wrap_into(
     }
 }
 
+/// Most rows a picture in post or comment text takes.
+const TEXT_PICTURE_ROWS: u16 = 12;
+/// Text pictures kept loaded before those far from view are dropped: each holds its pixels
+/// and their encoding. Dropped ones load again when reached.
+const TEXT_PICTURES_KEPT: usize = 24;
+
+/// What the post document needs to lay out pictures in its text: the loaded images (none
+/// when images are off), and the most rows one may take, so it fits the text area whole.
+struct PictureSizes<'a> {
+    images: Option<&'a HashMap<String, ImageSlot>>,
+    font: ratatui_image::FontSize,
+    rows: u16,
+}
+
+/// A picture in the post document: its URL, first line, the columns before it and its
+/// cells once it loaded.
+struct DocPicture {
+    url: String,
+    line: usize,
+    x: u16,
+    size: Option<Size>,
+}
+
+/// The URL of a picture line (`PICTURE` then the URL, maybe after a quote bar).
+fn picture_line(line: &str) -> Option<&str> {
+    line.find(PICTURE)
+        .map(|at| &line[at + PICTURE.len_utf8()..])
+}
+
+/// `wrap_into`, with each picture line laid out as the picture: rows for it by its shape
+/// once loaded (at most `sizes.rows`), else one line saying where it stands.
+fn text_into(
+    lines: &mut Vec<Line<'static>>,
+    pictures: &mut Vec<DocPicture>,
+    text: &str,
+    width: usize,
+    prefix: &[Span<'static>],
+    style: Style,
+    sizes: &PictureSizes<'_>,
+) {
+    let x = prefix.iter().map(|s| s.content.width()).sum::<usize>() as u16;
+    let mut rest = text;
+    while let Some(at) = rest.find(PICTURE) {
+        let start = rest[..at].rfind('\n').map_or(0, |n| n + 1);
+        let end = rest[at..].find('\n').map_or(rest.len(), |n| at + n);
+        if start > 0 {
+            wrap_into(lines, &rest[..start - 1], width, prefix, style);
+        }
+        let url = picture_line(&rest[start..end]).unwrap_or_default();
+        // What stands before it on its line, a bullet or quote bar, stays before it: quote
+        // bars on every row, the rest (a bullet) on the first.
+        let lead = &rest[start..at];
+        let quoted = lead.starts_with('│');
+        let lead_style = if quoted { style.fg(SUBTEXT) } else { style };
+        let bars = lead.len() - lead.trim_start_matches(['│', ' ']).len();
+        let lead_rest = format!("{}{}", &lead[..bars], " ".repeat(lead[bars..].width()));
+        let first_prefix = [prefix, &[Span::styled(lead.to_string(), lead_style)]].concat();
+        let rest_prefix = [prefix, &[Span::styled(lead_rest, lead_style)]].concat();
+        let slot = sizes.images.map(|images| images.get(url));
+        // A picture shown twice keeps one size, the first one, so it isn't encoded again
+        // for each place every frame; where that doesn't fit it is only named.
+        let first = pictures
+            .iter()
+            .find_map(|p| (p.url == url).then_some(p.size).flatten());
+        let cols = width.saturating_sub(lead.width()).max(1) as u16;
+        let size = match (slot, first) {
+            (Some(Some(ImageSlot::Ready { .. })), Some(first)) => {
+                (first.width <= cols).then_some(first)
+            }
+            (Some(Some(ImageSlot::Ready { pixels, .. })), None) => Some(picture_cells(
+                pixels.0,
+                pixels.1,
+                sizes.font,
+                cols,
+                sizes.rows,
+                sizes.rows,
+                MAX_ENLARGE,
+            )),
+            _ => None,
+        };
+        pictures.push(DocPicture {
+            url: url.to_string(),
+            line: lines.len(),
+            x: x + lead.width() as u16,
+            size,
+        });
+        match size {
+            Some(size) => {
+                for row in 0..size.height {
+                    let prefix = if row == 0 {
+                        &first_prefix
+                    } else {
+                        &rest_prefix
+                    };
+                    lines.push(Line::from(prefix.clone()));
+                }
+            }
+            None => {
+                let label = match slot {
+                    None | Some(Some(ImageSlot::Ready { .. })) => "▣ image",
+                    Some(Some(ImageSlot::Failed(_))) => "▣ image unavailable",
+                    _ => "◌ loading image",
+                };
+                let mut spans = first_prefix;
+                spans.push(Span::styled(label, Style::new().fg(OVERLAY)));
+                lines.push(Line::from(spans));
+            }
+        }
+        rest = rest.get(end + 1..).unwrap_or_default();
+    }
+    if !rest.is_empty() {
+        wrap_into(lines, rest, width, prefix, style);
+    }
+}
+
 fn thread_prefix(depth: usize) -> Vec<Span<'static>> {
     (0..depth)
         .map(|d| Span::styled("│ ", Style::new().fg(THREADS[d % THREADS.len()])))
@@ -1127,7 +1242,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(view) = app.post_view.as_ref() else {
         return;
     };
-    let post = view.page.as_ref().map_or(&view.post, |p| &p.post).clone();
+    let post = view.shown_post();
     let now = Utc::now();
 
     // Header card: never scrolls.
@@ -1154,7 +1269,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
         s
     })];
     header.push(Line::raw(""));
-    let title_style = if app.config.highlights(&post) {
+    let title_style = if app.config.highlights(post) {
         Style::new().fg(YELLOW).add_modifier(Modifier::BOLD)
     } else {
         Style::new().fg(TEXT).add_modifier(Modifier::BOLD)
@@ -1217,13 +1332,10 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
         head_area,
     );
 
-    // Inline image (or video) under the header while the document is at the top.
-    // Whether it shows depends on where the document scrolls, which depends on how
-    // tall the document area is: settle the scroll for the image layout first, and
-    // drop the image when the document does not stay at its top. Deciding from the
-    // old scroll showed the image for one frame, then the next redraw jumped the text.
-    // A video shows its poster until its first frame.
-    let video = matches!(&post.media, Media::Video { url: Some(_), .. });
+    // The image or video shows only while the document stays at its top. Settle the
+    // scroll for the image layout first: deciding from the old scroll flashed the image
+    // for one frame. A video shows its poster until its first frame.
+    let video = post.media.video_url().is_some();
     let image_url = post
         .media
         .shows_inline()
@@ -1233,10 +1345,36 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
         .post_view
         .as_ref()
         .is_some_and(|v| v.spoiler_hidden() || v.page.is_none());
-    let image_rows = IMAGE_MAX_HEIGHT.min(rest.height / 2) + 1;
-    // A video needs a row of picture above its status line and the blank row.
+    // The picture's rows follow its shape (`picture_cells`): a wide one fills the width
+    // while a few lines of text stay in view, a tall one is centred within half the post
+    // area. A video adds its status and blank rows, and decodes for its whole box so a
+    // frame arriving does not restart it.
+    let cols = rest.width.saturating_sub(2);
+    let wide_max = rest.height.saturating_sub(TEXT_UNDER_PICTURE).max(1);
+    let tall_max = (rest.height / 2).max(1);
+    app.video_tall_rows = tall_max;
+    let decode_rows = wide_max.min(video::KITTY_MAX_ROWS);
+    let still_url = image_url.as_ref().and_then(|u| u.as_deref());
+    let picture = |max: u16| {
+        picture_size(
+            app,
+            video,
+            still_url,
+            cols,
+            max.min(wide_max),
+            max.min(tall_max),
+        )
+        .map_or(1, |size| size.height)
+    };
+    let image_rows = if video {
+        picture(video::KITTY_MAX_ROWS) + 2
+    } else {
+        picture(u16::MAX) + 1
+    };
+    // A video needs a row of picture above its status line and the blank row, with a
+    // line of text under them.
     let image_url =
-        image_url.filter(|_| app.inline_images_on() && !hide_image && (!video || image_rows >= 3));
+        image_url.filter(|_| app.inline_images_on() && !hide_image && (!video || rest.height >= 4));
     let [img_area, with_image] =
         Layout::vertical([Constraint::Length(image_rows), Constraint::Min(1)]).areas(rest);
     let margin = Margin {
@@ -1246,11 +1384,20 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
     let (full, with_image) = (rest.inner(margin), with_image.inner(margin));
     // The image changes only the height: the text wraps the same in both layouts.
     let width = full.width.saturating_sub(2) as usize;
+    let sizes = PictureSizes {
+        images: app.inline_images_on().then_some(&app.images),
+        font: app.image_picker.font_size(),
+        rows: TEXT_PICTURE_ROWS.min(full.height).max(1),
+    };
     let Some(view) = app.post_view.as_mut() else {
         return;
     };
     let mut more_lines = std::mem::take(&mut view.rendered_more);
-    let PostDocument { lines, spans } = post_document(view, width, now, Some(&mut more_lines));
+    let PostDocument {
+        lines,
+        spans,
+        pictures,
+    } = post_document(view, width, now, Some(&mut more_lines), &sizes);
     view.row_starts = spans.iter().map(|(s, _)| *s).collect();
     let requested_scroll = view.scroll;
     // Replies loaded above the text being read: put it back where it was.
@@ -1259,6 +1406,35 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
         && let Some(&(start, _)) = spans.get(row)
     {
         view.scroll = start.saturating_add_signed(offset);
+    }
+    // Pictures above the text being read took their rows as they loaded: move with it. On
+    // a content change, text matching below, where it applies, places the view instead.
+    if reading_anchor.is_none() {
+        let grown: isize = pictures
+            .iter()
+            .zip(&view.rendered_pictures)
+            .take_while(|(new, (url, ..))| new.url == *url)
+            .filter(|(_, (_, line, _))| *line < requested_scroll)
+            // Only its rows above the top count: one wholly above moves the text by all it
+            // gained, one across the top by those it now has above the top.
+            .map(|(new, (_, line, rows))| {
+                let above = requested_scroll - line;
+                if *rows <= above {
+                    new.rows() as isize - *rows as isize
+                } else {
+                    new.rows().min(above) as isize - above as isize
+                }
+            })
+            .sum();
+        view.scroll = view.scroll.saturating_add_signed(grown);
+        // A comment held in place (`l`) is held at the moved text too.
+        if grown != 0
+            && let Some(hold) = &mut view.hold_view
+            && !hold.top
+            && let Some(&(start, _)) = spans.get(hold.row)
+        {
+            hold.offset = view.scroll as isize - start as isize;
+        }
     }
     if view.content_changed {
         let handoff = std::mem::take(&mut view.more_handoff);
@@ -1269,8 +1445,8 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
         let held = view
             .hold_view
             .filter(|hold| !view.free_scroll && hold.row == view.cursor && !hold.top);
-        // Text matching must not override a More → first-new-reply handoff by
-        // finding unchanged text in a later sibling.
+        // Text matching must not override a More → first-new-reply handoff by matching a
+        // later sibling.
         let anchor_row = if !view.free_scroll {
             Some(view.cursor)
         } else if handoff {
@@ -1302,9 +1478,8 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
         }
         view.content_changed = false;
     }
-    // `v` while reading: only spoiler lines changed, so the line that was on top
-    // is in the new wrapping too. Keys in the same batch move on from it; a jump to
-    // the post's top (`g`) stays there.
+    // After `v` only spoiler lines changed, so the old top line exists in the new wrap.
+    // Keys in the same batch move on from it; `g` stays at the top.
     if let Some((was, pinned)) = view.rewrapped.take()
         && view.free_scroll
         && view.reveal_spoilers != was
@@ -1312,21 +1487,20 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
     {
         let shown = view.reveal_spoilers;
         view.reveal_spoilers = was;
-        let old_lines = post_document(view, width, now, None).lines;
+        let old_lines = post_document(view, width, now, None, &sizes).lines;
         view.reveal_spoilers = shown;
         if let Some(at) = same_line(&old_lines, pinned, &lines) {
             let moved = view.scroll as isize - pinned as isize;
             view.scroll = at.saturating_add_signed(moved);
         }
     }
-    // `l` selecting the comment being read keeps its text where it was while that
-    // comment stays selected and shows any of it; keys that move the selection end
-    // the hold. Rows loading above move the comment, and the view moves with it.
+    // `l` on the comment being read holds its text in place while it stays selected and
+    // visible; moving the selection ends the hold. Loads above move both.
     if view.free_scroll || view.hold_view.is_none_or(|h| h.row != view.cursor) {
         view.hold_view = None;
     }
-    // Scrolled away, the image stays away (a short post clamps the scroll back to
-    // 0) until a key goes back to the top: no frame shows it and the next not.
+    // Scrolled away, the image stays away until a key returns to the top, even when a short
+    // post clamps the scroll back to 0: otherwise frames alternate with and without it.
     if image_url.is_some() && view.scroll != 0 {
         view.image_away = true;
     }
@@ -1350,8 +1524,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
     if !held {
         view.hold_view = None;
     }
-    // A hold kept at the top for the image: with no image this frame, hold the text
-    // where it is now instead, so later changes above it do not move it.
+    // A hold kept at the top for the image: with no image this frame, hold the text where it is.
     if image.is_none()
         && let Some(hold) = &mut view.hold_view
         && hold.top
@@ -1370,15 +1543,162 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
     }
     view.rendered_document = lines;
     view.rendered_more = more_lines;
+    view.rendered_pictures = pictures
+        .iter()
+        .map(|p| (p.url.clone(), p.line, p.rows()))
+        .collect();
     draw_scrollbar(f, doc_area, scroll, height, total);
+    // Pictures in the text: drawn when wholly in view, loaded from a screen away.
+    let near = scroll.saturating_sub(height)..scroll + height * 2;
+    let images_on = sizes.images.is_some();
+    let mut wanted = Vec::new();
+    let mut shown = Vec::new();
+    for picture in &pictures {
+        match picture.size {
+            Some(size)
+                if picture.line >= scroll
+                    && picture.line + usize::from(size.height) <= scroll + height =>
+            {
+                let at = Rect::new(
+                    doc_area.x + picture.x,
+                    doc_area.y + (picture.line - scroll) as u16,
+                    size.width,
+                    size.height,
+                );
+                shown.push((picture.url.clone(), at));
+            }
+            None if images_on && near.contains(&picture.line) => wanted.push(picture.url.clone()),
+            _ => {}
+        }
+    }
+    for (url, at) in shown {
+        draw_inline_image(f, app, &url, at);
+    }
+    for url in wanted {
+        app.request_text_picture(&url);
+    }
+    // Far from view: a picture still queued is let go so the ones in view come first; a
+    // loaded one only once many are loaded. Either loads again when near. Pictures with no
+    // place now (folded, removed, hidden again) are far too.
+    let kept = scroll.saturating_sub(height * 3)..scroll + height * 4;
+    let post_image = app
+        .post_view
+        .as_ref()
+        .and_then(|view| view.page.as_ref())
+        .and_then(|page| page.post.media.preview_image())
+        .map(str::to_string);
+    let text_pictures = || {
+        app.images
+            .iter()
+            .filter(|(url, _)| post_image.as_deref() != Some(url.as_str()))
+    };
+    let loaded = text_pictures()
+        .filter(|(_, slot)| matches!(slot, ImageSlot::Ready { .. }))
+        .count();
+    let far: Vec<String> = text_pictures()
+        .filter(|(_, slot)| match slot {
+            ImageSlot::Loading => true,
+            ImageSlot::Ready { .. } => loaded > TEXT_PICTURES_KEPT,
+            ImageSlot::Failed(_) => false,
+        })
+        .filter(|(url, _)| {
+            !pictures
+                .iter()
+                .any(|p| &p.url == *url && kept.contains(&p.line))
+        })
+        .map(|(url, _)| url.clone())
+        .collect();
+    for url in &far {
+        app.drop_text_picture(url);
+    }
     if let Some(still) = image {
         let area = img_area.inner(margin);
         if video {
-            draw_video(f, app, still.as_deref(), area);
+            let decode_box = Rect {
+                height: decode_rows,
+                ..area
+            };
+            draw_video(f, app, still.as_deref(), area, decode_box);
         } else if let Some(url) = still {
-            draw_inline_image(f, app, &url, area);
+            // The last row stays blank.
+            let picture = Rect {
+                height: area.height.saturating_sub(1).max(1),
+                ..area
+            };
+            draw_inline_image(f, app, &url, picture);
         }
     }
+}
+
+impl DocPicture {
+    /// Lines the picture takes in the document.
+    fn rows(&self) -> usize {
+        self.size.map_or(1, |size| usize::from(size.height))
+    }
+}
+
+/// The post's picture in cells, by `picture_cells`: a video's frame, else the loaded
+/// image or poster; none while it loads or after it failed. A frame encoded off the UI
+/// thread (sixel, iTerm2, half-blocks) has fixed cells, so the band takes exactly those.
+fn picture_size(
+    app: &App,
+    video: bool,
+    still: Option<&str>,
+    cols: u16,
+    wide_max: u16,
+    tall_max: u16,
+) -> Option<Size> {
+    let font = app.image_picker.font_size();
+    let frame = video
+        .then(|| app.video.as_ref().and_then(|p| p.frame()))
+        .flatten();
+    // A frame's pixels are the decoder's, not the source's: only its shape counts.
+    let (width, height, enlarge) = match frame {
+        Some(frame) => match &frame.pixels {
+            video::Pixels::Image(protocol) => return Some(protocol.size()),
+            video::Pixels::Zlib(_) => (frame.width, frame.height, f64::INFINITY),
+        },
+        None => match still.map(|u| app.images.get(u)) {
+            Some(Some(ImageSlot::Ready { pixels, .. })) => (pixels.0, pixels.1, MAX_ENLARGE),
+            _ => return None,
+        },
+    };
+    Some(picture_cells(
+        width, height, font, cols, wide_max, tall_max, enlarge,
+    ))
+}
+
+/// Lines of the post kept in view under a wide picture (with the blank row after it).
+const TEXT_UNDER_PICTURE: u16 = 5;
+/// A small picture grows at most this much, so a thumbnail-sized one stays sharp.
+const MAX_ENLARGE: f64 = 2.0;
+
+/// Cells a `width`×`height` px picture takes: wider than tall, it fills `cols` unless
+/// that is more than `wide_max` rows; otherwise it fits `tall_max` rows (centred by the
+/// caller). Never enlarged more than `enlarge` times. Rows round up, so fitting the
+/// picture again into the cells it got gives the same cells.
+fn picture_cells(
+    width: u32,
+    height: u32,
+    font: ratatui_image::FontSize,
+    cols: u16,
+    wide_max: u16,
+    tall_max: u16,
+    enlarge: f64,
+) -> Size {
+    let (fw, fh) = (f64::from(font.width.max(1)), f64::from(font.height.max(1)));
+    let (w, h) = (f64::from(width.max(1)), f64::from(height.max(1)));
+    let max_rows = if width > height { wide_max } else { tall_max };
+    let scale = (f64::from(cols) * fw / w)
+        .min(f64::from(max_rows) * fh / h)
+        .min(enlarge);
+    let wide = ((w * scale / fw).round() as u16).clamp(1, cols.max(1));
+    // Rows follow the width as rounded: a narrow picture rounded down is that much shorter.
+    let scale = scale.min(f64::from(wide) * fw / w);
+    Size::new(
+        wide,
+        ((h * scale / fh).ceil() as u16).clamp(1, max_rows.max(1)),
+    )
 }
 
 /// Text comparison ignores styling and the selected-comment bar.
@@ -1449,9 +1769,8 @@ fn same_line(old: &[Line], at: usize, new: &[Line]) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-/// Where the document scrolls for a doc area `height` lines tall, and whether a
-/// hold on the selected comment still applies: the hold keeps the text where it
-/// was, otherwise the selected comment is brought into view; never past the end.
+/// Scroll for a document area `height` lines tall, and whether the hold on the selected
+/// comment still applies; otherwise the selection is brought into view. Never past the end.
 fn settle_scroll(
     view: &PostView,
     spans: &[(usize, usize)],
@@ -1491,15 +1810,18 @@ fn settle_scroll(
 struct PostDocument {
     lines: Vec<Line<'static>>,
     spans: Vec<(usize, usize)>,
+    pictures: Vec<DocPicture>,
 }
 
-/// Selftext, comment spans and More-row geometry for the displayed document.
+/// Selftext, comment spans, pictures and More-row geometry for the displayed document.
 fn post_document(
     view: &PostView,
     width: usize,
     now: DateTime<Utc>,
     mut more_lines: Option<&mut Vec<(String, usize)>>,
+    sizes: &PictureSizes<'_>,
 ) -> PostDocument {
+    let mut pictures = Vec::new();
     let mut lines: Vec<Line<'static>> = Vec::new();
     // Early-return documents contain no More rows.
     if (view.page.is_none() || view.spoiler_hidden())
@@ -1546,7 +1868,8 @@ fn post_document(
         };
     } else if !page.body.is_empty() {
         let body = spoiler_text(&page.body, reveal);
-        wrap_into(&mut lines, &body, width, &[], Style::new().fg(TEXT));
+        let style = Style::new().fg(TEXT);
+        text_into(&mut lines, &mut pictures, &body, width, &[], style, sizes);
         lines.push(Line::raw(""));
     }
     let label = format!(" 💬 {} comments ", format_count(page.post.comments as i64));
@@ -1619,8 +1942,7 @@ fn post_document(
                     pad_to(&mut head, width, bg);
                 }
                 lines.push(Line::from(head));
-                // The bar runs down the whole selected comment, so a selection whose
-                // header is above the screen still shows.
+                // The bar spans the whole selected comment, so it shows with the header off screen.
                 let mut body_prefix = vec![if selected {
                     Span::styled("▌", Style::new().fg(ACCENT))
                 } else {
@@ -1632,6 +1954,13 @@ fn post_document(
                     let first = body
                         .lines()
                         .find(|l| !l.trim().is_empty())
+                        .map(|l| {
+                            if picture_line(l).is_some() {
+                                "▣ image"
+                            } else {
+                                l
+                            }
+                        })
                         .unwrap_or_default()
                         .to_string();
                     let mut l = body_prefix.clone();
@@ -1641,12 +1970,14 @@ fn post_document(
                     ));
                     lines.push(Line::from(l));
                 } else {
-                    wrap_into(
+                    text_into(
                         &mut lines,
+                        &mut pictures,
                         &spoiler_text(&comment.body, reveal),
                         body_width,
                         &body_prefix,
                         Style::new().fg(TEXT),
+                        sizes,
                     );
                 }
             }
@@ -1689,12 +2020,17 @@ fn post_document(
     if let Some(rows) = more_lines {
         rows.truncate(more_count);
     }
-    PostDocument { lines, spans }
+    PostDocument {
+        lines,
+        spans,
+        pictures,
+    }
 }
 
-/// The post's video under the header: the current frame (the poster until the
-/// first one), and under it a line with the time, the sound and the keys.
-fn draw_video(f: &mut Frame, app: &mut App, poster: Option<&str>, area: Rect) {
+/// The post's video: the current frame (the poster until the first), centred, then a
+/// status line. Frames are decoded for `decode_box`, which stays put while the drawn
+/// area follows the frame's shape.
+fn draw_video(f: &mut Frame, app: &mut App, poster: Option<&str>, area: Rect, decode_box: Rect) {
     // The last row stays blank, as under an image.
     let [picture, status, _] = Layout::vertical([
         Constraint::Min(1),
@@ -1706,7 +2042,7 @@ fn draw_video(f: &mut Frame, app: &mut App, poster: Option<&str>, area: Rect) {
         height: picture.height.min(video::KITTY_MAX_ROWS),
         ..picture
     };
-    app.video_area = Some(picture);
+    app.video_area = Some(decode_box);
     // As for images: nothing drawn under an overlay.
     let covered = app.overlay.is_some();
     let kitty = app.image_picker.protocol_type() == ProtocolType::Kitty;
@@ -1718,12 +2054,16 @@ fn draw_video(f: &mut Frame, app: &mut App, poster: Option<&str>, area: Rect) {
         shown = true;
         match &frame.pixels {
             video::Pixels::Zlib(_) if kitty => {
-                let cells = video::fit(
+                let fitted = picture_cells(
                     frame.width,
                     frame.height,
-                    picture,
                     app.image_picker.font_size(),
+                    picture.width,
+                    picture.height,
+                    picture.height,
+                    f64::INFINITY,
                 );
+                let cells = centred(Rect::new(0, 0, fitted.width, fitted.height), picture);
                 // A frame goes out once; a draw that only repeats it sends the cells.
                 let sent = Some((player.frame_number, cells));
                 let transmit = (app.video_sent != sent).then(|| {
@@ -1738,7 +2078,14 @@ fn draw_video(f: &mut Frame, app: &mut App, poster: Option<&str>, area: Rect) {
                 app.video_sent = sent;
                 video::kitty_cells(f.buffer_mut(), cells, video::kitty_id(), transmit);
             }
-            video::Pixels::Image(protocol) => f.render_widget(Image::new(protocol), picture),
+            video::Pixels::Image(protocol) => {
+                let size = protocol.size();
+                let at = centred(
+                    Rect::new(picture.x, picture.y, size.width, size.height),
+                    picture,
+                );
+                f.render_widget(Image::new(protocol), at.intersection(picture));
+            }
             video::Pixels::Zlib(_) => {}
         }
     }
@@ -1802,13 +2149,27 @@ fn draw_video(f: &mut Frame, app: &mut App, poster: Option<&str>, area: Rect) {
 }
 
 fn draw_inline_image(f: &mut Frame, app: &mut App, url: &str, area: Rect) {
-    // As in `draw_spots`: an image drawn under an overlay is lost (kitty) or leaves
-    // stale pixels (sixel, iTerm2), so it waits for the overlay to close.
+    // As in `draw_spots`: nothing drawn under an overlay.
     let covered = app.overlay.is_some();
     match app.images.get_mut(url) {
         Some(ImageSlot::Ready { .. }) if covered => {}
-        Some(ImageSlot::Ready { protocol, .. }) => {
-            f.render_stateful_widget(StatefulImage::default(), area, protocol.as_mut());
+        Some(ImageSlot::Ready {
+            protocol, pixels, ..
+        }) => {
+            // Sized by its shape as the layout was, centred; a small one may grow.
+            let size = picture_cells(
+                pixels.0,
+                pixels.1,
+                app.image_picker.font_size(),
+                area.width,
+                area.height,
+                area.height,
+                MAX_ENLARGE,
+            );
+            let at = centred(Rect::new(area.x, area.y, size.width, size.height), area);
+            let scaled = StatefulImage::default()
+                .resize(Resize::Scale(Some(ratatui_image::FilterType::Triangle)));
+            f.render_stateful_widget(scaled, at, protocol.as_mut());
         }
         Some(ImageSlot::Failed(e)) => {
             f.render_widget(
@@ -1829,6 +2190,15 @@ fn draw_inline_image(f: &mut Frame, app: &mut App, url: &str, area: Rect) {
     }
 }
 
+/// `inner` moved to the middle of `outer`'s width, at its top.
+fn centred(inner: Rect, outer: Rect) -> Rect {
+    Rect {
+        x: outer.x + outer.width.saturating_sub(inner.width) / 2,
+        y: outer.y,
+        ..inner
+    }
+}
+
 // ----- footer --------------------------------------------------------------
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -1843,7 +2213,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 format!(" {icon} "),
                 Style::new().fg(color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(status.text.clone(), Style::new().fg(color)),
+            Span::styled(status.text.as_str(), Style::new().fg(color)),
         ])
     } else if app.redlib_up == Some(false) {
         let hint = if app.config.redlib_start_command.is_some() {
@@ -1856,78 +2226,67 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(hint, Style::new().fg(RED)),
         ])
     } else {
-        let spoilers = app.post_view.as_ref().is_some_and(PostView::has_spoilers);
-        // What `c` does now, if anything: select the comment being read, or on the
-        // selected row load more replies, fold or unfold a thread.
-        let c = app.post_view.as_ref().and_then(|v| {
-            let rows = v.rows();
-            if v.free_scroll {
-                return (!rows.is_empty()).then_some(("c", "select"));
-            }
-            match &rows.get(v.cursor)?.kind {
-                // Already loading: `c` does nothing until the replies arrive.
-                RowKind::More { parent, .. } if v.loading_more.contains(*parent) => None,
-                RowKind::More { .. } => Some(("c", "load")),
-                RowKind::Comment { comment, .. } if v.collapsed.contains(&comment.id) => {
-                    Some(("c", "unfold"))
-                }
-                RowKind::Comment { comment, .. }
-                    if !comment.replies.is_empty() || comment.more.is_some() =>
-                {
-                    Some(("c", "fold"))
-                }
-                RowKind::Comment { .. } => None,
-            }
-        });
-        // `m` only with media to open; `b` says which way it goes.
-        let shown_post = app
-            .post_view
-            .as_ref()
-            .map(|v| v.page.as_ref().map_or(&v.post, |p| &p.post));
-        let media = shown_post
-            .is_some_and(|p| p.media.tag().is_some())
-            .then_some(("m", "media"));
-        let save = if shown_post.is_some_and(|p| app.state.is_bookmarked(&p.id)) {
-            ("b", "unsave")
-        } else {
-            ("b", "save")
-        };
-        // Pairs that do not fit the width drop from the end.
-        let post_hints: Vec<(&str, &str)> = [("j/k", "comments")]
-            .into_iter()
-            .chain(spoilers.then_some(("v", "spoilers")))
-            .chain(c)
-            .chain([("space", "page")])
-            .chain(media)
-            .chain([("o", "browser"), save, ("h", "back")])
-            .collect();
         // `x` closes only a tab opened with `p`.
         let closable = matches!(
             app.active_tab().kind,
             TabKind::Subreddit { pinned: false, .. }
         );
-        let sidebar_hints: Vec<(&str, &str)> = [
-            ("j/k", "tabs"),
-            ("g/G", "first/last"),
-            ("l/⏎", "list"),
-            ("p", "jump"),
-        ]
-        .into_iter()
-        .chain(closable.then_some(("x", "close")))
-        .collect();
-        // `t` sets the time range of a Top/Controversial listing, not of a search.
-        let feed = &app.active_tab().feed;
-        let time = (feed.sort.takes_time() && feed.search.is_none()).then_some(("t", "time"));
-        let subreddit_hints: Vec<(&str, &str)> = [("j/k", "move"), ("⏎", "open"), ("s", "sort")]
+        let dynamic;
+        let hints: &[(&str, &str)] = if app.post_focused() {
+            let spoilers = app.post_view.as_ref().is_some_and(PostView::has_spoilers);
+            // `c` selects the comment being read, or acts on the selected row.
+            let c = app.post_view.as_ref().and_then(|v| {
+                let rows = v.rows();
+                if v.free_scroll {
+                    return (!rows.is_empty()).then_some(("c", "select"));
+                }
+                match &rows.get(v.cursor)?.kind {
+                    RowKind::More { parent, .. } if v.loading_more.contains(*parent) => None,
+                    RowKind::More { .. } => Some(("c", "load")),
+                    RowKind::Comment { comment, .. } if v.collapsed.contains(&comment.id) => {
+                        Some(("c", "unfold"))
+                    }
+                    RowKind::Comment { comment, .. }
+                        if !comment.replies.is_empty() || comment.more.is_some() =>
+                    {
+                        Some(("c", "fold"))
+                    }
+                    RowKind::Comment { .. } => None,
+                }
+            });
+            let shown_post = app.post_view.as_ref().map(PostView::shown_post);
+            let media = shown_post
+                .is_some_and(|p| !matches!(p.media, Media::None))
+                .then_some(("m", "media"));
+            let save = if shown_post.is_some_and(|p| app.state.is_bookmarked(&p.id)) {
+                ("b", "unsave")
+            } else {
+                ("b", "save")
+            };
+            dynamic = [("j/k", "comments")]
+                .into_iter()
+                .chain(spoilers.then_some(("v", "spoilers")))
+                .chain(c)
+                .chain([("space", "page")])
+                .chain(media)
+                .chain([
+                    ("o", "browser"),
+                    save,
+                    ("h", if app.detail_fits() { "list" } else { "back" }),
+                ])
+                .collect::<Vec<_>>();
+            &dynamic
+        } else if app.focus == Focus::Sidebar {
+            dynamic = [
+                ("j/k", "tabs"),
+                ("g/G", "first/last"),
+                ("l/⏎", "list"),
+                ("p", "jump"),
+            ]
             .into_iter()
-            .chain(time)
-            .chain([("/", "search"), ("p", "jump")])
             .chain(closable.then_some(("x", "close")))
             .collect();
-        let hints: &[(&str, &str)] = if app.post_view.is_some() {
-            &post_hints
-        } else if app.sidebar_focused {
-            &sidebar_hints
+            &dynamic
         } else {
             match app.active_tab().kind {
                 TabKind::Home => &[
@@ -1945,27 +2304,34 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                     ("o", "browser"),
                     ("p", "jump"),
                 ],
-                TabKind::Subreddit { .. } => &subreddit_hints,
+                TabKind::Subreddit { .. } => {
+                    let feed = &app.active_tab().feed;
+                    let time =
+                        (feed.sort.takes_time() && feed.search.is_none()).then_some(("t", "time"));
+                    dynamic = [("j/k", "move"), ("⏎", "open"), ("s", "sort")]
+                        .into_iter()
+                        .chain(time)
+                        .chain([("/", "search"), ("p", "jump")])
+                        .chain(closable.then_some(("x", "close")))
+                        .collect();
+                    &dynamic
+                }
             }
         };
-        let mut spans = vec![Span::raw(" ")];
+        // Keep whole key + label pairs; do not build pairs past the available width.
+        let mut fitted = vec![Span::raw(" ")];
+        let mut used = 1;
         for (key, label) in hints.iter().chain(&[("?", "help")]) {
-            spans.push(key_chip(key));
-            spans.push(Span::styled(
-                format!(" {label}  "),
-                Style::new().fg(OVERLAY),
-            ));
-        }
-        // Keep whole key + label pairs: a key chip without its label means nothing.
-        let mut fitted = vec![spans[0].clone()];
-        let mut used = spans[0].content.width();
-        for pair in spans[1..].chunks(2) {
-            let w: usize = pair.iter().map(|s| s.content.width()).sum();
-            if used + w > area.width as usize {
+            let pair = [
+                key_chip(key),
+                Span::styled(format!(" {label}  "), Style::new().fg(OVERLAY)),
+            ];
+            let width = line_width(&pair);
+            if used + width > area.width as usize {
                 break;
             }
-            used += w;
-            fitted.extend(pair.iter().cloned());
+            used += width;
+            fitted.extend(pair);
         }
         Line::from(fitted)
     };
@@ -2013,7 +2379,7 @@ const HELP: &[(&str, &str)] = &[
     ("Lists", ""),
     ("j k · C-d C-u", "move · page"),
     ("g G", "first / last"),
-    ("Enter l", "open the post"),
+    ("Enter l", "open the post, or resume the one shown"),
     ("J K", "Home: next / previous card"),
     ("Space", "Home: open the card's subreddit"),
     ("s · t", "subreddit: sort · time range"),
@@ -2030,7 +2396,7 @@ const HELP: &[(&str, &str)] = &[
     ("P · a", "video: pause / play · sound on / off"),
     (", .", "video: back / forward 5 seconds"),
     ("g G", "top of post / last comment"),
-    ("h", "leave the comment, then back to the list"),
+    ("h", "split: list; narrow: back one level"),
     ("Esc q", "back to the list"),
     ("Anywhere", ""),
     ("o · y", "open on reddit.com · copy link"),
@@ -2191,8 +2557,7 @@ fn draw_search(f: &mut Frame, app: &App, input: &str) {
     let area = popup(f.area(), 60, 3);
     f.render_widget(Clear, area);
     let title = format!("Search {}", app.active_tab().title());
-    // Besides the query: borders and padding (4 columns), the icon and its space
-    // ("🔍 ", 3: the emoji is 2 wide), the caret (1).
+    // Borders and padding (4), "🔍 " (3: the emoji is 2 wide), the caret (1).
     let room = (area.width as usize).saturating_sub(4 + "🔍 ".width() + 1);
     let shown = input_tail(input, room);
     f.render_widget(
@@ -2206,8 +2571,7 @@ fn draw_search(f: &mut Frame, app: &App, input: &str) {
     );
 }
 
-/// Typed input fitted to `room` columns: a longer input shows its end, where you
-/// type, after "…".
+/// Input fitted to `room` columns; a longer input shows its end after "…".
 fn input_tail(input: &str, room: usize) -> String {
     if input.width() <= room {
         return input.to_string();
@@ -2319,24 +2683,8 @@ mod tests {
         screen(&mut app, 100, 30);
         while_loading(&mut app);
         let generation = app.post_view.as_ref().unwrap().generation;
-        let body = (1..=60)
-            .map(|i| format!("paragraph {i}"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let comment = Comment {
-            sources: None,
-            created: None,
-            id: "c".into(),
-            author: "x".into(),
-            flair: None,
-            is_op: false,
-            is_mod: false,
-            score: None,
-            age: String::new(),
-            body: "reply".into(),
-            replies: vec![],
-            more: None,
-        };
+        let body = paragraphs("paragraph", 1..=60);
+        let comment = reply("c".into());
         app.on_msg(Msg::Post {
             generation,
             result: Ok(Box::new(PostPage {
@@ -2349,12 +2697,429 @@ mod tests {
         (app, s)
     }
 
+    fn reply(id: String) -> Comment {
+        Comment {
+            sources: None,
+            created: None,
+            id,
+            author: "x".into(),
+            flair: None,
+            is_op: false,
+            is_mod: false,
+            score: None,
+            age: String::new(),
+            body: "reply".into(),
+            replies: vec![],
+            more: None,
+        }
+    }
+
+    fn paragraphs(prefix: &str, range: impl Iterator<Item = usize>) -> String {
+        range
+            .map(|i| format!("{prefix} {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    #[test]
+    fn a_picture_in_a_comment_should_load_then_take_rows_by_its_shape() {
+        let (mut app, _) = open_long_post(|_| {});
+        app.image_picker = kitty();
+        app.show_images = true;
+        let url = "/preview/pre/c.png";
+        let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
+        page.body.clear();
+        page.comments[0].body = format!("before\n{PICTURE}{url}\nafter");
+
+        let loading = screen(&mut app, 100, 40);
+        assert!(loading.contains("◌ loading image"), "{loading}");
+        assert!(matches!(app.images.get(url), Some(ImageSlot::Loading)));
+
+        let slot = ready(&app, 400, 200);
+        app.images.insert(url.into(), slot);
+        let loaded = screen(&mut app, 100, 40);
+
+        let row = |text: &str| loaded.lines().position(|l| l.contains(text)).unwrap();
+        // 400×200 grows twice to 800×400 px, 100×25 cells at 8×16: 12 rows at most.
+        assert_eq!(row("after") - row("before"), 13, "{loaded}");
+        let first = loaded.lines().nth(row("before") + 1).unwrap();
+        assert!(first.contains('\u{10EEEE}'), "{loaded}");
+    }
+
+    #[test]
+    fn when_a_picture_above_the_text_being_read_loads_that_text_should_stay_put() {
+        let (mut app, _) = open_long_post(|_| {});
+        app.image_picker = kitty();
+        app.show_images = true;
+        let url = "/preview/pre/c.png";
+        let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
+        page.body.clear();
+        page.comments[0].body = format!("{PICTURE}{url}\n\n{}", paragraphs("line", 1..=60));
+        screen(&mut app, 100, 30);
+        press(&mut app, ' ');
+        let top = |s: &str| {
+            s.lines().find_map(|l| {
+                let rest = l.split("line ").nth(1)?;
+                rest.split_whitespace().next().map(str::to_string)
+            })
+        };
+        let before = top(&screen(&mut app, 100, 30));
+
+        let slot = ready(&app, 400, 200);
+        app.images.insert(url.into(), slot);
+        let after = top(&screen(&mut app, 100, 30));
+
+        assert!(before.is_some());
+        assert_eq!(before, after);
+    }
+
+    /// An open post whose only comment is one picture, kitty and images on.
+    fn picture_comment(url: &str) -> App {
+        let (mut app, _) = open_long_post(|_| {});
+        app.image_picker = kitty();
+        app.show_images = true;
+        let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
+        page.body.clear();
+        page.comments[0].body = format!("{PICTURE}{url}");
+        app
+    }
+
+    #[test]
+    fn in_a_pane_shorter_than_a_picture_it_should_still_come_wholly_into_view() {
+        let url = "/preview/pre/c.png";
+        let mut app = picture_comment(url);
+        let slot = ready(&app, 400, 200);
+        app.images.insert(url.into(), slot);
+
+        // About 10 rows of text: shorter than the 12 a picture may take.
+        let drawn = (0..20).any(|_| {
+            let shown = screen(&mut app, 100, 18).contains('\u{10EEEE}');
+            app.scroll_post(1);
+            shown
+        });
+
+        assert!(drawn);
+    }
+
+    #[test]
+    fn after_r_a_failed_comment_picture_should_load_again() {
+        let url = "/preview/pre/c.png";
+        let mut app = picture_comment(url);
+        screen(&mut app, 100, 40);
+        app.images
+            .insert(url.into(), ImageSlot::Failed("HTTP 429".into()));
+        let failed = screen(&mut app, 100, 40);
+
+        press(&mut app, 'r');
+        let again = screen(&mut app, 100, 40);
+
+        assert!(failed.contains("▣ image unavailable"), "{failed}");
+        assert!(again.contains("◌ loading image"), "{again}");
+        assert!(matches!(app.images.get(url), Some(ImageSlot::Loading)));
+    }
+
+    #[test]
+    fn after_s_starts_redlib_the_posts_own_failed_image_should_load_again() {
+        let mut app = image_post("body text here");
+        screen(&mut app, 100, 40);
+        app.images
+            .insert("/img/big.jpeg".into(), ImageSlot::Failed("HTTP 429".into()));
+
+        app.on_msg(Msg::CommandDone {
+            argv: vec!["start".into()],
+            result: Ok(crate::worker::CommandEnd::Running),
+        });
+
+        assert!(matches!(
+            app.images.get("/img/big.jpeg"),
+            Some(ImageSlot::Loading)
+        ));
+    }
+
+    /// The number after "line " on the first line that has one.
+    fn first_numbered_line(s: &str) -> Option<String> {
+        s.lines().find_map(|l| {
+            let rest = l.split("line ").nth(1)?;
+            rest.split_whitespace().next().map(str::to_string)
+        })
+    }
+
+    #[test]
+    fn a_picture_loading_as_the_page_refreshes_should_not_move_a_short_selected_comment() {
+        let url = "/preview/pre/c.png";
+        let mut app = picture_comment(url);
+        let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
+        page.comments[0].body = format!("{PICTURE}{url}\n\n{}", paragraphs("line", 1..=60));
+        let mut short = reply("short".into());
+        short.body = "short reply".into();
+        page.comments.push(short);
+        screen(&mut app, 100, 30);
+        // The short comment selected and wholly in view, the picture above the top.
+        let view = app.post_view.as_mut().unwrap();
+        view.scroll = view.row_starts[1] - 5;
+        (view.free_scroll, view.cursor, view.hold_view) = (false, 1, None);
+        let row = |s: &str| s.lines().position(|l| l.contains("short reply"));
+        let before = row(&screen(&mut app, 100, 30));
+
+        app.post_view.as_mut().unwrap().content_changed = true;
+        let slot = ready(&app, 400, 200);
+        app.images.insert(url.into(), slot);
+        let after = row(&screen(&mut app, 100, 30));
+
+        assert!(before.is_some());
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn a_held_comment_should_stay_put_when_a_picture_in_it_loads() {
+        let url = "/preview/pre/c.png";
+        let mut app = picture_comment(url);
+        let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
+        page.comments[0].body = format!("intro\n{PICTURE}{url}\n\n{}", paragraphs("line", 1..=60));
+        screen(&mut app, 100, 30);
+        for key in [' ', ' ', ' ', 'l'] {
+            press(&mut app, key);
+        }
+        let before = first_numbered_line(&screen(&mut app, 100, 30));
+
+        let slot = ready(&app, 400, 200);
+        app.images.insert(url.into(), slot);
+        let after = first_numbered_line(&screen(&mut app, 100, 30));
+
+        assert!(before.is_some());
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn a_picture_shown_twice_should_go_to_the_terminal_once_not_every_frame() {
+        let url = "/preview/pre/c.png";
+        let mut app = picture_comment(url);
+        let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
+        let mut answer = reply("r".into());
+        answer.body = format!("{PICTURE}{url}");
+        page.comments[0].replies.push(answer);
+        // Wide: each place would size it by its own column.
+        let slot = ready(&app, 2000, 100);
+        app.images.insert(url.into(), slot);
+        let sends = |app: &mut App| screen(app, 100, 40).matches("_Gq=2").count();
+
+        sends(&mut app);
+
+        assert_eq!(sends(&mut app), 0, "a redraw repeats only the cells");
+    }
+
+    #[test]
+    fn a_queued_picture_scrolled_far_away_should_be_let_go() {
+        let urls: Vec<String> = (0..40).map(|i| format!("/preview/pre/q{i}.png")).collect();
+        let mut app = picture_comment(&urls[0]);
+        let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
+        page.comments[0].body = urls
+            .iter()
+            .map(|url| format!("{PICTURE}{url}\n\n{}", paragraphs("filler", 1..=10)))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        screen(&mut app, 100, 30);
+        assert!(matches!(app.images.get(&urls[0]), Some(ImageSlot::Loading)));
+
+        let view = app.post_view.as_mut().unwrap();
+        view.free_scroll = true;
+        view.scroll = 600;
+        screen(&mut app, 100, 30);
+
+        assert!(
+            !app.images.contains_key(&urls[0]),
+            "hundreds of lines above"
+        );
+    }
+
+    #[test]
+    fn r_in_the_list_should_retry_the_open_posts_failed_pictures_too() {
+        let url = "/preview/pre/c.png";
+        let mut app = picture_comment(url);
+        app.images
+            .insert(url.into(), ImageSlot::Failed("HTTP 429".into()));
+        app.focus = crate::app::Focus::List;
+
+        app.reload();
+
+        assert!(!matches!(app.images.get(url), Some(ImageSlot::Failed(_))));
+    }
+
+    #[test]
+    fn a_quoted_picture_should_keep_its_quote_bar_on_every_row() {
+        let url = "/preview/pre/c.png";
+        let mut app = picture_comment(url);
+        let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
+        page.comments[0].body = format!("│ {PICTURE}{url}");
+        let slot = ready(&app, 400, 200);
+        app.images.insert(url.into(), slot);
+
+        let s = screen(&mut app, 100, 40);
+
+        let rows: Vec<&str> = s.lines().filter(|l| l.contains('\u{10EEEE}')).collect();
+        assert!(rows.len() > 1, "{s}");
+        // The first row's first cell also carries the image's escape sequence.
+        let barred = |l: &&str| {
+            let at = l.find(['\u{10EEEE}', '\x1b']).unwrap();
+            l[..at].ends_with("│ ")
+        };
+        assert!(rows.iter().all(barred), "{s}");
+    }
+
+    #[test]
+    fn a_picture_loading_just_above_the_top_should_keep_the_text_being_read() {
+        let url = "/preview/pre/c.png";
+        let mut app = picture_comment(url);
+        let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
+        page.comments[0].body = format!("{PICTURE}{url}\n\n{}", paragraphs("line", 1..=60));
+        screen(&mut app, 100, 30);
+        // Its one-line label 3 lines above the top, fewer than the 12 rows it will take.
+        let view = app.post_view.as_mut().unwrap();
+        let line = view.rendered_pictures[0].1;
+        (view.free_scroll, view.scroll) = (true, line + 3);
+        let before = first_numbered_line(&screen(&mut app, 100, 30));
+
+        let slot = ready(&app, 400, 200);
+        app.images.insert(url.into(), slot);
+        let after = first_numbered_line(&screen(&mut app, 100, 30));
+
+        assert!(before.is_some());
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn a_queued_picture_in_a_folded_reply_should_be_let_go() {
+        let url = "/preview/pre/folded.png";
+        let mut app = picture_comment("/preview/pre/unused.png");
+        let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
+        page.comments[0].body = "parent".into();
+        let mut answer = reply("r".into());
+        answer.body = format!("{PICTURE}{url}");
+        page.comments[0].replies.push(answer);
+        screen(&mut app, 100, 30);
+        assert!(matches!(app.images.get(url), Some(ImageSlot::Loading)));
+
+        let id = app
+            .post_view
+            .as_ref()
+            .unwrap()
+            .page
+            .as_ref()
+            .unwrap()
+            .comments[0]
+            .id
+            .clone();
+        app.post_view.as_mut().unwrap().collapsed.insert(id);
+        screen(&mut app, 100, 30);
+
+        assert!(!app.images.contains_key(url));
+    }
+
+    #[test]
+    fn a_bulleted_picture_in_a_quote_should_show_its_bullet_once() {
+        let url = "/preview/pre/c.png";
+        let mut app = picture_comment(url);
+        let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
+        page.comments[0].body = format!("│ • {PICTURE}{url}");
+        let slot = ready(&app, 400, 200);
+        app.images.insert(url.into(), slot);
+
+        let s = screen(&mut app, 100, 40);
+
+        let rows: Vec<&str> = s.lines().filter(|l| l.contains('\u{10EEEE}')).collect();
+        assert!(rows.len() > 1, "{s}");
+        let bullets = rows.iter().filter(|l| l.contains("• ")).count();
+        assert_eq!(bullets, 1, "{s}");
+        assert!(rows.iter().all(|l| l.contains("│ ")), "{s}");
+    }
+
+    #[test]
+    fn a_picture_across_the_top_shrinking_should_keep_the_text_under_it() {
+        let url = "/preview/pre/c.png";
+        let mut app = picture_comment(url);
+        let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
+        page.comments[0].body = format!("{PICTURE}{url}\n\n{}", paragraphs("line", 1..=60));
+        let slot = ready(&app, 400, 200);
+        app.images.insert(url.into(), slot);
+        screen(&mut app, 100, 30);
+        // Five of the picture's 12 rows above the top, "line 1" a few rows down.
+        let view = app.post_view.as_mut().unwrap();
+        let line = view.rendered_pictures[0].1;
+        (view.free_scroll, view.scroll) = (true, line + 5);
+        let before = screen(&mut app, 100, 30);
+
+        app.show_images = false;
+        let after = screen(&mut app, 100, 30);
+
+        assert_eq!(
+            first_numbered_line(&before).as_deref(),
+            Some("1"),
+            "{before}"
+        );
+        assert_eq!(first_numbered_line(&after).as_deref(), Some("1"), "{after}");
+    }
+
+    #[test]
+    fn many_loaded_pictures_far_from_view_should_be_let_go() {
+        let urls: Vec<String> = (0..40).map(|i| format!("/preview/pre/p{i}.png")).collect();
+        let mut app = picture_comment(&urls[0]);
+        let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
+        page.comments[0].body = urls
+            .iter()
+            .map(|url| format!("{PICTURE}{url}\n\nfiller"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        for url in &urls {
+            let slot = ready(&app, 400, 400);
+            app.images.insert(url.clone(), slot);
+        }
+
+        screen(&mut app, 100, 30);
+
+        assert!(app.images.contains_key(&urls[0]), "in view");
+        assert!(
+            !app.images.contains_key(&urls[39]),
+            "hundreds of lines below"
+        );
+    }
+
     #[test]
     fn a_long_post_opens_at_its_top() {
         let (app, s) = open_long_post(|_| {});
 
         assert!(s.lines().any(|l| l.contains("paragraph 1 ")), "{s}");
         assert_eq!(app.post_view.as_ref().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn when_a_post_is_open_the_list_should_only_remain_if_both_panes_fit() {
+        for (sidebar, width, list_visible) in [
+            (true, 158, true),
+            (true, 157, false),
+            (false, 128, true),
+            (false, 127, false),
+        ] {
+            let (mut app, _) = open_long_post(|_| {});
+            app.show_sidebar = sidebar;
+
+            let actual = screen(&mut app, width, 30);
+            let content: String = actual
+                .lines()
+                .map(|line| {
+                    line.chars()
+                        .skip(if sidebar { 30 } else { 0 })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            assert_eq!(
+                content.contains("⌂ Home"),
+                list_visible,
+                "sidebar={sidebar}, width={width}\n{actual}"
+            );
+            assert!(content.contains("paragraph 1 "), "{actual}");
+        }
     }
 
     #[test]
@@ -2425,6 +3190,134 @@ mod tests {
     }
 
     #[test]
+    fn when_a_post_image_is_small_the_text_should_start_right_below_it() {
+        // Reddit's 140×73 link preview grows twice: 146 px is 10 rows of 16 px (rounded
+        // up), not the most a wide picture may take.
+        let mut app = image_post("first line of the body");
+        let slot = ready(&app, 140, 73);
+        app.images.insert("/img/big.jpeg".into(), slot);
+
+        let s = screen(&mut app, 100, 50);
+
+        let row = |text: &str| s.lines().position(|l| l.contains(text)).unwrap();
+        let gap = row("first line of the body") - row("╰");
+        // 10 picture rows plus the 3 rows of spacing every inline picture has.
+        assert_eq!(gap, 13, "rows between header and text:\n{s}");
+    }
+
+    #[test]
+    fn a_post_picture_should_fill_the_width_when_wide_and_stay_within_half_when_tall() {
+        // 8×16 px cells, 100 columns; a wide picture may take 40 rows, a tall one 20.
+        let font = ratatui_image::FontSize::new(8, 16);
+        let cells = |w, h| {
+            let size = picture_cells(w, h, font, 100, 40, 20, MAX_ENLARGE);
+            (size.width, size.height)
+        };
+
+        assert_eq!(cells(1600, 900), (100, 29), "wide: the whole width");
+        assert_eq!(
+            cells(4000, 400),
+            (100, 5),
+            "very wide: still the whole width"
+        );
+        assert_eq!(
+            cells(800, 700),
+            (91, 40),
+            "barely wide: until the wide limit"
+        );
+        assert_eq!(cells(900, 1600), (23, 20), "tall: within half");
+        assert_eq!(cells(1000, 1000), (40, 20), "square counts as tall");
+        assert_eq!(cells(140, 73), (35, 10), "small: at most twice its size");
+    }
+
+    #[test]
+    fn a_picture_fitted_again_into_its_cells_should_keep_them() {
+        // The layout sizes a picture, then the draw fits it into those cells: a wide one
+        // must still fill the width. 4000×420 is 5.25 rows across 100 columns of 8×16.
+        let font = ratatui_image::FontSize::new(8, 16);
+        for (w, h) in [
+            (4000, 420),
+            (400, 3000),
+            (275, 1500),
+            (1500, 1000),
+            (1600, 900),
+            (900, 1600),
+            (140, 73),
+        ] {
+            let laid = picture_cells(w, h, font, 100, 40, 20, MAX_ENLARGE);
+            let drawn = picture_cells(
+                w,
+                h,
+                font,
+                laid.width,
+                laid.height,
+                laid.height,
+                MAX_ENLARGE,
+            );
+            assert_eq!(drawn, laid, "{w}×{h}");
+        }
+    }
+
+    #[test]
+    fn when_a_video_frame_is_decoded_smaller_it_should_still_be_drawn_at_full_size() {
+        // The terminal scales a kitty frame: only its shape decides its cells.
+        let placement = |w, h| {
+            let mut app = open_video_post();
+            let frame = video::Frame {
+                width: w,
+                height: h,
+                pixels: video::Pixels::Zlib(vec![1, 2, 3]),
+                same_as_first: false,
+            };
+            let url = app.redlib.absolute(VIDEO);
+            app.video = Some(video::Player::showing(&url, frame));
+            let s = screen(&mut app, 100, 40);
+            let header = s.split("_Ga=T").nth(1).unwrap().to_string();
+            let keys: Vec<&str> = header
+                .split([',', ';'])
+                .filter(|k| k.starts_with("c=") || k.starts_with("r="))
+                .take(2)
+                .collect();
+            keys.join(",")
+        };
+
+        assert_eq!(placement(160, 90), placement(1280, 720));
+    }
+
+    #[test]
+    fn a_wide_video_taller_than_32_rows_should_still_fill_the_width() {
+        let placement = |w, h| {
+            let mut app = open_video_post();
+            let frame = video::Frame {
+                width: w,
+                height: h,
+                pixels: video::Pixels::Zlib(vec![1, 2, 3]),
+                same_as_first: false,
+            };
+            let url = app.redlib.absolute(VIDEO);
+            app.video = Some(video::Player::showing(&url, frame));
+            let s = screen(&mut app, 200, 80);
+            let header = s.split("_Ga=T").nth(1).unwrap().to_string();
+            let cell = |key: &str| -> u16 {
+                header
+                    .split([',', ';'])
+                    .find_map(|k| k.strip_prefix(key))
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            };
+            (cell("c="), cell("r="))
+        };
+
+        let (wide_cols, _) = placement(1600, 900);
+        // 4:3 across the post's width (over 90 columns of 8 px) needs more than 32 rows.
+        let (cols, rows) = placement(800, 600);
+        assert!(rows > 32, "{cols}×{rows}");
+        // A taller picture may drop the text's scrollbar column.
+        assert!(cols.abs_diff(wide_cols) <= 1, "{cols} vs {wide_cols}");
+    }
+
+    #[test]
     fn the_image_waits_for_the_post_page() {
         let shown = std::cell::RefCell::new(String::new());
         open_long_post(|app| {
@@ -2479,7 +3372,7 @@ mod tests {
         // `x` closes only tabs opened with `p`; r/s is a subscription.
         let mut feed = feed_app(Picker::halfblocks());
         let on_subscription = footer(&mut feed);
-        feed.sidebar_focused = true;
+        feed.focus = Focus::Sidebar;
         let in_sidebar = footer(&mut feed);
 
         assert!(reading.contains("select"), "{reading}");
@@ -2522,20 +3415,10 @@ mod tests {
     }
 
     fn replies(n: usize) -> Vec<Comment> {
-        let (app, _) = open_long_post(|_| {});
-        let reply = app
-            .post_view
-            .as_ref()
-            .unwrap()
-            .page
-            .as_ref()
-            .unwrap()
-            .comments[0]
-            .clone();
         (0..n)
             .map(|i| Comment {
-                id: format!("r{i}"),
-                ..reply.clone()
+                sources: Some(Default::default()),
+                ..reply(format!("r{i}"))
             })
             .collect()
     }
@@ -2928,10 +3811,7 @@ mod tests {
             .map(|n| format!("aaaaaaaaaa {SPOILER_START}{}{SPOILER_END}", "ab-".repeat(n)))
             .collect::<Vec<_>>()
             .join("\n\n");
-        page.comments[0].body = (1..=40)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        page.comments[0].body = paragraphs("line", 1..=40);
         screen(&mut app, 100, 30);
         let view = app.post_view.as_mut().unwrap();
         let masked_start = view.row_starts[0];
@@ -3009,10 +3889,7 @@ mod tests {
             .map(|n| format!("aaaaaaaaaa {SPOILER_START}{}{SPOILER_END}", "ab-".repeat(n)));
         let tail = (1..=body_tail).map(|i| format!("body {i}"));
         page.body = spoilers.chain(tail).collect::<Vec<_>>().join("\n\n");
-        page.comments[0].body = (1..=40)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        page.comments[0].body = paragraphs("line", 1..=40);
         screen(&mut app, 100, 30);
         app
     }
@@ -3236,10 +4113,7 @@ mod tests {
     fn selecting_the_comment_being_read_keeps_the_view() {
         let (mut app, _) = open_long_post(|_| {});
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
-        page.comments[0].body = (1..=40)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        page.comments[0].body = paragraphs("line", 1..=40);
         // Select the tall comment, then page down inside it: its header leaves.
         for key in ['j', ' ', ' '] {
             press(&mut app, key);
@@ -3297,10 +4171,7 @@ mod tests {
             let reply = page.comments[0].clone();
             let mut tall = reply.clone();
             tall.id = "tall".into();
-            tall.body = (1..=40)
-                .map(|i| format!("line {i}"))
-                .collect::<Vec<_>>()
-                .join("\n\n");
+            tall.body = paragraphs("line", 1..=40);
             page.comments[0].more = Some(MoreReplies {
                 path: "/r/s/comments/p/x/c".into(),
                 count: Some(20),
@@ -3416,10 +4287,7 @@ mod tests {
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         let mut reply = page.comments[0].clone();
         reply.id = "r".into();
-        let tall_body = (1..=40)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let tall_body = paragraphs("line", 1..=40);
         page.comments[0].body = tall_body.clone();
         page.comments[0].replies = vec![reply.clone()];
         // A tall thread below, so the folded document still scrolls this far.
@@ -3554,8 +4422,7 @@ mod tests {
         assert!(s.contains("img off"), "{s}");
     }
 
-    /// With nothing to show in a thumbnail slot (half-blocks, images off, or every
-    /// image post a spoiler), rows keep the full width, as on a text terminal.
+    /// With no thumbnail to show, rows keep the full width.
     #[test]
     fn lists_with_no_thumbnail_to_show_keep_text_only_rows() {
         let mut spoilers = feed_app(kitty());
@@ -3577,6 +4444,14 @@ mod tests {
             assert_eq!(title_run(&s, "p1"), reference, "{name}");
             assert_eq!(title_run(&s, "p2"), reference, "{name}");
         }
+    }
+
+    #[test]
+    fn a_hidden_picture_should_mask_as_a_short_bar_not_its_url() {
+        let text =
+            format!("see {SPOILER_START}{PICTURE}/preview/pre/abcdefghijklmnop.png{SPOILER_END}");
+
+        assert_eq!(spoiler_text(&text, false), "see ▒▒▒▒▒▒");
     }
 
     #[test]
@@ -3665,8 +4540,9 @@ mod tests {
         app.image_picker = picker;
         app.show_images = true;
         app.switch_tab(2);
-        let feed = &mut app.tabs[2].feed;
-        feed.posts = (1..=8)
+        let tab = app.tabs[2].id;
+        let generation = app.tabs[2].feed.generation;
+        let posts = (1..=8)
             .map(|i| {
                 let media = if i == 2 {
                     Media::None
@@ -3678,8 +4554,16 @@ mod tests {
                 post_with(&format!("p{i}"), media)
             })
             .collect();
-        feed.loading = false;
-        feed.loaded = true;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation,
+            append: false,
+            result: Ok(crate::model::Listing {
+                posts,
+                after: None,
+                icon: None,
+            }),
+        });
         app
     }
 
@@ -3749,14 +4633,15 @@ mod tests {
             ImageSlot::Ready {
                 protocol: Box::new(protocol),
                 refresh: crate::app::ImageRefresh::Idle,
+                pixels: (256, 256),
             },
         );
         let cells = placeholder_cells(&mut app, 100, 20);
 
         // Sidebar 24 + margin 1: the list starts at x 25 with the selection bar,
-        // so the 6×3 thumbnail fills x 26..=31 on the row's two lines and the gap below.
-        let expected: Vec<(u16, u16)> = (p1_row..p1_row + 3)
-            .flat_map(|y| (26..=31).map(move |x| (x, y)))
+        // so the 4×2 thumbnail fills x 26..=29 on the row's two lines only.
+        let expected: Vec<(u16, u16)> = (p1_row..p1_row + 2)
+            .flat_map(|y| (26..=29).map(move |x| (x, y)))
             .collect();
         let mut cells = cells;
         cells.sort_by_key(|&(x, y)| (y, x));
@@ -3803,6 +4688,7 @@ mod tests {
             ImageSlot::Ready {
                 protocol: Box::new(protocol),
                 refresh: crate::app::ImageRefresh::Idle,
+                pixels: (16, 16),
             },
         );
         let cells = placeholder_cells(&mut app, 120, 30);
@@ -3843,6 +4729,7 @@ mod tests {
         ImageSlot::Ready {
             protocol: Box::new(app.image_picker.new_resize_protocol(image)),
             refresh: crate::app::ImageRefresh::Idle,
+            pixels: (w, h),
         }
     }
 
@@ -3861,7 +4748,7 @@ mod tests {
         // kitty sends an image once, in its first cell: drawing it under the
         // popup would lose it, so it first draws after the popup closes.
         assert!(under_help.is_empty(), "{under_help:?}");
-        assert_eq!(after.len(), 8);
+        assert_eq!(after.len(), 8, "the whole 4×2 slot");
     }
 
     #[test]
@@ -4053,6 +4940,130 @@ mod tests {
     }
 
     #[test]
+    fn when_detail_is_split_h_should_focus_the_list_without_leaving_the_comment() {
+        let (mut app, _) = open_long_post(|_| {});
+        let mut other = app.home.groups[0].posts[0].clone();
+        other.id = "other".into();
+        other.permalink = "/r/s/comments/other/x/".into();
+        app.home.groups[0].posts.push(other);
+        screen(&mut app, 180, 30);
+        press(&mut app, 'j');
+        screen(&mut app, 180, 30);
+        let view = app.post_view.as_ref().unwrap();
+        let expected = (view.generation, view.cursor, view.scroll, view.free_scroll);
+        assert!(view.scroll > 0, "reading the comment, not the post's top");
+
+        press(&mut app, 'h');
+        screen(&mut app, 180, 30);
+        let view = app.post_view.as_ref().unwrap();
+        let actual = (view.generation, view.cursor, view.scroll, view.free_scroll);
+        press(&mut app, 'j');
+
+        assert_eq!(actual, expected, "h must not leave or reset the comment");
+        assert_eq!(app.home.post, 1, "j now moves the list selection");
+        assert_eq!(app.current_post().unwrap().id, "other");
+    }
+
+    #[test]
+    fn when_the_list_has_retained_detail_q_should_close_it_before_quitting() {
+        let (mut app, _) = open_long_post(|_| {});
+        screen(&mut app, 180, 30);
+        press(&mut app, 'h');
+
+        press(&mut app, 'q');
+
+        assert!(!app.quit, "the first q only closes the retained post");
+        assert!(app.post_view.is_none());
+        press(&mut app, 'q');
+        assert!(app.quit, "q quits once no post remains open");
+    }
+
+    #[test]
+    fn when_a_resize_hides_the_list_the_next_key_should_target_detail() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = open_long_post(|_| {});
+        let mut other = app.home.groups[0].posts[0].clone();
+        other.id = "other".into();
+        other.permalink = "/r/s/comments/other/x/".into();
+        app.home.groups[0].posts.push(other);
+        screen(&mut app, 180, 30);
+        press(&mut app, 'h');
+        press(&mut app, 'j');
+
+        crate::handle_event(&mut app, Event::Resize(157, 30));
+        crate::handle_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        assert_eq!(app.post_view.as_ref().unwrap().post.id, "p");
+        assert_eq!(app.home.post, 1, "the hidden list selection stays put");
+    }
+
+    #[test]
+    fn when_a_resize_shows_the_list_h_should_focus_it_before_the_next_key() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _) = open_long_post(|_| {});
+        let mut other = app.home.groups[0].posts[0].clone();
+        other.id = "other".into();
+        other.permalink = "/r/s/comments/other/x/".into();
+        app.home.groups[0].posts.push(other);
+        press(&mut app, 'j');
+        screen(&mut app, 100, 30);
+
+        crate::handle_event(&mut app, Event::Resize(180, 30));
+        crate::handle_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
+        );
+        press(&mut app, 'j');
+
+        assert_eq!(app.home.post, 1);
+        assert!(!app.post_view.as_ref().unwrap().free_scroll);
+    }
+
+    #[test]
+    fn when_a_list_search_is_cleared_escape_should_keep_the_retained_detail() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = feed_app(Picker::halfblocks());
+        app.open_current_post();
+        screen(&mut app, 180, 30);
+        press(&mut app, 'h');
+        app.search("query".into());
+        let expected_generation = app.post_view.as_ref().unwrap().generation;
+
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(app.active_tab().feed.search.is_none());
+        assert_eq!(
+            app.post_view.as_ref().unwrap().generation,
+            expected_generation
+        );
+    }
+
+    #[test]
+    fn when_the_list_becomes_empty_l_should_resume_the_retained_detail() {
+        let (mut app, _) = open_long_post(|_| {});
+        screen(&mut app, 180, 30);
+        press(&mut app, 'h');
+        app.home.groups[0].posts.clear();
+        screen(&mut app, 180, 30);
+
+        press(&mut app, 'l');
+        press(&mut app, ' ');
+        screen(&mut app, 180, 30);
+
+        let view = app
+            .post_view
+            .as_ref()
+            .expect("still reading the opened post");
+        assert!(
+            view.scroll > 0,
+            "Space pages detail instead of opening a tab"
+        );
+    }
+
+    #[test]
     fn h_climbs_from_a_comment_to_the_sidebar_and_l_comes_back() {
         let (mut app, _) = open_long_post(|_| {});
         press(&mut app, 'j');
@@ -4068,14 +5079,14 @@ mod tests {
         );
         press(&mut app, 'h');
         assert!(app.post_view.is_none(), "back to the list");
-        assert!(!app.sidebar_focused);
+        assert_eq!(app.focus, Focus::List);
         press(&mut app, 'h');
-        assert!(app.sidebar_focused);
+        assert_eq!(app.focus, Focus::Sidebar);
         press(&mut app, 'h');
-        assert!(app.sidebar_focused, "the sidebar is the top");
+        assert_eq!(app.focus, Focus::Sidebar, "the sidebar is the top");
 
         press(&mut app, 'l');
-        assert!(!app.sidebar_focused);
+        assert_eq!(app.focus, Focus::List);
         assert!(
             app.post_view.is_none(),
             "l from the sidebar only returns focus"
@@ -4103,7 +5114,7 @@ mod tests {
         assert_eq!(seen, ["Home", "Bookmarks", "r/a", "r/b", "r/c", "r/c"]);
         assert_eq!(after_k, "r/b");
         assert_eq!(first, "Home");
-        assert!(app.sidebar_focused);
+        assert_eq!(app.focus, Focus::Sidebar);
     }
 
     #[test]
@@ -4341,6 +5352,35 @@ mod tests {
     }
 
     #[test]
+    fn when_a_frame_is_encoded_for_fixed_cells_the_video_band_should_be_that_tall() {
+        let mut app = open_video_post();
+        let mut picker = kitty();
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Sixel);
+        app.image_picker = picker.clone();
+        // A 160×90 frame encoded unscaled is 20×6 cells; the rule would grow it twice.
+        let image = image::DynamicImage::new_rgb8(160, 90);
+        let protocol = picker
+            .new_protocol(image, Size::new(98, 30), Resize::Fit(None))
+            .unwrap();
+        let cells = protocol.size();
+        let frame = video::Frame {
+            width: 160,
+            height: 90,
+            pixels: video::Pixels::Image(protocol),
+            same_as_first: false,
+        };
+        let url = app.redlib.absolute(VIDEO);
+        app.video = Some(video::Player::showing(&url, frame));
+
+        let s = screen(&mut app, 100, 40);
+
+        let row = |text: &str| s.lines().position(|l| l.contains(text)).unwrap();
+        assert_eq!(cells.height, 6);
+        // Six picture rows right under the header, then the status line.
+        assert_eq!(row("pause") - row("╰"), 6 + 1, "no empty band:\n{s}");
+    }
+
+    #[test]
     fn the_video_plays_only_while_its_post_shows_it() {
         let mut app = open_video_post();
         let step = |app: &mut App| {
@@ -4364,6 +5404,37 @@ mod tests {
         assert_eq!(step(&mut app), Some(false));
         press(&mut app, 'q');
         assert_eq!(step(&mut app), None, "leaving the post stops it");
+    }
+
+    #[test]
+    fn when_a_gif_post_opens_it_should_play_inline_without_an_image_download() {
+        let (mut app, _) = open_long_post(|_| {});
+        app.image_picker = kitty();
+        app.show_images = true;
+        let view = app.post_view.as_mut().unwrap();
+        let generation = view.generation;
+        let mut page = view.page.take().unwrap();
+        page.post.media = Media::Image {
+            url: "/img/f5ndv6yotovh1.gif".into(),
+        };
+
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(page)),
+        });
+        screen(&mut app, 100, 30);
+        app.tick();
+
+        let player = app
+            .video
+            .as_ref()
+            .expect("GIF should start the video player");
+        assert!(player.url.ends_with("/img/f5ndv6yotovh1.gif"));
+        assert!(!player.hidden(), "the GIF should have a visible video area");
+        assert!(
+            !app.images.contains_key("/img/f5ndv6yotovh1.gif"),
+            "GIFs must not enter the full-image download queue"
+        );
     }
 
     #[test]
@@ -4425,12 +5496,48 @@ mod tests {
     }
 
     #[test]
+    fn when_a_frame_shrinks_the_drawn_video_the_decoder_should_not_restart() {
+        let mut app = open_video_post();
+        let step = |app: &mut App| {
+            screen(app, 100, 30);
+            app.tick();
+        };
+        step(&mut app);
+        let (url, decoding) = {
+            let player = app.video.as_ref().unwrap();
+            (player.url.clone(), player.area)
+        };
+        // A very wide frame takes far fewer rows than the box it was decoded for.
+        let frame = video::Frame {
+            width: 160,
+            height: 9,
+            pixels: video::Pixels::Zlib(vec![1, 2, 3]),
+            same_as_first: true,
+        };
+        let mut player = video::Player::showing(&url, frame);
+        player.area = decoding;
+        app.video = Some(player);
+
+        step(&mut app);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        step(&mut app);
+
+        let player = app.video.as_ref().unwrap();
+        assert!(
+            player.frame().is_some(),
+            "the same player, not a restarted one"
+        );
+        assert_eq!(player.area, decoding);
+    }
+
+    #[test]
     fn a_video_frame_goes_to_the_terminal_once() {
         let mut app = open_video_post();
         let frame = || video::Frame {
             width: 16,
             height: 9,
             pixels: video::Pixels::Zlib(vec![1, 2, 3]),
+            same_as_first: false,
         };
         let url = app.redlib.absolute(VIDEO);
         app.video = Some(video::Player::showing(&url, frame()));
@@ -4445,10 +5552,7 @@ mod tests {
     #[test]
     fn edited_selftext_keeps_the_unchanged_passage_being_read() {
         let (mut app, _) = open_long_post(|_| {});
-        let original = (1..=60)
-            .map(|i| format!("body passage {i}"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let original = paragraphs("body passage", 1..=60);
         app.post_view.as_mut().unwrap().page.as_mut().unwrap().body = original.clone();
         screen(&mut app, 100, 30);
         app.post_view.as_mut().unwrap().scroll = 26; // A blank line before unchanged text.
@@ -4538,10 +5642,7 @@ mod tests {
         for more in [false, true] {
             for held in [0, 1, 2] {
                 let (mut app, _) = open_long_post(|_| {});
-                let original = (1..=60)
-                    .map(|i| format!("comment passage {i}"))
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
+                let original = paragraphs("comment passage", 1..=60);
                 let view = app.post_view.as_mut().unwrap();
                 let page = view.page.as_mut().unwrap();
                 page.body.clear();
@@ -4614,10 +5715,7 @@ mod tests {
     fn spoiler_then_comment_refresh_in_one_batch_keeps_the_old_passage() {
         for more in [false, true] {
             let (mut app, _) = open_long_post(|_| {});
-            let original = (1..=60)
-                .map(|i| format!("unchanged comment passage {i}"))
-                .collect::<Vec<_>>()
-                .join("\n\n");
+            let original = paragraphs("unchanged comment passage", 1..=60);
             let original = format!("{original}\n\n{SPOILER_START}short spoiler{SPOILER_END}");
             let view = app.post_view.as_mut().unwrap();
             let page = view.page.as_mut().unwrap();
@@ -4676,10 +5774,7 @@ mod tests {
         let view = app.post_view.as_mut().unwrap();
         let page = view.page.as_mut().unwrap();
         page.body.clear();
-        page.comments[0].body = (1..=60)
-            .map(|i| format!("passage {i}"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        page.comments[0].body = paragraphs("passage", 1..=60);
         screen(&mut app, 100, 30);
         let view = app.post_view.as_mut().unwrap();
         view.scroll = view.row_starts[0] + 26;
@@ -4709,10 +5804,7 @@ mod tests {
             page.comments[0].body = "short first comment".into();
             let mut next = page.comments[0].clone();
             next.id = "next".into();
-            next.body = (1..=60)
-                .map(|i| format!("second passage {i}"))
-                .collect::<Vec<_>>()
-                .join("\n\n");
+            next.body = paragraphs("second passage", 1..=60);
             page.comments.push(next);
             screen(&mut app, 100, 30);
             press(&mut app, 'j');
@@ -4752,10 +5844,7 @@ mod tests {
             let (mut app, _) = open_long_post(|_| {});
             let original = format!(
                 "opening\n\n}}\n\nFIRST unique passage\n\n}}\n\nSECOND unique passage\n\n{}",
-                (1..=40)
-                    .map(|i| format!("tail {i}"))
-                    .collect::<Vec<_>>()
-                    .join("\n\n")
+                paragraphs("tail", 1..=40)
             );
             let view = app.post_view.as_mut().unwrap();
             let page = view.page.as_mut().unwrap();
@@ -4803,10 +5892,7 @@ mod tests {
         page.body = "short selftext".into();
         page.comments[0].body = format!(
             "{}\n\n{SPOILER_START}short spoiler{SPOILER_END}",
-            (1..=60)
-                .map(|i| format!("stable passage {i}"))
-                .collect::<Vec<_>>()
-                .join("\n\n")
+            paragraphs("stable passage", 1..=60)
         );
         screen(&mut app, 100, 30);
         let view = app.post_view.as_mut().unwrap();
@@ -4842,17 +5928,11 @@ mod tests {
             page.body.clear();
             page.comments[0].body = format!(
                 "{}\n{SPOILER_START}short spoiler{SPOILER_END}",
-                (1..=10)
-                    .map(|i| format!("first passage {i}"))
-                    .collect::<Vec<_>>()
-                    .join("\n\n")
+                paragraphs("first passage", 1..=10)
             );
             let mut next = page.comments[0].clone();
             next.id = "next".into();
-            next.body = (1..=60)
-                .map(|i| format!("next passage {i}"))
-                .collect::<Vec<_>>()
-                .join("\n\n");
+            next.body = paragraphs("next passage", 1..=60);
             page.comments.push(next);
             screen(&mut app, 100, 30);
             let view = app.post_view.as_mut().unwrap();
@@ -4913,10 +5993,7 @@ mod tests {
             let mut sibling = page.comments[0].clone();
             sibling.id = "sibling".into();
             sibling.more = None;
-            sibling.body = (1..=30)
-                .map(|i| format!("unique sibling passage {i}"))
-                .collect::<Vec<_>>()
-                .join("\n\n");
+            sibling.body = paragraphs("unique sibling passage", 1..=30);
             page.comments.push(sibling);
             screen(&mut app, 100, 30);
             let view = app.post_view.as_mut().unwrap();
@@ -4992,10 +6069,7 @@ mod tests {
         let mut sibling = child.clone();
         sibling.id = "sibling".into();
         sibling.more = None;
-        sibling.body = (0..30)
-            .map(|i| format!("unique following passage {i}"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        sibling.body = paragraphs("unique following passage", 0..30);
         page.comments = vec![parent, sibling];
         screen(&mut app, 100, 30);
         let view = app.post_view.as_mut().unwrap();
