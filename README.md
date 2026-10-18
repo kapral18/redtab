@@ -9,7 +9,8 @@ API key.
 - **Tabs**: a sidebar with Home, Bookmarks, your subscriptions and subreddits you opened,
   numbered `1`–`9` and badged with new-post counts. `\` hides it.
 - **Side by side**: at 158+ columns (128 with the sidebar hidden) the list and the open post
-  share the screen; narrower, the post replaces the list.
+  share the screen and the post follows the list selection; narrower, the post replaces
+  the list.
 - **Home**: one card per subscription with its top posts.
 - **Fuzzy jump** (`p`) to any tab or subreddit; sort, time range and search per subreddit.
 - **Post view**: selftext and a foldable comment tree; deep threads load on demand.
@@ -53,10 +54,8 @@ cargo install --git https://github.com/kapral18/redtab
 redtab                    # Home: your subscriptions
 redtab -s neovim          # open r/neovim on start
 redtab -c ~/redtab.toml   # another config file
-redtab --check            # config, Redlib status and state file; exits 1 if Redlib is down
+redtab --check            # config, Redlib status, subscriptions and state file; exits 1 if Redlib is down
 ```
-
-Press `?` inside redtab for the keys.
 
 ## Configure
 
@@ -92,9 +91,6 @@ image = ["open"]
 Reading state (seen posts, bookmarks) lives in `$XDG_STATE_HOME/redtab/state.json`; the
 disposable cache in `$XDG_CACHE_HOME/redtab`. Deleting the cache loses nothing you keep.
 
-`redtab --check` prints the config file, Redlib's status, the subscription count and the
-state file, and exits 1 when Redlib does not answer.
-
 ## Keys
 
 Press `?` in redtab for the full list.
@@ -110,13 +106,13 @@ Press `?` in redtab for the full list.
 | `Enter` `l` | open the selected post, or resume its retained detail |
 | `J` `K`, `Space` | Home: next / previous card, open the card's subreddit |
 | `s`, `t`, `/` | subreddit: sort, time range, search (`Esc` clears) |
-| `L` | load the next page now |
+| `L` | subreddit: load the next page now |
 | `l` `c` `Enter` | post: select the comment you are reading; again on a selected comment: fold a thread or load more replies |
 | `n` `N` | post: next / previous top-level comment |
 | `v` | post: show / hide spoilers |
 | `P`, `a`, `,` `.` | post video: pause / play, sound on / off, seek back / forward 5 s |
 | `Space`, `C-d` `C-u`, `C-e` `C-y` | post: scroll by page, half page, line |
-| `h` | split detail: focus the list without losing your place; narrow detail: back one level |
+| `h` | split detail: focus the list without losing your place (moving the list then shows the selected post beside it); narrow detail: back one level |
 | `Esc` `q` | detail: close the post and return to the list |
 | `o`, `y`, `m`, `b` | open on reddit.com, copy link, media, bookmark |
 | `i`, `r`, `S` | toggle images and videos, reload, start Redlib |

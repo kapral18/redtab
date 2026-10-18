@@ -33,6 +33,9 @@ const BOOKMARKS_TAB: usize = 1;
 const THUMB_CACHE_MAX: usize = 400;
 /// A video area that changed size restarts the video once the size holds this long.
 const VIDEO_RESIZE_SETTLE: Duration = Duration::from_millis(250);
+/// Moves through lists, tabs and posts closer together than this count as one quick run.
+/// A move after a pause loads at once; later moves in a quick run load only where it stops.
+pub(crate) const NAV_SETTLE: Duration = Duration::from_millis(200);
 pub const CARD_MIN_WIDTH: u16 = 54;
 /// Pane widths include horizontal margins.
 pub const MAIN_MIN_WIDTH: u16 = CARD_MIN_WIDTH + 2;
@@ -42,6 +45,60 @@ const SIDEBAR_NARROW: u16 = 24;
 
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+/// Holds back the loads that moving through lists, tabs and posts starts. A move after a
+/// pause loads at once; in a quick run of moves only the last move's target loads, once
+/// they pause.
+#[derive(Debug, Default)]
+struct Settle<T = u64> {
+    /// The target held back (a post view's generation, a tab id, or `()` for what is on
+    /// screen) and when it loads.
+    waiting: Option<(T, Instant)>,
+    last_move: Option<Instant>,
+}
+
+impl<T: Copy + PartialEq> Settle<T> {
+    /// A move to `target`: true when it loads now, else it waits for the moves to pause.
+    fn arrive(&mut self, target: T, now: Instant) -> bool {
+        let quick = self
+            .last_move
+            .is_some_and(|last| now.saturating_duration_since(last) < NAV_SETTLE);
+        self.last_move = Some(now);
+        self.waiting = quick.then(|| (target, now + NAV_SETTLE));
+        !quick
+    }
+
+    /// The held-back target whose wait is over by `now`.
+    fn due(&mut self, now: Instant) -> Option<T> {
+        if self.waiting.is_some_and(|(_, at)| at <= now) {
+            self.take()
+        } else {
+            None
+        }
+    }
+
+    /// The held-back target, its wait cut short.
+    fn take(&mut self) -> Option<T> {
+        self.waiting.take().map(|(target, _)| target)
+    }
+
+    /// Drop the held-back load of `target`: something else just loaded it.
+    fn forget(&mut self, target: T) {
+        if self.waiting.is_some_and(|(waiting, _)| waiting == target) {
+            self.waiting = None;
+        }
+    }
+
+    /// Whether a quick run of moves still holds its load back at `now`.
+    fn holding(&self, now: Instant) -> bool {
+        self.waiting.is_some_and(|(_, at)| at > now)
+    }
+
+    fn wake_in(&self, now: Instant) -> Option<Duration> {
+        self.waiting
+            .map(|(_, at)| at.saturating_duration_since(now))
+    }
 }
 
 /// A list picture cut to its slot's shape, centred, so it fills the slot without
@@ -129,6 +186,12 @@ impl Feed {
 
     pub fn refreshing(&self) -> bool {
         !self.refreshing.is_empty()
+    }
+
+    /// `posts` answer the current sort, time range or search, not an earlier one still
+    /// shown while the new one loads.
+    pub fn shows_current_query(&self) -> bool {
+        self.shown_query.as_ref() == Some(&self.query())
     }
 
     pub fn loading(&self) -> bool {
@@ -671,7 +734,7 @@ pub enum Overlay {
     },
 }
 
-/// Cached pixels stay usable independently of their next network request.
+/// Refetch state of a loaded picture; its pixels stay drawn whatever this says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageRefresh {
     Idle,
@@ -763,6 +826,12 @@ pub struct App {
     pub video_sent: Option<(u64, Rect)>,
     /// The video area's new size and when it first appeared; the video restarts once it holds.
     video_resize: Option<(ratatui::layout::Size, Instant)>,
+    /// Post loads of list moves beside an open post, by post view generation.
+    post_settle: Settle,
+    /// Feed loads of tab switches, by tab id.
+    feed_settle: Settle,
+    /// Thumbnails, icons and pictures in post text that moves bring on screen.
+    picture_settle: Settle<()>,
     command_running: bool,
     pub quit: bool,
 }
@@ -814,6 +883,9 @@ impl App {
             video_tall_rows: 1,
             video_sent: None,
             video_resize: None,
+            post_settle: Settle::default(),
+            feed_settle: Settle::default(),
+            picture_settle: Settle::default(),
             command_running: false,
             quit: false,
         };
@@ -892,10 +964,14 @@ impl App {
         }
     }
 
-    /// Timers: status expiry, health checks, saves, video frames. True when something
-    /// visible changed.
+    /// Timers: held-back navigation loads, status expiry, health checks, saves, video
+    /// frames. True when something visible changed.
     pub fn tick(&mut self) -> bool {
-        let mut changed = self.sync_video(Instant::now());
+        let now = Instant::now();
+        let mut changed = self.load_settled(now);
+        // Pictures a quick run of moves held back: the redraw fetches what it shows.
+        changed |= self.picture_settle.due(now).is_some();
+        changed |= self.sync_video(now);
         if self
             .status
             .as_ref()
@@ -916,7 +992,29 @@ impl App {
         changed
     }
 
-    /// How long the main loop may wait for input: next video frame, resize settling, or the timers.
+    /// Start the load a quick run of moves held back, once the moves paused and only if
+    /// its post or tab is still the one shown.
+    fn load_settled(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        if let Some(generation) = self.post_settle.due(now)
+            && let Some(view) = self.post_view.as_ref()
+            && view.generation == generation
+        {
+            let permalink = view.post.permalink.clone();
+            self.load_post(permalink);
+            changed = true;
+        }
+        if let Some(tab) = self.feed_settle.due(now)
+            && self.active_tab().id == tab
+        {
+            self.ensure_feed_loaded(self.active);
+            changed = true;
+        }
+        changed
+    }
+
+    /// How long the main loop may wait for input: next video frame, resize settling, a
+    /// held-back load, or the timers.
     pub fn wake_in(&self) -> Duration {
         const IDLE: Duration = Duration::from_millis(100);
         let now = Instant::now();
@@ -928,6 +1026,9 @@ impl App {
             .and_then(|p| p.wake_in(now))
             .into_iter()
             .chain(settle)
+            .chain(self.post_settle.wake_in(now))
+            .chain(self.feed_settle.wake_in(now))
+            .chain(self.picture_settle.wake_in(now))
             .fold(IDLE, Duration::min)
     }
 
@@ -1043,7 +1144,7 @@ impl App {
         }
     }
 
-    /// Videos start with sound (`a`); a video without sound still plays silent.
+    /// Whether videos start with sound (`a`).
     pub fn video_sound_wanted(&self) -> bool {
         self.video_sound_on
     }
@@ -1112,6 +1213,7 @@ impl App {
             .and_then(|id| bookmarks.iter().position(|b| b.post.id == id))
             .unwrap_or(feed.selected)
             .min(bookmarks.len().saturating_sub(1));
+        self.preview_selection();
     }
 
     pub fn save_state(&mut self) {
@@ -1143,7 +1245,10 @@ impl App {
         tab.entered = Some(Instant::now());
         tab.engaged = false;
         self.close_post();
-        self.ensure_feed_loaded(index);
+        self.moving();
+        if self.feed_settle.arrive(self.tabs[index].id, Instant::now()) {
+            self.ensure_feed_loaded(index);
+        }
     }
 
     pub fn cycle_tab(&mut self, forward: bool) {
@@ -1252,6 +1357,11 @@ impl App {
 
     fn fetch_feed(&mut self, index: usize, after: Option<String>, force: bool) {
         let generation = self.generation();
+        // A first-page load ends the wait of a tab switch to this tab: once it fails, that
+        // wait would ask again.
+        if after.is_none() {
+            self.feed_settle.forget(self.tabs[index].id);
+        }
         let tab = &mut self.tabs[index];
         let Some(subreddit) = tab.subreddit().map(str::to_string) else {
             return;
@@ -1346,10 +1456,15 @@ impl App {
         let Some(view) = &mut self.post_view else {
             return;
         };
+        // A preview still held back loads here first: it now counts as read.
+        if self.post_settle.take() == Some(view.generation) {
+            self.state.mark_read(&view.post, now());
+        }
         view.generation = generation;
         view.loading = true;
         view.error = None;
         view.loading_more.clear();
+        self.pool.want_post(Some(generation));
         self.pool.refresh(Job::Post {
             generation,
             permalink: view.post.permalink.clone(),
@@ -1469,6 +1584,8 @@ impl App {
                 }
             }
         }
+        self.moving();
+        self.preview_selection();
     }
 
     pub fn select_edge(&mut self, end: bool) {
@@ -1480,12 +1597,15 @@ impl App {
                     0
                 };
                 self.home.post = 0;
+                self.moving();
+                self.preview_selection();
             }
             _ => self.move_selection(if end { isize::MAX / 2 } else { isize::MIN / 2 }),
         }
     }
 
-    /// Posts shown in a Home group: the hot listing without pinned mod posts.
+    /// Posts shown in a Home group: the first `home_posts_per_group` of the hot listing
+    /// that the config does not hide, pinned posts left out.
     pub fn home_group_posts<'a>(&self, group: &'a Group) -> impl Iterator<Item = &'a Post> {
         self.config
             .visible(&group.posts)
@@ -1532,6 +1652,8 @@ impl App {
     pub fn move_home_group(&mut self, delta: isize) {
         self.home.group = step(self.home.group, delta, self.home.groups.len());
         self.home.post = 0;
+        self.moving();
+        self.preview_selection();
     }
 
     pub fn open_home_group_tab(&mut self) {
@@ -1573,12 +1695,17 @@ impl App {
         self.engage();
         if let Some(post) = self.current_post() {
             let permalink = post.permalink.clone();
-            if self
+            if let Some(generation) = self
                 .post_view
                 .as_ref()
-                .is_some_and(|view| view.post.permalink == permalink)
+                .filter(|view| view.post.permalink == permalink)
+                .map(|view| view.generation)
             {
                 self.focus = Focus::Post;
+                // A post previewed in a quick run of list moves loads now.
+                if self.post_settle.take() == Some(generation) {
+                    self.load_post(permalink);
+                }
                 return;
             }
             self.open_post_permalink(post, permalink);
@@ -1588,14 +1715,46 @@ impl App {
     }
 
     fn open_post_permalink(&mut self, post: Post, permalink: String) {
-        if permalink.is_empty() {
-            self.error("This post has no comments link");
+        if self.show_post(post, &permalink).is_some() {
+            self.focus = Focus::Post;
+            self.load_post(permalink);
+        }
+    }
+
+    /// A move through a list, tab or post: pictures it brings on screen are not fetched
+    /// while moves keep coming quickly; the redraw once they stop fetches them.
+    fn moving(&mut self) {
+        self.picture_settle.arrive((), Instant::now());
+    }
+
+    /// Beside an open post, the list selection takes its place as the list moves.
+    fn preview_selection(&mut self) {
+        if self.focus != Focus::List || !self.detail_fits() {
             return;
         }
+        let (Some(view), Some(post)) = (&self.post_view, self.current_post()) else {
+            return;
+        };
+        if view.post.permalink == post.permalink {
+            return;
+        }
+        let permalink = post.permalink.clone();
+        if let Some(generation) = self.show_post(post, &permalink)
+            && self.post_settle.arrive(generation, Instant::now())
+        {
+            self.load_post(permalink);
+        }
+    }
+
+    /// Show `post` in the detail pane, its page not asked for yet; its view's generation,
+    /// or None when it has no page.
+    fn show_post(&mut self, post: Post, permalink: &str) -> Option<u64> {
+        if permalink.is_empty() {
+            self.error("This post has no comments link");
+            return None;
+        }
         self.close_post();
-        self.focus = Focus::Post;
         let generation = self.generation();
-        self.state.mark_read(&post, now());
         self.post_view = Some(PostView {
             post,
             page: None,
@@ -1625,8 +1784,18 @@ impl App {
             page_height: 0,
             reveal_spoilers: false,
         });
+        Some(generation)
+    }
+
+    /// Ask for the shown post's page; from now on the post counts as read.
+    fn load_post(&mut self, permalink: String) {
+        let Some(view) = &self.post_view else {
+            return;
+        };
+        self.state.mark_read(&view.post, now());
+        self.pool.want_post(Some(view.generation));
         self.pool.submit(Job::Post {
-            generation,
+            generation: view.generation,
             permalink,
         });
     }
@@ -1673,6 +1842,7 @@ impl App {
         // Full-size previews are megabytes each: keep them only while their post is open.
         self.images.clear();
         self.pool.forget_images();
+        self.pool.want_post(None);
     }
 
     /// `h` in a post: leave a comment selection for reading; false if there is none.
@@ -1688,6 +1858,7 @@ impl App {
     }
 
     pub fn move_comment_cursor(&mut self, delta: isize) {
+        self.moving();
         let Some(view) = &mut self.post_view else {
             return;
         };
@@ -1723,6 +1894,7 @@ impl App {
     }
 
     pub fn post_top(&mut self) {
+        self.moving();
         if let Some(view) = &mut self.post_view {
             view.cursor = 0;
             view.go_to_top();
@@ -1730,6 +1902,7 @@ impl App {
     }
 
     pub fn post_bottom(&mut self) {
+        self.moving();
         if let Some(view) = &mut self.post_view {
             let len = view.rows().len();
             // A hidden spoiler post has no comments to select.
@@ -1747,6 +1920,7 @@ impl App {
     }
 
     pub fn scroll_post(&mut self, delta: isize) {
+        self.moving();
         if let Some(view) = &mut self.post_view {
             if delta < 0 && view.scroll <= delta.unsigned_abs() {
                 view.go_to_top();
@@ -1769,6 +1943,7 @@ impl App {
     }
 
     pub fn jump_top_level(&mut self, forward: bool) {
+        self.moving();
         let Some(view) = &mut self.post_view else {
             return;
         };
@@ -1924,6 +2099,8 @@ impl App {
         });
     }
 
+    // ----- focus, layout and sidebar ----------------------------------------
+
     pub fn post_focused(&self) -> bool {
         self.focus == Focus::Post && self.post_view.is_some()
     }
@@ -2004,15 +2181,17 @@ impl App {
         self.move_sidebar(if last { isize::MAX } else { isize::MIN });
     }
 
+    // ----- pictures ---------------------------------------------------------
+
     /// The open post's image or video poster, fetched ahead of everything else queued.
     fn request_image(&mut self, url: &str) {
         self.fetch_image(url, false);
     }
 
     /// A picture in post or comment text, fetched in the background once: a failed one
-    /// waits for `r` or `S`.
+    /// waits for `r` or `S`. Held during a quick run of moves.
     pub fn request_text_picture(&mut self, url: &str) {
-        if !self.images.contains_key(url) {
+        if !self.images.contains_key(url) && !self.picture_settle.holding(Instant::now()) {
             self.fetch_image(url, true);
         }
     }
@@ -2079,25 +2258,28 @@ impl App {
     }
 
     /// After a frame: load drawn thumbnails, let off-screen queued ones be skipped, and past
-    /// `THUMB_CACHE_MAX` keep only what is on screen or in flight.
+    /// `THUMB_CACHE_MAX` keep only what is on screen or in flight. Rows a quick run of moves
+    /// only passes are not fetched; the redraw once it stops fetches what it shows.
     pub fn thumbs_drawn(&mut self, urls: &[&str]) {
         self.pool.set_on_screen(urls);
-        for url in urls {
-            let submit = match self.thumbs.get_mut(*url) {
-                None => {
-                    self.thumbs.insert(url.to_string(), ImageSlot::Loading);
-                    true
+        if !self.picture_settle.holding(Instant::now()) {
+            for url in urls {
+                let submit = match self.thumbs.get_mut(*url) {
+                    None => {
+                        self.thumbs.insert(url.to_string(), ImageSlot::Loading);
+                        true
+                    }
+                    Some(ImageSlot::Ready { refresh, .. }) if *refresh == ImageRefresh::Needed => {
+                        *refresh = ImageRefresh::Loading;
+                        true
+                    }
+                    _ => false,
+                };
+                if submit {
+                    self.pool.submit(Job::Thumb {
+                        url: url.to_string(),
+                    });
                 }
-                Some(ImageSlot::Ready { refresh, .. }) if *refresh == ImageRefresh::Needed => {
-                    *refresh = ImageRefresh::Loading;
-                    true
-                }
-                _ => false,
-            };
-            if submit {
-                self.pool.submit(Job::Thumb {
-                    url: url.to_string(),
-                });
             }
         }
         if self.thumbs.len() > THUMB_CACHE_MAX {
@@ -2115,7 +2297,7 @@ impl App {
         }
     }
 
-    // ----- actions on the current post ------------------------------------
+    // ----- actions: current post, Redlib ------------------------------------
 
     pub fn open_in_browser(&mut self) {
         let Some(post) = self.current_post() else {
@@ -2309,7 +2491,17 @@ impl App {
     // ----- worker results -----------------------------------------------------
 
     pub fn on_msg(&mut self, msg: Msg) {
+        // New list data can put another post under the cursor: the side pane follows it.
+        let list_data = match &msg {
+            Msg::Snapshot { message, .. } => {
+                matches!(**message, Msg::Feed { .. } | Msg::Group { .. })
+            }
+            message => matches!(message, Msg::Feed { .. } | Msg::Group { .. }),
+        };
         self.on_result(msg, Source::default(), false);
+        if list_data {
+            self.preview_selection();
+        }
     }
 
     fn on_result(&mut self, msg: Msg, source: Source, refreshing: bool) {
@@ -2363,7 +2555,29 @@ impl App {
                     return;
                 };
                 if view.generation != generation {
-                    return;
+                    // An earlier load of this same post, still on its way when you came
+                    // back to it: take its network answer rather than wait for the newer
+                    // load, while this view has nothing, or only a cached copy refreshing
+                    // that the answer is provably no older than (`r` keeps an up-to-date
+                    // copy loading). Never a cached answer: one still refreshing may rely
+                    // on a network load the worker has since dropped.
+                    let waiting = view.page.is_none()
+                        || (view.loading
+                            && view
+                                .freshness
+                                .is_some_and(|f| f.source.cached && source.may_replace(f.source)));
+                    let same_post = !source.cached
+                        && waiting
+                        && result.as_ref().is_ok_and(|page| {
+                            !page.post.id.is_empty() && page.post.id == view.post.id
+                        });
+                    if !same_post {
+                        return;
+                    }
+                    view.generation = generation;
+                    // Reply loads sent under the newer generation are dropped on arrival.
+                    view.loading_more.clear();
+                    self.pool.want_post(Some(generation));
                 }
                 view.loading = false;
                 match result {
@@ -3095,7 +3309,9 @@ fn merge_replies(
     }
 }
 
-/// Completeness applies to this direct child list, not the entire subtree.
+/// True when `parent`'s reply list came complete (no More link) from a source that
+/// `source` cannot replace: `source` may then neither replace nor add to it. Deeper
+/// lists are judged on their own.
 fn replies_superseded(parent: &Comment, source: Source) -> bool {
     parent.more.is_none()
         && parent
@@ -3103,7 +3319,8 @@ fn replies_superseded(parent: &Comment, source: Source) -> bool {
             .is_some_and(|old| !source.may_replace(old.more))
 }
 
-/// Find a new visible reply without copying the existing tree's identifiers.
+/// The first reply in `replies` that `previous` lacks, depth first, skipping folded
+/// threads and lists `source` may not add to (`allow_new` at this level).
 fn first_new_reply<'a>(
     replies: &'a [Comment],
     previous: &[Comment],
@@ -3231,7 +3448,12 @@ mod tests {
     /// An app plus the replies its jobs produce. Port 9 is discard: nothing answers,
     /// so every network job fails quickly and no test touches the network.
     fn app_with_messages(subscriptions: &[&str]) -> (App, std::sync::mpsc::Receiver<Msg>) {
-        let redlib = Redlib::new("http://127.0.0.1:9", false);
+        app_at("http://127.0.0.1:9", subscriptions)
+    }
+
+    /// An app on the Redlib at `url`, without a disk cache, plus the replies its jobs produce.
+    fn app_at(url: &str, subscriptions: &[&str]) -> (App, std::sync::mpsc::Receiver<Msg>) {
+        let redlib = Redlib::new(url, false);
         let (pool, messages) = Pool::start(redlib.clone(), 3, None);
         let state = std::env::temp_dir().join(format!(
             "redtab-app-test-{}-{:?}.json",
@@ -3307,6 +3529,384 @@ mod tests {
             .iter()
             .position(|t| t.subreddit() == Some(name))
             .unwrap()
+    }
+
+    /// r/s listing `ids`, its first post open beside the list and the list focused.
+    fn split_feed(ids: &[&str]) -> (App, std::sync::mpsc::Receiver<Msg>) {
+        let (mut app, messages) = app_with_messages(&["s"]);
+        let i = tab_index(&app, "s");
+        app.switch_tab(i);
+        let (tab, generation) = (app.tabs[i].id, app.tabs[i].feed.generation);
+        app.on_msg(Msg::Feed {
+            tab,
+            generation,
+            append: false,
+            result: Ok(listing("s", ids, None)),
+        });
+        app.resize(200);
+        app.open_current_post();
+        app.focus_main();
+        (app, messages)
+    }
+
+    /// A Redlib that answers each post page `delay` late, as `post.html` retitled with the
+    /// requested id, and records the post ids asked for. Other paths answer at once, empty.
+    struct SlowRedlib {
+        url: String,
+        asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl SlowRedlib {
+        fn start(delay: Duration) -> Self {
+            use std::io::{BufRead, BufReader, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = std::sync::Arc::clone(&asked);
+            std::thread::spawn(move || {
+                for mut stream in listener.incoming().flatten() {
+                    let log = std::sync::Arc::clone(&log);
+                    std::thread::spawn(move || {
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        let mut request = String::new();
+                        let _ = reader.read_line(&mut request);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                            line.clear();
+                        }
+                        let path = request.split(' ').nth(1).unwrap_or_default();
+                        let body = match path
+                            .split('/')
+                            .nth(4)
+                            .filter(|_| path.contains("/comments/"))
+                        {
+                            Some(id) => {
+                                log.lock().unwrap().push(id.to_string());
+                                std::thread::sleep(delay);
+                                include_str!("../tests/fixtures/post.html").replace("1x4v4sn", id)
+                            }
+                            None => String::new(),
+                        };
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                    });
+                }
+            });
+            Self { url, asked }
+        }
+
+        /// Home with one card per post id, the first post open beside the cards and the
+        /// cards focused. No subscriptions: nothing else asks this Redlib for pages.
+        fn home(&self, ids: &[&str]) -> (App, std::sync::mpsc::Receiver<Msg>) {
+            let (mut app, messages) = app_at(&self.url, &[]);
+            app.home.groups = ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| Group {
+                    subreddit: format!("s{i}"),
+                    posts: vec![post(id, &format!("s{i}"))],
+                    ..Group::default()
+                })
+                .collect();
+            app.resize(200);
+            app.open_current_post();
+            app.focus_main();
+            (app, messages)
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    /// Handle replies and timers until the shown post's page is in; how long that took.
+    fn wait_for_page(app: &mut App, messages: &std::sync::mpsc::Receiver<Msg>) -> Duration {
+        let started = Instant::now();
+        while app.post_view.as_ref().is_some_and(|v| v.page.is_none())
+            && started.elapsed() < Duration::from_secs(10)
+        {
+            if let Ok(msg) = messages.recv_timeout(Duration::from_millis(20)) {
+                app.on_msg(msg);
+            }
+            app.tick();
+        }
+        started.elapsed()
+    }
+
+    #[test]
+    fn coming_back_to_a_post_still_loading_shows_its_first_answer_without_another_wait() {
+        let delay = Duration::from_secs(1);
+        let server = SlowRedlib::start(delay);
+        let (mut app, messages) = server.home(&["warm", "fa", "fb"]);
+        wait_for_page(&mut app, &messages);
+        let pause = NAV_SETTLE + Duration::from_millis(50);
+
+        app.move_selection(1);
+        std::thread::sleep(pause);
+        app.move_selection(1);
+        std::thread::sleep(pause);
+        app.move_selection(-1);
+        let waited = wait_for_page(&mut app, &messages);
+
+        assert_eq!(app.post_view.as_ref().unwrap().post.id, "fa");
+        assert!(
+            waited < delay,
+            "waited {waited:?}: fa's first load, still running, answers it"
+        );
+    }
+
+    #[test]
+    fn post_loads_moved_past_while_queued_never_reach_redlib() {
+        let server = SlowRedlib::start(Duration::from_millis(1500));
+        let (mut app, messages) = server.home(&["warm", "fa", "fb", "fc", "fd"]);
+        wait_for_page(&mut app, &messages);
+        let pause = NAV_SETTLE + Duration::from_millis(50);
+
+        for _ in 0..4 {
+            app.move_selection(1);
+            std::thread::sleep(pause);
+        }
+        wait_for_page(&mut app, &messages);
+
+        assert_eq!(app.post_view.as_ref().unwrap().post.id, "fd");
+        assert_eq!(
+            server.asked(),
+            ["warm", "fa", "fb", "fd"],
+            "fc waited behind fa and fb and was moved past"
+        );
+    }
+
+    #[test]
+    fn beside_an_open_post_a_quick_run_of_list_moves_previews_each_and_loads_only_its_end() {
+        let (mut app, _) = split_feed(&["run1", "run2", "run3", "run4"]);
+
+        app.move_selection(1);
+        app.move_selection(1);
+        assert_eq!(app.post_view.as_ref().unwrap().post.id, "run3");
+        app.move_selection(1);
+
+        assert_eq!(app.post_view.as_ref().unwrap().post.id, "run4");
+        assert_eq!(app.focus, Focus::List, "the list keeps focus");
+        // A post counts as read exactly when its page is asked for.
+        assert!(
+            app.state.is_read("run2"),
+            "a move after a pause loads at once"
+        );
+        assert!(!app.state.is_read("run4"), "mid-run nothing loads");
+        assert!(!app.load_settled(Instant::now()));
+        assert!(app.load_settled(Instant::now() + NAV_SETTLE));
+        assert!(
+            !app.state.is_read("run3"),
+            "a post passed over stays unread"
+        );
+        assert!(app.state.is_read("run4"));
+    }
+
+    #[test]
+    fn opening_a_held_back_preview_loads_it_at_once_and_only_once() {
+        let (mut app, _) = split_feed(&["hold1", "hold2", "hold3"]);
+        app.move_selection(1);
+        app.move_selection(1);
+        assert!(!app.state.is_read("hold3"), "held back");
+
+        app.open_current_post();
+
+        assert_eq!(app.focus, Focus::Post);
+        assert!(app.state.is_read("hold3"));
+        assert!(
+            !app.load_settled(Instant::now() + NAV_SETTLE),
+            "opening ended the wait"
+        );
+    }
+
+    #[test]
+    fn a_quick_run_of_tab_switches_loads_only_the_tab_it_stops_on() {
+        let mut app = app_with(&["a", "b", "c"]);
+        let [a, b, c] = ["a", "b", "c"].map(|name| tab_index(&app, name));
+
+        app.switch_tab(a);
+        app.switch_tab(b);
+        app.switch_tab(c);
+
+        assert!(
+            app.tabs[a].feed.loading(),
+            "a switch after a pause loads at once"
+        );
+        assert!(!app.tabs[c].feed.loading(), "mid-run nothing loads");
+        assert!(app.load_settled(Instant::now() + NAV_SETTLE));
+        assert!(
+            !app.tabs[b].feed.loading(),
+            "a tab passed over is not loaded"
+        );
+        assert!(app.tabs[c].feed.loading());
+    }
+
+    #[test]
+    fn reloading_a_newer_cached_copy_keeps_it_over_an_older_loads_late_answer() {
+        let (mut app, _) = split_feed(&["ord1", "ord2"]);
+        let first = app.post_view.as_ref().unwrap().generation;
+        app.move_selection(1);
+        app.move_selection(-1);
+        let back = app.post_view.as_ref().unwrap().generation;
+        let answer = |generation, body: &str, order, cached| {
+            let page = PostPage {
+                post: post("ord1", "s"),
+                body: body.into(),
+                comments: vec![],
+            };
+            ordered_snapshot(
+                Msg::Post {
+                    generation,
+                    result: Ok(Box::new(page)),
+                },
+                order,
+                cached,
+                false,
+            )
+        };
+        app.on_msg(answer(back, "newer", 12, true));
+        app.open_current_post();
+        app.reload();
+        let refresh = app.post_view.as_ref().unwrap().generation;
+
+        app.on_msg(answer(first, "older", 10, false));
+
+        let view = app.post_view.as_ref().unwrap();
+        assert_eq!(view.generation, refresh, "the refresh still owns the view");
+        assert_eq!(view.page.as_ref().unwrap().body, "newer");
+    }
+
+    #[test]
+    fn coming_back_over_a_cached_copy_takes_only_the_earlier_loads_network_answer() {
+        let (mut app, _) = split_feed(&["back1", "back2"]);
+        let first = app.post_view.as_ref().unwrap().generation;
+        app.move_selection(1);
+        app.move_selection(-1);
+        let back = app.post_view.as_ref().unwrap().generation;
+        let answer = |generation, order, cached, refreshing| {
+            let page = PostPage {
+                post: post("back1", "s"),
+                body: String::new(),
+                comments: vec![],
+            };
+            ordered_snapshot(
+                Msg::Post {
+                    generation,
+                    result: Ok(Box::new(page)),
+                },
+                order,
+                cached,
+                refreshing,
+            )
+        };
+
+        app.on_msg(answer(first, 1, true, true));
+        assert_eq!(
+            app.post_view.as_ref().unwrap().generation,
+            back,
+            "a cached answer still refreshing is not taken"
+        );
+        app.on_msg(answer(back, 1, true, true));
+        // Replies asked for under the newer load, whose answer will be dropped.
+        let view = app.post_view.as_mut().unwrap();
+        view.loading_more.insert("parent".into());
+        app.on_msg(answer(first, 2, false, false));
+
+        let view = app.post_view.as_ref().unwrap();
+        assert_eq!(
+            view.generation, first,
+            "the earlier load's network answer replaces the cached copy"
+        );
+        assert!(!view.loading);
+        assert!(
+            view.loading_more.is_empty(),
+            "no reply row stays loading for a dropped answer"
+        );
+    }
+
+    #[test]
+    fn beside_an_open_post_a_card_that_loads_under_the_cursor_shows_its_post() {
+        let mut app = app_with(&["ca", "cb"]);
+        let group = |subreddit: &str, id: &str| Msg::Group {
+            subreddit: subreddit.into(),
+            generation: 0,
+            result: Ok(listing(subreddit, &[id], None)),
+        };
+        app.on_msg(group("ca", "card1"));
+        app.resize(200);
+        app.open_current_post();
+        app.focus_main();
+        app.move_home_group(1);
+        assert_eq!(
+            app.post_view.as_ref().unwrap().post.id,
+            "card1",
+            "the next card has nothing yet"
+        );
+
+        app.on_msg(group("cb", "card2"));
+
+        assert_eq!(app.post_view.as_ref().unwrap().post.id, "card2");
+    }
+
+    #[test]
+    fn reloading_a_held_back_preview_marks_it_read() {
+        let (mut app, _) = split_feed(&["rel1", "rel2", "rel3"]);
+        app.move_selection(1);
+        app.move_selection(1);
+        app.resize(100);
+
+        app.reload();
+
+        assert!(app.state.is_read("rel3"));
+    }
+
+    #[test]
+    fn pictures_a_quick_run_of_moves_passes_wait_until_it_stops() {
+        let mut app = app_with(&[]);
+        let (thumb, picture) = ("/img/row.png", "/preview/pre/text.png");
+        app.move_selection(1);
+        app.thumbs_drawn(&[thumb]);
+        assert!(app.thumbs.contains_key(thumb), "a lone move loads at once");
+        app.thumbs.clear();
+
+        app.move_selection(1);
+        app.thumbs_drawn(&[thumb]);
+        app.request_text_picture(picture);
+
+        assert!(!app.thumbs.contains_key(thumb), "mid-run rows wait");
+        assert!(!app.images.contains_key(picture), "mid-run pictures wait");
+        std::thread::sleep(NAV_SETTLE);
+        assert!(app.tick(), "the pause redraws");
+        app.thumbs_drawn(&[thumb]);
+        app.request_text_picture(picture);
+        assert!(app.thumbs.contains_key(thumb));
+        assert!(app.images.contains_key(picture));
+    }
+
+    #[test]
+    fn a_reload_during_a_tab_switch_wait_is_not_asked_again_once_it_fails() {
+        let mut app = app_with(&["a", "b"]);
+        let [a, b] = ["a", "b"].map(|name| tab_index(&app, name));
+        app.switch_tab(a);
+        app.switch_tab(b);
+
+        app.reload();
+        let (tab, generation) = (app.tabs[b].id, app.tabs[b].feed.generation);
+        app.on_msg(Msg::Feed {
+            tab,
+            generation,
+            append: false,
+            result: Err("connection refused".into()),
+        });
+
+        assert!(!app.load_settled(Instant::now() + NAV_SETTLE));
+        assert!(
+            !app.tabs[b].feed.loading(),
+            "the failed reload is not repeated"
+        );
     }
 
     #[test]

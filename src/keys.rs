@@ -89,7 +89,7 @@ fn handle_sidebar(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('g') | KeyCode::Home => app.sidebar_edge(false),
         KeyCode::Char('G') | KeyCode::End => app.sidebar_edge(true),
         KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter | KeyCode::Esc => app.focus_main(),
-        // Already at the top of the ladder.
+        // `h` moves focus outward (post, list, sidebar); the sidebar is the outermost.
         KeyCode::Char('h') | KeyCode::Left => {}
         _ => return false,
     }

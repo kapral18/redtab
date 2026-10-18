@@ -26,7 +26,8 @@ pub struct Config {
     pub filters: Filters,
     pub highlight: Highlight,
     pub commands: Commands,
-    /// Source file, for error messages.
+    /// The loaded file, empty for a config built in code. Error messages and `--check`
+    /// name it, and the default subscriptions file sits next to it.
     #[serde(skip)]
     pub path: PathBuf,
 }

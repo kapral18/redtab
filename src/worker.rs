@@ -261,13 +261,15 @@ impl Queues {
 
 type SharedRx = Arc<Mutex<Receiver<Work>>>;
 
-/// URLs whose queued fetches are still worth running; others are skipped.
+/// URLs and pages whose queued fetches are still worth running; others are skipped.
 #[derive(Default)]
 struct Wanted {
     /// Thumbnails drawn in the last frame.
     thumbs: Mutex<HashSet<String>>,
     /// Full-size images of the open post.
     images: Mutex<HashSet<String>>,
+    /// Generation of the page load the open post waits for.
+    post: Mutex<Option<u64>>,
 }
 
 impl Pool {
@@ -311,6 +313,9 @@ impl Pool {
                 .spawn(move || {
                     while let Ok(work) = rx.recv() {
                         let job = &work.job;
+                        if superseded_post(job, &wanted) {
+                            continue;
+                        }
                         if let Some(msg) = skipped_image(job, &wanted) {
                             let _ = msg_tx.send(msg);
                             continue;
@@ -415,6 +420,14 @@ impl Pool {
             set.clear();
         }
     }
+
+    /// The page load the open post waits for; queued loads of other generations are
+    /// dropped. `None` once no post is open.
+    pub fn want_post(&self, generation: Option<u64>) {
+        if let Ok(mut post) = self.wanted.post.lock() {
+            *post = generation;
+        }
+    }
 }
 
 /// Worker thread name; the panic hook leaves the screen alone on non-main threads.
@@ -439,6 +452,9 @@ fn spawn_worker(
                         Err(_) => return,
                     }
                 };
+                if superseded_post(&job, &wanted) {
+                    continue;
+                }
                 if let Some(msg) = skipped_image(&job, &wanted) {
                     if tx.send(msg).is_err() {
                         return;
@@ -592,6 +608,13 @@ impl Job {
             _ => return None,
         })
     }
+}
+
+/// A post page load for a post no longer shown (moved past in the list, or closed): queued
+/// behind other loads it would only delay the one you wait for, so it is dropped unanswered.
+fn superseded_post(job: &Job, wanted: &Wanted) -> bool {
+    matches!(job, Job::Post { generation, .. }
+        if wanted.post.lock().is_ok_and(|post| *post != Some(*generation)))
 }
 
 fn skipped_image(job: &Job, wanted: &Wanted) -> Option<Msg> {
@@ -1451,6 +1474,7 @@ mod tests {
             )
             .unwrap();
         let (pool, messages) = Pool::start(redlib, 3, Some(cache));
+        pool.want_post(Some(1));
 
         pool.refresh(job);
 

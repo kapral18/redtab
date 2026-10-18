@@ -23,7 +23,7 @@ use crate::app::{
 use crate::model::{Media, PICTURE, Post, SPOILER_END, SPOILER_START, Sort};
 use crate::video;
 
-/// Catppuccin Mocha, with Reddit orange as the accent.
+/// Catppuccin Mocha, with an orange accent close to Reddit's.
 mod theme {
     use ratatui::style::Color;
     pub const ACCENT: Color = Color::Rgb(255, 99, 51);
@@ -376,7 +376,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect, spots: &mut Vec<ImageSpot>
 
     let (dot, color, down) = match app.redlib_up {
         Some(true) => ("●", GREEN, false),
-        Some(false) => ("●", RED, true),
+        Some(false) => ("✗", RED, true),
         None => ("○", OVERLAY, false),
     };
     let img = if app.inline_images_on() {
@@ -384,7 +384,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect, spots: &mut Vec<ImageSpot>
     } else {
         "img off"
     };
-    // " ● redlib down  ◧ img off" needs 25 columns; narrower sidebars keep the red dot only.
+    // " ✗ redlib down  ◧ img off" needs 25 columns; narrower sidebars show the ✗ only.
     let label = if down && width >= 25 {
         "redlib down"
     } else {
@@ -879,7 +879,13 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
             Style::new().fg(RED),
         )]
     } else if posts.is_empty() {
-        vec![Line::styled("   no posts", Style::new().fg(OVERLAY))]
+        // Non-pinned posts exist, so the config hid them.
+        let text = if group.posts.iter().any(|p| !p.stickied) {
+            "   all posts hidden by your config"
+        } else {
+            "   no posts"
+        };
+        vec![Line::styled(text, Style::new().fg(OVERLAY))]
     } else {
         let reserve = thumb_reserve(app, posts.iter().copied());
         let mut lines = Vec::new();
@@ -974,7 +980,7 @@ fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
     let error = feed.error();
     let posts: Vec<&Post> = app.config.visible(&feed.posts).collect();
     let selected = feed.selected;
-    let loaded = feed.loaded;
+    let current = feed.shows_current_query();
     let mut offset = feed.offset;
     let body = view_header(f, area, &title, chips);
     if let Some(e) = error.filter(|_| posts.is_empty()) {
@@ -988,7 +994,26 @@ fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
         return;
     }
     if posts.is_empty() {
-        if loaded {
+        // Until the current sort or search answers, an earlier empty answer says nothing.
+        if !current {
+            empty_state(f, body, "⋯", "Loading", "");
+        } else if !feed.posts.is_empty() {
+            empty_state(
+                f,
+                body,
+                "∅",
+                "Every loaded post is hidden",
+                "show_nsfw and [filters] in config.toml decide what shows",
+            );
+        } else if feed.search.is_some() {
+            empty_state(
+                f,
+                body,
+                "∅",
+                "No results",
+                "/ edits the search, Esc clears it",
+            );
+        } else {
             empty_state(
                 f,
                 body,
@@ -996,8 +1021,6 @@ fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
                 "No posts here",
                 "try another sort with s, or a different subreddit with p",
             );
-        } else {
-            empty_state(f, body, "⋯", "Loading", "");
         }
         return;
     }
@@ -2377,14 +2400,14 @@ const HELP: &[(&str, &str)] = &[
     ("h · l Enter Esc", "focus the sidebar · back to the list"),
     ("j k · g G", "sidebar: next / previous tab · first / last"),
     ("Lists", ""),
-    ("j k · C-d C-u", "move · page"),
+    ("j k · C-d C-u", "move · page; a post open beside follows"),
     ("g G", "first / last"),
     ("Enter l", "open the post, or resume the one shown"),
     ("J K", "Home: next / previous card"),
     ("Space", "Home: open the card's subreddit"),
     ("s · t", "subreddit: sort · time range"),
     ("/ · Esc", "subreddit: search · clear search"),
-    ("L", "load the next page (automatic near the end)"),
+    ("L", "subreddit: next page (automatic near end)"),
     ("Post", ""),
     ("j k", "next / previous comment"),
     ("Space PgDn · PgUp", "page down · up"),
@@ -4593,6 +4616,42 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_feed_says_whether_the_config_hid_the_posts_or_a_search_found_none() {
+        let mut app = feed_app(Picker::halfblocks());
+        let answer = |app: &mut App, posts: Vec<Post>| {
+            let tab = app.tabs[2].id;
+            let generation = app.tabs[2].feed.generation;
+            app.on_msg(Msg::Feed {
+                tab,
+                generation,
+                append: false,
+                result: Ok(crate::model::Listing {
+                    posts,
+                    after: None,
+                    icon: None,
+                }),
+            });
+        };
+
+        app.search("first".into());
+        answer(&mut app, Vec::new());
+        let no_results = screen(&mut app, 100, 20);
+        app.search("second".into());
+        let waiting = screen(&mut app, 100, 20);
+        let mut nsfw = post_with("n1", Media::None);
+        nsfw.nsfw = true;
+        answer(&mut app, vec![nsfw]);
+        let hidden = screen(&mut app, 100, 20);
+
+        assert!(no_results.contains("No results"), "{no_results}");
+        assert!(!no_results.contains("try another sort"), "{no_results}");
+        // The first search's empty answer says nothing about the second one.
+        assert!(waiting.contains("Loading"), "{waiting}");
+        assert!(!waiting.contains("No results"), "{waiting}");
+        assert!(hidden.contains("Every loaded post is hidden"), "{hidden}");
+    }
+
+    #[test]
     fn feed_rows_load_and_place_thumbnails_only_for_visible_image_posts() {
         let mut app = feed_app(kitty());
 
@@ -4677,6 +4736,8 @@ mod tests {
             }),
         });
         app.switch_tab(0);
+        // Two quick tab switches hold new icons until they settle.
+        std::thread::sleep(crate::app::NAV_SETTLE);
 
         let s = screen(&mut app, 120, 30);
 
@@ -4993,10 +5054,10 @@ mod tests {
         crate::handle_event(&mut app, Event::Resize(157, 30));
         crate::handle_event(
             &mut app,
-            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
         );
 
-        assert_eq!(app.post_view.as_ref().unwrap().post.id, "p");
+        assert_eq!(app.post_view.as_ref().unwrap().post.id, "other");
         assert_eq!(app.home.post, 1, "the hidden list selection stays put");
     }
 
@@ -5016,10 +5077,13 @@ mod tests {
             &mut app,
             Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
         );
+        assert!(
+            !app.post_view.as_ref().unwrap().free_scroll,
+            "h kept the comment selected"
+        );
         press(&mut app, 'j');
 
         assert_eq!(app.home.post, 1);
-        assert!(!app.post_view.as_ref().unwrap().free_scroll);
     }
 
     #[test]

@@ -98,7 +98,7 @@ fn resolve_link(path: &Path) -> std::path::PathBuf {
         return real;
     }
     let mut current = path.to_path_buf();
-    // The kernel's cap, so a link loop can't spin.
+    // Linux's symlink limit (macOS stops at 32), so a link loop can't spin.
     for _ in 0..40 {
         let Ok(target) = std::fs::read_link(&current) else {
             break;

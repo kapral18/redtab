@@ -178,7 +178,6 @@ pub struct Comment {
 }
 
 impl Comment {
-    /// Age relative to `now`, so a cached comment ages with the clock.
     pub fn age_at(&self, now: DateTime<Utc>) -> String {
         age_at(self.created, &self.age, now)
     }
