@@ -4,7 +4,7 @@ mod config;
 mod keys;
 mod media;
 mod model;
-mod redlib;
+mod reddit;
 mod state;
 mod ui;
 mod video;
@@ -22,19 +22,19 @@ use ratatui_image::picker::Picker;
 
 use crate::app::App;
 use crate::config::Config;
-use crate::redlib::Redlib;
+use crate::reddit::{Health, Reddit};
 use crate::worker::Pool;
 
 const USAGE: &str = "\
-redtab — terminal Reddit reader with tabs, built on a local Redlib
+redtab — terminal Reddit reader with tabs and direct guest access
 
 Usage: redtab [--config PATH] [--subreddit NAME]
 
 Options:
   -c, --config PATH      config file (default: $XDG_CONFIG_HOME/redtab/config.toml)
   -s, --subreddit NAME   open this subreddit on start
-      --check            print the config file, Redlib status, subscriptions and state
-                         file, then exit (status 1 when Redlib does not answer)
+      --check            print the config file, Reddit status, subscriptions, subscriptions
+                         file and state file, then exit (status 1 unless Reddit is up)
   -h, --help             show this help
   -V, --version          show the version
 
@@ -63,10 +63,6 @@ fn parse_args() -> Result<Option<Args>> {
     let mut it = std::env::args_os().skip(1);
     while let Some(arg) = it.next() {
         match arg.to_str() {
-            Some(worker::COMMAND_ARG) => {
-                worker::command_process(&it.collect::<Vec<_>>())?;
-                return Ok(None);
-            }
             Some(PROBE_ARG) => {
                 probe_image_protocol();
                 return Ok(None);
@@ -102,24 +98,38 @@ fn main() -> Result<()> {
     };
     let config = Config::load(args.config.as_deref())?;
     let subscriptions = config.subscriptions()?;
-    let redlib = Redlib::new(&config.redlib_url, config.show_nsfw);
+    let reddit = Reddit::new(config.show_nsfw)?;
 
     if args.check {
-        let up = redlib.healthy();
+        let health = reddit.check();
         let config_file = if config.path.exists() {
             config.path.display().to_string()
         } else {
             format!("{} (missing; defaults)", config.path.display())
         };
         println!("config         {config_file}");
-        println!("redlib_url     {}", redlib.base());
-        println!("redlib         {}", if up { "up" } else { "NOT answering" });
+        println!(
+            "reddit         {}",
+            match health {
+                Health::Up => "up",
+                Health::Paused => "paused",
+                Health::Down => "NOT answering",
+                Health::Unknown => "unknown",
+            }
+        );
+        let subscriptions_file = config.subscriptions_path();
+        let subscriptions_file = if subscriptions_file.exists() {
+            subscriptions_file.display().to_string()
+        } else {
+            format!("{} (missing)", subscriptions_file.display())
+        };
         println!("subscriptions  {}", subscriptions.len());
+        println!("subs file      {subscriptions_file}");
         println!(
             "state          {}",
             config::state_dir().join("state.json").display()
         );
-        if !up {
+        if health != Health::Up {
             std::process::exit(1);
         }
         return Ok(());
@@ -147,7 +157,7 @@ fn main() -> Result<()> {
         Picker::halfblocks()
     };
     let cache = cache::Cache::new(config::cache_dir());
-    let (pool, messages) = Pool::start(redlib.clone(), WORKER_THREADS, Some(cache));
+    let (pool, messages) = Pool::start(reddit.clone(), WORKER_THREADS, Some(cache));
     // The terminal may have closed during the probe.
     if quit_signal.load(Ordering::Relaxed) {
         return Ok(());
@@ -191,7 +201,7 @@ fn main() -> Result<()> {
         config,
         subscriptions,
         pool,
-        redlib,
+        reddit,
         state_path,
         image_picker,
     );

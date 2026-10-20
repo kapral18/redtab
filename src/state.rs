@@ -441,7 +441,6 @@ mod tests {
             score: None,
             comments: 0,
             created: None,
-            age: String::new(),
             permalink: format!("/r/{sub}/comments/{id}/x/"),
             media: Media::None,
             stickied: false,

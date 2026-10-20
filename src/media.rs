@@ -8,8 +8,35 @@ use base64::Engine;
 
 /// Spawns `argv + extra` with no shared stdio and reaps it in the background.
 pub fn spawn_detached(argv: &[String], extra: &[String]) -> Result<()> {
+    spawn(argv, extra, |program| Command::new(program))
+}
+
+/// `spawn_detached` for video players, through [`local_command`].
+pub fn spawn_media(argv: &[String], extra: &[String]) -> Result<()> {
+    spawn(argv, extra, local_command)
+}
+
+/// Media subprocesses receive loopback URLs. Ignore inherited system proxies for
+/// that local hop; the relay alone owns upstream routing.
+pub fn local_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    for name in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        command.env_remove(name);
+    }
+    command.env("NO_PROXY", "*").env("no_proxy", "*");
+    command
+}
+
+fn spawn(argv: &[String], extra: &[String], command: impl FnOnce(&str) -> Command) -> Result<()> {
     let (program, args) = argv.split_first().context("empty command in config")?;
-    let mut child = Command::new(program)
+    let mut child = command(program)
         .args(args)
         .args(extra)
         .stdin(Stdio::null())
@@ -75,6 +102,27 @@ fn osc52(text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_children_ignore_system_proxies() {
+        use std::ffi::OsStr;
+
+        let command = local_command("player");
+
+        // `get_envs` lists a variable the child will not inherit with no value.
+        let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+        for name in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            assert_eq!(envs.get(OsStr::new(name)), Some(&None), "{name}");
+        }
+        assert_eq!(envs[OsStr::new("no_proxy")], Some(OsStr::new("*")));
+    }
 
     #[test]
     fn when_the_tool_reads_all_input_and_succeeds_the_copy_should_count() {

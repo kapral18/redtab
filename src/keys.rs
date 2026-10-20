@@ -270,7 +270,6 @@ fn handle_global(app: &mut App, key: KeyEvent) {
         KeyCode::Char(c @ '1'..='9') => app.switch_tab(c as usize - '1' as usize),
         KeyCode::Char('0') => app.switch_tab(app.tabs.len() - 1),
         KeyCode::Char('r') => app.reload(),
-        KeyCode::Char('S') => app.start_redlib(),
         KeyCode::Char('i') => app.toggle_images(),
         KeyCode::Char('o') => app.open_in_browser(),
         KeyCode::Char('y') => app.copy_link(),

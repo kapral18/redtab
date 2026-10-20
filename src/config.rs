@@ -11,23 +11,20 @@ use crate::model::Post;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    pub redlib_url: String,
     /// Inline subreddits, in tab order.
     pub subscriptions: Vec<String>,
-    /// File with more subreddits; defaults to `subscriptions` next to the config file.
+    /// File with more subreddits; defaults to `$XDG_STATE_HOME/redtab/subscriptions`.
     pub subscriptions_file: Option<PathBuf>,
     /// Posts per subreddit group on the Home wall.
     pub home_posts_per_group: usize,
     pub show_nsfw: bool,
     /// Inline images, list thumbnails and subreddit icons.
     pub image_preview: bool,
-    /// Offered when Redlib is down, e.g. `["docker", "start", "redlib"]`.
-    pub redlib_start_command: Option<Vec<String>>,
     pub filters: Filters,
     pub highlight: Highlight,
     pub commands: Commands,
     /// The loaded file, empty for a config built in code. Error messages and `--check`
-    /// name it, and the default subscriptions file sits next to it.
+    /// name it; relative `subscriptions_file` overrides resolve next to it.
     #[serde(skip)]
     pub path: PathBuf,
 }
@@ -81,13 +78,11 @@ impl Default for Commands {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            redlib_url: "http://127.0.0.1:8080".into(),
             subscriptions: Vec::new(),
             subscriptions_file: None,
             home_posts_per_group: 3,
             show_nsfw: false,
             image_preview: true,
-            redlib_start_command: None,
             filters: Filters::default(),
             highlight: Highlight::default(),
             commands: Commands::default(),
@@ -159,16 +154,6 @@ impl Config {
 
     /// Catch values that would only fail later, with a vaguer message.
     fn validate(&self) -> Result<()> {
-        if !(self.redlib_url.starts_with("http://") || self.redlib_url.starts_with("https://")) {
-            bail!("redlib_url must start with http:// or https://");
-        }
-        if self
-            .redlib_start_command
-            .as_ref()
-            .is_some_and(Vec::is_empty)
-        {
-            bail!("redlib_start_command is empty; remove it or name a program");
-        }
         for (key, argv) in [
             ("browser", &self.commands.browser),
             ("video", &self.commands.video),
@@ -181,20 +166,16 @@ impl Config {
         Ok(())
     }
 
+    pub fn subscriptions_path(&self) -> PathBuf {
+        self.subscriptions_file
+            .clone()
+            .unwrap_or_else(|| state_dir().join("subscriptions"))
+    }
+
     /// Inline subscriptions followed by the subscriptions file, deduplicated.
     pub fn subscriptions(&self) -> Result<Vec<String>> {
-        let (path, required) = match &self.subscriptions_file {
-            Some(p) => (p.clone(), true),
-            // Next to the loaded config; a config built in code (no file) uses the XDG dir.
-            None if self.path.as_os_str().is_empty() => (config_dir().join("subscriptions"), false),
-            None => (
-                self.path
-                    .parent()
-                    .unwrap_or(Path::new(""))
-                    .join("subscriptions"),
-                false,
-            ),
-        };
+        let path = self.subscriptions_path();
+        let required = self.subscriptions_file.is_some();
         let file_text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => String::new(),
@@ -295,7 +276,6 @@ mod tests {
             score: None,
             comments: 0,
             created: None,
-            age: String::new(),
             permalink: String::new(),
             media: Media::None,
             stickied: false,
@@ -341,35 +321,156 @@ mod tests {
 
     #[test]
     fn a_bad_inline_subscription_names_the_config_file() {
-        let config = Config {
-            subscriptions: vec!["bad-name".into()],
-            path: PathBuf::from("/etc/redtab.toml"),
-            ..Config::default()
-        };
+        let (_dir, mut config) = config_with_file("", &["bad-name"]);
+        config.path = PathBuf::from("/etc/redtab.toml");
 
         let err = config.subscriptions().unwrap_err().to_string();
 
         assert!(err.starts_with("/etc/redtab.toml"), "{err}");
     }
 
-    /// With `-c`, the subscriptions file (default or a relative `subscriptions_file`)
-    /// is next to that config, not in the default config directory.
     #[test]
-    fn the_subscriptions_file_sits_next_to_a_given_config() {
+    fn an_explicit_relative_subscriptions_file_sits_next_to_a_given_config() {
         let dir = tempdir::Dir::new();
         let config_path = dir.path().join("config.toml");
-        std::fs::write(dir.path().join("subscriptions"), "rust\n").unwrap();
         std::fs::write(dir.path().join("subs"), "neovim\n").unwrap();
-        let subscriptions = |config: &str| {
-            std::fs::write(&config_path, config).unwrap();
-            Config::load(Some(&config_path))
-                .unwrap()
-                .subscriptions()
-                .unwrap()
-        };
+        std::fs::write(&config_path, "subscriptions_file = \"subs\"\n").unwrap();
 
-        assert_eq!(subscriptions(""), ["rust"]);
-        assert_eq!(subscriptions("subscriptions_file = \"subs\"\n"), ["neovim"]);
+        let config = Config::load(Some(&config_path)).unwrap();
+
+        assert_eq!(config.subscriptions().unwrap(), ["neovim"]);
+    }
+
+    #[test]
+    fn when_config_is_default_subscriptions_should_merge_inline_with_private_state() {
+        with_subscription_home(
+            "when_config_is_default_subscriptions_should_merge_inline_with_private_state",
+            Some("état"),
+            |home| {
+                std::fs::write(
+                    home.join("config/redtab/config.toml"),
+                    "subscriptions = [\"rust\", \"neovim\"]\n",
+                )
+                .unwrap();
+                std::fs::write(home.join("config/redtab/subscriptions"), "old-place\n").unwrap();
+                std::fs::write(home.join("état/redtab/subscriptions"), "RUST\ntmux\n").unwrap();
+
+                let config = Config::load(None).unwrap();
+
+                assert_eq!(config.subscriptions().unwrap(), ["rust", "neovim", "tmux"]);
+            },
+        );
+    }
+
+    #[test]
+    fn when_config_is_elsewhere_subscriptions_should_still_use_private_state() {
+        with_subscription_home(
+            "when_config_is_elsewhere_subscriptions_should_still_use_private_state",
+            Some("état"),
+            |home| {
+                let path = home.join("custom.toml");
+                std::fs::write(&path, "").unwrap();
+                std::fs::write(home.join("subscriptions"), "old-place\n").unwrap();
+                std::fs::write(home.join("état/redtab/subscriptions"), "rust\n").unwrap();
+
+                let config = Config::load(Some(&path)).unwrap();
+
+                assert_eq!(config.subscriptions().unwrap(), ["rust"]);
+            },
+        );
+    }
+
+    #[test]
+    fn when_xdg_state_home_is_unset_subscriptions_should_use_home_state() {
+        with_subscription_home(
+            "when_xdg_state_home_is_unset_subscriptions_should_use_home_state",
+            None,
+            |home| {
+                std::fs::write(home.join(".local/state/redtab/subscriptions"), "rust\n").unwrap();
+
+                assert_eq!(Config::default().subscriptions().unwrap(), ["rust"]);
+            },
+        );
+    }
+
+    #[test]
+    fn when_private_subscriptions_change_the_config_should_read_the_current_list() {
+        with_subscription_home(
+            "when_private_subscriptions_change_the_config_should_read_the_current_list",
+            Some("état"),
+            |home| {
+                let path = home.join("état/redtab/subscriptions");
+                let mut config = Config {
+                    subscriptions: vec!["rust".into()],
+                    ..Config::load(None).unwrap()
+                };
+
+                assert_eq!(config.subscriptions().unwrap(), ["rust"]);
+                std::fs::write(&path, "").unwrap();
+                assert_eq!(config.subscriptions().unwrap(), ["rust"]);
+                std::fs::write(&path, "RUST\nvim\nvim\n").unwrap();
+                assert_eq!(config.subscriptions().unwrap(), ["rust", "vim"]);
+                config.subscriptions = vec!["tmux".into()];
+                assert_eq!(config.subscriptions().unwrap(), ["tmux", "RUST", "vim"]);
+                std::fs::remove_file(&path).unwrap();
+                assert_eq!(config.subscriptions().unwrap(), ["tmux"]);
+                std::fs::write(&path, "neovim\n").unwrap();
+                assert_eq!(config.subscriptions().unwrap(), ["tmux", "neovim"]);
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn when_private_subscriptions_is_a_symlink_it_should_read_the_target() {
+        with_subscription_home(
+            "when_private_subscriptions_is_a_symlink_it_should_read_the_target",
+            Some("état"),
+            |home| {
+                let target = home.join("abonnements");
+                std::fs::write(&target, "rust\n").unwrap();
+                std::os::unix::fs::symlink(&target, home.join("état/redtab/subscriptions"))
+                    .unwrap();
+
+                assert_eq!(
+                    Config::load(None).unwrap().subscriptions().unwrap(),
+                    ["rust"]
+                );
+            },
+        );
+    }
+
+    fn with_subscription_home(name: &str, state_subdir: Option<&str>, check: impl FnOnce(&Path)) {
+        const CHILD_HOME: &str = "REDTAB_SUBSCRIPTIONS_TEST_HOME";
+        if let Some(home) = std::env::var_os(CHILD_HOME) {
+            check(Path::new(&home));
+            return;
+        }
+        let dir = tempdir::Dir::new();
+        let home = dir.path();
+        std::fs::create_dir_all(home.join("config/redtab")).unwrap();
+        std::fs::create_dir_all(
+            home.join(state_subdir.unwrap_or(".local/state"))
+                .join("redtab"),
+        )
+        .unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args(["--exact", &format!("config::tests::{name}"), "--nocapture"])
+            .env(CHILD_HOME, home)
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join("config"));
+        match state_subdir {
+            Some(subdir) => child.env("XDG_STATE_HOME", home.join(subdir)),
+            None => child.env_remove("XDG_STATE_HOME"),
+        };
+        let output = child.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "{stdout}\n{stderr}"
+        );
     }
 
     #[test]
@@ -382,21 +483,10 @@ mod tests {
         };
 
         assert!(
-            load("redlib_url = \"localhost:8080\"\n")
-                .unwrap_err()
-                .contains("http://")
-        );
-        assert!(
-            load("redlib_start_command = []\n")
-                .unwrap_err()
-                .contains("redlib_start_command")
-        );
-        assert!(
             load("[commands]\nimage = []\n")
                 .unwrap_err()
                 .contains("commands.image")
         );
-        assert!(load("redlib_url = \"https://r.example\"\n").is_ok());
     }
 
     #[test]
@@ -460,7 +550,7 @@ mod tests {
     fn config_file_rejects_unknown_keys() {
         let dir = tempdir::Dir::new();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "redlib_url = \"http://x\"\nunknown = 1\n").unwrap();
+        std::fs::write(&path, "show_nsfw = true\nunknown = 1\n").unwrap();
 
         assert!(Config::load(Some(&path)).is_err());
     }

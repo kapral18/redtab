@@ -12,15 +12,14 @@ use crate::cache::{Freshness, Source};
 use crate::config::{Config, is_subreddit_name, normalize_subreddit};
 use crate::media;
 use crate::model::{
-    Comment, CommentSources, Listing, Media, MoreReplies, Post, PostPage, SPOILER_START, Sort,
-    TimeRange,
+    Comment, CommentSources, Listing, Media, MoreReplies, ParentMembership, Post, PostPage,
+    ReplyPage, SPOILER_START, Sort, THREAD_ROOT, TimeRange,
 };
-use crate::redlib::Redlib;
+use crate::reddit::{Health, Reddit};
 use crate::state::State;
 use crate::video::{self, Player};
-use crate::worker::{CommandEnd, FeedQuery, Job, Msg, Pool};
+use crate::worker::{FeedQuery, Job, Msg, Pool};
 
-const HEALTH_INTERVAL: Duration = Duration::from_secs(30);
 const SAVE_INTERVAL: Duration = Duration::from_secs(60);
 const STATUS_TTL: Duration = Duration::from_secs(6);
 /// A tab's posts count as seen once you stay this long or interact with it.
@@ -359,6 +358,8 @@ pub struct PostView {
     pub generation: u64,
     pub collapsed: HashSet<String>,
     pub loading_more: HashSet<String>,
+    /// Removal evidence outlives a comment so older ancestor snapshots cannot restore it.
+    removed_comments: HashMap<String, Source>,
     /// Index into [`PostView::rows`].
     pub cursor: usize,
     pub scroll: usize,
@@ -456,6 +457,21 @@ impl PostView {
     }
 
     fn flatten<'a>(&'a self, c: &'a Comment, depth: usize, rows: &mut Vec<Row<'a>>) {
+        if c.id.starts_with(THREAD_ROOT) {
+            for reply in &c.replies {
+                self.flatten(reply, depth, rows);
+            }
+            if let Some(more) = &c.more {
+                rows.push(Row {
+                    depth,
+                    kind: RowKind::More {
+                        parent: &c.id,
+                        more,
+                    },
+                });
+            }
+            return;
+        }
         let folded = self.collapsed.contains(&c.id);
         rows.push(Row {
             depth,
@@ -714,6 +730,16 @@ fn find_comment_mut<'a>(comments: &'a mut [Comment], id: &str) -> Option<&'a mut
     None
 }
 
+fn find_comment<'a>(comments: &'a [Comment], id: &str) -> Option<&'a Comment> {
+    comments.iter().find_map(|c| {
+        if c.id == id {
+            Some(c)
+        } else {
+            find_comment(&c.replies, id)
+        }
+    })
+}
+
 #[derive(Debug, Default)]
 pub struct PickerState {
     pub input: String,
@@ -778,7 +804,7 @@ pub enum Focus {
 
 pub struct App {
     pub config: Config,
-    pub redlib: Redlib,
+    pub reddit: Reddit,
     pool: Pool,
     pub state: State,
     state_path: PathBuf,
@@ -790,8 +816,7 @@ pub struct App {
     pub post_view: Option<PostView>,
     pub overlay: Option<Overlay>,
     pub status: Option<Status>,
-    pub redlib_up: Option<bool>,
-    last_health: Option<Instant>,
+    pub health: Health,
     last_save: Instant,
     pub show_images: bool,
     pub show_sidebar: bool,
@@ -832,7 +857,6 @@ pub struct App {
     feed_settle: Settle,
     /// Thumbnails, icons and pictures in post text that moves bring on screen.
     picture_settle: Settle<()>,
-    command_running: bool,
     pub quit: bool,
 }
 
@@ -841,7 +865,7 @@ impl App {
         config: Config,
         subscriptions: Vec<String>,
         pool: Pool,
-        redlib: Redlib,
+        reddit: Reddit,
         state_path: PathBuf,
         image_picker: Picker,
     ) -> Self {
@@ -849,7 +873,7 @@ impl App {
         let show_images = config.image_preview;
         let mut app = Self {
             config,
-            redlib,
+            reddit,
             pool,
             state,
             state_path,
@@ -861,8 +885,7 @@ impl App {
             post_view: None,
             overlay: None,
             status: None,
-            redlib_up: None,
-            last_health: None,
+            health: Health::Unknown,
             last_save: Instant::now(),
             show_images,
             show_sidebar: true,
@@ -886,7 +909,6 @@ impl App {
             post_settle: Settle::default(),
             feed_settle: Settle::default(),
             picture_settle: Settle::default(),
-            command_running: false,
             quit: false,
         };
         app.push_tab(TabKind::Home);
@@ -906,7 +928,6 @@ impl App {
                 ..Group::default()
             })
             .collect();
-        app.check_health();
         for name in subscriptions {
             app.pool.submit(Job::Group {
                 subreddit: name,
@@ -964,7 +985,7 @@ impl App {
         }
     }
 
-    /// Timers: held-back navigation loads, status expiry, health checks, saves, video
+    /// Timers: held-back navigation loads, status expiry, Reddit health, saves, video
     /// frames. True when something visible changed.
     pub fn tick(&mut self) -> bool {
         let now = Instant::now();
@@ -980,11 +1001,10 @@ impl App {
             self.status = None;
             changed = true;
         }
-        if self
-            .last_health
-            .is_none_or(|t| t.elapsed() > HEALTH_INTERVAL)
-        {
-            self.check_health();
+        let health = self.reddit.health();
+        if health != self.health {
+            self.health = health;
+            changed = true;
         }
         if self.last_save.elapsed() > SAVE_INTERVAL && self.persist() {
             changed = true;
@@ -1042,7 +1062,7 @@ impl App {
         page.post
             .media
             .video_url()
-            .map(|url| self.redlib.absolute(url))
+            .and_then(|url| self.reddit.media_url(url).ok())
     }
 
     /// Starts, stops, pauses and advances the inline video to match the post view. It
@@ -1161,11 +1181,6 @@ impl App {
             Some(_) => self.info("The video is still loading"),
             None => self.info("No video plays here"),
         }
-    }
-
-    pub fn check_health(&mut self) {
-        self.last_health = Some(Instant::now());
-        self.pool.submit(Job::Health);
     }
 
     /// Save state. True when something visible changed: a merge changed the bookmark
@@ -1438,7 +1453,6 @@ impl App {
                 }
             }
         }
-        self.check_health();
     }
 
     fn refresh_group(pool: &Pool, group: &mut Group) {
@@ -1486,31 +1500,6 @@ impl App {
             && let Some(url) = image
         {
             self.request_image(&url);
-        }
-    }
-
-    /// After `S` started Redlib: reload only what failed or never loaded, keeping your place.
-    fn reload_failed(&mut self) {
-        self.retry_failed_thumbs();
-        self.retry_failed_pictures();
-        if let Some(view) = &self.post_view
-            && view.error.is_some()
-        {
-            self.refresh_post();
-        }
-        for g in &mut self.home.groups {
-            if g.error.is_some() || (g.posts.is_empty() && !g.loading) {
-                Self::refresh_group(&self.pool, g);
-            }
-        }
-        for i in 0..self.tabs.len() {
-            let feed = &self.tabs[i].feed;
-            if self.tabs[i].subreddit().is_some() && feed.error().is_some() {
-                let failed: Vec<_> = feed.failures.keys().cloned().collect();
-                for cursor in failed {
-                    self.fetch_feed(i, cursor, true);
-                }
-            }
         }
     }
 
@@ -1764,6 +1753,7 @@ impl App {
             generation,
             collapsed: HashSet::new(),
             loading_more: HashSet::new(),
+            removed_comments: HashMap::new(),
             cursor: 0,
             scroll: 0,
             // Start at the top of the post; the first comment key selects a comment.
@@ -2009,7 +1999,7 @@ impl App {
     pub fn activate_comment(&mut self) {
         enum Action {
             Toggle(String),
-            More { parent: String, path: String },
+            More { parent: String, cursor: String },
         }
         let Some(view) = &mut self.post_view else {
             return;
@@ -2028,7 +2018,7 @@ impl App {
                 }
                 Some(RowKind::More { parent, more }) => Some(Action::More {
                     parent: parent.to_string(),
-                    path: more.path.clone(),
+                    cursor: more.cursor.clone(),
                 }),
                 _ => None,
             }
@@ -2044,7 +2034,7 @@ impl App {
                 // Show the header with its fold chip: the fold's result is there.
                 view.hold_view = None;
             }
-            Some(Action::More { parent, path }) => {
+            Some(Action::More { parent, cursor }) => {
                 let first_request = view.loading_more.insert(parent.clone());
                 let generation = view.generation;
                 if first_request {
@@ -2057,7 +2047,7 @@ impl App {
                     self.pool.submit(Job::MoreReplies {
                         generation,
                         comment_id: parent,
-                        path,
+                        cursor,
                         minimum,
                     });
                 }
@@ -2189,7 +2179,7 @@ impl App {
     }
 
     /// A picture in post or comment text, fetched in the background once: a failed one
-    /// waits for `r` or `S`. Held during a quick run of moves.
+    /// waits for `r`. Held during a quick run of moves.
     pub fn request_text_picture(&mut self, url: &str) {
         if !self.images.contains_key(url) && !self.picture_settle.holding(Instant::now()) {
             self.fetch_image(url, true);
@@ -2297,7 +2287,7 @@ impl App {
         }
     }
 
-    // ----- actions: current post, Redlib ------------------------------------
+    // ----- actions: current post, Reddit ------------------------------------
 
     pub fn open_in_browser(&mut self) {
         let Some(post) = self.current_post() else {
@@ -2345,7 +2335,10 @@ impl App {
     fn hand_off_media(&mut self, permalink: &str, media: Media) {
         let commands = &self.config.commands;
         let result = if let Some(url) = media.video_url() {
-            let started = media::spawn_detached(&commands.video, &[self.redlib.absolute(url)]);
+            let started = self
+                .reddit
+                .media_url(url)
+                .and_then(|url| media::spawn_media(&commands.video, &[url]));
             // The window plays it now: the inline copy waits, so two do not sound.
             if started.is_ok()
                 && let Some(player) = &mut self.video
@@ -2401,21 +2394,6 @@ impl App {
             permalink: permalink.to_string(),
             urls,
         });
-    }
-
-    pub fn start_redlib(&mut self) {
-        if self.command_running {
-            self.info("Still starting Redlib…");
-            return;
-        }
-        match self.config.redlib_start_command.clone() {
-            Some(argv) => {
-                self.command_running = true;
-                self.info(format!("Running {}…", argv.join(" ")));
-                self.pool.submit(Job::RunCommand { argv });
-            }
-            None => self.info("Set redlib_start_command in config.toml to start Redlib from here"),
-        }
     }
 
     // ----- picker -----------------------------------------------------------
@@ -2583,13 +2561,26 @@ impl App {
                 match result {
                     Ok(page) => {
                         let mut page = *page;
+                        filter_removed_comments(&mut page.comments, source, &view.removed_comments);
                         let selected = view.cursor_key();
                         view.content_changed = true;
                         view.pin_view();
                         if let Some(old) = &mut view.page {
-                            merge_comments(&mut page.comments, &mut old.comments, source, false);
+                            merge_comments(
+                                &mut page.comments,
+                                &mut old.comments,
+                                source,
+                                false,
+                                &mut view.removed_comments,
+                            );
                         } else {
-                            merge_comments(&mut page.comments, &mut Vec::new(), source, false);
+                            merge_comments(
+                                &mut page.comments,
+                                &mut Vec::new(),
+                                source,
+                                false,
+                                &mut view.removed_comments,
+                            );
                         }
                         // A link post's page has no thumbnail; keep the listing's.
                         if let (
@@ -2637,7 +2628,13 @@ impl App {
                 }
                 view.loading_more.remove(&comment_id);
                 match result {
-                    Ok(replies) => {
+                    Ok(ReplyPage {
+                        comments: mut replies,
+                        more,
+                        refreshed,
+                        order,
+                    }) => {
+                        filter_removed_comments(&mut replies, source, &view.removed_comments);
                         view.content_changed = true;
                         // Rows above may grow: keep the selection and the text being read in place.
                         let mut selected = view.cursor_key();
@@ -2684,18 +2681,21 @@ impl App {
                                     reorder: c
                                         .sources
                                         .is_none_or(|old| source.may_replace(old.more)),
+                                    refreshed: refreshed.as_deref(),
+                                    order: &order,
                                 },
+                                &mut view.removed_comments,
                             );
                             let mut sources = c.sources.unwrap_or(CommentSources {
                                 content: source,
                                 more: source,
-                                from_expansion: false,
+                                parent: None,
                             });
                             if source.may_replace(sources.more) {
                                 // An empty preview has no replacement row: keep the More
                                 // target until terminal delivery.
                                 if !refreshing {
-                                    c.more = None;
+                                    c.more = more;
                                 }
                                 sources.more = source;
                                 c.sources = Some(sources);
@@ -2801,10 +2801,10 @@ impl App {
                 }
                 match result {
                     Ok(Media::Gallery { images, .. }) if images.is_empty() => {
-                        self.error("Gallery has no images Redlib can show")
+                        self.error("Gallery has no readable images")
                     }
                     Ok(Media::Video { url: None, .. }) => {
-                        self.error("Redlib has no playable source for this video")
+                        self.error("This video has no playable source")
                     }
                     Ok(media) => self.hand_off_media(&permalink, media),
                     Err(e) => self.error(format!("media: {e}")),
@@ -2822,31 +2822,6 @@ impl App {
                         }
                     }
                     Err(e) => self.error(format!("image download: {e}")),
-                }
-            }
-            Msg::Health(up) => {
-                let was = self.redlib_up;
-                self.redlib_up = Some(up);
-                if was == Some(false) && up {
-                    self.info("Redlib is back; press r to reload");
-                }
-            }
-            Msg::CommandDone { argv, result } => {
-                self.command_running = false;
-                match result {
-                    Ok(end) => {
-                        let done = match end {
-                            CommandEnd::Exited => "finished",
-                            CommandEnd::Running => "is running",
-                        };
-                        self.info(format!("{} {done}; reloading what failed", argv.join(" ")));
-                        // Unknown until the check answers, so a reload doesn't announce
-                        // "Redlib is back".
-                        self.redlib_up = None;
-                        self.check_health();
-                        self.reload_failed();
-                    }
-                    Err(e) => self.error(e),
                 }
             }
         }
@@ -2921,17 +2896,17 @@ impl App {
                             let minimum = comment.sources?.more;
                             let more = comment.more.as_ref()?;
                             (!freshness.source.may_replace(minimum))
-                                .then(|| (more.path.clone(), minimum))
+                                .then(|| (more.cursor.clone(), minimum))
                         })
                 } else {
                     None
                 };
                 let refreshing = refreshing || revalidate.is_some();
-                if let Some((path, minimum)) = revalidate {
+                if let Some((cursor, minimum)) = revalidate {
                     self.pool.refresh(Job::MoreReplies {
                         generation,
                         comment_id: comment_id.clone(),
-                        path,
+                        cursor,
                         minimum: Some(minimum),
                     });
                 }
@@ -3164,38 +3139,87 @@ impl App {
     }
 }
 
+fn filter_removed_comments(
+    comments: &mut Vec<Comment>,
+    source: Source,
+    removed: &HashMap<String, Source>,
+) {
+    comments.retain_mut(|comment| {
+        if removed
+            .get(&comment.id)
+            .is_some_and(|old| !source.may_replace(*old))
+        {
+            return false;
+        }
+        filter_removed_comments(&mut comment.replies, source, removed);
+        true
+    });
+}
+
+fn record_removal(removed: &mut HashMap<String, Source>, id: &str, source: Source) {
+    if removed.get(id).is_none_or(|old| source.may_replace(*old)) {
+        removed.insert(id.to_owned(), source);
+    }
+}
+
 /// Merge partial trees without letting older snapshots replace newer fields or continuations.
 fn merge_comments(
     incoming: &mut Vec<Comment>,
     previous: &mut Vec<Comment>,
     source: Source,
     keep_missing: bool,
+    removed: &mut HashMap<String, Source>,
 ) {
     for comment in incoming.iter_mut() {
         let old = previous.iter_mut().find(|old| old.id == comment.id);
-        merge_comment(comment, old, source);
+        merge_comment(comment, old, source, removed);
     }
     if previous.is_empty() {
         return;
     }
     let known: HashSet<_> = incoming.iter().map(|comment| comment.id.as_str()).collect();
-    previous.retain(|comment| {
-        !known.contains(comment.id.as_str())
-            && (keep_missing || comment_newer_than(comment, source))
+    previous.retain_mut(|comment| {
+        let retained = !known.contains(comment.id.as_str())
+            && (keep_missing || comment_newer_than(comment, source));
+        if retained && let Some(sources) = &mut comment.sources {
+            sources.parent = Some(parent_membership(sources.parent, source, false));
+        }
+        if !retained && !known.contains(comment.id.as_str()) {
+            record_removal(removed, &comment.id, source);
+        }
+        retained
     });
     drop(known);
     incoming.append(previous);
 }
 
-fn merge_comment(incoming: &mut Comment, previous: Option<&mut Comment>, source: Source) {
+fn parent_membership(
+    previous: Option<ParentMembership>,
+    source: Source,
+    present: bool,
+) -> ParentMembership {
+    previous
+        .filter(|old| !source.may_replace(old.source))
+        .unwrap_or(ParentMembership { source, present })
+}
+
+fn merge_comment(
+    incoming: &mut Comment,
+    previous: Option<&mut Comment>,
+    source: Source,
+    removed: &mut HashMap<String, Source>,
+) {
     let Some(previous) = previous else {
         incoming.sources = Some(CommentSources {
             content: source,
             more: source,
-            from_expansion: false,
+            parent: Some(ParentMembership {
+                source,
+                present: true,
+            }),
         });
         for child in &mut incoming.replies {
-            merge_comment(child, None, source);
+            merge_comment(child, None, source, removed);
         }
         return;
     };
@@ -3223,6 +3247,7 @@ fn merge_comment(incoming: &mut Comment, previous: Option<&mut Comment>, source:
             source,
             !keep_children,
             ReplyMerge::ParentSnapshot,
+            removed,
         );
     } else {
         incoming.replies = incoming_children;
@@ -3231,19 +3256,24 @@ fn merge_comment(incoming: &mut Comment, previous: Option<&mut Comment>, source:
             &mut previous_children,
             source,
             more.is_some(),
+            removed,
         );
     }
     incoming.more = more;
     incoming.sources = Some(CommentSources {
         content: if keep_content { old.content } else { source },
         more: if keep_more { old.more } else { source },
-        from_expansion: false,
+        parent: Some(parent_membership(old.parent, source, true)),
     });
 }
 
-enum ReplyMerge {
+enum ReplyMerge<'a> {
     ParentSnapshot,
-    Expansion { reorder: bool },
+    Expansion {
+        reorder: bool,
+        refreshed: Option<&'a [String]>,
+        order: &'a [String],
+    },
 }
 
 fn merge_replies(
@@ -3251,60 +3281,107 @@ fn merge_replies(
     replies: Vec<Comment>,
     source: Source,
     allow_new: bool,
-    kind: ReplyMerge,
+    kind: ReplyMerge<'_>,
+    removed: &mut HashMap<String, Source>,
 ) {
-    let expansion = matches!(kind, ReplyMerge::Expansion { .. });
-    let reorder = matches!(kind, ReplyMerge::Expansion { reorder: true });
-    // A More response replaces its own earlier contributions, not children from the
-    // parent page; newer content still wins.
+    let expansion = matches!(&kind, ReplyMerge::Expansion { .. });
+    let order = match &kind {
+        ReplyMerge::Expansion {
+            reorder: true,
+            order,
+            ..
+        } if allow_new => Some(*order),
+        _ => None,
+    };
+    let covered = |id: &str| match &kind {
+        ReplyMerge::Expansion {
+            refreshed: Some(ids),
+            ..
+        } => ids.iter().any(|candidate| candidate == id),
+        _ => true,
+    };
+    // A More response replaces unconfirmed children within its coverage; current
+    // parent membership and independently newer content still win.
     if expansion {
+        let protected = |comment: &Comment| {
+            comment
+                .sources
+                .is_none_or(|s| s.parent.is_some_and(|p| p.present))
+                || comment_newer_than(comment, source)
+        };
+        if let ReplyMerge::Expansion {
+            refreshed: Some(ids),
+            ..
+        } = &kind
+        {
+            for id in *ids {
+                if find_comment(&replies, id).is_none()
+                    && find_comment(existing, id).is_none_or(|c| !protected(c))
+                {
+                    record_removal(removed, id, source);
+                }
+            }
+        }
         existing.retain(|old| {
-            !old.sources.is_some_and(|sources| sources.from_expansion)
-                || replies.iter().any(|reply| reply.id == old.id)
-                || comment_newer_than(old, source)
+            let retained = protected(old)
+                || !covered(&old.id)
+                || replies.iter().any(|reply| reply.id == old.id);
+            if !retained {
+                record_removal(removed, &old.id, source);
+            }
+            retained
         });
     }
-    let mut next_slot = 0;
-    let mut replies = replies.into_iter();
-    while let Some(mut reply) = replies.next() {
-        let at = if let Some(at) = existing.iter().position(|old| old.id == reply.id) {
+    for mut reply in replies {
+        if let Some(at) = existing.iter().position(|old| old.id == reply.id) {
             let old = &mut existing[at];
-            let from_expansion =
-                expansion && old.sources.is_some_and(|sources| sources.from_expansion);
-            merge_comment(&mut reply, Some(old), source);
-            reply
-                .sources
-                .as_mut()
-                .expect("merged comment provenance")
-                .from_expansion = from_expansion;
-            *old = reply;
-            at
-        } else if allow_new {
-            merge_comment(&mut reply, None, source);
-            reply
-                .sources
-                .as_mut()
-                .expect("merged comment provenance")
-                .from_expansion = expansion;
-            existing.push(reply);
-            existing.len() - 1
-        } else {
-            continue;
-        };
-        if reorder && allow_new && existing[at].sources.is_some_and(|old| old.from_expansion) {
-            // Only this parent list sets sibling rank; nested freshness protects fields,
-            // not position. Leave absent or parent-owned slots alone.
-            if let Some(slot) = (next_slot..existing.len()).find(|&i| {
-                existing[i].sources.is_some_and(|old| old.from_expansion)
-                    && (i == at
-                        || replies
-                            .as_slice()
-                            .iter()
-                            .any(|reply| reply.id == existing[i].id))
-            }) {
-                existing.swap(slot, at);
-                next_slot = slot + 1;
+            let parent = old.sources.and_then(|sources| sources.parent);
+            merge_comment(&mut reply, Some(old), source, removed);
+            if expansion {
+                reply
+                    .sources
+                    .as_mut()
+                    .expect("merged comment provenance")
+                    .parent = parent;
             }
+            *old = reply;
+        } else if allow_new {
+            merge_comment(&mut reply, None, source, removed);
+            if expansion {
+                reply
+                    .sources
+                    .as_mut()
+                    .expect("merged comment provenance")
+                    .parent = None;
+            }
+            existing.push(reply);
+        }
+    }
+    if let Some(order) = order {
+        // A batch ranks unconfirmed siblings before its continuation, including
+        // retained later batches. Parent-confirmed and unranked positions stay put.
+        let mut ranks = HashMap::new();
+        for (rank, id) in order.iter().enumerate() {
+            ranks.entry(id.as_str()).or_insert(rank);
+        }
+        let slots: Vec<_> = existing
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                ranks.contains_key(c.id.as_str())
+                    && c.sources
+                        .is_some_and(|s| s.parent.is_none_or(|p| !p.present))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let mut ids: Vec<_> = slots.iter().map(|&i| existing[i].id.clone()).collect();
+        ids.sort_by_key(|id| ranks[id.as_str()]);
+        for (slot, id) in slots.into_iter().zip(ids) {
+            let at = existing
+                .iter()
+                .position(|c| c.id == id)
+                .expect("ranked reply");
+            existing.swap(slot, at);
         }
     }
 }
@@ -3351,13 +3428,14 @@ fn first_new_reply<'a>(
 }
 
 fn comment_newer_than(comment: &Comment, source: Source) -> bool {
-    comment
-        .sources
-        .is_some_and(|old| !source.may_replace(old.content) || !source.may_replace(old.more))
-        || comment
-            .replies
-            .iter()
-            .any(|child| comment_newer_than(child, source))
+    comment.sources.is_some_and(|old| {
+        !source.may_replace(old.content)
+            || !source.may_replace(old.more)
+            || old.parent.is_some_and(|p| !source.may_replace(p.source))
+    }) || comment
+        .replies
+        .iter()
+        .any(|child| comment_newer_than(child, source))
 }
 
 /// Move `current` by `delta` within `0..len`, clamping at the ends.
@@ -3371,7 +3449,446 @@ fn step(current: usize, delta: isize, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Media;
+
+    /// The ids of the replies under comment `parent` in the open post.
+    fn reply_ids(app: &App, parent: &str) -> Vec<String> {
+        let page = app.post_view.as_ref().unwrap().page.as_ref().unwrap();
+        find_comment(&page.comments, parent)
+            .unwrap()
+            .replies
+            .iter()
+            .map(|c| c.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn cached_ancestor_cannot_resurrect_a_removed_reply_but_newer_data_can() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        let generation = app.post_view.as_ref().unwrap().generation;
+        let parent = |id| comment("parent", vec![comment(id, vec![], None)], Some("/parent"));
+        let page = |children| {
+            thread_message(
+                generation,
+                vec![comment("ancestor", children, Some("/ancestor"))],
+            )
+        };
+        let ancestor = || Msg::MoreReplies {
+            generation,
+            comment_id: "ancestor".into(),
+            result: Ok(ReplyPage::complete(vec![parent("b")])),
+        };
+        app.on_msg(ordered_snapshot(page(vec![]), 1, false, false));
+        app.on_msg(ordered_snapshot(ancestor(), 2, true, false));
+        app.on_msg(ordered_snapshot(page(vec![parent("a")]), 3, false, false));
+        app.on_msg(ordered_snapshot(page(vec![]), 4, false, false));
+        app.on_msg(ordered_snapshot(
+            Msg::MoreReplies {
+                generation,
+                comment_id: "parent".into(),
+                result: Ok(ReplyPage {
+                    comments: vec![],
+                    refreshed: Some(vec!["b".into()]),
+                    order: vec![],
+                    more: Some(MoreReplies {
+                        cursor: "/parent-next".into(),
+                        count: None,
+                    }),
+                }),
+            },
+            5,
+            false,
+            false,
+        ));
+        let has_b = |app: &App| reply_ids(app, "parent").iter().any(|id| id == "b");
+        let removed = has_b(&app);
+        app.on_msg(ordered_snapshot(ancestor(), 2, true, true));
+        let stale = has_b(&app);
+        app.on_msg(ordered_snapshot(ancestor(), 6, false, false));
+        assert_eq!([removed, stale, has_b(&app)], [false, false, true]);
+    }
+
+    #[test]
+    fn explicit_omissions_remember_unseen_ids_and_advance_without_rolling_back() {
+        let mut outcomes = Vec::new();
+        for loaded in [false, true] {
+            let mut app = app_with(&[]);
+            app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+            let generation = app.post_view.as_ref().unwrap().generation;
+            let parent = |ids: &[&str]| {
+                comment(
+                    "parent",
+                    ids.iter().map(|id| comment(id, vec![], None)).collect(),
+                    Some("/parent"),
+                )
+            };
+            let page = |children| {
+                thread_message(
+                    generation,
+                    vec![comment("ancestor", children, Some("/ancestor"))],
+                )
+            };
+            app.on_msg(ordered_snapshot(
+                page(vec![parent(if loaded { &["a", "b"] } else { &["a"] })]),
+                1,
+                false,
+                false,
+            ));
+            app.on_msg(ordered_snapshot(
+                page(vec![parent(&["a"])]),
+                3,
+                false,
+                false,
+            ));
+            let omission = || Msg::MoreReplies {
+                generation,
+                comment_id: "parent".into(),
+                result: Ok(ReplyPage {
+                    comments: vec![],
+                    refreshed: Some(vec!["b".into()]),
+                    order: vec![],
+                    more: Some(MoreReplies {
+                        cursor: "/next".into(),
+                        count: None,
+                    }),
+                }),
+            };
+            for sequence in [5, 7, 5] {
+                app.on_msg(ordered_snapshot(omission(), sequence, false, false));
+            }
+            let ancestor = || Msg::MoreReplies {
+                generation,
+                comment_id: "ancestor".into(),
+                result: Ok(ReplyPage::complete(vec![parent(&["b"])])),
+            };
+            let has_b = |app: &App| reply_ids(app, "parent").iter().any(|id| id == "b");
+            app.on_msg(ordered_snapshot(ancestor(), 6, true, true));
+            let stale = has_b(&app);
+            app.on_msg(ordered_snapshot(ancestor(), 8, false, false));
+            outcomes.push([stale, has_b(&app)]);
+        }
+        assert_eq!(outcomes, [[false, true], [false, true]]);
+    }
+
+    #[test]
+    fn parent_page_demotion_allows_later_batch_order_and_removal() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        let generation = app.post_view.as_ref().unwrap().generation;
+        let page = |ids: &[&str]| {
+            thread_message(
+                generation,
+                vec![comment(
+                    "parent",
+                    ids.iter().map(|id| comment(id, vec![], None)).collect(),
+                    Some("/more"),
+                )],
+            )
+        };
+        let batch = |ids: &[&str], covered: &[&str], remaining: &[&str]| Msg::MoreReplies {
+            generation,
+            comment_id: "parent".into(),
+            result: Ok(ReplyPage {
+                comments: ids.iter().map(|id| comment(id, vec![], None)).collect(),
+                refreshed: Some(covered.iter().map(|s| s.to_string()).collect()),
+                order: ids.iter().chain(remaining).map(|s| s.to_string()).collect(),
+                more: (!remaining.is_empty()).then(|| MoreReplies {
+                    cursor: "/next".into(),
+                    count: None,
+                }),
+            }),
+        };
+        app.on_msg(ordered_snapshot(page(&["a", "b"]), 1, false, false));
+        app.on_msg(ordered_snapshot(
+            batch(&["c", "d"], &["c", "d"], &[]),
+            2,
+            false,
+            false,
+        ));
+        app.on_msg(ordered_snapshot(page(&["a"]), 3, false, false));
+        // An older cached parent cannot confirm b again after the newer demotion.
+        app.on_msg(ordered_snapshot(page(&["a", "b"]), 1, true, false));
+        app.on_msg(ordered_snapshot(
+            batch(&["x", "b", "c"], &["x", "b", "c"], &["d"]),
+            4,
+            false,
+            false,
+        ));
+        let ordered = reply_ids(&app, "parent");
+        // A covered omission removes b, and a newer response may add it back.
+        app.on_msg(ordered_snapshot(
+            batch(&[], &["b"], &["d"]),
+            5,
+            false,
+            false,
+        ));
+        let removed = reply_ids(&app, "parent");
+        app.on_msg(ordered_snapshot(
+            batch(&["b"], &["b"], &["c", "d"]),
+            6,
+            false,
+            false,
+        ));
+        let readded = reply_ids(&app, "parent");
+        let expected = [
+            vec!["a", "x", "b", "c", "d"],
+            vec!["a", "x", "c", "d"],
+            vec!["a", "x", "b", "c", "d"],
+        ]
+        .map(|ids| ids.into_iter().map(str::to_owned).collect::<Vec<_>>());
+        assert_eq!([ordered, removed, readded], expected);
+    }
+
+    #[test]
+    fn growing_reply_batches_stay_before_retained_later_comments() {
+        let mut outcomes = Vec::new();
+        for returned in [&["x", "b", "c"][..], &["x", "y"][..]] {
+            let mut app = app_with(&[]);
+            app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+            let generation = app.post_view.as_ref().unwrap().generation;
+            let parent_page = || {
+                thread_message(
+                    generation,
+                    vec![comment(
+                        "parent",
+                        vec![comment("a", vec![], None)],
+                        Some("/more"),
+                    )],
+                )
+            };
+            app.on_msg(parent_page());
+            let batch =
+                |comments: Vec<Comment>, covered: &[&str], remaining: &[&str]| Msg::MoreReplies {
+                    generation,
+                    comment_id: "parent".into(),
+                    result: Ok(ReplyPage {
+                        order: comments
+                            .iter()
+                            .map(|c| c.id.clone())
+                            .chain(remaining.iter().map(|id| id.to_string()))
+                            .collect(),
+                        comments,
+                        refreshed: Some(covered.iter().map(|id| id.to_string()).collect()),
+                        more: (!remaining.is_empty()).then(|| MoreReplies {
+                            cursor: "/next".into(),
+                            count: None,
+                        }),
+                    }),
+                };
+            app.on_msg(batch(
+                vec![
+                    comment("b", vec![], None),
+                    comment("c", vec![], None),
+                    comment("d", vec![comment("child", vec![], None)], Some("/child")),
+                ],
+                &["b", "c", "d"],
+                &[],
+            ));
+            let view = app.post_view.as_mut().unwrap();
+            view.free_scroll = false;
+            view.reselect(Some(RowKey::Comment("child".into())));
+            app.on_msg(parent_page());
+            let remaining = if returned.contains(&"b") {
+                &[][..]
+            } else {
+                &["b", "c"][..]
+            };
+            let remaining: Vec<_> = remaining.iter().copied().chain(["d"]).collect();
+            app.on_msg(batch(
+                returned
+                    .iter()
+                    .map(|id| comment(id, vec![], None))
+                    .collect(),
+                returned,
+                &remaining,
+            ));
+            let mut expected: Vec<_> = ["a"]
+                .into_iter()
+                .chain(returned.iter().copied())
+                .chain(remaining.iter().copied())
+                .map(str::to_string)
+                .collect();
+            outcomes.push((reply_ids(&app, "parent"), expected.clone()));
+            app.on_msg(batch(
+                remaining
+                    .iter()
+                    .map(|id| comment(id, vec![], (*id == "d").then_some("/child")))
+                    .collect(),
+                &remaining,
+                &[],
+            ));
+            outcomes.push((reply_ids(&app, "parent"), std::mem::take(&mut expected)));
+            let view = app.post_view.as_ref().unwrap();
+            assert!(matches!(view.cursor_key(), Some(RowKey::Comment(id)) if id == "child"));
+            assert_eq!(
+                view.page.as_ref().unwrap().comments[0]
+                    .replies
+                    .iter()
+                    .find(|c| c.id == "d")
+                    .unwrap()
+                    .replies[0]
+                    .id,
+                "child"
+            );
+        }
+        assert!(
+            outcomes.iter().all(|(actual, expected)| actual == expected),
+            "{outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn top_level_refresh_and_reexpansion_keep_later_batches_and_selection() {
+        use serde_json::json;
+        let page = |ids: &[&str], more: &[&str]| {
+            let mut value: serde_json::Value =
+                serde_json::from_str(include_str!("../tests/fixtures/post.json")).unwrap();
+            let more_of = |children: &[&str]| {
+                let count = children.len();
+                json!({"kind": "more", "data": {"children": children, "count": count}})
+            };
+            let hidden =
+                |child| json!({"kind": "Listing", "data": {"children": [more_of(&[child])]}});
+            let mut children: Vec<_> = ids
+                .iter()
+                .map(|id| {
+                    let replies = match *id {
+                        "c" => hidden("child"),
+                        "d" => hidden("dchild"),
+                        _ => json!(""),
+                    };
+                    json!({"kind": "t1", "data": {"id": id, "body": id, "replies": replies}})
+                })
+                .collect();
+            if !more.is_empty() {
+                children.push(more_of(more));
+            }
+            value[1]["data"]["children"] = json!(children);
+            crate::reddit::parse::parse_post_page(&value.to_string()).unwrap()
+        };
+        let batch = |comments: Vec<Comment>, refreshed: &[&str], next: Option<&str>| ReplyPage {
+            order: comments.iter().map(|c| c.id.clone()).collect(),
+            comments,
+            refreshed: Some(refreshed.iter().map(|s| s.to_string()).collect()),
+            more: next.map(|cursor| MoreReplies {
+                cursor: cursor.into(),
+                count: None,
+            }),
+        };
+        let mut app = app_with(&[]);
+        let initial = page(&["a"], &["b", "c", "d"]);
+        app.open_post_permalink(initial.post.clone(), initial.post.permalink.clone());
+        let generation = app.post_view.as_ref().unwrap().generation;
+        let root = initial.comments[0].id.clone();
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(initial)),
+        });
+        for result in [
+            batch(
+                vec![
+                    comment("b", vec![], None),
+                    comment("c", vec![comment("child", vec![], None)], Some("/child")),
+                ],
+                &["b", "c"],
+                Some("/second"),
+            ),
+            batch(
+                vec![comment(
+                    "d",
+                    vec![comment("dchild", vec![], None)],
+                    Some("/dchild"),
+                )],
+                &["d"],
+                None,
+            ),
+        ] {
+            app.on_msg(Msg::MoreReplies {
+                generation,
+                comment_id: root.clone(),
+                result: Ok(result),
+            });
+        }
+        let view = app.post_view.as_mut().unwrap();
+        view.free_scroll = false;
+        view.reselect(Some(RowKey::Comment("dchild".into())));
+        let check = |app: &App| {
+            let view = app.post_view.as_ref().unwrap();
+            let ids: Vec<_> = view
+                .rows()
+                .iter()
+                .filter_map(|r| match r.kind {
+                    RowKind::Comment { comment, .. } => Some(comment.id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(ids, ["a", "b", "c", "child", "d", "dchild"]);
+            assert!(matches!(view.cursor_key(), Some(RowKey::Comment(id)) if id == "dchild"));
+        };
+        check(&app);
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(page(&["a", "b"], &["c", "d"]))),
+        });
+        check(&app);
+        for result in [
+            batch(
+                vec![comment("c", vec![], Some("/child"))],
+                &["c"],
+                Some("/second"),
+            ),
+            batch(vec![comment("d", vec![], Some("/dchild"))], &["d"], None),
+        ] {
+            app.on_msg(Msg::MoreReplies {
+                generation,
+                comment_id: root.clone(),
+                result: Ok(result),
+            });
+            check(&app);
+        }
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(page(&["a", "b", "c", "d"], &[]))),
+        });
+        check(&app);
+        let loaded = app.post_view.as_ref().unwrap().page.as_ref().unwrap();
+        assert!(
+            find_comment(&loaded.comments, &root)
+                .unwrap()
+                .more
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn top_level_more_expands_without_a_synthetic_author_or_extra_indent() {
+        let mut app = app_with(&[]);
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/post.json")).unwrap();
+        value[1]["data"]["children"] =
+            serde_json::json!([{"kind":"more","data":{"children":["c1"],"count":1}}]);
+        let page = crate::reddit::parse::parse_post_page(&value.to_string()).unwrap();
+        app.open_post_permalink(page.post.clone(), page.post.permalink.clone());
+        let generation = app.post_view.as_ref().unwrap().generation;
+        let parent = page.comments[0].id.clone();
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(page)),
+        });
+        let rows = app.post_view.as_ref().unwrap().rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].depth, 0);
+        assert!(matches!(rows[0].kind, RowKind::More { .. }));
+        app.on_msg(Msg::MoreReplies {
+            generation,
+            comment_id: parent,
+            result: Ok(ReplyPage::complete(vec![comment("c1", vec![], None)])),
+        });
+        let rows = app.post_view.as_ref().unwrap().rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].depth, 0);
+        assert!(matches!(&rows[0].kind, RowKind::Comment { comment, .. } if comment.id == "c1"));
+    }
 
     #[test]
     fn when_a_list_picture_arrives_it_should_be_cut_to_the_slots_shape_around_its_middle() {
@@ -3400,7 +3917,7 @@ mod tests {
     #[test]
     fn a_second_fetch_of_a_loaded_picture_should_not_replace_it() {
         let mut app = app_with(&[]);
-        let url = "/preview/pre/twice.png";
+        let url = "https://preview.redd.it/twice.png";
         app.request_text_picture(url);
         let image = |side| Ok(image::DynamicImage::new_rgb8(side, side));
 
@@ -3425,7 +3942,7 @@ mod tests {
     #[test]
     fn a_picture_asked_for_again_while_still_queued_should_be_fetched_once() {
         let (mut app, messages) = app_with_messages(&[]);
-        let url = "/preview/pre/once.png";
+        let url = "https://preview.redd.it/once.png";
         app.request_text_picture(url);
         app.drop_text_picture(url);
         app.request_text_picture(url);
@@ -3451,10 +3968,11 @@ mod tests {
         app_at("http://127.0.0.1:9", subscriptions)
     }
 
-    /// An app on the Redlib at `url`, without a disk cache, plus the replies its jobs produce.
+    /// An app whose Reddit API is the server at `url`, without a disk cache, plus the replies
+    /// its jobs produce.
     fn app_at(url: &str, subscriptions: &[&str]) -> (App, std::sync::mpsc::Receiver<Msg>) {
-        let redlib = Redlib::new(url, false);
-        let (pool, messages) = Pool::start(redlib.clone(), 3, None);
+        let reddit = Reddit::test_at(url, false);
+        let (pool, messages) = Pool::start(reddit.clone(), 3, None);
         let state = std::env::temp_dir().join(format!(
             "redtab-app-test-{}-{:?}.json",
             std::process::id(),
@@ -3464,7 +3982,7 @@ mod tests {
             Config::default(),
             subscriptions.iter().map(|s| s.to_string()).collect(),
             pool,
-            redlib,
+            reddit,
             state,
             Picker::halfblocks(),
         );
@@ -3481,7 +3999,6 @@ mod tests {
             score: Some(1),
             comments: 0,
             created: None,
-            age: String::new(),
             permalink: format!("/r/{sub}/comments/{id}/x/"),
             media: Media::None,
             stickied: false,
@@ -3508,11 +4025,10 @@ mod tests {
             is_op: false,
             is_mod: false,
             score: None,
-            age: String::new(),
             body: id.into(),
             replies,
             more: more.map(|p| MoreReplies {
-                path: p.into(),
+                cursor: p.into(),
                 count: Some(1),
             }),
         }
@@ -3549,14 +4065,15 @@ mod tests {
         (app, messages)
     }
 
-    /// A Redlib that answers each post page `delay` late, as `post.html` retitled with the
-    /// requested id, and records the post ids asked for. Other paths answer at once, empty.
-    struct SlowRedlib {
+    /// A fixture Reddit API that answers each post page `delay` late, as `post.json`
+    /// retitled with the requested id, and records the post ids asked for. Other paths
+    /// answer at once, empty.
+    struct SlowReddit {
         url: String,
         asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
-    impl SlowRedlib {
+    impl SlowReddit {
         fn start(delay: Duration) -> Self {
             use std::io::{BufRead, BufReader, Write};
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3577,13 +4094,14 @@ mod tests {
                         let path = request.split(' ').nth(1).unwrap_or_default();
                         let body = match path
                             .split('/')
-                            .nth(4)
-                            .filter(|_| path.contains("/comments/"))
+                            .nth(2)
+                            .filter(|_| path.starts_with("/comments/"))
+                            .map(|id| id.split('.').next().unwrap())
                         {
                             Some(id) => {
                                 log.lock().unwrap().push(id.to_string());
                                 std::thread::sleep(delay);
-                                include_str!("../tests/fixtures/post.html").replace("1x4v4sn", id)
+                                include_str!("../tests/fixtures/post.json").replace("1x4v4sn", id)
                             }
                             None => String::new(),
                         };
@@ -3599,7 +4117,7 @@ mod tests {
         }
 
         /// Home with one card per post id, the first post open beside the cards and the
-        /// cards focused. No subscriptions: nothing else asks this Redlib for pages.
+        /// cards focused. No subscriptions: nothing else asks this server for pages.
         fn home(&self, ids: &[&str]) -> (App, std::sync::mpsc::Receiver<Msg>) {
             let (mut app, messages) = app_at(&self.url, &[]);
             app.home.groups = ids
@@ -3622,6 +4140,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_rate_limit_shows_paused_requests_not_an_unanswering_reddit() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    line.clear();
+                }
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        let (mut app, messages) = app_at(&url, &[]);
+        app.status = None;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 30)).unwrap();
+        let mut footer = |app: &mut App| {
+            let buffer = terminal
+                .draw(|frame| crate::ui::draw(frame, app))
+                .unwrap()
+                .buffer
+                .clone();
+            (0..110)
+                .map(|x| buffer[(x, 29)].symbol())
+                .collect::<String>()
+        };
+
+        assert!(app.reddit.search("rust", "x", None).is_err());
+        let started = Instant::now();
+        let mut shown = footer(&mut app);
+        while !shown.contains("paused")
+            && !shown.contains("not answering")
+            && started.elapsed() < Duration::from_secs(5)
+        {
+            if let Ok(msg) = messages.recv_timeout(Duration::from_millis(20)) {
+                app.on_msg(msg);
+            }
+            app.tick();
+            shown = footer(&mut app);
+        }
+
+        assert!(shown.contains("paused"), "{shown}");
+    }
+
     /// Handle replies and timers until the shown post's page is in; how long that took.
     fn wait_for_page(app: &mut App, messages: &std::sync::mpsc::Receiver<Msg>) -> Duration {
         let started = Instant::now();
@@ -3639,7 +4208,7 @@ mod tests {
     #[test]
     fn coming_back_to_a_post_still_loading_shows_its_first_answer_without_another_wait() {
         let delay = Duration::from_secs(1);
-        let server = SlowRedlib::start(delay);
+        let server = SlowReddit::start(delay);
         let (mut app, messages) = server.home(&["warm", "fa", "fb"]);
         wait_for_page(&mut app, &messages);
         let pause = NAV_SETTLE + Duration::from_millis(50);
@@ -3659,8 +4228,8 @@ mod tests {
     }
 
     #[test]
-    fn post_loads_moved_past_while_queued_never_reach_redlib() {
-        let server = SlowRedlib::start(Duration::from_millis(1500));
+    fn post_loads_moved_past_while_queued_never_reach_reddit() {
+        let server = SlowReddit::start(Duration::from_millis(1500));
         let (mut app, messages) = server.home(&["warm", "fa", "fb", "fc", "fd"]);
         wait_for_page(&mut app, &messages);
         let pause = NAV_SETTLE + Duration::from_millis(50);
@@ -3866,7 +4435,10 @@ mod tests {
     #[test]
     fn pictures_a_quick_run_of_moves_passes_wait_until_it_stops() {
         let mut app = app_with(&[]);
-        let (thumb, picture) = ("/img/row.png", "/preview/pre/text.png");
+        let (thumb, picture) = (
+            "https://i.redd.it/row.png",
+            "https://preview.redd.it/text.png",
+        );
         app.move_selection(1);
         app.thumbs_drawn(&[thumb]);
         assert!(app.thumbs.contains_key(thumb), "a lone move loads at once");
@@ -3923,7 +4495,7 @@ mod tests {
         let mut page_post = post("p", "s");
         page_post.spoiler = true;
         page_post.media = Media::Gallery {
-            images: vec!["/img/full.jpg".into()],
+            images: vec!["https://i.redd.it/full.jpg".into()],
             thumb: None,
         };
 
@@ -4067,65 +4639,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn after_s_a_failed_next_page_is_retried_as_a_next_page() {
-        let (mut app, messages) = app_with_messages(&["vim"]);
-        let i = tab_index(&app, "vim");
-        app.switch_tab(i);
-        let id = app.tabs[i].id;
-        let g = app.tabs[i].feed.generation;
-        app.on_msg(Msg::Feed {
-            tab: id,
-            generation: g,
-            append: false,
-            result: Ok(listing("vim", &["a", "b"], Some("t3_b"))),
-        });
-        app.load_feed(i, true);
-        let g = app.tabs[i].feed.generation;
-        app.on_msg(Msg::Feed {
-            tab: id,
-            generation: g,
-            append: true,
-            result: Err("timeout".into()),
-        });
-
-        app.on_msg(Msg::CommandDone {
-            argv: vec!["start".into()],
-            result: Ok(crate::worker::CommandEnd::Exited),
-        });
-        let retry = app.tabs[i].feed.generation;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let append = loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let msg = messages.recv_timeout(left).expect("the retry's reply");
-            let msg = match msg {
-                Msg::Snapshot { message, .. } => *message,
-                other => other,
-            };
-            match msg {
-                Msg::Feed {
-                    generation, append, ..
-                } if generation == retry => break append,
-                _ => {}
-            }
-        };
-
-        assert!(append, "the retry asks for the next page, not page 1");
-        app.on_msg(Msg::Feed {
-            tab: id,
-            generation: retry,
-            append,
-            result: Ok(listing("vim", &["c"], None)),
-        });
-        let ids: Vec<&str> = app.tabs[i]
-            .feed
-            .posts
-            .iter()
-            .map(|p| p.id.as_str())
-            .collect();
-        assert_eq!(ids, ["a", "b", "c"], "the next page joins the loaded one");
-    }
-
     /// A failed load keeps the posts only when it asked for the same listing:
     /// a reload keeps the reader's place, a new sort shows nothing to page onto.
     #[test]
@@ -4223,10 +4736,10 @@ mod tests {
         app.on_msg(Msg::MoreReplies {
             generation,
             comment_id: "c1".into(),
-            result: Ok(vec![
+            result: Ok(ReplyPage::complete(vec![
                 comment("r1", vec![], None),
                 comment("r2", vec![], None),
-            ]),
+            ])),
         });
 
         let view = app.post_view.as_ref().unwrap();
@@ -4257,10 +4770,10 @@ mod tests {
         app.on_msg(Msg::MoreReplies {
             generation,
             comment_id: "c1".into(),
-            result: Ok(vec![
+            result: Ok(ReplyPage::complete(vec![
                 comment("r1", vec![], None),
                 comment("r2", vec![], None),
-            ]),
+            ])),
         });
 
         let view = app.post_view.as_ref().unwrap();
@@ -4380,7 +4893,7 @@ mod tests {
         app.on_msg(Msg::MoreReplies {
             generation,
             comment_id: "c1".into(),
-            result: Ok(vec![comment("c1c", vec![], None)]),
+            result: Ok(ReplyPage::complete(vec![comment("c1c", vec![], None)])),
         });
         let view = app.post_view.as_mut().unwrap();
         assert_eq!(view.rows().len(), 5); // c1, c1a, c1b, c1c, c2
@@ -4931,7 +5444,7 @@ mod tests {
         app.on_msg(Msg::MoreReplies {
             generation,
             comment_id: "parent".into(),
-            result: Ok(vec![updated]),
+            result: Ok(ReplyPage::complete(vec![updated])),
         });
 
         let reply = &app
@@ -5005,7 +5518,7 @@ mod tests {
         ));
 
         assert!(matches!(app.post_view.as_ref().unwrap().rows()[1].kind,
-            RowKind::More { more, .. } if more.path == "/new-replies"));
+            RowKind::More { more, .. } if more.cursor == "/new-replies"));
     }
 
     #[test]
@@ -5387,10 +5900,10 @@ mod tests {
             Msg::MoreReplies {
                 generation,
                 comment_id: "parent".into(),
-                result: Ok(vec![
+                result: Ok(ReplyPage::complete(vec![
                     comment("child", vec![comment("removed", vec![], None)], None),
                     comment("missing", vec![], None),
-                ]),
+                ])),
             },
             1,
             true,
@@ -5629,7 +6142,7 @@ mod tests {
             Msg::MoreReplies {
                 generation,
                 comment_id: "parent".into(),
-                result: Ok(vec![comment("missing", vec![], None)]),
+                result: Ok(ReplyPage::complete(vec![comment("missing", vec![], None)])),
             },
             20,
             true,
@@ -5680,10 +6193,10 @@ mod tests {
             Msg::MoreReplies {
                 generation,
                 comment_id: "parent".into(),
-                result: Ok(vec![
+                result: Ok(ReplyPage::complete(vec![
                     comment("child", vec![], None),
                     comment("missing", vec![], None),
-                ]),
+                ])),
             },
             1,
             true,
@@ -5693,10 +6206,10 @@ mod tests {
             Msg::MoreReplies {
                 generation,
                 comment_id: "parent".into(),
-                result: Ok(vec![
+                result: Ok(ReplyPage::complete(vec![
                     comment("child", vec![], None),
                     comment("missing", vec![], None),
-                ]),
+                ])),
             },
             3,
             false,
@@ -5729,10 +6242,11 @@ mod tests {
             let more = |ids: &[&str]| Msg::MoreReplies {
                 generation,
                 comment_id: "parent".into(),
-                result: Ok(ids
-                    .iter()
-                    .map(|id| comment(id, vec![], (*id == "a").then_some("/nested")))
-                    .collect()),
+                result: Ok(ReplyPage::complete(
+                    ids.iter()
+                        .map(|id| comment(id, vec![], (*id == "a").then_some("/nested")))
+                        .collect(),
+                )),
             };
             app.on_msg(ordered_snapshot(more(&["a", "b"]), 1, true, true));
             let view = app.post_view.as_mut().unwrap();
@@ -5743,7 +6257,7 @@ mod tests {
                     Msg::MoreReplies {
                         generation,
                         comment_id: "a".into(),
-                        result: Ok(vec![comment("nested", vec![], None)]),
+                        result: Ok(ReplyPage::complete(vec![comment("nested", vec![], None)])),
                     },
                     4,
                     false,
@@ -5818,10 +6332,10 @@ mod tests {
             Msg::MoreReplies {
                 generation,
                 comment_id: "parent".into(),
-                result: Ok(vec![
+                result: Ok(ReplyPage::complete(vec![
                     comment("removed", vec![], None),
                     comment("current", vec![comment("recovered", vec![], None)], None),
-                ]),
+                ])),
             },
             20,
             true,
@@ -6000,14 +6514,14 @@ mod tests {
             Msg::MoreReplies {
                 generation,
                 comment_id: "parent".into(),
-                result: Ok(vec![comment(
+                result: Ok(ReplyPage::complete(vec![comment(
                     "complete",
                     vec![
                         comment("removed", vec![], None),
                         comment("incomplete", vec![comment("recovered", vec![], None)], None),
                     ],
                     None,
-                )]),
+                )])),
             },
             1,
             true,
@@ -6054,10 +6568,10 @@ mod tests {
                 Msg::MoreReplies {
                     generation,
                     comment_id: "parent".into(),
-                    result: Ok(vec![
+                    result: Ok(ReplyPage::complete(vec![
                         comment("a", vec![], None),
                         comment("b", vec![comment("expanded", vec![], None)], None),
-                    ]),
+                    ])),
                 },
                 1,
                 true,
@@ -6072,7 +6586,7 @@ mod tests {
                 Msg::MoreReplies {
                     generation,
                     comment_id: "parent".into(),
-                    result: Ok(replies),
+                    result: Ok(ReplyPage::complete(replies)),
                 },
                 3,
                 false,
@@ -6116,10 +6630,10 @@ mod tests {
             Msg::MoreReplies {
                 generation,
                 comment_id: "parent".into(),
-                result: Ok(vec![
+                result: Ok(ReplyPage::complete(vec![
                     comment("confirmed", vec![], None),
                     comment("removed", vec![], None),
-                ]),
+                ])),
             },
             2,
             true,
@@ -6142,10 +6656,10 @@ mod tests {
             Msg::MoreReplies {
                 generation,
                 comment_id: "parent".into(),
-                result: Ok(vec![
+                result: Ok(ReplyPage::complete(vec![
                     comment("confirmed", vec![], None),
                     comment("removed", vec![], None),
-                ]),
+                ])),
             },
             2,
             true,
@@ -6155,7 +6669,7 @@ mod tests {
             Msg::MoreReplies {
                 generation,
                 comment_id: "parent".into(),
-                result: Ok(vec![comment("new", vec![], None)]),
+                result: Ok(ReplyPage::complete(vec![comment("new", vec![], None)])),
             },
             4,
             false,
@@ -6204,7 +6718,11 @@ mod tests {
                 Msg::MoreReplies {
                     generation,
                     comment_id: "ancestor".into(),
-                    result: Ok(vec![comment("parent", vec![], Some("/parent-more"))]),
+                    result: Ok(ReplyPage::complete(vec![comment(
+                        "parent",
+                        vec![],
+                        Some("/parent-more"),
+                    )])),
                 },
                 3,
                 false,
@@ -6217,7 +6735,7 @@ mod tests {
                     Msg::MoreReplies {
                         generation,
                         comment_id: "parent".into(),
-                        result: Ok(vec![child]),
+                        result: Ok(ReplyPage::complete(vec![child])),
                     },
                     4,
                     true,
@@ -6243,7 +6761,7 @@ mod tests {
                 Msg::MoreReplies {
                     generation,
                     comment_id: "parent".into(),
-                    result: Ok(vec![comment("new", vec![], None)]),
+                    result: Ok(ReplyPage::complete(vec![comment("new", vec![], None)])),
                 },
                 5,
                 false,
@@ -6561,7 +7079,7 @@ mod tests {
     }
 
     #[test]
-    fn an_older_home_success_keeps_a_newer_feed_failure_visible_and_retryable() {
+    fn an_older_home_success_keeps_a_newer_feed_failure_visible() {
         let mut app = app_with(&["vim"]);
         let i = tab_index(&app, "vim");
         app.switch_tab(i);
@@ -6600,9 +7118,6 @@ mod tests {
         ));
         assert_eq!(app.tabs[i].feed.posts[0].id, "useful-older-success");
         assert_eq!(app.tabs[i].feed.error(), Some("newer request failed"));
-        let generation = app.tabs[i].feed.generation;
-        app.reload_failed();
-        assert_ne!(app.tabs[i].feed.generation, generation);
     }
     #[test]
     fn an_interim_expansion_without_new_replies_keeps_its_target() {
@@ -6634,11 +7149,11 @@ mod tests {
                 Msg::MoreReplies {
                     generation,
                     comment_id: "parent".into(),
-                    result: Ok(if empty {
+                    result: Ok(ReplyPage::complete(if empty {
                         vec![]
                     } else {
                         vec![comment("child", vec![], None)]
-                    }),
+                    })),
                 },
                 2,
                 true,
@@ -6653,10 +7168,10 @@ mod tests {
                 Msg::MoreReplies {
                     generation,
                     comment_id: "parent".into(),
-                    result: Ok(vec![
+                    result: Ok(ReplyPage::complete(vec![
                         comment("child", vec![], None),
                         comment("new", vec![], None),
-                    ]),
+                    ])),
                 },
                 4,
                 false,
@@ -6700,7 +7215,7 @@ mod tests {
                 message: Box::new(Msg::MoreReplies {
                     generation,
                     comment_id: "parent".into(),
-                    result: Ok(vec![old]),
+                    result: Ok(ReplyPage::complete(vec![old])),
                 }),
                 fetched_at: now(),
                 refreshing: false,
@@ -6727,7 +7242,7 @@ mod tests {
                 message: Box::new(Msg::MoreReplies {
                     generation,
                     comment_id: "parent".into(),
-                    result: Ok(vec![new]),
+                    result: Ok(ReplyPage::complete(vec![new])),
                 }),
                 fetched_at: now(),
                 refreshing: false,
@@ -6814,7 +7329,7 @@ mod tests {
 
     #[test]
     fn cached_thumbnail_retries_keep_pixels_after_failure_or_skipped_work() {
-        for retry in ["reload", "started", "revisit"] {
+        for retry in ["reload", "revisit"] {
             let mut app = app_with(&[]);
             let url = "/image.png";
             app.thumbs_drawn(&[url]);
@@ -6856,10 +7371,8 @@ mod tests {
                 }
             });
             app.thumbs_drawn(&[]);
-            match retry {
-                "reload" => app.reload(),
-                "started" => app.reload_failed(),
-                _ => {}
+            if retry == "reload" {
+                app.reload();
             }
             app.thumbs_drawn(&[url]);
             assert!(

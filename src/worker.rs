@@ -12,8 +12,8 @@ use std::thread;
 use image::DynamicImage;
 
 use crate::cache::{CONTENT_TTL, Cache, IMAGE_TTL, Source};
-use crate::model::{Comment, Listing, Media, PostPage, Sort, TimeRange};
-use crate::redlib::Redlib;
+use crate::model::{Listing, Media, PostPage, ReplyPage, Sort, TimeRange};
+use crate::reddit::Reddit;
 
 /// Largest image edge sent to the terminal; bigger images only cost bandwidth.
 const MAX_IMAGE_EDGE: u32 = 1600;
@@ -44,13 +44,13 @@ impl FeedQuery {
 
     fn fetch(
         &self,
-        redlib: &Redlib,
+        reddit: &Reddit,
         subreddit: &str,
         after: Option<&str>,
     ) -> anyhow::Result<Listing> {
         match self {
-            Self::Listing { sort, time } => redlib.listing(subreddit, *sort, *time, after),
-            Self::Search { query } => redlib.search(subreddit, query, after),
+            Self::Listing { sort, time } => reddit.listing(subreddit, *sort, *time, after),
+            Self::Search { query } => reddit.search(subreddit, query, after),
         }
     }
 }
@@ -76,7 +76,7 @@ pub enum Job {
     MoreReplies {
         generation: u64,
         comment_id: String,
-        path: String,
+        cursor: String,
         minimum: Option<Source>,
     },
     Image {
@@ -98,10 +98,6 @@ pub enum Job {
         /// One download per post at a time.
         permalink: String,
         urls: Vec<String>,
-    },
-    Health,
-    RunCommand {
-        argv: Vec<String>,
     },
 }
 
@@ -157,11 +153,6 @@ impl Job {
                 permalink: permalink.clone(),
                 result: Err(e),
             },
-            Job::Health => Msg::Health(false),
-            Job::RunCommand { argv } => Msg::CommandDone {
-                argv: argv.clone(),
-                result: Err(e),
-            },
         }
     }
 }
@@ -193,7 +184,7 @@ pub enum Msg {
     MoreReplies {
         generation: u64,
         comment_id: String,
-        result: Result<Vec<Comment>, String>,
+        result: Result<ReplyPage, String>,
     },
     Image {
         url: String,
@@ -219,11 +210,6 @@ pub enum Msg {
     /// scrolled far away).
     ImageSkipped {
         url: String,
-    },
-    Health(bool),
-    CommandDone {
-        argv: Vec<String>,
-        result: Result<CommandEnd, String>,
     },
 }
 
@@ -273,14 +259,14 @@ struct Wanted {
 }
 
 impl Pool {
-    pub fn start(redlib: Redlib, threads: usize, cache: Option<Cache>) -> (Self, Receiver<Msg>) {
+    pub fn start(reddit: Reddit, threads: usize, cache: Option<Cache>) -> (Self, Receiver<Msg>) {
         let (priority_tx, priority_rx) = channel::<Work>();
         let (background_tx, background_rx) = channel::<Work>();
         let (thumbs_tx, thumbs_rx) = channel::<Work>();
         let (msg_tx, msg_rx) = channel::<Msg>();
         let wanted = Arc::<Wanted>::default();
         let cache = cache.map(Arc::new);
-        let namespace: Arc<str> = redlib.cache_namespace().into();
+        let namespace: Arc<str> = reddit.cache_namespace().into();
         let queues = Queues {
             priority: priority_tx,
             background: background_tx,
@@ -297,7 +283,7 @@ impl Pool {
                 spawn_worker(
                     Arc::clone(&rx),
                     msg_tx.clone(),
-                    redlib.clone(),
+                    reddit.clone(),
                     Arc::clone(&wanted),
                     cache.clone(),
                     Arc::clone(&namespace),
@@ -436,7 +422,7 @@ const WORKER_THREAD: &str = "redtab-worker";
 fn spawn_worker(
     rx: SharedRx,
     tx: Sender<Msg>,
-    redlib: Redlib,
+    reddit: Reddit,
     wanted: Arc<Wanted>,
     cache: Option<Arc<Cache>>,
     namespace: Arc<str>,
@@ -476,7 +462,7 @@ fn spawn_worker(
                 let started = NEXT_EVENT.fetch_add(1, Ordering::Relaxed);
                 // A job's panic becomes its error instead of killing the worker.
                 let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let msg = run(&redlib, &job, &wanted);
+                    let msg = run(&reddit, &job, &wanted);
                     cache_result(
                         msg,
                         &job,
@@ -554,9 +540,10 @@ impl Job {
                 serde_json::to_string(&("post", permalink)).ok()?,
                 CONTENT_TTL,
             ),
-            Job::MoreReplies { path, .. } => {
-                (serde_json::to_string(&("replies", path)).ok()?, CONTENT_TTL)
-            }
+            Job::MoreReplies { cursor, .. } => (
+                serde_json::to_string(&("replies", cursor)).ok()?,
+                CONTENT_TTL,
+            ),
             Job::Thumb { url } => (serde_json::to_string(&("thumb", url)).ok()?, IMAGE_TTL),
             _ => return None,
         };
@@ -693,7 +680,7 @@ fn cache_result(
     }
 }
 
-fn run(redlib: &Redlib, job: &Job, wanted: &Wanted) -> Msg {
+fn run(reddit: &Reddit, job: &Job, wanted: &Wanted) -> Msg {
     if let Some(message) = skipped_image(job, wanted) {
         return message;
     }
@@ -709,7 +696,7 @@ fn run(redlib: &Redlib, job: &Job, wanted: &Wanted) -> Msg {
             generation: *generation,
             append: after.is_some(),
             result: query
-                .fetch(redlib, subreddit, after.as_deref())
+                .fetch(reddit, subreddit, after.as_deref())
                 .map_err(err_string),
         },
         Job::Group {
@@ -719,7 +706,7 @@ fn run(redlib: &Redlib, job: &Job, wanted: &Wanted) -> Msg {
             generation: *generation,
             subreddit: subreddit.clone(),
             result: FeedQuery::HOME
-                .fetch(redlib, subreddit, None)
+                .fetch(reddit, subreddit, None)
                 .map_err(err_string),
         },
         Job::Post {
@@ -727,49 +714,44 @@ fn run(redlib: &Redlib, job: &Job, wanted: &Wanted) -> Msg {
             permalink,
         } => Msg::Post {
             generation: *generation,
-            result: redlib.post(permalink).map(Box::new).map_err(err_string),
+            result: reddit.post(permalink).map(Box::new).map_err(err_string),
         },
         Job::MoreReplies {
             generation,
             comment_id,
-            path,
+            cursor,
             ..
         } => Msg::MoreReplies {
             generation: *generation,
             comment_id: comment_id.clone(),
-            result: redlib.more_replies(path).map_err(err_string),
+            result: reddit.more_replies(cursor).map_err(err_string),
         },
         Job::Image { url, .. } => Msg::Image {
             url: url.clone(),
-            result: fetch_image(redlib, url, MAX_IMAGE_EDGE),
+            result: fetch_image(reddit, url, MAX_IMAGE_EDGE),
         },
         Job::Thumb { url } => Msg::Thumb {
             url: url.clone(),
-            result: fetch_image(redlib, url, MAX_THUMB_EDGE),
+            result: fetch_image(reddit, url, MAX_THUMB_EDGE),
         },
         Job::ResolveMedia { permalink } => Msg::MediaResolved {
             permalink: permalink.clone(),
-            result: redlib
+            result: reddit
                 .post(permalink)
                 .map(|page| page.post.media)
                 .map_err(err_string),
         },
         Job::DownloadImages { permalink, urls } => Msg::ImagesDownloaded {
             permalink: permalink.clone(),
-            result: download_images(redlib, urls).map_err(err_string),
-        },
-        Job::Health => Msg::Health(redlib.healthy()),
-        Job::RunCommand { argv } => Msg::CommandDone {
-            argv: argv.clone(),
-            result: run_command(argv),
+            result: download_images(reddit, urls).map_err(err_string),
         },
     }
 }
 
 /// Download and decode an image, shrunk to fit `max_edge`. A GIF gives its first frame
 /// and the rest of the file is never read: animated GIFs play as video and can be huge.
-fn fetch_image(redlib: &Redlib, url: &str, max_edge: u32) -> Result<DynamicImage, String> {
-    redlib
+fn fetch_image(reddit: &Reddit, url: &str, max_edge: u32) -> Result<DynamicImage, String> {
+    reddit
         .still_image(url)
         .map(|img| {
             if img.width() > max_edge || img.height() > max_edge {
@@ -912,13 +894,13 @@ fn process_running(pid: u32) -> bool {
     exists || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-fn download_images(redlib: &Redlib, urls: &[String]) -> anyhow::Result<Vec<PathBuf>> {
+fn download_images(reddit: &Reddit, urls: &[String]) -> anyhow::Result<Vec<PathBuf>> {
     let dir = media_dir()?;
     remove_old_downloads(&dir, std::time::SystemTime::now());
     urls.iter()
         .enumerate()
         .map(|(i, url)| {
-            let bytes = redlib.image(url)?;
+            let bytes = reddit.image(url)?;
             let ext = image::guess_format(&bytes)
                 .ok()
                 .and_then(|f| f.extensions_str().first().copied())
@@ -968,159 +950,6 @@ fn download_images(redlib: &Redlib, urls: &[String]) -> anyhow::Result<Vec<PathB
         .collect()
 }
 
-/// How long `S` waits. A command that is the server itself never exits and then counts as started.
-const COMMAND_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// How the start command ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum CommandEnd {
-    Exited,
-    /// Still running after `COMMAND_WAIT`: it is the server itself.
-    Running,
-}
-
-/// Hidden process entry: keep draining a server's stderr after the TUI exits.
-pub const COMMAND_ARG: &str = "--supervise-start-command";
-const COMMAND_STDERR_LIMIT: usize = 64 * 1024;
-
-/// Runs `argv` under a supervisor process (`COMMAND_ARG`) that reports startup once, then
-/// drains the server's stderr until it closes; a TUI thread would close the pipe when the
-/// TUI quits.
-fn run_command(argv: &[String]) -> Result<CommandEnd, String> {
-    use std::io::{BufRead, BufReader};
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
-
-    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut supervisor = Command::new(executable)
-        .arg(COMMAND_ARG)
-        .args(argv)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("start command supervisor: {e}"))?;
-    let output = supervisor.stdout.take().expect("piped stdout");
-    thread::spawn(move || supervisor.wait());
-    let mut reply = String::new();
-    BufReader::new(output)
-        .read_line(&mut reply)
-        .map_err(|e| format!("start command supervisor: {e}"))?;
-    serde_json::from_str(&reply).map_err(|e| format!("start command supervisor: {e}"))?
-}
-
-struct StartedCommand {
-    child: std::process::Child,
-    stderr: std::io::PipeReader,
-    result: Result<CommandEnd, String>,
-}
-
-/// The supervisor process, entered before terminal setup. A failed report (TUI gone) must
-/// not stop the draining.
-pub fn command_process(argv: &[std::ffi::OsString]) -> std::io::Result<()> {
-    use std::io::Write;
-
-    let started = start_command(argv);
-    let result = match &started {
-        Ok(command) => &command.result,
-        Err(e) => &Err(e.clone()),
-    };
-    let mut output = std::io::stdout().lock();
-    let _ = serde_json::to_writer(&mut output, result);
-    let _ = output.write_all(b"\n");
-    let _ = output.flush();
-    if let Ok(mut command) = started {
-        nonblocking(&command.stderr, false)?;
-        let drained = std::io::copy(&mut command.stderr, &mut std::io::sink());
-        let _ = command.child.wait();
-        drained?;
-    }
-    Ok(())
-}
-
-fn start_command(argv: &[std::ffi::OsString]) -> Result<StartedCommand, String> {
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-
-    let (program, args) = argv.split_first().ok_or("empty command")?;
-    let (mut stderr, writer) = std::io::pipe().map_err(|e| e.to_string())?;
-    nonblocking(&stderr, true).map_err(|e| e.to_string())?;
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(writer)
-        .spawn()
-        .map_err(|e| format!("{}: {e}", program.to_string_lossy()))?;
-    let started = Instant::now();
-    let mut captured = Vec::new();
-    let status = loop {
-        let status = child.try_wait().map_err(|e| e.to_string())?;
-        // Drain after observing exit so all of the command's final writes count.
-        capture_stderr(&mut stderr, &mut captured).map_err(|e| e.to_string())?;
-        if status.is_some() || started.elapsed() >= COMMAND_WAIT {
-            break status;
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    let result = match status {
-        Some(status) if !status.success() => Err(format!(
-            "{} exited {status}: {}",
-            program.to_string_lossy(),
-            String::from_utf8_lossy(&captured).trim()
-        )),
-        Some(_) => Ok(CommandEnd::Exited),
-        None => Ok(CommandEnd::Running),
-    };
-    Ok(StartedCommand {
-        child,
-        stderr,
-        result,
-    })
-}
-
-fn nonblocking(pipe: &std::io::PipeReader, enabled: bool) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    // SAFETY: the pipe owns this live descriptor throughout both fcntl calls.
-    let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
-    if flags == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let flags = if enabled {
-        flags | libc::O_NONBLOCK
-    } else {
-        flags & !libc::O_NONBLOCK
-    };
-    if unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags) } == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Keeps the first 64 KiB, and bounds each pass so steady output can't starve the startup deadline.
-fn capture_stderr(pipe: &mut std::io::PipeReader, captured: &mut Vec<u8>) -> std::io::Result<()> {
-    use std::io::{ErrorKind, Read};
-
-    let mut buffer = [0; 8192];
-    let mut remaining = COMMAND_STDERR_LIMIT;
-    while remaining > 0 {
-        match pipe.read(&mut buffer[..remaining.min(8192)]) {
-            Ok(0) => break,
-            Ok(n) => {
-                let keep = n.min(COMMAND_STDERR_LIMIT - captured.len());
-                captured.extend_from_slice(&buffer[..keep]);
-                remaining -= n;
-            }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1137,7 +966,7 @@ mod tests {
         };
         let image = |background| Work {
             job: Job::Image {
-                url: "/preview/pre/x.png".into(),
+                url: "https://preview.redd.it/x.png".into(),
                 background,
             },
             force: false,
@@ -1174,9 +1003,9 @@ mod tests {
 
     #[test]
     fn fetches_no_longer_wanted_are_skipped() {
-        // Nothing listens on port 9: a fetch comes back as a connection error.
-        let redlib = Redlib::new("http://127.0.0.1:9", false);
-        let url = "/img/a.jpeg";
+        // The fixture client refuses Reddit media hosts: a fetch comes back as an error.
+        let reddit = Reddit::test_at("http://127.0.0.1:9", false);
+        let url = "https://i.redd.it/a.jpeg";
         let none = Wanted::default();
         let all = Wanted::default();
         all.thumbs.lock().unwrap().insert(url.into());
@@ -1187,10 +1016,10 @@ mod tests {
             background: false,
         };
 
-        let thumb_skipped = run(&redlib, &thumb(), &none);
-        let thumb_fetched = run(&redlib, &thumb(), &all);
-        let image_skipped = run(&redlib, &image(), &none);
-        let image_fetched = run(&redlib, &image(), &all);
+        let thumb_skipped = run(&reddit, &thumb(), &none);
+        let thumb_fetched = run(&reddit, &thumb(), &all);
+        let image_skipped = run(&reddit, &image(), &none);
+        let image_fetched = run(&reddit, &image(), &all);
 
         assert!(matches!(thumb_skipped, Msg::ThumbSkipped { url: u } if u == url));
         assert!(matches!(thumb_fetched, Msg::Thumb { result: Err(_), .. }));
@@ -1202,42 +1031,6 @@ mod tests {
             matches!(image_fetched, Msg::Image { result: Err(_), .. }),
             "the open post's image is fetched"
         );
-    }
-
-    #[test]
-    fn a_start_command_that_leaves_a_background_server_returns_promptly() {
-        // A short sleep: the backgrounded child outlives the test run otherwise.
-        let argv: Vec<std::ffi::OsString> = ["sh", "-c", "sleep 8 & exit 0"]
-            .map(std::ffi::OsString::from)
-            .to_vec();
-        let started = std::time::Instant::now();
-
-        let result = start_command(&argv).unwrap().result;
-
-        assert_eq!(result, Ok(CommandEnd::Exited));
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
-    }
-
-    #[test]
-    fn a_failing_start_command_reports_its_stderr() {
-        let argv: Vec<std::ffi::OsString> = ["sh", "-c", "echo no such container >&2; exit 3"]
-            .map(std::ffi::OsString::from)
-            .to_vec();
-
-        let err = start_command(&argv).unwrap().result.unwrap_err();
-
-        assert!(err.contains("no such container"), "{err}");
-    }
-
-    #[test]
-    fn a_failing_start_command_bounds_its_stderr() {
-        let argv = ["sh", "-c", "head -c 131072 /dev/zero >&2; exit 3"]
-            .map(std::ffi::OsString::from)
-            .to_vec();
-
-        let err = start_command(&argv).unwrap().result.unwrap_err();
-
-        assert!(err.len() < 66000, "captured {} bytes", err.len());
     }
 
     struct CacheDir(PathBuf);
@@ -1338,7 +1131,7 @@ mod tests {
         use std::io::{BufRead, BufReader, Write};
         let dir = CacheDir::new();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let redlib = Redlib::new(&format!("http://{}", listener.local_addr().unwrap()), false);
+        let reddit = Reddit::test_at(&format!("http://{}", listener.local_addr().unwrap()), false);
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
@@ -1352,19 +1145,19 @@ mod tests {
                 }
                 line.clear();
             }
-            let html = include_str!("../tests/fixtures/sub.html");
+            let body = include_str!("../tests/fixtures/sub.json");
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
-                html.len()
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
             )
             .unwrap();
         });
         let job = || Job::Group {
-            subreddit: "rust".into(),
+            subreddit: "popular".into(),
             generation: 0,
         };
-        let (cold, messages) = Pool::start(redlib.clone(), 3, Some(Cache::new(dir.0.clone())));
+        let (cold, messages) = Pool::start(reddit.clone(), 3, Some(Cache::new(dir.0.clone())));
         cold.submit(job());
         let Msg::Snapshot {
             message,
@@ -1383,7 +1176,7 @@ mod tests {
         };
         server.join().unwrap();
         drop(cold);
-        let (warm, messages) = Pool::start(redlib, 3, Some(Cache::new(dir.0.clone())));
+        let (warm, messages) = Pool::start(reddit, 3, Some(Cache::new(dir.0.clone())));
 
         warm.submit(job());
 
@@ -1408,15 +1201,15 @@ mod tests {
     #[test]
     fn stale_content_arrives_before_a_failed_refresh() {
         let dir = CacheDir::new();
-        let redlib = Redlib::new("http://127.0.0.1:9", false);
+        let reddit = Reddit::test_at("http://127.0.0.1:9", false);
         let job = Job::Group {
             subreddit: "rust".into(),
             generation: 0,
         };
         let cache = Cache::new(dir.0.clone());
-        let (key, _) = job.cache_key(&redlib.cache_namespace()).unwrap();
+        let (key, _) = job.cache_key(&reddit.cache_namespace()).unwrap();
         let listing =
-            crate::redlib::parse::parse_listing(include_str!("../tests/fixtures/sub.html"))
+            crate::reddit::parse::parse_listing(include_str!("../tests/fixtures/sub.json"))
                 .unwrap();
         cache
             .store(
@@ -1426,7 +1219,7 @@ mod tests {
                 cache.reserve_request().unwrap(),
             )
             .unwrap();
-        let (pool, messages) = Pool::start(redlib, 3, Some(cache));
+        let (pool, messages) = Pool::start(reddit, 3, Some(cache));
 
         pool.submit(job);
 
@@ -1455,15 +1248,15 @@ mod tests {
     #[test]
     fn force_refresh_does_not_accept_a_fresh_disk_snapshot() {
         let dir = CacheDir::new();
-        let redlib = Redlib::new("http://127.0.0.1:9", false);
+        let reddit = Reddit::test_at("http://127.0.0.1:9", false);
         let job = Job::Post {
             generation: 1,
             permalink: "/r/rust/comments/p/title/".into(),
         };
         let cache = Cache::new(dir.0.clone());
-        let (key, _) = job.cache_key(&redlib.cache_namespace()).unwrap();
+        let (key, _) = job.cache_key(&reddit.cache_namespace()).unwrap();
         let page =
-            crate::redlib::parse::parse_post_page(include_str!("../tests/fixtures/post.html"))
+            crate::reddit::parse::parse_post_page(include_str!("../tests/fixtures/post.json"))
                 .unwrap();
         cache
             .store(
@@ -1473,7 +1266,7 @@ mod tests {
                 cache.reserve_request().unwrap(),
             )
             .unwrap();
-        let (pool, messages) = Pool::start(redlib, 3, Some(cache));
+        let (pool, messages) = Pool::start(reddit, 3, Some(cache));
         pool.want_post(Some(1));
 
         pool.refresh(job);
@@ -1487,12 +1280,12 @@ mod tests {
     #[test]
     fn cached_thumbnail_arrives_before_a_failed_background_refresh() {
         let dir = CacheDir::new();
-        let redlib = Redlib::new("http://127.0.0.1:9", false);
+        let reddit = Reddit::test_at("http://127.0.0.1:9", false);
         let job = Job::Thumb {
-            url: "/img/cached.png".into(),
+            url: "https://i.redd.it/cached.png".into(),
         };
         let cache = Cache::new(dir.0.clone());
-        let (key, _) = job.cache_key(&redlib.cache_namespace()).unwrap();
+        let (key, _) = job.cache_key(&reddit.cache_namespace()).unwrap();
         let image =
             DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2, 2, image::Rgb([10, 20, 30])));
         let mut bytes = std::io::Cursor::new(Vec::new());
@@ -1505,8 +1298,8 @@ mod tests {
                 cache.reserve_request().unwrap(),
             )
             .unwrap();
-        let (pool, messages) = Pool::start(redlib, 3, Some(cache));
-        pool.set_on_screen(&["/img/cached.png"]);
+        let (pool, messages) = Pool::start(reddit, 3, Some(cache));
+        pool.set_on_screen(&["https://i.redd.it/cached.png"]);
 
         pool.submit(job);
 
@@ -1534,14 +1327,14 @@ mod tests {
     #[test]
     fn stale_media_resolution_does_not_trigger_a_cached_viewer_action() {
         let dir = CacheDir::new();
-        let redlib = Redlib::new("http://127.0.0.1:9", false);
+        let reddit = Reddit::test_at("http://127.0.0.1:9", false);
         let job = Job::ResolveMedia {
             permalink: "/r/pics/comments/p/gallery/".into(),
         };
         let cache = Cache::new(dir.0.clone());
-        let (key, _) = job.cache_key(&redlib.cache_namespace()).unwrap();
+        let (key, _) = job.cache_key(&reddit.cache_namespace()).unwrap();
         let page =
-            crate::redlib::parse::parse_post_page(include_str!("../tests/fixtures/gallery.html"))
+            crate::reddit::parse::parse_post_page(include_str!("../tests/fixtures/gallery.json"))
                 .unwrap();
         cache
             .store(
@@ -1551,7 +1344,7 @@ mod tests {
                 cache.reserve_request().unwrap(),
             )
             .unwrap();
-        let (pool, messages) = Pool::start(redlib, 3, Some(cache));
+        let (pool, messages) = Pool::start(reddit, 3, Some(cache));
 
         pool.submit(job);
 
@@ -1566,19 +1359,26 @@ mod tests {
         let cache = Cache::new(dir.0.clone());
         let older = cache.reserve_request().unwrap();
         let newer = cache.reserve_request().unwrap();
-        let redlib = Redlib::new("http://127.0.0.1:9", false);
+        let reddit = Reddit::test_at("http://127.0.0.1:9", false);
         let job = Job::MoreReplies {
             generation: 1,
             comment_id: "parent".into(),
-            path: "/r/rust/comments/post/title/parent/".into(),
+            cursor: "parent".into(),
             minimum: Some(Source {
                 order: Some(newer),
                 ..Source::default()
             }),
         };
-        let (key, _) = job.cache_key(&redlib.cache_namespace()).unwrap();
-        cache.store(&key, b"[]", crate::app::now(), older).unwrap();
-        let (pool, messages) = Pool::start(redlib, 3, Some(cache));
+        let (key, _) = job.cache_key(&reddit.cache_namespace()).unwrap();
+        cache
+            .store(
+                &key,
+                &serde_json::to_vec(&ReplyPage::complete(Vec::new())).unwrap(),
+                crate::app::now(),
+                older,
+            )
+            .unwrap();
+        let (pool, messages) = Pool::start(reddit, 3, Some(cache));
 
         pool.submit(job);
 

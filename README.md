@@ -1,8 +1,7 @@
 # redtab
 
-A terminal Reddit reader with tabs. It reads Reddit through a
-[Redlib](https://github.com/redlib-org/redlib) instance, so it needs no Reddit account or
-API key.
+A terminal Reddit reader with tabs. It reads Reddit JSON using an anonymous guest session;
+no Reddit account or API key is needed.
 
 ## Features
 
@@ -23,29 +22,22 @@ API key.
   keyword highlights.
 - **Offline-friendly cache**: feeds, posts and thumbnails show instantly from the last visit
   and refresh in the background.
-- **Redlib health** in the sidebar, with an optional command to start it (`S`).
+- **Connection status** in the sidebar: up, down, or paused on a rate limit.
 
 Honors `NO_COLOR`.
 
 ## Requirements
 
-- A Redlib instance. Public ones usually show bot checks, so run one locally:
-
-  ```sh
-  docker run -d --name redlib --restart unless-stopped -p 127.0.0.1:8080:8080 quay.io/redlib/redlib:latest
-  ```
-
-  If it fails with `Failed to create OAuth client`
-  ([redlib#485](https://github.com/redlib-org/redlib/issues/485)), the fork
-  `ghcr.io/silvenga/redlib` has kept working.
 - Optional: `ffmpeg` (with `ffplay`) for inline video and sound, `mpv` for `m` on videos.
 
 ## Install
 
-Requires Rust 1.90 or newer.
+Requires Rust 1.90 or newer, CMake, a C/C++ compiler and libclang for the HTTP client's
+BoringSSL build. On macOS these come from the Command Line Tools plus CMake; on Debian/Ubuntu
+the build packages are `build-essential cmake clang libclang-dev pkg-config`.
 
 ```sh
-cargo install --git https://github.com/kapral18/redtab
+cargo install --git https://github.com/kapral18/redtab --locked
 ```
 
 ## Usage
@@ -54,7 +46,7 @@ cargo install --git https://github.com/kapral18/redtab
 redtab                    # Home: your subscriptions
 redtab -s neovim          # open r/neovim on start
 redtab -c ~/redtab.toml   # another config file
-redtab --check            # config, Redlib status, subscriptions and state file; exits 1 if Redlib is down
+redtab --check            # print config, status and files; exit 1 unless Reddit is up
 ```
 
 ## Configure
@@ -63,16 +55,13 @@ redtab --check            # config, Redlib status, subscriptions and state file;
 optional.
 
 ```toml
-redlib_url = "http://127.0.0.1:8080"
-
 # Subscriptions: inline, and/or one per line in a file (`#` comments allowed).
 subscriptions = ["neovim", "rust"]
-subscriptions_file = "subscriptions"   # default; relative to config.toml; a set path must exist
+# subscriptions_file = "my-subreddits"  # override; relative to config.toml; must exist
 
 home_posts_per_group = 3
 show_nsfw = false
 image_preview = true                    # graphics are detected only when this is on at start
-redlib_start_command = ["docker", "start", "redlib"]   # run by `S`
 
 [filters]
 keywords = ["giveaway"]   # hide titles containing these (case-insensitive)
@@ -88,8 +77,21 @@ video = ["mpv", "--force-window=immediate"]
 image = ["open"]
 ```
 
+Keep public subscriptions inline in `config.toml`, or a private list in
+`$XDG_STATE_HOME/redtab/subscriptions` (default `~/.local/state/redtab/subscriptions`).
+The private file is optional. Inline names come first, followed by file entries, with
+case-insensitive duplicates removed. `-c` does not change the private file's default location;
+`subscriptions_file` overrides it, with relative paths resolved beside the config file.
+
 Reading state (seen posts, bookmarks) lives in `$XDG_STATE_HOME/redtab/state.json`; the
 disposable cache in `$XDG_CACHE_HOME/redtab`. Deleting the cache loses nothing you keep.
+
+redtab connects to Reddit directly and ignores `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and
+`NO_PROXY`. Guest tokens are never written to the cache or passed to media players. Video
+players receive a loopback stream, so keep redtab open while they play.
+
+On a rate limit, redtab pauses requests for the time Reddit gives (60 s if none) and keeps
+its guest session.
 
 ## Keys
 
@@ -115,7 +117,7 @@ Press `?` in redtab for the full list.
 | `h` | split detail: focus the list without losing your place (moving the list then shows the selected post beside it); narrow detail: back one level |
 | `Esc` `q` | detail: close the post and return to the list |
 | `o`, `y`, `m`, `b` | open on reddit.com, copy link, media, bookmark |
-| `i`, `r`, `S` | toggle images and videos, reload, start Redlib |
+| `i`, `r` | toggle images and videos, reload |
 | `x` | close a tab opened with `p` |
 | `q`, `C-c` | quit (`q` closes an open post first, even when the list has focus) |
 
@@ -123,7 +125,7 @@ Press `?` in redtab for the full list.
 
 ```sh
 cargo fmt --check
-cargo test     # parser tests run against saved Redlib pages in tests/fixtures
+cargo test     # synthetic Reddit JSON and local HTTP fixtures; no Reddit traffic
 cargo clippy --all-targets
 cargo build
 ```

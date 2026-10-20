@@ -21,6 +21,7 @@ use crate::app::{
     PickerEntry, PostView, RowKind, Tab, TabKind,
 };
 use crate::model::{Media, PICTURE, Post, SPOILER_END, SPOILER_START, Sort};
+use crate::reddit::Health;
 use crate::video;
 
 /// Catppuccin Mocha, with an orange accent close to Reddit's.
@@ -374,21 +375,22 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect, spots: &mut Vec<ImageSpot>
         .collect();
     f.render_widget(Paragraph::new(lines).style(panel), list);
 
-    let (dot, color, down) = match app.redlib_up {
-        Some(true) => ("●", GREEN, false),
-        Some(false) => ("✗", RED, true),
-        None => ("○", OVERLAY, false),
+    let (dot, color, label) = match app.health {
+        Health::Unknown => ("○", OVERLAY, "reddit"),
+        Health::Up => ("●", GREEN, "reddit"),
+        Health::Paused => ("◐", YELLOW, "reddit paused"),
+        Health::Down => ("✗", RED, "reddit down"),
     };
     let img = if app.inline_images_on() {
         "img on"
     } else {
         "img off"
     };
-    // " ✗ redlib down  ◧ img off" needs 25 columns; narrower sidebars show the ✗ only.
-    let label = if down && width >= 25 {
-        "redlib down"
+    // " ✗ reddit down  ◧ img off" is the label plus 14 columns; narrower sidebars drop the state.
+    let label = if width >= label.len() + 14 {
+        label
     } else {
-        "redlib"
+        "reddit"
     };
     f.render_widget(
         Paragraph::new(vec![
@@ -844,7 +846,7 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
                 crate::app::now(),
                 group.loading,
                 group.error.is_some(),
-                app.redlib_up == Some(false),
+                app.health == Health::Down,
             ),
             Style::new().fg(OVERLAY),
         ));
@@ -969,7 +971,7 @@ fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
                 crate::app::now(),
                 feed.loading() || feed.refreshing(),
                 feed.error().is_some(),
-                app.redlib_up == Some(false),
+                app.health == Health::Down,
             ),
             OVERLAY,
             SURFACE0,
@@ -1345,7 +1347,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
                                 now.timestamp(),
                                 view.loading,
                                 view.error.is_some(),
-                                app.redlib_up == Some(false),
+                                app.health == Health::Down,
                             )
                         })
                         .unwrap_or_default(),
@@ -2238,15 +2240,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(status.text.as_str(), Style::new().fg(color)),
         ])
-    } else if app.redlib_up == Some(false) {
-        let hint = if app.config.redlib_start_command.is_some() {
-            "Redlib is not answering · S starts it · r retries"
-        } else {
-            "Redlib is not answering · start it, then press r"
-        };
+    } else if app.health == Health::Down {
         Line::from(vec![
             Span::styled(" ✗ ", Style::new().fg(RED)),
-            Span::styled(hint, Style::new().fg(RED)),
+            Span::styled("Reddit is not answering", Style::new().fg(RED)),
+        ])
+    } else if app.health == Health::Paused {
+        Line::from(vec![
+            Span::styled(" ◐ ", Style::new().fg(YELLOW)),
+            Span::styled(
+                "Reddit requests paused · wait before retrying",
+                Style::new().fg(YELLOW),
+            ),
         ])
     } else {
         // `x` closes only a tab opened with `p`.
@@ -2426,7 +2431,7 @@ const HELP: &[(&str, &str)] = &[
     ("m", "media: image viewer, mpv, or browser"),
     ("b", "bookmark"),
     ("i", "images and videos on / off"),
-    ("r · S", "reload · start Redlib"),
+    ("r", "reload"),
     ("q · C-c", "quit"),
 ];
 
@@ -2616,16 +2621,16 @@ fn input_tail(input: &str, room: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::model::{Comment, PostPage};
-    use crate::redlib::Redlib;
+    use crate::model::{Comment, PostPage, ReplyPage};
+    use crate::reddit::Reddit;
     use crate::worker::{Msg, Pool};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui_image::picker::Picker;
 
     fn app(subscriptions: &[&str]) -> App {
-        let redlib = Redlib::new("http://127.0.0.1:9", false);
-        let (pool, _rx) = Pool::start(redlib.clone(), 3, None);
+        let reddit = Reddit::test_at("http://127.0.0.1:9", false);
+        let (pool, _rx) = Pool::start(reddit.clone(), 3, None);
         let state = std::env::temp_dir().join(format!(
             "redtab-ui-test-{}-{:?}.json",
             std::process::id(),
@@ -2638,7 +2643,7 @@ mod tests {
             },
             subscriptions.iter().map(|s| s.to_string()).collect(),
             pool,
-            redlib,
+            reddit,
             state,
             Picker::halfblocks(),
         )
@@ -2678,6 +2683,38 @@ mod tests {
         assert!(row_of("neovim") < row_of("rust"));
     }
 
+    #[test]
+    fn health_shows_in_the_sidebar_footer_and_card_ages() {
+        let mut app = app(&["rust"]);
+        app.status = None;
+        app.home.groups[0].freshness = Some(crate::cache::Freshness {
+            fetched_at: crate::app::now(),
+            source: crate::cache::Source::default(),
+        });
+        for (health, sidebar) in [
+            (Health::Unknown, "○ reddit "),
+            (Health::Up, "● reddit "),
+            (Health::Paused, "◐ reddit paused"),
+            (Health::Down, "✗ reddit down"),
+        ] {
+            app.health = health;
+            let s = screen(&mut app, 120, 30);
+            let footer = s.lines().last().unwrap();
+
+            assert!(
+                s.lines()
+                    .any(|l| l.chars().take(30).collect::<String>().contains(sidebar)),
+                "{health:?}: {s}"
+            );
+            assert_eq!(footer.contains("requests paused"), health == Health::Paused);
+            assert_eq!(footer.contains("not answering"), health == Health::Down);
+            assert_eq!(s.contains("offline"), health == Health::Down, "{health:?}");
+        }
+        // A narrow sidebar keeps the mark and drops the state.
+        let s = screen(&mut app, 100, 30);
+        assert!(s.contains("✗ reddit ") && !s.contains("reddit down"), "{s}");
+    }
+
     /// Opens a 60-paragraph post; `while_loading` runs before the page arrives.
     fn open_long_post(while_loading: impl FnOnce(&mut App)) -> (App, String) {
         let mut app = app(&[]);
@@ -2690,7 +2727,6 @@ mod tests {
             score: Some(1),
             comments: 1,
             created: None,
-            age: String::new(),
             permalink: "/r/s/comments/p/x/".into(),
             media: Media::None,
             stickied: false,
@@ -2730,7 +2766,6 @@ mod tests {
             is_op: false,
             is_mod: false,
             score: None,
-            age: String::new(),
             body: "reply".into(),
             replies: vec![],
             more: None,
@@ -2749,7 +2784,7 @@ mod tests {
         let (mut app, _) = open_long_post(|_| {});
         app.image_picker = kitty();
         app.show_images = true;
-        let url = "/preview/pre/c.png";
+        let url = "https://preview.redd.it/c.png";
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         page.body.clear();
         page.comments[0].body = format!("before\n{PICTURE}{url}\nafter");
@@ -2774,7 +2809,7 @@ mod tests {
         let (mut app, _) = open_long_post(|_| {});
         app.image_picker = kitty();
         app.show_images = true;
-        let url = "/preview/pre/c.png";
+        let url = "https://preview.redd.it/c.png";
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         page.body.clear();
         page.comments[0].body = format!("{PICTURE}{url}\n\n{}", paragraphs("line", 1..=60));
@@ -2809,7 +2844,7 @@ mod tests {
 
     #[test]
     fn in_a_pane_shorter_than_a_picture_it_should_still_come_wholly_into_view() {
-        let url = "/preview/pre/c.png";
+        let url = "https://preview.redd.it/c.png";
         let mut app = picture_comment(url);
         let slot = ready(&app, 400, 200);
         app.images.insert(url.into(), slot);
@@ -2826,7 +2861,7 @@ mod tests {
 
     #[test]
     fn after_r_a_failed_comment_picture_should_load_again() {
-        let url = "/preview/pre/c.png";
+        let url = "https://preview.redd.it/c.png";
         let mut app = picture_comment(url);
         screen(&mut app, 100, 40);
         app.images
@@ -2841,24 +2876,6 @@ mod tests {
         assert!(matches!(app.images.get(url), Some(ImageSlot::Loading)));
     }
 
-    #[test]
-    fn after_s_starts_redlib_the_posts_own_failed_image_should_load_again() {
-        let mut app = image_post("body text here");
-        screen(&mut app, 100, 40);
-        app.images
-            .insert("/img/big.jpeg".into(), ImageSlot::Failed("HTTP 429".into()));
-
-        app.on_msg(Msg::CommandDone {
-            argv: vec!["start".into()],
-            result: Ok(crate::worker::CommandEnd::Running),
-        });
-
-        assert!(matches!(
-            app.images.get("/img/big.jpeg"),
-            Some(ImageSlot::Loading)
-        ));
-    }
-
     /// The number after "line " on the first line that has one.
     fn first_numbered_line(s: &str) -> Option<String> {
         s.lines().find_map(|l| {
@@ -2869,7 +2886,7 @@ mod tests {
 
     #[test]
     fn a_picture_loading_as_the_page_refreshes_should_not_move_a_short_selected_comment() {
-        let url = "/preview/pre/c.png";
+        let url = "https://preview.redd.it/c.png";
         let mut app = picture_comment(url);
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         page.comments[0].body = format!("{PICTURE}{url}\n\n{}", paragraphs("line", 1..=60));
@@ -2895,7 +2912,7 @@ mod tests {
 
     #[test]
     fn a_held_comment_should_stay_put_when_a_picture_in_it_loads() {
-        let url = "/preview/pre/c.png";
+        let url = "https://preview.redd.it/c.png";
         let mut app = picture_comment(url);
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         page.comments[0].body = format!("intro\n{PICTURE}{url}\n\n{}", paragraphs("line", 1..=60));
@@ -2915,7 +2932,7 @@ mod tests {
 
     #[test]
     fn a_picture_shown_twice_should_go_to_the_terminal_once_not_every_frame() {
-        let url = "/preview/pre/c.png";
+        let url = "https://preview.redd.it/c.png";
         let mut app = picture_comment(url);
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         let mut answer = reply("r".into());
@@ -2933,7 +2950,9 @@ mod tests {
 
     #[test]
     fn a_queued_picture_scrolled_far_away_should_be_let_go() {
-        let urls: Vec<String> = (0..40).map(|i| format!("/preview/pre/q{i}.png")).collect();
+        let urls: Vec<String> = (0..40)
+            .map(|i| format!("https://preview.redd.it/q{i}.png"))
+            .collect();
         let mut app = picture_comment(&urls[0]);
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         page.comments[0].body = urls
@@ -2957,7 +2976,7 @@ mod tests {
 
     #[test]
     fn r_in_the_list_should_retry_the_open_posts_failed_pictures_too() {
-        let url = "/preview/pre/c.png";
+        let url = "https://preview.redd.it/c.png";
         let mut app = picture_comment(url);
         app.images
             .insert(url.into(), ImageSlot::Failed("HTTP 429".into()));
@@ -2970,7 +2989,7 @@ mod tests {
 
     #[test]
     fn a_quoted_picture_should_keep_its_quote_bar_on_every_row() {
-        let url = "/preview/pre/c.png";
+        let url = "https://preview.redd.it/c.png";
         let mut app = picture_comment(url);
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         page.comments[0].body = format!("│ {PICTURE}{url}");
@@ -2991,7 +3010,7 @@ mod tests {
 
     #[test]
     fn a_picture_loading_just_above_the_top_should_keep_the_text_being_read() {
-        let url = "/preview/pre/c.png";
+        let url = "https://preview.redd.it/c.png";
         let mut app = picture_comment(url);
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         page.comments[0].body = format!("{PICTURE}{url}\n\n{}", paragraphs("line", 1..=60));
@@ -3012,8 +3031,8 @@ mod tests {
 
     #[test]
     fn a_queued_picture_in_a_folded_reply_should_be_let_go() {
-        let url = "/preview/pre/folded.png";
-        let mut app = picture_comment("/preview/pre/unused.png");
+        let url = "https://preview.redd.it/folded.png";
+        let mut app = picture_comment("https://preview.redd.it/unused.png");
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         page.comments[0].body = "parent".into();
         let mut answer = reply("r".into());
@@ -3040,7 +3059,7 @@ mod tests {
 
     #[test]
     fn a_bulleted_picture_in_a_quote_should_show_its_bullet_once() {
-        let url = "/preview/pre/c.png";
+        let url = "https://preview.redd.it/c.png";
         let mut app = picture_comment(url);
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         page.comments[0].body = format!("│ • {PICTURE}{url}");
@@ -3058,7 +3077,7 @@ mod tests {
 
     #[test]
     fn a_picture_across_the_top_shrinking_should_keep_the_text_under_it() {
-        let url = "/preview/pre/c.png";
+        let url = "https://preview.redd.it/c.png";
         let mut app = picture_comment(url);
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         page.comments[0].body = format!("{PICTURE}{url}\n\n{}", paragraphs("line", 1..=60));
@@ -3084,7 +3103,9 @@ mod tests {
 
     #[test]
     fn many_loaded_pictures_far_from_view_should_be_let_go() {
-        let urls: Vec<String> = (0..40).map(|i| format!("/preview/pre/p{i}.png")).collect();
+        let urls: Vec<String> = (0..40)
+            .map(|i| format!("https://preview.redd.it/p{i}.png"))
+            .collect();
         let mut app = picture_comment(&urls[0]);
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         page.comments[0].body = urls
@@ -3163,7 +3184,7 @@ mod tests {
         app.image_picker = kitty();
         app.show_images = true;
         let image = Media::Image {
-            url: "/img/big.jpeg".into(),
+            url: "https://i.redd.it/big.jpeg".into(),
         };
         let view = app.post_view.as_mut().unwrap();
         view.post.media = image.clone();
@@ -3218,7 +3239,7 @@ mod tests {
         // up), not the most a wide picture may take.
         let mut app = image_post("first line of the body");
         let slot = ready(&app, 140, 73);
-        app.images.insert("/img/big.jpeg".into(), slot);
+        app.images.insert("https://i.redd.it/big.jpeg".into(), slot);
 
         let s = screen(&mut app, 100, 50);
 
@@ -3292,7 +3313,7 @@ mod tests {
                 pixels: video::Pixels::Zlib(vec![1, 2, 3]),
                 same_as_first: false,
             };
-            let url = app.redlib.absolute(VIDEO);
+            let url = app.reddit.media_url(VIDEO).unwrap();
             app.video = Some(video::Player::showing(&url, frame));
             let s = screen(&mut app, 100, 40);
             let header = s.split("_Ga=T").nth(1).unwrap().to_string();
@@ -3317,7 +3338,7 @@ mod tests {
                 pixels: video::Pixels::Zlib(vec![1, 2, 3]),
                 same_as_first: false,
             };
-            let url = app.redlib.absolute(VIDEO);
+            let url = app.reddit.media_url(VIDEO).unwrap();
             app.video = Some(video::Player::showing(&url, frame));
             let s = screen(&mut app, 200, 80);
             let header = s.split("_Ga=T").nth(1).unwrap().to_string();
@@ -3347,7 +3368,7 @@ mod tests {
             app.image_picker = kitty();
             app.show_images = true;
             app.post_view.as_mut().unwrap().post.media = Media::Image {
-                url: "/img/big.jpeg".into(),
+                url: "https://i.redd.it/big.jpeg".into(),
             };
             *shown.borrow_mut() = screen(app, 100, 40);
         });
@@ -3369,7 +3390,7 @@ mod tests {
             .unwrap()
             .comments[0]
             .more = Some(MoreReplies {
-            path: "/r/s/comments/p/x/c".into(),
+            cursor: "c".into(),
             count: Some(3),
         });
         let footer = |app: &mut App| {
@@ -3423,7 +3444,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n\n");
         page.comments[0].more = Some(MoreReplies {
-            path: "/r/s/comments/p/x/c".into(),
+            cursor: "c".into(),
             count: Some(2),
         });
         for i in 1..=n {
@@ -3468,7 +3489,7 @@ mod tests {
         app.on_msg(Msg::MoreReplies {
             generation,
             comment_id: "c".into(),
-            result: Ok(replies(2)),
+            result: Ok(ReplyPage::complete(replies(2))),
         });
         let after = row_of(&screen(&mut app, 100, 30));
 
@@ -3488,7 +3509,7 @@ mod tests {
             .unwrap()
             .comments[0]
             .more = Some(MoreReplies {
-            path: "/r/s/comments/p/x/c".into(),
+            cursor: "c".into(),
             count: Some(3),
         });
         screen(&mut app, 100, 30);
@@ -3590,7 +3611,7 @@ mod tests {
         app.on_msg(Msg::MoreReplies {
             generation,
             comment_id: "c".into(),
-            result: Ok(replies(2)),
+            result: Ok(ReplyPage::complete(replies(2))),
         });
     }
 
@@ -3601,7 +3622,7 @@ mod tests {
         // "marker 2" gets a "more replies" row of its own, below "marker 1".
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         page.comments[2].more = Some(MoreReplies {
-            path: "/r/s/comments/p/x/m2".into(),
+            cursor: "m2".into(),
             count: Some(1),
         });
         screen(&mut app, 100, 60);
@@ -3614,7 +3635,7 @@ mod tests {
         app.on_msg(Msg::MoreReplies {
             generation,
             comment_id: "m2".into(),
-            result: Ok(replies(1)),
+            result: Ok(ReplyPage::complete(replies(1))),
         });
         screen(&mut app, 100, 60);
         let top = app
@@ -3691,7 +3712,7 @@ mod tests {
                 app.on_msg(Msg::MoreReplies {
                     generation,
                     comment_id: "c".into(),
-                    result: Ok(replies(2)),
+                    result: Ok(ReplyPage::complete(replies(2))),
                 });
             }
             let s = screen(&mut app, 100, 60);
@@ -3712,7 +3733,7 @@ mod tests {
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         let reply = page.comments[0].clone();
         page.comments[0].more = Some(MoreReplies {
-            path: "/r/s/comments/p/x/c".into(),
+            cursor: "c".into(),
             count: Some(2),
         });
         page.comments[0].body = format!("so {SPOILER_START}{}{SPOILER_END}", "ab-".repeat(40));
@@ -3738,12 +3759,14 @@ mod tests {
         app.on_msg(Msg::MoreReplies {
             generation: app.post_view.as_ref().unwrap().generation,
             comment_id: "c".into(),
-            result: Ok((0..2)
-                .map(|i| Comment {
-                    id: format!("r{i}"),
-                    ..reply.clone()
-                })
-                .collect()),
+            result: Ok(ReplyPage::complete(
+                (0..2)
+                    .map(|i| Comment {
+                        id: format!("r{i}"),
+                        ..reply.clone()
+                    })
+                    .collect(),
+            )),
         });
         let after_load = draw(&mut app);
 
@@ -3765,7 +3788,7 @@ mod tests {
         app.image_picker = kitty();
         app.show_images = true;
         let image = Media::Image {
-            url: "/img/big.jpeg".into(),
+            url: "https://i.redd.it/big.jpeg".into(),
         };
         let view = app.post_view.as_mut().unwrap();
         view.post.media = image.clone();
@@ -3792,7 +3815,7 @@ mod tests {
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         let reply = page.comments[0].clone();
         page.comments[0].more = Some(MoreReplies {
-            path: "/r/s/comments/p/x/c".into(),
+            cursor: "c".into(),
             count: Some(2),
         });
         page.comments.push(Comment {
@@ -3812,12 +3835,14 @@ mod tests {
         app.on_msg(Msg::MoreReplies {
             generation,
             comment_id: "c".into(),
-            result: Ok((0..2)
-                .map(|i| Comment {
-                    id: format!("r{i}"),
-                    ..reply.clone()
-                })
-                .collect()),
+            result: Ok(ReplyPage::complete(
+                (0..2)
+                    .map(|i| Comment {
+                        id: format!("r{i}"),
+                        ..reply.clone()
+                    })
+                    .collect(),
+            )),
         });
         let after = row_of(&screen(&mut app, 100, 30));
 
@@ -3863,7 +3888,7 @@ mod tests {
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         let reply = page.comments[0].clone();
         page.comments[0].more = Some(MoreReplies {
-            path: "/r/s/comments/p/x/c".into(),
+            cursor: "c".into(),
             count: Some(2),
         });
         page.comments.push(Comment {
@@ -3886,12 +3911,14 @@ mod tests {
         app.on_msg(Msg::MoreReplies {
             generation,
             comment_id: "c".into(),
-            result: Ok((0..2)
-                .map(|i| Comment {
-                    id: format!("r{i}"),
-                    ..reply.clone()
-                })
-                .collect()),
+            result: Ok(ReplyPage::complete(
+                (0..2)
+                    .map(|i| Comment {
+                        id: format!("r{i}"),
+                        ..reply.clone()
+                    })
+                    .collect(),
+            )),
         });
         screen(&mut app, 100, 30);
         let view = app.post_view.as_ref().unwrap();
@@ -3998,7 +4025,7 @@ mod tests {
             let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
             let reply = page.comments[0].clone();
             page.comments[0].more = Some(MoreReplies {
-                path: "/r/s/comments/p/x/c".into(),
+                cursor: "c".into(),
                 count: Some(2),
             });
             for (id, body) in [("a", "marker a"), ("b", "marker b")] {
@@ -4026,12 +4053,14 @@ mod tests {
             app.on_msg(Msg::MoreReplies {
                 generation,
                 comment_id: "c".into(),
-                result: Ok((0..2)
-                    .map(|i| Comment {
-                        id: format!("r{i}"),
-                        ..reply.clone()
-                    })
-                    .collect()),
+                result: Ok(ReplyPage::complete(
+                    (0..2)
+                        .map(|i| Comment {
+                            id: format!("r{i}"),
+                            ..reply.clone()
+                        })
+                        .collect(),
+                )),
             });
             let s = screen(&mut app, 100, 30);
             s.lines().position(|l| l.contains("marker b"))
@@ -4146,7 +4175,7 @@ mod tests {
 
         press(&mut app, 'l');
         screen(&mut app, 100, 30);
-        // Later redraws (a status timing out, a health check) keep it too.
+        // Later redraws (a status timing out, a health change) keep it too.
         let s = screen(&mut app, 100, 30);
         let (selected, held) = {
             let view = app.post_view.as_ref().unwrap();
@@ -4196,7 +4225,7 @@ mod tests {
             tall.id = "tall".into();
             tall.body = paragraphs("line", 1..=40);
             page.comments[0].more = Some(MoreReplies {
-                path: "/r/s/comments/p/x/c".into(),
+                cursor: "c".into(),
                 count: Some(20),
             });
             page.comments.push(Comment {
@@ -4225,7 +4254,7 @@ mod tests {
                 app.on_msg(Msg::MoreReplies {
                     generation,
                     comment_id: parent.to_string(),
-                    result: Ok(replies),
+                    result: Ok(ReplyPage::complete(replies)),
                 });
             }
             (before, first_line(&screen(&mut app, 100, 30)))
@@ -4256,7 +4285,7 @@ mod tests {
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         let reply = page.comments[0].clone();
         page.comments[0].more = Some(MoreReplies {
-            path: "/r/s/comments/p/x/c".into(),
+            cursor: "c".into(),
             count: Some(20),
         });
         page.comments.push(Comment {
@@ -4285,7 +4314,7 @@ mod tests {
             app.on_msg(Msg::MoreReplies {
                 generation,
                 comment_id: parent.into(),
-                result: Ok(replies),
+                result: Ok(ReplyPage::complete(replies)),
             });
         }
         screen(&mut app, 100, 30);
@@ -4471,8 +4500,9 @@ mod tests {
 
     #[test]
     fn a_hidden_picture_should_mask_as_a_short_bar_not_its_url() {
-        let text =
-            format!("see {SPOILER_START}{PICTURE}/preview/pre/abcdefghijklmnop.png{SPOILER_END}");
+        let text = format!(
+            "see {SPOILER_START}{PICTURE}https://preview.redd.it/abcdefghijklmnop.png{SPOILER_END}"
+        );
 
         assert_eq!(spoiler_text(&text, false), "see ▒▒▒▒▒▒");
     }
@@ -4496,7 +4526,7 @@ mod tests {
 
         let s = screen(&mut app, 100, 20);
 
-        assert!(!app.thumbs.contains_key("/img/p1.jpeg"));
+        assert!(!app.thumbs.contains_key("https://i.redd.it/p1.jpeg"));
         assert!(s.lines().any(|l| l.contains(" spoiler ")), "{s}");
     }
 
@@ -4513,7 +4543,6 @@ mod tests {
                 score: Some(1),
                 comments: 0,
                 created: None,
-                age: String::new(),
                 permalink: format!("/r/s/comments/p{i}/x/"),
                 media: Media::None,
                 stickied: false,
@@ -4548,7 +4577,6 @@ mod tests {
             score: Some(1),
             comments: 0,
             created: None,
-            age: String::new(),
             permalink: format!("/r/s/comments/{id}/x/"),
             media,
             stickied: false,
@@ -4571,7 +4599,7 @@ mod tests {
                     Media::None
                 } else {
                     Media::Image {
-                        url: format!("/img/p{i}.jpeg"),
+                        url: format!("https://i.redd.it/p{i}.jpeg"),
                     }
                 };
                 post_with(&format!("p{i}"), media)
@@ -4663,10 +4691,10 @@ mod tests {
         assert_eq!(
             requested,
             [
-                "/img/p1.jpeg",
-                "/img/p3.jpeg",
-                "/img/p4.jpeg",
-                "/img/p5.jpeg"
+                "https://i.redd.it/p1.jpeg",
+                "https://i.redd.it/p3.jpeg",
+                "https://i.redd.it/p4.jpeg",
+                "https://i.redd.it/p5.jpeg"
             ]
         );
         // Every row gets the slot, so the post without an image stays aligned;
@@ -4688,7 +4716,7 @@ mod tests {
         let image = image::DynamicImage::new_rgb8(256, 256);
         let protocol = app.image_picker.new_resize_protocol(image);
         app.thumbs.insert(
-            "/img/p1.jpeg".into(),
+            "https://i.redd.it/p1.jpeg".into(),
             ImageSlot::Ready {
                 protocol: Box::new(protocol),
                 refresh: crate::app::ImageRefresh::Idle,
@@ -4799,7 +4827,7 @@ mod tests {
         let mut app = feed_app(kitty());
         screen(&mut app, 100, 20);
         let slot = ready(&app, 32, 32);
-        app.thumbs.insert("/img/p1.jpeg".into(), slot);
+        app.thumbs.insert("https://i.redd.it/p1.jpeg".into(), slot);
 
         app.overlay = Some(crate::app::Overlay::Help { scroll: 0 });
         let under_help = placeholder_cells(&mut app, 100, 20);
@@ -4816,13 +4844,15 @@ mod tests {
     fn a_failed_thumbnail_keeps_its_row_aligned_until_reload_retries_it() {
         let mut app = feed_app(kitty());
         screen(&mut app, 100, 20);
-        app.thumbs
-            .insert("/img/p1.jpeg".into(), ImageSlot::Failed("timed out".into()));
+        app.thumbs.insert(
+            "https://i.redd.it/p1.jpeg".into(),
+            ImageSlot::Failed("timed out".into()),
+        );
 
         let s = screen(&mut app, 100, 20);
 
         assert!(matches!(
-            app.thumbs.get("/img/p1.jpeg"),
+            app.thumbs.get("https://i.redd.it/p1.jpeg"),
             Some(ImageSlot::Failed(_))
         ));
         assert_eq!(title_run(&s, "p1"), title_run(&s, "p2"));
@@ -4831,7 +4861,7 @@ mod tests {
         screen(&mut app, 100, 20);
 
         assert!(matches!(
-            app.thumbs.get("/img/p1.jpeg"),
+            app.thumbs.get("https://i.redd.it/p1.jpeg"),
             Some(ImageSlot::Loading)
         ));
     }
@@ -4840,8 +4870,10 @@ mod tests {
     fn a_full_thumbnail_cache_keeps_only_what_is_on_screen() {
         let mut app = feed_app(kitty());
         for i in 0..400 {
-            app.thumbs
-                .insert(format!("/img/old{i}.jpeg"), ImageSlot::Failed("x".into()));
+            app.thumbs.insert(
+                format!("https://i.redd.it/old{i}.jpeg"),
+                ImageSlot::Failed("x".into()),
+            );
         }
 
         screen(&mut app, 100, 20);
@@ -4851,10 +4883,10 @@ mod tests {
         assert_eq!(
             kept,
             [
-                "/img/p1.jpeg",
-                "/img/p3.jpeg",
-                "/img/p4.jpeg",
-                "/img/p5.jpeg"
+                "https://i.redd.it/p1.jpeg",
+                "https://i.redd.it/p3.jpeg",
+                "https://i.redd.it/p4.jpeg",
+                "https://i.redd.it/p5.jpeg"
             ]
         );
     }
@@ -4869,7 +4901,7 @@ mod tests {
                 post_with(
                     &format!("p{i}"),
                     Media::Image {
-                        url: format!("/img/p{i}.jpeg"),
+                        url: format!("https://i.redd.it/p{i}.jpeg"),
                     },
                 )
             })
@@ -4882,10 +4914,10 @@ mod tests {
         app.move_selection(2);
         screen(&mut app, 100, 12);
 
-        assert_eq!(top, ["/img/p1.jpeg"]);
+        assert_eq!(top, ["https://i.redd.it/p1.jpeg"]);
         // Scrolled to p3: p2's first line is above the card's top.
-        assert!(app.thumbs.contains_key("/img/p3.jpeg"));
-        assert!(!app.thumbs.contains_key("/img/p2.jpeg"));
+        assert!(app.thumbs.contains_key("https://i.redd.it/p3.jpeg"));
+        assert!(!app.thumbs.contains_key("https://i.redd.it/p2.jpeg"));
     }
 
     #[test]
@@ -4920,14 +4952,14 @@ mod tests {
         screen(&mut app, 100, 20);
 
         app.on_msg(Msg::ThumbSkipped {
-            url: "/img/p1.jpeg".into(),
+            url: "https://i.redd.it/p1.jpeg".into(),
         });
-        let gone = !app.thumbs.contains_key("/img/p1.jpeg");
+        let gone = !app.thumbs.contains_key("https://i.redd.it/p1.jpeg");
         screen(&mut app, 100, 20);
 
         assert!(gone);
         assert!(matches!(
-            app.thumbs.get("/img/p1.jpeg"),
+            app.thumbs.get("https://i.redd.it/p1.jpeg"),
             Some(ImageSlot::Loading)
         ));
     }
@@ -4937,16 +4969,16 @@ mod tests {
         let mut app = feed_app(kitty());
         screen(&mut app, 100, 20);
         app.on_msg(Msg::Thumb {
-            url: "/img/p1.jpeg".into(),
+            url: "https://i.redd.it/p1.jpeg".into(),
             result: Ok(image::DynamicImage::new_rgb8(4, 4)),
         });
 
         app.on_msg(Msg::ThumbSkipped {
-            url: "/img/p1.jpeg".into(),
+            url: "https://i.redd.it/p1.jpeg".into(),
         });
 
         assert!(matches!(
-            app.thumbs.get("/img/p1.jpeg"),
+            app.thumbs.get("https://i.redd.it/p1.jpeg"),
             Some(ImageSlot::Ready { .. })
         ));
     }
@@ -4970,7 +5002,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_comments_show_their_age_now_not_at_fetch_time() {
+    fn comment_age_counts_from_its_creation_time() {
         let (mut app, _) = open_long_post(|_| {});
         let comment = &mut app
             .post_view
@@ -4980,7 +5012,6 @@ mod tests {
             .as_mut()
             .unwrap()
             .comments[0];
-        comment.age = "1h ago".into();
         comment.created = Some(Utc::now() - chrono::Duration::days(3));
         let view = app.post_view.as_mut().unwrap();
         view.scroll = usize::MAX / 2;
@@ -5399,7 +5430,7 @@ mod tests {
         assert!(truncate("❤️❤️❤️❤️", 4).width() <= 4);
     }
 
-    const VIDEO: &str = "/hls/v/HLSPlaylist.m3u8";
+    const VIDEO: &str = "https://v.redd.it/v/HLSPlaylist.m3u8";
 
     /// A loaded video post in a kitty terminal with images on, drawn once.
     fn open_video_post() -> App {
@@ -5433,7 +5464,7 @@ mod tests {
             pixels: video::Pixels::Image(protocol),
             same_as_first: false,
         };
-        let url = app.redlib.absolute(VIDEO);
+        let url = app.reddit.media_url(VIDEO).unwrap();
         app.video = Some(video::Player::showing(&url, frame));
 
         let s = screen(&mut app, 100, 40);
@@ -5479,7 +5510,7 @@ mod tests {
         let generation = view.generation;
         let mut page = view.page.take().unwrap();
         page.post.media = Media::Image {
-            url: "/img/f5ndv6yotovh1.gif".into(),
+            url: "https://i.redd.it/f5ndv6yotovh1.gif".into(),
         };
 
         app.on_msg(Msg::Post {
@@ -5493,10 +5524,16 @@ mod tests {
             .video
             .as_ref()
             .expect("GIF should start the video player");
-        assert!(player.url.ends_with("/img/f5ndv6yotovh1.gif"));
+        assert_eq!(
+            player.url,
+            app.reddit
+                .media_url("https://i.redd.it/f5ndv6yotovh1.gif")
+                .unwrap()
+        );
         assert!(!player.hidden(), "the GIF should have a visible video area");
         assert!(
-            !app.images.contains_key("/img/f5ndv6yotovh1.gif"),
+            !app.images
+                .contains_key("https://i.redd.it/f5ndv6yotovh1.gif"),
             "GIFs must not enter the full-image download queue"
         );
     }
@@ -5603,7 +5640,7 @@ mod tests {
             pixels: video::Pixels::Zlib(vec![1, 2, 3]),
             same_as_first: false,
         };
-        let url = app.redlib.absolute(VIDEO);
+        let url = app.reddit.media_url(VIDEO).unwrap();
         app.video = Some(video::Player::showing(&url, frame()));
         let sends = |app: &mut App| screen(app, 100, 30).matches("_Ga=T").count();
 
@@ -5756,7 +5793,9 @@ mod tests {
                         Msg::MoreReplies {
                             generation,
                             comment_id: "parent".into(),
-                            result: Ok(std::mem::take(&mut page.comments[0].replies)),
+                            result: Ok(ReplyPage::complete(std::mem::take(
+                                &mut page.comments[0].replies,
+                            ))),
                         }
                     } else {
                         Msg::Post {
@@ -5820,7 +5859,9 @@ mod tests {
                 Msg::MoreReplies {
                     generation,
                     comment_id: "parent".into(),
-                    result: Ok(std::mem::take(&mut page.comments[0].replies)),
+                    result: Ok(ReplyPage::complete(std::mem::take(
+                        &mut page.comments[0].replies,
+                    ))),
                 }
             } else {
                 Msg::Post {
@@ -6051,7 +6092,7 @@ mod tests {
             page.body.clear();
             page.comments[0].body = format!("parent {SPOILER_START}short spoiler{SPOILER_END}");
             page.comments[0].more = Some(crate::model::MoreReplies {
-                path: "/more".into(),
+                cursor: "/more".into(),
                 count: Some(10),
             });
             let mut sibling = page.comments[0].clone();
@@ -6086,7 +6127,7 @@ mod tests {
                 app.on_msg(Msg::MoreReplies {
                     generation,
                     comment_id: "c".into(),
-                    result: Ok(replies.clone()),
+                    result: Ok(ReplyPage::complete(replies.clone())),
                 });
             }
             screen(&mut app, 100, 30);
@@ -6118,17 +6159,20 @@ mod tests {
         let mut child = page.comments[0].clone();
         child.id = "child".into();
         child.more = Some(crate::model::MoreReplies {
-            path: "/child".into(),
+            cursor: "/child".into(),
             count: None,
         });
         child.sources = Some(crate::model::CommentSources {
             content: source(1, true),
             more: source(1, true),
-            from_expansion: false,
+            parent: Some(crate::model::ParentMembership {
+                source: source(1, true),
+                present: true,
+            }),
         });
         let mut parent = child.clone();
         parent.id = "parent".into();
-        parent.more.as_mut().unwrap().path = "/parent".into();
+        parent.more.as_mut().unwrap().cursor = "/parent".into();
         parent.replies = vec![child.clone()];
         let mut sibling = child.clone();
         sibling.id = "sibling".into();
@@ -6178,7 +6222,7 @@ mod tests {
             message: Box::new(Msg::MoreReplies {
                 generation,
                 comment_id: "parent".into(),
-                result: Ok(vec![child]),
+                result: Ok(ReplyPage::complete(vec![child])),
             }),
             fetched_at: 1000,
             source: source(2, true),

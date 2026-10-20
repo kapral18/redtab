@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Post media. URLs are Redlib-relative (`/img/…`, `/hls/…`) or absolute for links.
+/// Post media. URLs are absolute upstream URLs; temporary media-relay URLs are never persisted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Media {
     #[default]
@@ -10,13 +10,13 @@ pub enum Media {
         url: String,
     },
     Video {
-        /// File or HLS playlist; `None` when Redlib has no playable source.
+        /// File or HLS playlist; `None` when Reddit has no playable source.
         url: Option<String>,
         poster: Option<String>,
     },
     Gallery {
         images: Vec<String>,
-        /// Listing thumbnail; only post pages list the images.
+        /// Listing thumbnail, also used when gallery entries are unavailable.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thumb: Option<String>,
     },
@@ -39,7 +39,7 @@ impl Media {
         }
     }
 
-    /// Playable media, including GIFs stored as images in Redlib pages and bookmarks.
+    /// Playable media, including GIFs stored as images in posts and bookmarks.
     pub fn video_url(&self) -> Option<&str> {
         match self {
             Media::Video { url, .. } => url.as_deref(),
@@ -101,8 +101,6 @@ pub struct Post {
     pub score: Option<i64>,
     pub comments: u64,
     pub created: Option<DateTime<Utc>>,
-    /// Redlib's fetch-time age text; display prefers `created`.
-    pub age: String,
     /// e.g. `/r/neovim/comments/abc/title/`.
     pub permalink: String,
     pub media: Media,
@@ -120,6 +118,8 @@ pub const SPOILER_END: char = '\u{FDD1}';
 /// Starts a line of post or comment text that stands for a picture, its URL after it. A
 /// noncharacter too, stripped from Reddit text like the spoiler marks.
 pub const PICTURE: char = '\u{FDD2}';
+/// Id prefix of the hidden comment that holds a thread's top-level comments.
+pub const THREAD_ROOT: &str = "more:";
 
 impl Post {
     pub fn reddit_url(&self) -> String {
@@ -127,14 +127,14 @@ impl Post {
     }
 
     pub fn age_at(&self, now: DateTime<Utc>) -> String {
-        age_at(self.created, &self.age, now)
+        age_at(self.created, now)
     }
 }
 
-/// `created` relative to `now`, else Redlib's fetch-time text.
-fn age_at(created: Option<DateTime<Utc>>, fetched: &str, now: DateTime<Utc>) -> String {
+/// `created` relative to `now`; empty when unknown.
+fn age_at(created: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
     let Some(created) = created else {
-        return fetched.to_owned();
+        return String::new();
     };
     let secs = (now - created).num_seconds().max(0);
     match secs {
@@ -163,14 +163,12 @@ pub struct Comment {
     pub is_op: bool,
     pub is_mod: bool,
     pub score: Option<i64>,
-    /// Redlib's relative age ("1h ago") at fetch time; display uses `created` when known.
-    pub age: String,
     /// Absolute creation time, so cached comments age with the clock.
     #[serde(default)]
     pub created: Option<DateTime<Utc>>,
     pub body: String,
     pub replies: Vec<Comment>,
-    /// "More replies" link Redlib renders instead of deeper levels.
+    /// Opaque cursor for replies that Reddit omitted.
     pub more: Option<MoreReplies>,
     /// In-memory response provenance; cached JSON never serializes it.
     #[serde(skip)]
@@ -179,7 +177,7 @@ pub struct Comment {
 
 impl Comment {
     pub fn age_at(&self, now: DateTime<Utc>) -> String {
-        age_at(self.created, &self.age, now)
+        age_at(self.created, now)
     }
 }
 
@@ -187,15 +185,44 @@ impl Comment {
 pub struct CommentSources {
     pub content: crate::cache::Source,
     pub more: crate::cache::Source,
-    /// A direct More contribution, not also supplied by a parent snapshot.
-    pub from_expansion: bool,
+    /// Latest parent-page membership, independent of expansion content freshness.
+    pub parent: Option<ParentMembership>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParentMembership {
+    pub source: crate::cache::Source,
+    pub present: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MoreReplies {
-    /// Redlib path of the thread rooted at the parent comment.
-    pub path: String,
+    /// Opaque backend cursor, safe to cache; contains no credentials.
+    pub cursor: String,
     pub count: Option<u64>,
+}
+
+/// One expansion of a logical parent's children, including its next cursor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplyPage {
+    pub comments: Vec<Comment>,
+    pub more: Option<MoreReplies>,
+    /// IDs whose omission means removal. None means the complete child list;
+    /// a partial response must not remove comments outside this set.
+    pub refreshed: Option<Vec<String>>,
+    /// Relative sibling order, including retained comments still behind the cursor.
+    pub order: Vec<String>,
+}
+
+impl ReplyPage {
+    pub fn complete(comments: Vec<Comment>) -> Self {
+        Self {
+            order: comments.iter().map(|c| c.id.clone()).collect(),
+            comments,
+            more: None,
+            refreshed: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -285,12 +312,18 @@ mod tests {
     #[test]
     fn when_image_urls_have_gif_extensions_they_should_play_as_video() {
         for (url, expected) in [
-            ("/img/a.GIF", Some("/img/a.GIF")),
-            ("/img/a.gif?width=640&s=x", Some("/img/a.gif?width=640&s=x")),
-            ("/img/a.gif#t", Some("/img/a.gif#t")),
-            ("/img/a.gifv", None),
-            ("/img/a.jpeg", None),
-            ("/img/gif", None),
+            ("https://i.redd.it/a.GIF", Some("https://i.redd.it/a.GIF")),
+            (
+                "https://i.redd.it/a.gif?width=640&s=x",
+                Some("https://i.redd.it/a.gif?width=640&s=x"),
+            ),
+            (
+                "https://i.redd.it/a.gif#t",
+                Some("https://i.redd.it/a.gif#t"),
+            ),
+            ("https://i.redd.it/a.gifv", None),
+            ("https://i.redd.it/a.jpeg", None),
+            ("https://i.redd.it/gif", None),
             ("", None),
         ] {
             let media = Media::Image { url: url.into() };
@@ -302,10 +335,10 @@ mod tests {
     #[test]
     fn when_a_gif_post_lists_it_should_have_a_thumbnail_but_no_still_preview() {
         let media = Media::Image {
-            url: "/img/a.gif".into(),
+            url: "https://i.redd.it/a.gif".into(),
         };
 
-        assert_eq!(media.list_thumb(), Some("/img/a.gif"));
+        assert_eq!(media.list_thumb(), Some("https://i.redd.it/a.gif"));
         assert_eq!(media.preview_image(), None, "it plays as video instead");
     }
 
@@ -313,10 +346,13 @@ mod tests {
     fn a_link_post_should_list_its_preview_but_not_show_it_as_the_posts_picture() {
         let media = Media::Link {
             url: "https://claude.ai/artifact/x".into(),
-            thumb: Some("/preview/external-pre/t.png".into()),
+            thumb: Some("https://external-preview.redd.it/t.png".into()),
         };
 
-        assert_eq!(media.list_thumb(), Some("/preview/external-pre/t.png"));
+        assert_eq!(
+            media.list_thumb(),
+            Some("https://external-preview.redd.it/t.png")
+        );
         assert_eq!(media.preview_image(), None);
         assert!(!media.shows_inline());
     }
@@ -335,10 +371,10 @@ mod tests {
 
         let new = Media::Gallery {
             images: Vec::new(),
-            thumb: Some("/preview/pre/a.jpg".into()),
+            thumb: Some("https://preview.redd.it/a.jpg".into()),
         };
         let json = serde_json::to_string(&new).unwrap();
         assert_eq!(serde_json::from_str::<Media>(&json).unwrap(), new);
-        assert_eq!(new.list_thumb(), Some("/preview/pre/a.jpg"));
+        assert_eq!(new.list_thumb(), Some("https://preview.redd.it/a.jpg"));
     }
 }

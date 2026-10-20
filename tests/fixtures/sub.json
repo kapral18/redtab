@@ -1,0 +1,23 @@
+{
+  "kind": "Listing",
+  "data": {
+    "children": [
+      {
+        "kind": "t3",
+        "data": {
+          "id": "1x4v4sn",
+          "title": "Error with Neovim and Tree Sitter",
+          "subreddit": "neovim",
+          "permalink": "/r/neovim/comments/1x4v4sn/title/",
+          "author": "reader",
+          "num_comments": 3,
+          "score": 12,
+          "created_utc": 1791849600,
+          "is_self": true,
+          "selftext_html": "<p>Body <span class=\"md-spoiler-text\">secret</span>.</p>"
+        }
+      }
+    ],
+    "after": "t3_1x4v4sn"
+  }
+}

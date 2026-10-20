@@ -3,7 +3,7 @@
 //! ratatui-image protocol encoded off the UI thread. ffplay plays sound in its own process.
 
 use std::io::{self, BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::time::{Duration, Instant};
@@ -83,7 +83,7 @@ struct Decoder {
 impl Decoder {
     fn spawn(url: &str, start: f64, frame_box: (u32, u32), output: Output) -> io::Result<Self> {
         let filter = video_filter(frame_box, &output);
-        let mut child = Command::new("ffmpeg")
+        let mut child = crate::media::local_command("ffmpeg")
             .args([
                 "-nostdin",
                 "-hide_banner",
@@ -432,6 +432,8 @@ fn resolve(
         return Ok(Sources::file(url));
     }
     let agent: ureq::Agent = ureq::Agent::config_builder()
+        // Inputs come from the loopback relay; upstream routing belongs to it.
+        .proxy(None)
         .timeout_global(Some(Duration::from_secs(15)))
         .build()
         .into();
@@ -1042,7 +1044,7 @@ impl Player {
             return;
         };
         let at = format!("{:.3}", self.clock.position(now));
-        let started = Command::new("ffplay")
+        let started = crate::media::local_command("ffplay")
             .args(["-nodisp", "-vn", "-autoexit", "-loglevel", "quiet"])
             .args(["-ss", &at, url])
             .stdin(Stdio::null())
@@ -1459,7 +1461,11 @@ mod tests {
     /// The first frame ffmpeg decodes from a one-frame `w`×`h` GIF, or None without ffmpeg
     /// (an optional dependency).
     fn first_frame(w: u16, h: u16, frame_box: (u32, u32), output: Output) -> Option<(u32, u32)> {
-        if Command::new("ffmpeg").arg("-version").output().is_err() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
             return None;
         }
         // One directory per call: the tests run in parallel.
@@ -2074,20 +2080,20 @@ mod tests {
 
     #[test]
     fn when_a_plain_gif_plays_it_should_stream_without_seeking_its_input() {
-        let gif = "http://r/img/a.gif";
-        let mp4 = "http://r/preview/pre/a.gif?format=mp4&s=x";
+        let gif = "http://127.0.0.1:1/k/https/i.redd.it/a.gif";
+        let mp4 = "http://127.0.0.1:1/k/https/preview.redd.it/a.gif?format=mp4&s=x";
 
         let args = |url: &str, at: f64| input_args(url, at).join(" ");
 
-        assert_eq!(args(gif, 0.0), "-seekable 0 -i http://r/img/a.gif");
+        assert_eq!(args(gif, 0.0), format!("-seekable 0 -i {gif}"));
         assert_eq!(
             args(gif, 5.0),
-            "-seekable 0 -i http://r/img/a.gif -ss 5.000",
+            format!("-seekable 0 -i {gif} -ss 5.000"),
             "a later start decodes past earlier frames"
         );
         assert_eq!(
             args(mp4, 5.0),
-            "-reconnect 1 -ss 5.000 -i http://r/preview/pre/a.gif?format=mp4&s=x",
+            format!("-reconnect 1 -ss 5.000 -i {mp4}"),
             "an MP4 behind a .gif name still seeks"
         );
     }
