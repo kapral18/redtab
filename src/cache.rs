@@ -212,6 +212,15 @@ impl Cache {
         })
     }
 
+    /// Mark an entry used at `now`: pruning removes the oldest modification time first, so
+    /// a touched entry outlives ones written before `now`.
+    pub fn touch(&self, key: &str, now: i64) {
+        if let Some(file) = self.open_entry(key) {
+            let used = UNIX_EPOCH + Duration::from_secs(now.max(0) as u64);
+            let _ = file.set_times(fs::FileTimes::new().set_modified(used));
+        }
+    }
+
     fn open_entry(&self, key: &str) -> Option<fs::File> {
         OpenOptions::new()
             .read(true)

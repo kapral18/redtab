@@ -3,7 +3,7 @@ name = "redtab"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
-description = "Terminal Reddit reader with tabs and direct guest access"
+description = "Terminal Reddit reader with tabs and browser-session sign-in"
 license = "MIT"
 repository = "https://github.com/kapral18/redtab"
 publish = false
@@ -33,10 +33,18 @@ signal-hook = "0.4"
 ureq = "3"
 url = "2"
 tiny_http = "0.12"
+tempfile = "3"
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 uuid = { version = "1", features = ["v4"] }
 wreq = { version = "=6.0.0-rc.28", features = ["json", "gzip", "brotli", "deflate", "zstd"] }
 wreq-util = "=3.0.0-rc.10"
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+rookie-cookies = { version = "=0.6.0", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7", default-features = false }
 
 [profile.release]
 lto = "thin"

@@ -5,8 +5,6 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::app::{App, Focus, Overlay, PickerState, TabKind};
 use crate::model::Sort;
 
-const PAGE: isize = 10;
-
 pub fn handle(app: &mut App, mut key: KeyEvent) {
     if key.kind == KeyEventKind::Release {
         return;
@@ -67,7 +65,7 @@ pub fn handle(app: &mut App, mut key: KeyEvent) {
             (true, 'd' | 'u' | 'e' | 'y') => {
                 handle_post(app, key);
             }
-            (false, 'd' | 'u') => handle_global(app, key),
+            (false, 'd' | 'u' | 'e' | 'y') => handle_global(app, key),
             _ => {}
         }
         return;
@@ -132,6 +130,54 @@ fn handle_overlay(app: &mut App, overlay: Overlay, key: KeyEvent) -> Option<Over
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let typing = !ctrl;
     match overlay {
+        Overlay::Auth => {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q')
+                    if !matches!(
+                        app.auth.phase,
+                        crate::auth::Phase::Saving | crate::auth::Phase::Disconnecting
+                    ) =>
+                {
+                    app.auth.cancel();
+                    return None;
+                }
+                KeyCode::Down | KeyCode::Char('j') if !app.auth.busy() => {
+                    app.auth.selected =
+                        (app.auth.selected + 1).min(app.auth.choices().saturating_sub(1))
+                }
+                KeyCode::Up | KeyCode::Char('k') if !app.auth.busy() => {
+                    app.auth.selected = app.auth.selected.saturating_sub(1)
+                }
+                KeyCode::Enter
+                    if matches!(
+                        app.auth.phase,
+                        crate::auth::Phase::Confirm | crate::auth::Phase::DisconnectConfirm
+                    ) =>
+                {
+                    app.confirm_auth()
+                }
+                KeyCode::Char('d') if app.auth.can_remove() => app.auth.request_disconnect(),
+                KeyCode::Enter if app.select_auth() => return None,
+                KeyCode::Char('a') if app.auth.phase == crate::auth::Phase::Accounts => {
+                    app.auth.discover()
+                }
+                KeyCode::Char('r') if !app.auth.busy() => app.auth.reconnect(),
+                _ => {}
+            }
+            Some(Overlay::Auth)
+        }
+        Overlay::Membership { subreddit, join } => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => None,
+            KeyCode::Enter => {
+                app.set_membership(subreddit, join);
+                None
+            }
+            KeyCode::Char(' ') => {
+                app.open_subreddit(&subreddit);
+                None
+            }
+            _ => Some(Overlay::Membership { subreddit, join }),
+        },
         Overlay::Help { scroll } => match key.code {
             KeyCode::Char('j') | KeyCode::Down => Some(Overlay::Help { scroll: scroll + 1 }),
             KeyCode::Char('k') | KeyCode::Up => Some(Overlay::Help {
@@ -170,11 +216,12 @@ fn handle_overlay(app: &mut App, overlay: Overlay, key: KeyEvent) -> Option<Over
             Some(Overlay::Picker(picker))
         }
         Overlay::Sort { mut selected } => {
+            let sorts = app.active_tab().sorts();
             let pick = match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => return None,
-                KeyCode::Enter => Some(Sort::ALL[selected]),
+                KeyCode::Enter => Some(sorts[selected]),
                 KeyCode::Char('j') | KeyCode::Down => {
-                    selected = (selected + 1).min(Sort::ALL.len() - 1);
+                    selected = (selected + 1).min(sorts.len() - 1);
                     None
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
@@ -182,6 +229,7 @@ fn handle_overlay(app: &mut App, overlay: Overlay, key: KeyEvent) -> Option<Over
                     None
                 }
                 KeyCode::Char('h') => Some(Sort::Hot),
+                KeyCode::Char('b') if sorts.contains(&Sort::Best) => Some(Sort::Best),
                 KeyCode::Char('n') => Some(Sort::New),
                 KeyCode::Char('t') => Some(Sort::Top),
                 KeyCode::Char('r') => Some(Sort::Rising),
@@ -255,8 +303,9 @@ fn handle_post(app: &mut App, key: KeyEvent) -> bool {
 fn handle_global(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let in_post = app.post_focused();
-    let home = matches!(app.active_tab().kind, TabKind::Home);
+    let all_subs = matches!(app.active_tab().kind, TabKind::AllSubs);
     let on_sub = matches!(app.active_tab().kind, TabKind::Subreddit { .. });
+    let on_feed = on_sub || matches!(app.active_tab().kind, TabKind::Home);
     match key.code {
         KeyCode::Char('q') if app.post_view.is_some() => app.close_post(),
         KeyCode::Char('q') => app.quit = true,
@@ -264,6 +313,7 @@ fn handle_global(app: &mut App, key: KeyEvent) {
         KeyCode::Esc if app.post_view.is_some() => app.close_post(),
         KeyCode::Esc => app.status = None,
         KeyCode::Char('?') => app.overlay = Some(Overlay::Help { scroll: 0 }),
+        KeyCode::Char('A') => app.show_auth(),
         KeyCode::Char('p') => app.overlay = Some(Overlay::Picker(PickerState::default())),
         KeyCode::Tab | KeyCode::Char(']') => app.cycle_tab(true),
         KeyCode::BackTab | KeyCode::Char('[') => app.cycle_tab(false),
@@ -271,36 +321,40 @@ fn handle_global(app: &mut App, key: KeyEvent) {
         KeyCode::Char('0') => app.switch_tab(app.tabs.len() - 1),
         KeyCode::Char('r') => app.reload(),
         KeyCode::Char('i') => app.toggle_images(),
+        KeyCode::Char('V') => app.toggle_list_view(),
         KeyCode::Char('o') => app.open_in_browser(),
-        KeyCode::Char('y') => app.copy_link(),
+        KeyCode::Char('y') if !ctrl => app.copy_link(),
         KeyCode::Char('m') => app.open_media(),
         KeyCode::Char('b') => app.toggle_bookmark(),
         KeyCode::Char('\\') => app.toggle_sidebar(),
+        KeyCode::Char('S') => app.show_membership(),
         _ if in_post => {}
         KeyCode::Char('j') | KeyCode::Down => app.move_selection(1),
         KeyCode::Char('k') | KeyCode::Up => app.move_selection(-1),
-        KeyCode::Char('d') if ctrl => app.move_selection(PAGE),
-        KeyCode::Char('u') if ctrl => app.move_selection(-PAGE),
-        KeyCode::PageDown => app.move_selection(PAGE),
-        KeyCode::PageUp => app.move_selection(-PAGE),
+        KeyCode::Char('d') if ctrl => app.page_list(1, 2),
+        KeyCode::Char('u') if ctrl => app.page_list(-1, 2),
+        KeyCode::Char('e') if ctrl => app.scroll_card(1),
+        KeyCode::Char('y') if ctrl => app.scroll_card(-1),
+        KeyCode::PageDown => app.page_list(1, 1),
+        KeyCode::PageUp => app.page_list(-1, 1),
         KeyCode::Char('g') | KeyCode::Home => app.select_edge(false),
         KeyCode::Char('G') | KeyCode::End => app.select_edge(true),
         KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => app.open_current_post(),
         KeyCode::Char('h') | KeyCode::Left => app.focus_sidebar(),
-        KeyCode::Char('J') if home => app.move_home_group(1),
-        KeyCode::Char('K') if home => app.move_home_group(-1),
-        KeyCode::Char(' ') if home => app.open_home_group_tab(),
-        KeyCode::Char('s') if on_sub => {
+        KeyCode::Char('J') if all_subs => app.move_all_subs_group(1),
+        KeyCode::Char('K') if all_subs => app.move_all_subs_group(-1),
+        KeyCode::Char(' ') => app.open_current_community(),
+        KeyCode::Char('s') if on_feed => {
             app.overlay = Some(Overlay::Sort {
                 selected: sort_index(app),
             })
         }
-        KeyCode::Char('t') if on_sub => app.cycle_time(),
+        KeyCode::Char('t') if on_feed => app.cycle_time(),
         KeyCode::Char('/') if on_sub => {
             let input = app.active_tab().feed.search.clone().unwrap_or_default();
             app.overlay = Some(Overlay::Search { input });
         }
-        KeyCode::Char('L') if on_sub => {
+        KeyCode::Char('L') if on_feed => {
             let active = app.active;
             app.load_feed(active, true);
         }
@@ -311,5 +365,9 @@ fn handle_global(app: &mut App, key: KeyEvent) {
 
 fn sort_index(app: &App) -> usize {
     let sort = app.active_tab().feed.sort;
-    Sort::ALL.iter().position(|s| *s == sort).unwrap_or(0)
+    app.active_tab()
+        .sorts()
+        .iter()
+        .position(|s| *s == sort)
+        .unwrap_or(0)
 }

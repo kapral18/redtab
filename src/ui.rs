@@ -17,11 +17,13 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, CARD_MIN_WIDTH, DETAIL_MIN_WIDTH, Focus, Group, ImageSlot, MAIN_MIN_WIDTH, Overlay,
-    PickerEntry, PostView, RowKind, Tab, TabKind,
+    App, CARD_MIN_WIDTH, CardImageProtocol, CardImageSlot, CardScroll, DETAIL_MIN_WIDTH, Focus,
+    Group, ImageRefresh, ImageSlot, MAIN_MIN_WIDTH, Overlay, PickerEntry, PostView, RowKind, Tab,
+    TabKind,
 };
 use crate::model::{Media, PICTURE, Post, SPOILER_END, SPOILER_START, Sort};
 use crate::reddit::Health;
+use crate::state::ListView;
 use crate::video;
 
 /// Catppuccin Mocha, with an orange accent close to Reddit's.
@@ -55,11 +57,60 @@ pub const THUMB_ROWS: u16 = 2;
 const THUMB_RESERVE: usize = THUMB_COLS as usize + 1;
 /// A subreddit icon: one line tall.
 const ICON_COLS: u16 = 2;
+#[cfg(test)]
+use crate::card_image::encode_tile;
+/// Kitty's Unicode placeholders can address only 297 rows or columns per image.
+use crate::card_image::{Key as CardImageKey, TILE_COLS, TILE_ROWS};
 
 /// A thumbnail or icon to draw once the text is down.
 struct ImageSpot {
     url: String,
     area: Rect,
+}
+
+struct PostCard {
+    lines: Vec<Line<'static>>,
+    footer: Line<'static>,
+    marker: Span<'static>,
+    style: Style,
+    image: Option<String>,
+    image_rows: u16,
+    geometry_known: bool,
+    pixels: (u32, u32),
+}
+
+impl PostCard {
+    fn height(&self) -> usize {
+        self.lines.len() + usize::from(self.image_rows) + 1
+    }
+
+    fn visible(&self, skip: usize, rows: usize) -> Vec<Line<'static>> {
+        (skip..skip + rows)
+            .map(|line| {
+                if let Some(header) = self.lines.get(line) {
+                    header.clone()
+                } else if line + 1 == self.height() {
+                    self.footer.clone()
+                } else {
+                    Line::from(self.marker.clone()).style(self.style)
+                }
+            })
+            .collect()
+    }
+}
+
+struct CardPicture {
+    url: String,
+    area: Rect,
+    size: Size,
+    skipped: u16,
+    pixels: (u32, u32),
+}
+
+#[derive(Default)]
+struct ListPictures {
+    thumbs: Vec<ImageSpot>,
+    cards: Vec<CardPicture>,
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -69,6 +120,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let [sidebar, main] =
         Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(20)]).areas(area);
     let mut spots = Vec::new();
+    let mut pictures = ListPictures::default();
     if sidebar_width > 0 {
         draw_sidebar(f, app, sidebar, &mut spots);
     }
@@ -101,25 +153,30 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if !main.is_empty() {
         let body = main.inner(margin);
         match app.active_tab().kind {
-            TabKind::Home => draw_home(f, app, body, &mut spots),
-            TabKind::Bookmarks => draw_bookmarks(f, app, body, &mut spots),
-            TabKind::Subreddit { .. } => draw_feed(f, app, body, &mut spots),
+            TabKind::Home => draw_feed(f, app, body, &mut pictures),
+            TabKind::AllSubs => draw_all_subs(f, app, body, &mut spots),
+            TabKind::Bookmarks => draw_bookmarks(f, app, body, &mut pictures),
+            TabKind::Subreddit { .. } => draw_feed(f, app, body, &mut pictures),
         }
     }
+    draw_card_pictures(f, app, &pictures.cards);
+    spots.extend(pictures.thumbs);
     if let Some(detail) = detail {
         draw_post(f, app, detail.inner(margin));
     }
+    draw_spots(f, app, &spots);
     draw_footer(f, app, footer);
     app.status_drawn();
-    draw_spots(f, app, &spots);
     if let Some(Overlay::Help { scroll }) = &mut app.overlay {
         draw_help(f, scroll);
         return;
     }
     match &app.overlay {
+        Some(Overlay::Auth) => draw_auth(f, app),
         Some(Overlay::Picker(p)) => draw_picker(f, app, &p.input, p.selected),
-        Some(Overlay::Sort { selected }) => draw_sort(f, *selected),
+        Some(Overlay::Sort { selected }) => draw_sort(f, app, *selected),
         Some(Overlay::Search { input }) => draw_search(f, app, input),
+        Some(Overlay::Membership { subreddit, join }) => draw_membership(f, subreddit, *join),
         Some(Overlay::Help { .. }) | None => {}
     }
 }
@@ -146,6 +203,8 @@ fn draw_spots(f: &mut Frame, app: &mut App, spots: &[ImageSpot]) {
                 let fill = StatefulImage::default()
                     .resize(Resize::Scale(Some(ratatui_image::FilterType::Triangle)));
                 f.render_stateful_widget(fill, spot.area, protocol.as_mut());
+            } else if !matches!(app.thumbs.get(&spot.url), Some(ImageSlot::Failed(_))) {
+                draw_picture_wait(f, spot.area, "◌");
             }
         }
     }
@@ -318,7 +377,11 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect, spots: &mut Vec<ImageSpot>
         brand,
     );
 
-    let mut rows = vec![SideRow::Tab(0), SideRow::Tab(1)];
+    let mut rows = vec![
+        SideRow::Tab(0),
+        SideRow::Tab(1),
+        SideRow::Tab(crate::app::ALL_SUBS_TAB),
+    ];
     let (pinned, opened) = app.sidebar_tabs();
     if !pinned.is_empty() {
         rows.push(SideRow::Blank);
@@ -376,6 +439,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect, spots: &mut Vec<ImageSpot>
     f.render_widget(Paragraph::new(lines).style(panel), list);
 
     let (dot, color, label) = match app.health {
+        Health::SignedOut => ("○", YELLOW, "connect · A"),
         Health::Unknown => ("○", OVERLAY, "reddit"),
         Health::Up => ("●", GREEN, "reddit"),
         Health::Paused => ("◐", YELLOW, "reddit paused"),
@@ -411,6 +475,7 @@ fn sidebar_item(app: &App, index: usize, width: usize) -> Line<'static> {
     let active = index == app.active;
     let (icon, name) = match &tab.kind {
         TabKind::Home => ("⌂", "Home"),
+        TabKind::AllSubs => ("▦", "All subs"),
         TabKind::Bookmarks => ("★", "Bookmarks"),
         TabKind::Subreddit { name, .. } => ("#", name.as_str()),
     };
@@ -491,6 +556,7 @@ fn view_header(f: &mut Frame, area: Rect, title: &str, chips: Vec<Span<'static>>
 
 fn sort_chip(sort: Sort) -> Span<'static> {
     let (icon, color) = match sort {
+        Sort::Best => ("✦", LAVENDER),
         Sort::Hot => ("🔥", PEACH),
         Sort::New => ("✦", GREEN),
         Sort::Top => ("▲", YELLOW),
@@ -498,6 +564,14 @@ fn sort_chip(sort: Sort) -> Span<'static> {
         Sort::Controversial => ("⚡", RED),
     };
     chip(format!("{icon} {}", sort.as_str()), color, SURFACE0)
+}
+
+fn list_view_chip(app: &App) -> Span<'static> {
+    chip(
+        format!("V {}", app.state.list_view().label()),
+        TEXT,
+        SURFACE0,
+    )
 }
 
 // ----- post cards ----------------------------------------------------------
@@ -512,12 +586,7 @@ struct CardOpts<'a> {
 
 /// Two lines per post: score gutter + title, comment gutter + meta chips.
 fn post_card(app: &App, post: &Post, width: usize, opts: &CardOpts<'_>) -> [Line<'static>; 2] {
-    let now = Utc::now();
-    let bg = if opts.selected {
-        Style::new().bg(SURFACE0)
-    } else {
-        Style::new()
-    };
+    let bg = post_background(app, post, opts.selected);
     let unseen = opts
         .seen_key
         .is_some_and(|k| !app.state.is_seen(k, &post.id));
@@ -558,7 +627,7 @@ fn post_card(app: &App, post: &Post, width: usize, opts: &CardOpts<'_>) -> [Line
     pad_to(&mut title, width, bg);
 
     let comments = format!("💬 {}", format_count(post.comments as i64));
-    let mut meta = vec![
+    let meta = vec![
         bar,
         slot,
         Span::styled(
@@ -570,14 +639,39 @@ fn post_card(app: &App, post: &Post, width: usize, opts: &CardOpts<'_>) -> [Line
         ),
         Span::styled("  ", bg),
     ];
-    if opts.show_subreddit {
+    [
+        Line::from(title),
+        post_meta(post, width, opts.show_subreddit, bg, meta),
+    ]
+}
+
+fn post_background(app: &App, post: &Post, selected: bool) -> Style {
+    if selected {
+        Style::new().bg(SURFACE0)
+    } else if matches!(app.active_tab().kind, TabKind::Home)
+        && app.joined(&post.subreddit) == Some(false)
+    {
+        Style::new().bg(MANTLE)
+    } else {
+        Style::new()
+    }
+}
+
+fn post_meta(
+    post: &Post,
+    width: usize,
+    show_subreddit: bool,
+    bg: Style,
+    mut meta: Vec<Span<'static>>,
+) -> Line<'static> {
+    if show_subreddit {
         meta.push(Span::styled(
             format!("r/{}  ", post.subreddit),
             bg.fg(LAVENDER),
         ));
     }
     meta.push(Span::styled(format!("u/{}", post.author), bg.fg(SUBTEXT)));
-    let age = post.age_at(now);
+    let age = post.age_at(Utc::now());
     if !age.is_empty() {
         meta.push(Span::styled(format!(" · {age}"), bg.fg(OVERLAY)));
     }
@@ -608,7 +702,7 @@ fn post_card(app: &App, post: &Post, width: usize, opts: &CardOpts<'_>) -> [Line
         meta_line.push(span);
     }
     pad_to(&mut meta_line, width, bg);
-    [Line::from(title), Line::from(meta_line)]
+    Line::from(meta_line).style(bg)
 }
 
 fn media_label(media: &Media, tag: &str) -> String {
@@ -628,6 +722,421 @@ struct ListSpec<'a> {
     selected: usize,
     seen_key: Option<&'a str>,
     show_subreddit: bool,
+    offset: usize,
+    scroll: CardScroll,
+    tail: Option<&'static str>,
+}
+
+fn card_marker(app: &App, selected: bool, bg: Style) -> Span<'static> {
+    Span::styled(
+        if selected { "▌ " } else { "  " },
+        bg.fg(if app.focus == Focus::List {
+            ACCENT
+        } else {
+            OVERLAY
+        }),
+    )
+}
+
+fn expanded_card(
+    app: &App,
+    post: &Post,
+    width: usize,
+    opts: &CardOpts<'_>,
+    height: u16,
+) -> PostCard {
+    let bg = post_background(app, post, opts.selected);
+    let marker = card_marker(app, opts.selected, bg);
+    let meta = post_meta(post, width, opts.show_subreddit, bg, vec![marker.clone()]);
+    let mut lines = card_title(app, post, width, opts, height, bg);
+    let image = (!post.spoiler && width >= 8 && app.inline_images_on())
+        .then(|| {
+            post.media
+                .preview_image()
+                .or_else(|| post.media.list_thumb())
+                .map(str::to_string)
+        })
+        .flatten();
+    let image_size = image.as_deref().and_then(|url| {
+        post.preview_size
+            .filter(|&(width, height)| width > 0 && height > 0)
+            .or_else(|| app.card_image_sizes.get(url).copied())
+            .filter(|&(width, height)| width > 0 && height > 0)
+    });
+    let image_rows = image.as_ref().map_or(0, |_| {
+        let (image_width, image_height) = image_size.unwrap_or((1, 1));
+        let font = app.image_picker.font_size();
+        let pixels_wide = width.saturating_sub(4) as f64 * f64::from(font.width.max(1));
+        (pixels_wide * f64::from(image_height)
+            / f64::from(image_width)
+            / f64::from(font.height.max(1)))
+        .ceil()
+        .clamp(1.0, f64::from(i16::MAX)) as u16
+    });
+    lines.insert(0, meta);
+    let image = image.filter(|_| image_rows > 0);
+    let score = post.score.map_or("•".into(), format_count);
+    let footer = Line::from(vec![
+        marker.clone(),
+        Span::styled(format!("▲ {score}  "), bg.fg(score_color(post.score))),
+        Span::styled(
+            format!("💬 {} comments", format_count(post.comments as i64)),
+            bg.fg(BLUE),
+        ),
+    ])
+    .style(bg);
+    let geometry_known = image.is_none()
+        || image_size.is_some()
+        || image
+            .as_deref()
+            .is_some_and(|url| matches!(app.card_images.get(url), Some(CardImageSlot::Failed(_))));
+    PostCard {
+        lines,
+        footer,
+        marker,
+        style: bg,
+        geometry_known,
+        pixels: image_size.unwrap_or((1, 1)),
+        image,
+        image_rows,
+    }
+}
+
+fn card_title(
+    app: &App,
+    post: &Post,
+    width: usize,
+    opts: &CardOpts<'_>,
+    height: u16,
+    bg: Style,
+) -> Vec<Line<'static>> {
+    let mut style = bg.fg(TEXT).add_modifier(Modifier::BOLD);
+    if app.state.is_read(&post.id) {
+        style = style.fg(SUBTEXT);
+    }
+    if app.config.highlights(post) {
+        style = style.fg(YELLOW);
+    }
+    let saved = if app.state.is_bookmarked(&post.id) {
+        "★ "
+    } else {
+        ""
+    };
+    let pinned = if post.stickied { "📌 " } else { "" };
+    let unseen = if opts
+        .seen_key
+        .is_some_and(|key| !app.state.is_seen(key, &post.id))
+    {
+        "● "
+    } else {
+        ""
+    };
+    let title = format!("{saved}{pinned}{unseen}{}", post.title);
+    let title_rows = height.saturating_sub(4).clamp(1, 3) as usize;
+    let wrapped = textwrap::wrap(&title, width.saturating_sub(4).max(1));
+    let clipped = wrapped.len() > title_rows;
+    let mut unseen_pending = !unseen.is_empty();
+    wrapped
+        .into_iter()
+        .take(title_rows)
+        .enumerate()
+        .map(|(i, text)| {
+            let text = if clipped && i + 1 == title_rows {
+                truncate(&format!("{text}…"), width.saturating_sub(4))
+            } else {
+                text.into_owned()
+            };
+            let mut spans = vec![card_marker(app, opts.selected, bg)];
+            if unseen_pending && let Some((before, after)) = text.split_once('●') {
+                spans.push(Span::styled(before.to_string(), style));
+                spans.push(Span::styled("●", style.fg(ACCENT)));
+                spans.push(Span::styled(after.to_string(), style));
+                unseen_pending = false;
+            } else {
+                spans.push(Span::styled(text, style));
+            }
+            Line::from(spans).style(bg)
+        })
+        .collect()
+}
+
+fn draw_card_list(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    spec: &mut ListSpec<'_>,
+    pictures: &mut ListPictures,
+) {
+    if area.is_empty() || spec.posts.is_empty() {
+        return;
+    }
+    let width = area.width.saturating_sub(2) as usize;
+    let card_at = |i| {
+        expanded_card(
+            app,
+            spec.posts[i],
+            width,
+            &CardOpts {
+                selected: i == spec.selected,
+                seen_key: spec.seen_key,
+                show_subreddit: spec.show_subreddit,
+                reserve: 0,
+            },
+            area.height,
+        )
+    };
+    let selected = card_at(spec.selected);
+    let post_id = &spec.posts[spec.selected].id;
+    let scroll = &mut spec.scroll;
+    let offset = &mut spec.offset;
+    if scroll.post.as_ref() != Some(post_id) {
+        if scroll.post.is_some() {
+            scroll.line = 0;
+            scroll.height = 0;
+            scroll.bottom = false;
+        }
+        scroll.post = Some(post_id.clone());
+    }
+    scroll.height = selected.height();
+    scroll.viewport = area.height as usize;
+    if scroll.bottom {
+        scroll.line = scroll.height.saturating_sub(scroll.viewport);
+        scroll.bottom = !selected.geometry_known;
+    }
+    scroll.line = scroll
+        .line
+        .min(scroll.height.saturating_sub(scroll.viewport));
+    *offset = (*offset).min(spec.selected);
+    if scroll.height > scroll.viewport {
+        *offset = spec.selected;
+    }
+    let mut used = 0;
+    for i in (*offset..=spec.selected).rev() {
+        used += card_at(i).height() + 1;
+        if used > area.height as usize {
+            *offset = (i + 1).min(spec.selected);
+            break;
+        }
+    }
+    let mut y = area.y;
+    let mut shown = 0;
+    for i in *offset..spec.posts.len() {
+        let card = card_at(i);
+        let skip = if i == *offset { scroll.line } else { 0 };
+        let rows = card.height() - skip;
+        let at = Rect::new(
+            area.x,
+            y,
+            area.width.saturating_sub(2),
+            rows.min(usize::from(area.bottom() - y)) as u16,
+        );
+        f.render_widget(
+            Paragraph::new(card.visible(skip, usize::from(at.height))),
+            at,
+        );
+        if let Some(url) = &card.image {
+            let image_start = card.lines.len();
+            let image_y = y + image_start.saturating_sub(skip).min(area.height as usize) as u16;
+            let skipped = skip.saturating_sub(image_start) as u16;
+            if skipped < card.image_rows && image_y < at.bottom() {
+                pictures.cards.push(CardPicture {
+                    url: url.clone(),
+                    area: Rect::new(
+                        area.x + 2,
+                        image_y,
+                        area.width.saturating_sub(6),
+                        (card.image_rows - skipped).min(at.bottom() - image_y),
+                    ),
+                    size: Size::new(area.width.saturating_sub(6), card.image_rows),
+                    skipped,
+                    pixels: card.pixels,
+                });
+            }
+        }
+        shown += 1;
+        if i + 1 == spec.posts.len()
+            && usize::from(at.height) == rows
+            && at.bottom() < area.bottom()
+            && let Some(tail) = spec.tail
+        {
+            draw_list_tail(
+                f,
+                Rect::new(
+                    area.x,
+                    at.bottom(),
+                    area.width.saturating_sub(2),
+                    area.bottom() - at.bottom(),
+                ),
+                tail,
+            );
+        }
+        y = y.saturating_add(at.height.saturating_add(1));
+        if y >= area.bottom() {
+            break;
+        }
+    }
+    if scroll.height > scroll.viewport {
+        draw_scrollbar(f, area, scroll.line, scroll.viewport, scroll.height);
+    } else {
+        draw_scrollbar(f, area, *offset, shown, spec.posts.len());
+    }
+}
+
+fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture]) {
+    let prepare = app.card_preparation_allowed();
+    let urls: Vec<&str> = spots.iter().map(|spot| spot.url.as_str()).collect();
+    app.card_pictures_drawn(&urls);
+    app.card_renderer.begin();
+    for spot in spots {
+        if app.overlay.is_some() {
+            continue;
+        }
+        let Some(slot) = app.card_images.get_mut(&spot.url) else {
+            draw_picture_wait(f, spot.area, "▣ loading image…");
+            continue;
+        };
+        match slot {
+            CardImageSlot::Ready { image, protocol }
+            | CardImageSlot::Cached {
+                image, protocol, ..
+            } => {
+                if let Err(error) = draw_card_image(
+                    f,
+                    &app.image_picker,
+                    &mut app.card_renderer,
+                    image,
+                    protocol,
+                    spot,
+                    prepare,
+                ) {
+                    *slot = CardImageSlot::Failed(error);
+                }
+            }
+            CardImageSlot::Loading => draw_picture_wait(f, spot.area, "▣ loading image…"),
+            CardImageSlot::Failed(error) => f.render_widget(
+                Paragraph::new(format!(
+                    "▣ image unavailable: {}",
+                    truncate(error, spot.area.width as usize)
+                ))
+                .style(Style::new().fg(OVERLAY)),
+                spot.area,
+            ),
+        }
+    }
+    app.card_renderer.finish();
+}
+
+fn draw_card_image(
+    f: &mut Frame,
+    picker: &ratatui_image::picker::Picker,
+    renderer: &mut crate::card_image::Renderer,
+    image: &std::sync::Arc<image::DynamicImage>,
+    protocol: &mut Option<CardImageProtocol>,
+    spot: &CardPicture,
+    prepare: bool,
+) -> Result<(), String> {
+    if protocol
+        .as_ref()
+        .is_none_or(|protocol| protocol.size != spot.size || protocol.pixels != spot.pixels)
+    {
+        *protocol = Some(CardImageProtocol {
+            size: spot.size,
+            pixels: spot.pixels,
+            tiles: HashMap::new(),
+        });
+    }
+    let Some(protocol) = protocol else {
+        return Ok(());
+    };
+    let first = spot.skipped / TILE_ROWS;
+    let end = (spot.skipped + spot.area.height).div_ceil(TILE_ROWS);
+    let mut visible = Vec::new();
+    for row in first..end {
+        for column in 0..spot.size.width.div_ceil(TILE_COLS) {
+            let start = spot.skipped.max(row * TILE_ROWS);
+            let y = spot.area.y + start - spot.skipped;
+            let rows = ((row + 1) * TILE_ROWS - start).min(spot.area.bottom() - y);
+            let key = (start, column, rows);
+            visible.push(key);
+            let request = CardImageKey::new(
+                &spot.url,
+                picker,
+                spot.size,
+                spot.pixels,
+                start,
+                rows,
+                column,
+            );
+            if let Some(result) = renderer.tile(request, image, picker, prepare) {
+                protocol.tiles.insert(key, result?);
+            }
+            if let Some(encoded) = protocol.tiles.get(&key) {
+                let area = Rect::new(
+                    spot.area.x + column * TILE_COLS,
+                    y,
+                    encoded.size().width,
+                    rows,
+                );
+                f.render_widget(Image::new(encoded.as_ref()), area);
+            } else {
+                draw_picture_wait(
+                    f,
+                    Rect::new(
+                        spot.area.x + column * TILE_COLS,
+                        y,
+                        TILE_COLS.min(spot.size.width - column * TILE_COLS),
+                        rows,
+                    ),
+                    "◌ preparing image…",
+                );
+            }
+        }
+    }
+    protocol.tiles.retain(|key, _| visible.contains(key));
+    Ok(())
+}
+
+fn draw_picture_wait(f: &mut Frame, area: Rect, label: &str) {
+    if area.is_empty() {
+        return;
+    }
+    f.render_widget(
+        Paragraph::new(label)
+            .alignment(Alignment::Center)
+            .style(Style::new().fg(SUBTEXT)),
+        Rect::new(area.x, area.y + area.height / 2, area.width, 1),
+    );
+}
+
+fn draw_list_tail(f: &mut Frame, mut area: Rect, label: &'static str) {
+    if area.is_empty() {
+        return;
+    }
+    if area.height > 1 {
+        area.y += 1;
+        area.height -= 1;
+    }
+    let mut panel = Block::default().style(Style::new().bg(MANTLE));
+    if area.height >= 4 && area.width >= 8 {
+        panel = panel
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(SURFACE1));
+    }
+    let inner = panel.inner(area);
+    f.render_widget(panel, area);
+    let error = label.starts_with('✗');
+    let style = Style::new()
+        .fg(if error { RED } else { ACCENT })
+        .add_modifier(Modifier::BOLD);
+    let mut lines = Vec::new();
+    if !error && inner.height >= 3 && usize::from(inner.width) >= label.width() {
+        lines.push(Line::styled("⋯", style));
+        lines.push(Line::styled(label, style.fg(TEXT)));
+    } else {
+        lines.push(Line::styled(label, style));
+    }
+    centered(f, inner, lines);
 }
 
 /// Scrolling list of post cards separated by a blank line.
@@ -635,11 +1144,16 @@ fn draw_post_list(
     f: &mut Frame,
     app: &App,
     area: Rect,
-    spec: &ListSpec<'_>,
-    offset: &mut usize,
-    spots: &mut Vec<ImageSpot>,
+    spec: &mut ListSpec<'_>,
+    pictures: &mut ListPictures,
 ) {
+    if app.state.list_view() == ListView::Card && area.height >= 3 {
+        draw_card_list(f, app, area, spec, pictures);
+        return;
+    }
+    spec.scroll.viewport = area.height as usize;
     const ITEM: usize = 3;
+    let offset = &mut spec.offset;
     let fits = (area.height as usize / ITEM).max(1);
     if spec.selected < *offset {
         *offset = spec.selected;
@@ -649,12 +1163,13 @@ fn draw_post_list(
     let width = area.width.saturating_sub(2) as usize;
     let reserve = thumb_reserve(app, spec.posts.iter().copied());
     let mut lines = Vec::new();
+    let mut tail_y = None;
     for (i, post) in spec.posts.iter().enumerate().skip(*offset).take(fits) {
         let y = area.y + lines.len() as u16;
         if let Some(url) = row_thumb(app, post)
             && y + THUMB_ROWS <= area.bottom()
         {
-            spots.push(ImageSpot {
+            pictures.thumbs.push(ImageSpot {
                 url: url.to_string(),
                 area: Rect {
                     x: area.x + 1,
@@ -674,8 +1189,20 @@ fn draw_post_list(
         lines.push(title);
         lines.push(meta);
         lines.push(Line::raw(""));
+        if i + 1 == spec.posts.len() {
+            tail_y = Some(y.saturating_add(2));
+        }
     }
     f.render_widget(Paragraph::new(lines), area);
+    if let (Some(y), Some(tail)) = (tail_y, spec.tail)
+        && y < area.bottom()
+    {
+        draw_list_tail(
+            f,
+            Rect::new(area.x, y, area.width.saturating_sub(2), area.bottom() - y),
+            tail,
+        );
+    }
     draw_scrollbar(f, area, *offset, fits, spec.posts.len());
 }
 
@@ -708,23 +1235,23 @@ fn draw_scrollbar(f: &mut Frame, area: Rect, offset: usize, visible: usize, tota
 // ----- home wall -----------------------------------------------------------
 
 fn card_height(app: &App, group: &Group) -> u16 {
-    let shown = app.home_group_posts(group).count().max(1) as u16;
+    let shown = app.group_posts(group).count().max(1) as u16;
     // borders + top/bottom padding + 2 lines per post + a gap between posts
     2 + 2 + shown * 2 + shown.saturating_sub(1)
 }
 
 const CARD_ROW_GAP: u16 = 1;
 
-fn draw_home(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot>) {
+fn draw_all_subs(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot>) {
     let total_new: usize = app
-        .home
+        .all_subs
         .groups
         .iter()
         .map(|g| app.state.unseen(&g.subreddit, app.config.visible(&g.posts)))
         .sum();
-    let loading = app.home.groups.iter().filter(|g| g.loading).count();
+    let loading = app.all_subs.groups.iter().filter(|g| g.loading).count();
     let mut chips = vec![chip(
-        match app.home.groups.len() {
+        match app.all_subs.groups.len() {
             1 => "1 subreddit".to_string(),
             n => format!("{n} subreddits"),
         },
@@ -737,20 +1264,55 @@ fn draw_home(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
     if loading > 0 {
         chips.push(chip(format!("⋯ loading {loading}"), OVERLAY, SURFACE0));
     }
-    let body = view_header(f, area, "⌂ Home", chips);
-    if app.home.groups.is_empty() {
+    if app.all_subs.loading {
+        chips.push(chip("⋯ syncing subscriptions", OVERLAY, SURFACE0));
+    }
+    if app.all_subs.error.is_some() {
+        chips.push(chip("✗ subscriptions failed · r retries", RED, SURFACE0));
+    }
+    if let Some(freshness) = app.all_subs.freshness {
+        chips.push(chip(
+            freshness.label(
+                crate::app::now(),
+                app.all_subs.loading,
+                app.all_subs.error.is_some(),
+                app.health == Health::Down,
+            ),
+            OVERLAY,
+            SURFACE0,
+        ));
+    }
+    let body = view_header(f, area, "▦ All subs", chips);
+    if app.reddit.needs_sign_in() && app.all_subs.groups.is_empty() {
         empty_state(
             f,
             body,
-            "⌂",
-            "No subscriptions yet",
-            "press p to open a subreddit, or list names in the subscriptions file",
+            "○",
+            "Connect Reddit",
+            "Press A to connect your account",
         );
+        return;
+    }
+    if app.all_subs.groups.is_empty() {
+        let (title, hint) = if let Some(error) = &app.all_subs.error {
+            (
+                "Could not load subscriptions",
+                format!("{error} — press r to retry"),
+            )
+        } else if app.all_subs.loading {
+            ("Loading subscriptions", String::new())
+        } else {
+            (
+                "No joined communities",
+                "join communities on Reddit, then press r; p opens any subreddit".to_string(),
+            )
+        };
+        empty_state(f, body, "▦", title, &hint);
         return;
     }
     let cols = (body.width / CARD_MIN_WIDTH).clamp(1, 3) as usize;
     let heights: Vec<u16> = app
-        .home
+        .all_subs
         .groups
         .chunks(cols)
         .map(|row| {
@@ -762,19 +1324,19 @@ fn draw_home(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
             card + CARD_ROW_GAP
         })
         .collect();
-    let selected_row = app.home.group / cols;
-    let mut offset = app.home.offset.min(selected_row);
+    let selected_row = app.all_subs.group / cols;
+    let mut offset = app.all_subs.offset.min(selected_row);
     // The gap after the last visible row may fall outside the body.
     let fits = |rows: &[u16]| rows.iter().sum::<u16>() - CARD_ROW_GAP <= body.height;
     while !fits(&heights[offset..=selected_row]) && offset < selected_row {
         offset += 1;
     }
-    app.home.offset = offset;
+    app.all_subs.offset = offset;
 
     let bottom = body.y + body.height;
     let mut y = body.y;
     let mut shown = 0;
-    for (row_index, row) in app.home.groups.chunks(cols).enumerate().skip(offset) {
+    for (row_index, row) in app.all_subs.groups.chunks(cols).enumerate().skip(offset) {
         let h = heights[row_index];
         let card = h - CARD_ROW_GAP;
         // Later rows only when whole; the first row always shows, clipped in a short pane.
@@ -801,8 +1363,8 @@ fn draw_home(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
 }
 
 fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &mut Vec<ImageSpot>) {
-    let group = &app.home.groups[index];
-    let selected_card = index == app.home.group;
+    let group = &app.all_subs.groups[index];
+    let selected_card = index == app.all_subs.group;
     let badge = app
         .state
         .unseen(&group.subreddit, app.config.visible(&group.posts));
@@ -870,7 +1432,7 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
     let inner = block.inner(area);
     f.render_widget(block, area);
     let width = inner.width as usize;
-    let posts: Vec<_> = app.home_group_posts(group).collect();
+    let posts: Vec<_> = app.group_posts(group).collect();
     // (line in the card, URL) for each post row with a thumbnail.
     let mut thumbs: Vec<(u16, &str)> = Vec::new();
     let lines: Vec<Line> = if group.loading && group.posts.is_empty() {
@@ -896,7 +1458,7 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
                 lines.push(Line::raw(""));
             }
             let opts = CardOpts {
-                selected: selected_card && i == app.home.post,
+                selected: selected_card && i == app.all_subs.post,
                 seen_key: Some(&group.subreddit),
                 show_subreddit: false,
                 reserve,
@@ -910,7 +1472,7 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
     };
     // In a short pane the card is clipped: scroll it so the selected post shows.
     let selected_end = if selected_card {
-        app.home.post as u16 * 3 + 2
+        app.all_subs.post as u16 * 3 + 2
     } else {
         0
     };
@@ -934,10 +1496,10 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
 
 // ----- subreddit feed & bookmarks --------------------------------------------
 
-fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot>) {
+fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListPictures) {
     let tab = app.active_tab();
     let feed = &tab.feed;
-    let mut chips = Vec::new();
+    let mut chips = vec![list_view_chip(app)];
     match &feed.search {
         Some(q) => chips.push(chip(format!("🔍 {q}"), SKY, SURFACE0)),
         None => {
@@ -946,6 +1508,17 @@ fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
                 chips.push(chip(format!("◷ {}", feed.time.as_str()), SUBTEXT, SURFACE0));
             }
         }
+    }
+    if let Some(name) = tab
+        .subreddit()
+        .filter(|name| crate::reddit::is_community(name))
+    {
+        let (label, color) = match app.joined(name) {
+            Some(true) => ("✓ Joined", GREEN),
+            Some(false) => ("Not joined", SUBTEXT),
+            None => ("Membership unknown", OVERLAY),
+        };
+        chips.push(chip(label, color, SURFACE0));
     }
     let badge = app.badge(tab);
     if badge > 0 {
@@ -983,8 +1556,19 @@ fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
     let posts: Vec<&Post> = app.config.visible(&feed.posts).collect();
     let selected = feed.selected;
     let current = feed.shows_current_query();
-    let mut offset = feed.offset;
+    let offset = feed.offset;
+    let scroll = feed.cards.clone();
     let body = view_header(f, area, &title, chips);
+    if app.reddit.needs_sign_in() && posts.is_empty() {
+        empty_state(
+            f,
+            body,
+            "○",
+            "Connect Reddit",
+            "Press A to connect your account",
+        );
+        return;
+    }
     if let Some(e) = error.filter(|_| posts.is_empty()) {
         empty_state(
             f,
@@ -1026,25 +1610,38 @@ fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot
         }
         return;
     }
-    let show_subreddit = matches!(seen_key, Some("all" | "popular"));
-    let spec = ListSpec {
+    let show_subreddit =
+        matches!(tab.kind, TabKind::Home) || matches!(seen_key, Some("all" | "popular"));
+    let mut spec = ListSpec {
         posts: &posts,
         selected,
         seen_key,
         show_subreddit,
+        offset,
+        scroll,
+        tail: if feed.page_failed() {
+            Some("✗ Next page failed · L retries")
+        } else {
+            feed_activity(feed, !app.reddit.needs_sign_in()).map(|(label, _)| label)
+        },
     };
-    draw_post_list(f, app, body, &spec, &mut offset, spots);
+    draw_post_list(f, app, body, &mut spec, pictures);
+    let (offset, scroll) = (spec.offset, spec.scroll);
     let active = app.active;
     app.tabs[active].feed.offset = offset;
+    app.tabs[active].feed.cards = scroll;
 }
 
-fn draw_bookmarks(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot>) {
+fn draw_bookmarks(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListPictures) {
     let count = app.state.bookmarks().len();
     let body = view_header(
         f,
         area,
         "★ Bookmarks",
-        vec![chip(format!("{count} saved"), SUBTEXT, SURFACE0)],
+        vec![
+            list_view_chip(app),
+            chip(format!("{count} saved"), SUBTEXT, SURFACE0),
+        ],
     );
     let posts: Vec<&Post> = app.state.bookmarks().iter().map(|b| &b.post).collect();
     if posts.is_empty() {
@@ -1058,16 +1655,20 @@ fn draw_bookmarks(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<Imag
         return;
     }
     let selected = app.active_tab().feed.selected.min(posts.len() - 1);
-    let mut offset = app.active_tab().feed.offset;
-    let spec = ListSpec {
+    let mut spec = ListSpec {
         posts: &posts,
         selected,
         seen_key: None,
         show_subreddit: true,
+        offset: app.active_tab().feed.offset,
+        scroll: app.active_tab().feed.cards.clone(),
+        tail: None,
     };
-    draw_post_list(f, app, body, &spec, &mut offset, spots);
+    draw_post_list(f, app, body, &mut spec, pictures);
+    let (offset, scroll) = (spec.offset, spec.scroll);
     let active = app.active;
     app.tabs[active].feed.offset = offset;
+    app.tabs[active].feed.cards = scroll;
 }
 
 // ----- post view -----------------------------------------------------------
@@ -1579,6 +2180,9 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
     let mut wanted = Vec::new();
     let mut shown = Vec::new();
     for picture in &pictures {
+        if images_on && near.contains(&picture.line) {
+            wanted.push(picture.url.clone());
+        }
         match picture.size {
             Some(size)
                 if picture.line >= scroll
@@ -1592,7 +2196,6 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
                 );
                 shown.push((picture.url.clone(), at));
             }
-            None if images_on && near.contains(&picture.line) => wanted.push(picture.url.clone()),
             _ => {}
         }
     }
@@ -2174,9 +2777,24 @@ fn draw_video(f: &mut Frame, app: &mut App, poster: Option<&str>, area: Rect, de
 }
 
 fn draw_inline_image(f: &mut Frame, app: &mut App, url: &str, area: Rect) {
+    draw_image_slot(
+        f,
+        app.images.get_mut(url),
+        app.image_picker.font_size(),
+        app.overlay.is_some(),
+        area,
+    );
+}
+
+fn draw_image_slot(
+    f: &mut Frame,
+    slot: Option<&mut ImageSlot>,
+    font: ratatui_image::FontSize,
+    covered: bool,
+    area: Rect,
+) {
     // As in `draw_spots`: nothing drawn under an overlay.
-    let covered = app.overlay.is_some();
-    match app.images.get_mut(url) {
+    match slot {
         Some(ImageSlot::Ready { .. }) if covered => {}
         Some(ImageSlot::Ready {
             protocol, pixels, ..
@@ -2185,7 +2803,7 @@ fn draw_inline_image(f: &mut Frame, app: &mut App, url: &str, area: Rect) {
             let size = picture_cells(
                 pixels.0,
                 pixels.1,
-                app.image_picker.font_size(),
+                font,
                 area.width,
                 area.height,
                 area.height,
@@ -2226,8 +2844,90 @@ fn centred(inner: Rect, outer: Rect) -> Rect {
 
 // ----- footer --------------------------------------------------------------
 
+fn feed_activity(feed: &crate::app::Feed, can_load: bool) -> Option<(&'static str, &'static str)> {
+    if feed.loading_more() {
+        Some(("Loading more posts…", "more posts"))
+    } else if feed.loading() || (can_load && !feed.loaded && feed.error().is_none()) {
+        Some(if feed.posts.is_empty() || !feed.shows_current_query() {
+            ("Loading posts…", "posts")
+        } else {
+            ("Refreshing posts…", "refresh")
+        })
+    } else if feed.refreshing() {
+        Some(("Refreshing posts…", "refresh"))
+    } else {
+        None
+    }
+}
+
+fn loading_activity(app: &App) -> Option<&'static str> {
+    if app.media_loading() {
+        return Some("media");
+    }
+    if app.post_focused() {
+        if let Some(view) = &app.post_view {
+            if view.loading || (view.page.is_none() && view.error.is_none()) {
+                return Some(if view.page.is_some() {
+                    "refresh"
+                } else {
+                    "post"
+                });
+            }
+            if !view.loading_more.is_empty() {
+                return Some("replies");
+            }
+        }
+    } else {
+        match app.active_tab().kind {
+            TabKind::Home | TabKind::Subreddit { .. } => {
+                if let Some((_, activity)) =
+                    feed_activity(&app.active_tab().feed, !app.reddit.needs_sign_in())
+                {
+                    return Some(activity);
+                }
+            }
+            TabKind::AllSubs if app.all_subs.loading => return Some("subs"),
+            TabKind::AllSubs if app.all_subs.groups.iter().any(|group| group.loading) => {
+                return Some("communities");
+            }
+            _ => {}
+        }
+    }
+    (app.inline_images_on()
+        && (app.card_renderer.pending()
+            || app.card_images.values().any(|slot| {
+                matches!(
+                    slot,
+                    CardImageSlot::Loading
+                        | CardImageSlot::Cached {
+                            refreshing: true,
+                            ..
+                        }
+                )
+            })
+            || app
+                .images
+                .values()
+                .chain(app.thumbs.values().filter(|_| app.thumbnails_on()))
+                .any(|slot| {
+                    matches!(
+                        slot,
+                        ImageSlot::Loading
+                            | ImageSlot::Ready {
+                                refresh: ImageRefresh::Loading,
+                                ..
+                            }
+                    )
+                })))
+    .then_some("images")
+}
+
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let line = if let Some(status) = &app.status {
+    let activity = loading_activity(app)
+        .map(|activity| Span::styled(format!(" ⋯ {activity}  "), Style::new().fg(YELLOW)));
+    let content_width =
+        usize::from(area.width).saturating_sub(activity.as_ref().map_or(0, Span::width));
+    let mut line = if let Some(status) = &app.status {
         let (icon, color) = if status.error {
             ("✗", RED)
         } else {
@@ -2240,6 +2940,16 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(status.text.as_str(), Style::new().fg(color)),
         ])
+    } else if let Some(progress) = app.membership_progress() {
+        Line::from(vec![Span::styled(
+            format!(" ⋯ {progress}"),
+            Style::new().fg(YELLOW),
+        )])
+    } else if app.health == Health::SignedOut {
+        Line::from(Span::styled(
+            " Reddit sign-in required · A connect",
+            Style::new().fg(YELLOW),
+        ))
     } else if app.health == Health::Down {
         Line::from(vec![
             Span::styled(" ✗ ", Style::new().fg(RED)),
@@ -2296,6 +3006,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 .chain(spoilers.then_some(("v", "spoilers")))
                 .chain(c)
                 .chain([("space", "page")])
+                .chain([("S", "join/leave")])
                 .chain(media)
                 .chain([
                     ("o", "browser"),
@@ -2310,6 +3021,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 ("g/G", "first/last"),
                 ("l/⏎", "list"),
                 ("p", "jump"),
+                ("S", "join/leave"),
             ]
             .into_iter()
             .chain(closable.then_some(("x", "close")))
@@ -2317,31 +3029,45 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             &dynamic
         } else {
             match app.active_tab().kind {
-                TabKind::Home => &[
+                TabKind::AllSubs => &[
                     ("j/k", "posts"),
                     ("J/K", "cards"),
                     ("⏎", "open"),
                     ("space", "subreddit"),
+                    ("S", "join/leave"),
                     ("tab", "next"),
                     ("p", "jump"),
                 ],
                 TabKind::Bookmarks => &[
                     ("j/k", "move"),
                     ("⏎", "open"),
+                    ("V", "view"),
+                    ("PgUp/Dn", "page"),
+                    ("space", "sub"),
+                    ("S", "join/leave"),
                     ("b", "remove"),
                     ("o", "browser"),
                     ("p", "jump"),
                 ],
-                TabKind::Subreddit { .. } => {
+                TabKind::Home | TabKind::Subreddit { .. } => {
                     let feed = &app.active_tab().feed;
                     let time =
                         (feed.sort.takes_time() && feed.search.is_none()).then_some(("t", "time"));
-                    dynamic = [("j/k", "move"), ("⏎", "open"), ("s", "sort")]
-                        .into_iter()
-                        .chain(time)
-                        .chain([("/", "search"), ("p", "jump")])
-                        .chain(closable.then_some(("x", "close")))
-                        .collect();
+                    dynamic = [
+                        ("j/k", "move"),
+                        ("⏎", "open"),
+                        ("V", "view"),
+                        ("PgUp/Dn", "page"),
+                        ("space", "sub"),
+                        ("S", "join/leave"),
+                        ("s", "sort"),
+                    ]
+                    .into_iter()
+                    .chain(time)
+                    .chain(app.active_tab().subreddit().map(|_| ("/", "search")))
+                    .chain([("p", "jump")])
+                    .chain(closable.then_some(("x", "close")))
+                    .collect();
                     &dynamic
                 }
             }
@@ -2350,12 +3076,15 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         let mut fitted = vec![Span::raw(" ")];
         let mut used = 1;
         for (key, label) in hints.iter().chain(&[("?", "help")]) {
+            if *key == "PgUp/Dn" && app.state.list_view() != ListView::Card {
+                continue;
+            }
             let pair = [
                 key_chip(key),
                 Span::styled(format!(" {label}  "), Style::new().fg(OVERLAY)),
             ];
             let width = line_width(&pair);
-            if used + width > area.width as usize {
+            if used + width > content_width {
                 break;
             }
             used += width;
@@ -2363,6 +3092,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         }
         Line::from(fitted)
     };
+    if let Some(activity) = activity {
+        line.spans.insert(0, activity);
+    }
     f.render_widget(line, area);
 }
 
@@ -2396,6 +3128,9 @@ fn popup_block(title: &str) -> Block<'static> {
 }
 
 const HELP: &[(&str, &str)] = &[
+    ("A", "saved accounts: switch, add or reconnect"),
+    ("Space (list)", "open the selected community"),
+    ("S", "join or leave a community on Reddit"),
     ("Tabs", ""),
     ("Tab ] / S-Tab [", "next / previous tab"),
     ("1-9 / 0", "jump to a tab / the last tab"),
@@ -2405,14 +3140,20 @@ const HELP: &[(&str, &str)] = &[
     ("h · l Enter Esc", "focus the sidebar · back to the list"),
     ("j k · g G", "sidebar: next / previous tab · first / last"),
     ("Lists", ""),
+    ("V", "Card / Compact view (saved)"),
+    (
+        "PgDn/PgUp · C-d/u",
+        "cards: page / half page; then next post",
+    ),
+    ("C-e C-y", "cards: scroll down / up one line"),
     ("j k · C-d C-u", "move · page; a post open beside follows"),
     ("g G", "first / last"),
     ("Enter l", "open the post, or resume the one shown"),
-    ("J K", "Home: next / previous card"),
-    ("Space", "Home: open the card's subreddit"),
-    ("s · t", "subreddit: sort · time range"),
+    ("J K", "All subs: next / previous card"),
+    ("Space", "All subs: open the card's subreddit"),
+    ("s · t", "Home/subreddit: sort · time range"),
     ("/ · Esc", "subreddit: search · clear search"),
-    ("L", "subreddit: next page (automatic near end)"),
+    ("L", "feed: next page (automatic near end)"),
     ("Post", ""),
     ("j k", "next / previous comment"),
     ("Space PgDn · PgUp", "page down · up"),
@@ -2514,6 +3255,7 @@ fn draw_picker(f: &mut Frame, app: &App, input: &str, selected: usize) {
                 PickerEntry::Tab { index, title } => {
                     let icon = match app.tabs[*index].kind {
                         TabKind::Home => "⌂",
+                        TabKind::AllSubs => "▦",
                         TabKind::Bookmarks => "★",
                         TabKind::Subreddit { .. } => "#",
                     };
@@ -2552,10 +3294,12 @@ fn draw_picker(f: &mut Frame, app: &App, input: &str, selected: usize) {
     );
 }
 
-fn draw_sort(f: &mut Frame, selected: usize) {
-    let area = popup(f.area(), 34, 9);
+fn draw_sort(f: &mut Frame, app: &App, selected: usize) {
+    let sorts = app.active_tab().sorts();
+    let home = matches!(app.active_tab().kind, TabKind::Home);
+    let area = popup(f.area(), 34, sorts.len() as u16 + 4);
     f.render_widget(Clear, area);
-    let lines: Vec<Line> = Sort::ALL
+    let lines: Vec<Line> = sorts
         .iter()
         .enumerate()
         .map(|(i, s)| {
@@ -2574,11 +3318,226 @@ fn draw_sort(f: &mut Frame, selected: usize) {
                 Span::raw(" "),
                 sort_chip(*s),
             ];
+            if home && *s == Sort::Best {
+                spans.push(Span::styled(" recommendations", bg.fg(TEXT)));
+            }
             pad_to(&mut spans, 28, bg);
             Line::from(spans)
         })
         .collect();
     f.render_widget(Paragraph::new(lines).block(popup_block("Sort")), area);
+}
+
+fn draw_membership(f: &mut Frame, subreddit: &str, join: bool) {
+    let action = if join { "Join" } else { "Leave" };
+    let lines = vec![
+        Line::styled(
+            format!("r/{subreddit}"),
+            Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(format!(
+            "Enter {} · Esc cancel",
+            action.to_ascii_lowercase()
+        )),
+        Line::raw("Space open subreddit"),
+    ];
+    let cols = f.area().width.saturating_sub(8).clamp(1, 50) as usize;
+    let rows: usize = lines
+        .iter()
+        .map(|line| {
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            textwrap::wrap(&text, cols).len().max(1)
+        })
+        .sum();
+    let area = popup(f.area(), 54, rows as u16 + 2);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(popup_block(&format!("{action} on Reddit"))),
+        area,
+    );
+}
+
+fn draw_auth(f: &mut Frame, app: &App) {
+    use crate::auth::Phase;
+    let auth = &app.auth;
+    let area = popup(f.area(), 76, 22);
+    f.render_widget(Clear, area);
+    let block = popup_block(
+        if matches!(auth.phase, Phase::DisconnectConfirm | Phase::Disconnecting) {
+            " Remove from redtab "
+        } else if matches!(
+            auth.phase,
+            Phase::Accounts | Phase::LoadingAccounts | Phase::Switching
+        ) {
+            " Accounts "
+        } else {
+            " Connect Reddit "
+        },
+    );
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let width = usize::from(inner.width).max(1);
+    let wrapped = |text: &str, color| -> Vec<Line<'static>> {
+        textwrap::wrap(text, width)
+            .into_iter()
+            .map(|row| Line::styled(row.into_owned(), Style::new().fg(color)))
+            .collect()
+    };
+    let mut lines = auth
+        .message
+        .as_deref()
+        .map(|message| wrapped(message, YELLOW))
+        .unwrap_or_default();
+    let mut controls = Vec::new();
+    match auth.phase {
+        Phase::Accounts => {
+            let mut footer = wrapped("Enter switches · j/k choose · a Add account", TEXT);
+            footer.extend(wrapped("r Reconnect selected · Esc close", TEXT));
+            footer.extend(wrapped("d Remove from redtab", TEXT));
+            let height = usize::from(inner.height);
+            lines.truncate(height.saturating_sub(footer.len() + 1));
+            if lines.is_empty() && height > footer.len() + 1 {
+                lines.extend(wrapped("Choose a saved account or add another.", TEXT));
+            }
+            let visible = height.saturating_sub(lines.len() + footer.len()).max(1);
+            let start = auth.selected.saturating_sub(visible.saturating_sub(1));
+            for index in (start..auth.choices()).take(visible) {
+                let selected = index == auth.selected;
+                let label = if let Some(account) = auth.accounts.get(index) {
+                    let active = auth.active_id.as_ref() == Some(&account.id);
+                    let status = match (active, account.expired) {
+                        (true, true) => "active, expired · ",
+                        (true, false) => "active · ",
+                        (false, true) => "expired · ",
+                        (false, false) => "",
+                    };
+                    format!("{status}{}", account.name)
+                } else {
+                    "+ Add account".into()
+                };
+                lines.push(Line::styled(
+                    truncate(
+                        &format!("{} {label}", if selected { "›" } else { " " }),
+                        width,
+                    ),
+                    Style::new().fg(if selected { ACCENT } else { TEXT }),
+                ));
+            }
+            lines.extend(footer);
+        }
+        Phase::LoadingAccounts => {
+            lines.extend(wrapped("⋯ Loading saved accounts…", TEXT));
+            controls = wrapped("Esc cancels", TEXT);
+        }
+        Phase::Switching => {
+            lines.extend(wrapped("⋯ Verifying account…", TEXT));
+            lines.extend(wrapped(
+                "A failed switch leaves your connection unchanged.",
+                SUBTEXT,
+            ));
+            controls = wrapped("Esc cancels", TEXT);
+        }
+        Phase::Idle | Phase::Choose => {
+            let mut footer = wrapped("Enter connects · j/k choose · r rescan · Esc cancel", TEXT);
+            if auth.active_id.is_some() {
+                footer.extend(wrapped("d Remove from redtab", TEXT));
+            }
+            let disclosure = wrapped("Only Reddit cookies; OS access may prompt.", SUBTEXT);
+            let height = usize::from(inner.height);
+            if lines.len() + footer.len() + disclosure.len() + 2 <= height {
+                footer.extend(disclosure);
+            }
+            // Errors and controls stay visible; labels occupy one row each.
+            lines.truncate(height.saturating_sub(footer.len() + 1));
+            if lines.is_empty() && height > footer.len() + 1 {
+                lines.extend(wrapped("Choose a profile or a new login window.", TEXT));
+            }
+            let visible = height.saturating_sub(lines.len() + footer.len()).max(1);
+            let start = auth.selected.saturating_sub(visible.saturating_sub(1));
+            for (index, source) in auth.sources.iter().enumerate().skip(start).take(visible) {
+                let selected = index == auth.selected;
+                lines.push(Line::from(Span::styled(
+                    truncate(
+                        &format!("{} {}", if selected { "›" } else { " " }, source.label()),
+                        width,
+                    ),
+                    Style::new().fg(if selected { ACCENT } else { TEXT }),
+                )));
+            }
+            lines.extend(footer);
+        }
+        Phase::Discovering => {
+            lines.extend(wrapped("⋯ Finding browser profiles…", TEXT));
+            controls = wrapped(
+                if auth.can_remove() {
+                    "d Remove from redtab · Esc cancels"
+                } else {
+                    "Esc cancels"
+                },
+                TEXT,
+            );
+        }
+        Phase::Importing => {
+            let window = matches!(
+                auth.sources.get(auth.selected),
+                Some(crate::auth::Source::Window { .. })
+            );
+            lines.extend(wrapped(
+                if window {
+                    "⋯ Sign in to Reddit in the separate browser window…"
+                } else {
+                    "⋯ Reading Reddit session and verifying account…"
+                },
+                TEXT,
+            ));
+            lines.extend(wrapped("Allow OS access if prompted. Esc cancels.", TEXT));
+            if auth.can_remove() {
+                controls = wrapped("d Remove from redtab", TEXT);
+            }
+        }
+        Phase::Confirm => {
+            lines.extend(wrapped(
+                &format!("Verified u/{}", auth.account_name().unwrap_or_default()),
+                GREEN,
+            ));
+            controls = wrapped(
+                "Enter saves this connection · Esc keeps the current account",
+                TEXT,
+            );
+        }
+        Phase::Saving => lines.extend(wrapped("⋯ Saving account…", TEXT)),
+        Phase::DisconnectConfirm => {
+            let who = auth
+                .removal_name
+                .as_deref()
+                .unwrap_or("the current account");
+            lines.extend(wrapped(&format!("Remove {who} from redtab?"), YELLOW));
+            lines.extend(wrapped(
+                if auth.removing_current {
+                    "Remove its saved session and disconnect redtab."
+                } else {
+                    "Remove only this saved session."
+                },
+                TEXT,
+            ));
+            lines.extend(wrapped(
+                "Other accounts, bookmarks and history are kept.",
+                SUBTEXT,
+            ));
+            lines.extend(wrapped("Your browser session is unchanged.", SUBTEXT));
+            controls = wrapped("Enter removes · Esc cancels", TEXT);
+        }
+        Phase::Disconnecting => lines.extend(wrapped("⋯ Removing saved session…", TEXT)),
+    }
+    lines.truncate(usize::from(inner.height).saturating_sub(controls.len()));
+    lines.extend(controls);
+    f.render_widget(Paragraph::new(lines).style(Style::new().fg(TEXT)), inner);
 }
 
 fn draw_search(f: &mut Frame, app: &App, input: &str) {
@@ -2618,7 +3577,7 @@ fn input_tail(input: &str, room: usize) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::Config;
     use crate::model::{Comment, PostPage, ReplyPage};
@@ -2636,31 +3595,489 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        App::new(
+        let mut app = App::new(
             Config {
                 image_preview: false,
                 ..Config::default()
             },
-            subscriptions.iter().map(|s| s.to_string()).collect(),
             pool,
             reddit,
             state,
             Picker::halfblocks(),
-        )
+        );
+        app.on_msg(Msg::Subscriptions {
+            generation: 0,
+            result: Ok(subscriptions.iter().map(|s| s.to_string()).collect()),
+        });
+        app.active = crate::app::ALL_SUBS_TAB;
+        app
+    }
+
+    #[test]
+    fn when_disconnect_is_chosen_it_should_require_confirmation_and_allow_escape() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app(&[]);
+        app.auth.phase = crate::auth::Phase::Choose;
+        app.auth.active_id = Some("reader".into());
+        app.auth.active_name = Some("reader".into());
+        app.overlay = Some(Overlay::Auth);
+        crate::keys::handle(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.auth.phase, crate::auth::Phase::DisconnectConfirm);
+        let actual = screen(&mut app, 60, 12);
+        assert!(actual.contains("Remove u/reader from redtab?"), "{actual}");
+        assert!(
+            actual.contains("Other accounts, bookmarks and history are kept."),
+            "{actual}"
+        );
+        assert!(
+            actual.contains("Your browser session is unchanged."),
+            "{actual}"
+        );
+        assert!(actual.contains("Enter removes"), "{actual}");
+        crate::keys::handle(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.overlay.is_none());
+        assert!(!app.reddit.needs_sign_in());
+    }
+
+    #[test]
+    fn when_profile_discovery_is_pending_disconnect_should_still_be_available() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app(&[]);
+        app.auth.phase = crate::auth::Phase::Discovering;
+        app.auth.active_id = Some("reader".into());
+        app.overlay = Some(Overlay::Auth);
+        let actual = screen(&mut app, 60, 12);
+        assert!(actual.contains("d Remove from redtab"), "{actual}");
+        crate::keys::handle(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.auth.phase, crate::auth::Phase::DisconnectConfirm);
+    }
+
+    #[test]
+    fn when_disconnect_is_pending_it_should_show_progress_and_prevent_accidental_escape() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app(&[]);
+        app.auth.phase = crate::auth::Phase::Disconnecting;
+        app.overlay = Some(Overlay::Auth);
+        crate::keys::handle(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let actual = screen(&mut app, 60, 12);
+        assert!(actual.contains("Removing saved session"), "{actual}");
+        assert_eq!(app.auth.phase, crate::auth::Phase::Disconnecting);
+        assert!(matches!(app.overlay, Some(Overlay::Auth)));
+    }
+
+    #[test]
+    fn when_disconnected_the_empty_feed_should_invite_connecting_without_loading_activity() {
+        let mut app = app(&[]);
+        app.reddit = Reddit::disconnected(false).unwrap();
+        app.health = Health::SignedOut;
+        app.active = 0;
+        let actual = screen(&mut app, 90, 24);
+        assert!(actual.contains("Connect Reddit"), "{actual}");
+        assert!(
+            actual.contains("Press A to connect your account"),
+            "{actual}"
+        );
+        assert!(!actual.contains("Loading"), "{actual}");
+        assert!(loading_activity(&app).is_none());
+    }
+
+    #[test]
+    fn when_disconnected_all_subs_should_invite_connecting_instead_of_claiming_no_memberships() {
+        let mut app = app(&[]);
+        app.reddit = Reddit::disconnected(false).unwrap();
+        app.health = Health::SignedOut;
+        let actual = screen(&mut app, 90, 24);
+        assert!(actual.contains("Connect Reddit"), "{actual}");
+        assert!(!actual.contains("No joined communities"), "{actual}");
+    }
+
+    #[test]
+    fn when_disconnect_cannot_save_state_its_controls_should_stay_visible_with_a_long_error() {
+        let mut app = app(&[]);
+        app.auth.phase = crate::auth::Phase::DisconnectConfirm;
+        app.auth.message =
+            Some("Could not save the current reading state; connection unchanged. ".repeat(8));
+        app.overlay = Some(Overlay::Auth);
+        let actual = screen(&mut app, 60, 12);
+        assert!(
+            actual.contains("Could not save the current reading state"),
+            "{actual}"
+        );
+        assert!(actual.contains("Enter removes · Esc cancels"), "{actual}");
+    }
+
+    #[test]
+    fn when_the_connect_dialog_is_open_it_should_show_profile_selection_without_export_instructions()
+     {
+        let mut app = app(&[]);
+        app.auth.phase = crate::auth::Phase::Choose;
+        app.auth.sources = vec![crate::auth::Source::Browser {
+            browser: "firefox".into(),
+            profile: "fixture-profile".into(),
+            label: "Firefox · Work".into(),
+        }];
+        app.overlay = Some(Overlay::Auth);
+        let actual = screen(&mut app, 110, 30);
+        assert!(actual.contains("Connect Reddit"));
+        assert!(actual.contains("Firefox · Work"));
+        assert!(actual.contains("Enter connects"));
+    }
+
+    fn saved_account(id: &str, expired: bool) -> crate::reddit::SavedAccount {
+        crate::reddit::SavedAccount {
+            id: id.into(),
+            name: format!("u/{id}"),
+            expired,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn when_saved_accounts_are_shown_it_should_mark_active_expired_and_add_choices() {
+        let mut app = app(&[]);
+        app.auth.phase = crate::auth::Phase::Accounts;
+        app.auth.active_id = Some("first".into());
+        app.auth.accounts = vec![saved_account("first", false), saved_account("second", true)];
+        app.overlay = Some(Overlay::Auth);
+
+        let actual = screen(&mut app, 90, 24);
+
+        assert!(actual.contains("Accounts"), "{actual}");
+        assert!(actual.contains("active · u/first"), "{actual}");
+        assert!(actual.contains("expired · u/second"), "{actual}");
+        assert!(actual.contains("+ Add account"), "{actual}");
+        assert!(actual.contains("Enter switches"), "{actual}");
+        assert!(actual.contains("d Remove from redtab"), "{actual}");
+    }
+
+    #[test]
+    fn when_navigating_saved_accounts_the_arrow_keys_should_reach_accounts_and_add() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app(&[]);
+        app.auth.phase = crate::auth::Phase::Accounts;
+        app.auth.accounts = vec![saved_account("first", false)];
+        app.overlay = Some(Overlay::Auth);
+
+        crate::keys::handle(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+        assert_eq!(
+            app.auth.selected, 1,
+            "Add account must be reachable without browser sources"
+        );
+        let actual = screen(&mut app, 90, 24);
+        assert!(actual.contains("› + Add account"), "{actual}");
+    }
+
+    #[test]
+    fn when_saved_account_switching_is_pending_it_should_show_progress_and_allow_escape() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app(&[]);
+        app.auth.phase = crate::auth::Phase::Switching;
+        app.overlay = Some(Overlay::Auth);
+        let actual = screen(&mut app, 60, 12);
+        assert!(actual.contains("Verifying account"), "{actual}");
+        assert!(actual.contains("Esc cancels"), "{actual}");
+
+        crate::keys::handle(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.overlay.is_none());
+        assert!(!app.reddit.needs_sign_in());
+    }
+
+    #[test]
+    fn when_account_loading_is_pending_it_should_show_a_loading_indicator() {
+        let mut app = app(&[]);
+        app.auth.phase = crate::auth::Phase::LoadingAccounts;
+        app.overlay = Some(Overlay::Auth);
+        let actual = screen(&mut app, 60, 12);
+        assert!(actual.contains("Loading saved accounts"), "{actual}");
+        assert!(actual.contains("Esc cancels"), "{actual}");
+    }
+
+    #[test]
+    fn when_saved_account_errors_are_long_the_selected_row_and_controls_should_stay_visible() {
+        let mut app = app(&[]);
+        app.auth.phase = crate::auth::Phase::Accounts;
+        app.auth.accounts = (0..10)
+            .map(|n| saved_account(&format!("reader{n}"), false))
+            .collect();
+        app.auth.selected = 9;
+        app.auth.message =
+            Some("Could not switch accounts. Reconnect from your browser. ".repeat(8));
+        app.overlay = Some(Overlay::Auth);
+        let actual = screen(&mut app, 60, 12);
+        assert!(actual.contains("Could not switch accounts"), "{actual}");
+        assert!(actual.contains("› u/reader9"), "{actual}");
+        assert!(actual.contains("Enter switches"), "{actual}");
+        assert!(actual.contains("r Reconnect selected"), "{actual}");
+        assert!(actual.contains("d Remove from redtab"), "{actual}");
+    }
+
+    #[test]
+    fn when_removing_an_inactive_saved_account_repeated_delete_keys_should_keep_the_same_confirmation()
+     {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app(&[]);
+        app.auth.phase = crate::auth::Phase::Accounts;
+        app.auth.active_id = Some("current".into());
+        app.auth.accounts = vec![saved_account("expired", true)];
+        app.overlay = Some(Overlay::Auth);
+        crate::keys::handle(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        crate::keys::handle(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        let actual = screen(&mut app, 76, 22);
+        assert!(actual.contains("Remove u/expired from redtab?"), "{actual}");
+        assert!(
+            actual.contains("Remove only this saved session."),
+            "{actual}"
+        );
+        assert!(actual.contains("Enter removes"), "{actual}");
+    }
+
+    #[test]
+    fn when_import_fails_in_a_small_terminal_it_should_show_the_error_selection_and_controls() {
+        let mut app = app(&[]);
+        app.auth.phase = crate::auth::Phase::Choose;
+        app.auth.sources = (0..10)
+            .map(|index| crate::auth::Source::Browser {
+                browser: "firefox".into(),
+                profile: format!("profile-{index}"),
+                label: format!("Firefox {index} · {}", "Wørk ".repeat(30)),
+            })
+            .collect();
+        app.auth.selected = 9;
+        app.auth.message = Some(
+            "Could not read Reddit cookies. Unlock your browser or choose a login window.".into(),
+        );
+        app.overlay = Some(Overlay::Auth);
+        let actual = screen(&mut app, 60, 12);
+        assert!(actual.contains("Could not read Reddit cookies"), "{actual}");
+        assert!(actual.contains("login window"), "{actual}");
+        assert!(actual.contains("› Firefox 9"), "{actual}");
+        assert!(actual.contains("Enter connects"), "{actual}");
+        assert!(actual.contains("Esc cancel"), "{actual}");
+    }
+
+    #[test]
+    fn when_connection_loading_has_no_active_account_it_should_not_offer_disconnect() {
+        for phase in [
+            crate::auth::Phase::Discovering,
+            crate::auth::Phase::Importing,
+        ] {
+            for connected in [false, true] {
+                let mut app = app(&[]);
+                app.auth.phase = phase;
+                app.auth.active_id = connected.then(|| "current".into());
+                app.overlay = Some(Overlay::Auth);
+
+                let actual = screen(&mut app, 76, 22);
+
+                assert_eq!(
+                    actual.contains("d Remove from redtab"),
+                    connected,
+                    "{actual}"
+                );
+                assert!(actual.contains("Esc cancels"), "{actual}");
+            }
+        }
+    }
+
+    #[test]
+    fn when_import_is_pending_it_should_remain_visible_in_a_small_terminal() {
+        let mut app = app(&[]);
+        app.auth.phase = crate::auth::Phase::Importing;
+        app.overlay = Some(Overlay::Auth);
+        let actual = screen(&mut app, 60, 12);
+        assert!(actual.contains("verifying account"));
+        assert!(actual.contains("Esc cancels"));
     }
 
     fn screen(app: &mut App, w: u16, h: u16) -> String {
+        buffer_text(&screen_buffer(app, w, h))
+    }
+
+    fn screen_buffer(app: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal.draw(|f| draw(f, app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        (0..h)
+        while app.card_renderer.pending() {
+            app.card_renderer.wait_for_completion();
+            app.card_renderer.poll();
+            terminal.draw(|f| draw(f, app)).unwrap();
+        }
+        terminal.backend().buffer().clone()
+    }
+
+    fn first_screen(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        (0..buf.area.height)
             .map(|y| {
-                (0..w)
+                (0..buf.area.width)
                     .map(|x| buf[(x, y)].symbol().to_string())
                     .collect::<String>()
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn when_home_sort_opens_in_a_short_terminal_it_should_show_every_option() {
+        let mut app = app(&[]);
+        app.switch_tab(0);
+        app.overlay = Some(Overlay::Sort { selected: 5 });
+
+        let shown = screen(&mut app, 80, 10);
+
+        assert!(shown.contains("rising"), "{shown}");
+        assert!(shown.contains("controversial"), "{shown}");
+        assert!(shown.contains("▌ c"), "{shown}");
+    }
+
+    #[test]
+    fn when_membership_dialog_opens_it_should_name_the_account_action_in_a_short_terminal() {
+        let name = "a_very_long_community_name_with_fifty_characters_123";
+        for join in [true, false] {
+            for width in [56, 80] {
+                let mut app = app(&[]);
+                app.overlay = Some(Overlay::Membership {
+                    subreddit: name.into(),
+                    join,
+                });
+                let shown = screen(&mut app, width, 10);
+                assert!(
+                    shown.contains(if join {
+                        "Join on Reddit"
+                    } else {
+                        "Leave on Reddit"
+                    }),
+                    "{shown}"
+                );
+                // Wrapping must retain the entire target, including its suffix.
+                let unwrapped: String = shown
+                    .lines()
+                    .filter_map(|line| line.split('│').nth(1))
+                    .flat_map(str::chars)
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                assert!(unwrapped.contains(&format!("r/{name}")), "{shown}");
+                assert!(
+                    shown.contains("Enter")
+                        && shown.contains("Esc cancel")
+                        && shown.contains("Space open subreddit"),
+                    "{shown}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn when_a_community_is_open_it_should_show_membership_and_discoverable_controls() {
+        let mut app = app(&["rust"]);
+        app.open_subreddit("rust");
+        let shown = screen(&mut app, 120, 24);
+        assert!(
+            shown.contains("Joined") && shown.contains("join/leave"),
+            "{shown}"
+        );
+        app.open_subreddit("armenia");
+        let shown = screen(&mut app, 120, 24);
+        assert!(shown.contains("Not joined"), "{shown}");
+        app.set_membership("armenia".into(), true);
+        let shown = screen(&mut app, 120, 24);
+        assert!(shown.contains("Joining r/armenia"), "{shown}");
+    }
+
+    #[test]
+    fn when_home_sort_opens_it_should_explain_where_recommendations_appear() {
+        let mut app = app(&[]);
+        app.switch_tab(0);
+        app.overlay = Some(Overlay::Sort { selected: 0 });
+
+        let shown = screen(&mut app, 80, 24);
+
+        assert!(shown.contains("recommendations"), "{shown}");
+    }
+
+    #[test]
+    fn when_home_is_open_it_should_show_a_mixed_list_and_all_subs_should_keep_islands() {
+        let mut app = app(&["rust"]);
+        app.switch_tab(0);
+        let mut post = post_with("personalized", Media::None);
+        post.subreddit = "rust".into();
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Ok(crate::model::Listing {
+                posts: vec![post.clone()],
+                after: None,
+            }),
+        });
+        let home = screen(&mut app, 120, 30);
+        assert!(
+            home.contains("best") && home.contains("r/rust") && home.contains("personalized"),
+            "{home}"
+        );
+        assert!(!home.contains("J/K"), "{home}");
+
+        app.switch_tab(crate::app::ALL_SUBS_TAB);
+        app.on_msg(Msg::Group {
+            generation: app.all_subs.groups[0].generation,
+            subreddit: "rust".into(),
+            result: Ok(crate::model::Listing {
+                posts: vec![post],
+                after: None,
+            }),
+        });
+        let islands = screen(&mut app, 120, 30);
+        assert!(
+            islands.contains("▦ All subs") && islands.contains("personalized"),
+            "{islands}"
+        );
+        assert!(islands.contains("J/K"), "{islands}");
+    }
+
+    #[test]
+    fn when_subscriptions_are_loading_empty_or_failed_all_subs_should_explain_the_state() {
+        let mut app = app(&[]);
+        app.all_subs.loading = true;
+        assert!(screen(&mut app, 80, 24).contains("Loading subscriptions"));
+        app.all_subs.loading = false;
+        assert!(screen(&mut app, 80, 24).contains("No joined communities"));
+        app.all_subs.error = Some("offline".into());
+        let failed = screen(&mut app, 80, 24);
+        assert!(
+            failed.contains("Could not load subscriptions") && failed.contains("press r"),
+            "{failed}"
+        );
+    }
+
+    #[test]
+    fn when_home_sorts_change_best_should_be_available_only_on_home() {
+        let mut app = app(&["rust"]);
+        app.switch_tab(0);
+        press(&mut app, 's');
+        assert!(screen(&mut app, 80, 24).contains("best"));
+        press(&mut app, 'n');
+        assert_eq!(app.active_tab().feed.sort, Sort::New);
+        app.open_subreddit("rust");
+        press(&mut app, 's');
+        assert!(!screen(&mut app, 80, 24).contains("best"));
     }
 
     #[test]
@@ -2687,7 +4104,7 @@ mod tests {
     fn health_shows_in_the_sidebar_footer_and_card_ages() {
         let mut app = app(&["rust"]);
         app.status = None;
-        app.home.groups[0].freshness = Some(crate::cache::Freshness {
+        app.all_subs.groups[0].freshness = Some(crate::cache::Freshness {
             fetched_at: crate::app::now(),
             source: crate::cache::Source::default(),
         });
@@ -2729,11 +4146,12 @@ mod tests {
             created: None,
             permalink: "/r/s/comments/p/x/".into(),
             media: Media::None,
+            preview_size: None,
             stickied: false,
             nsfw: false,
             spoiler: false,
         };
-        app.home.groups = vec![crate::app::Group {
+        app.all_subs.groups = vec![crate::app::Group {
             subreddit: "s".into(),
             posts: vec![post.clone()],
             ..Default::default()
@@ -2840,6 +4258,59 @@ mod tests {
         page.body.clear();
         page.comments[0].body = format!("{PICTURE}{url}");
         app
+    }
+
+    #[test]
+    fn when_a_cached_comment_picture_refresh_fails_retry_should_keep_its_rows_and_update_pixels() {
+        let url = "https://preview.redd.it/cached-comment.png";
+        let mut app = picture_comment(url);
+        screen(&mut app, 100, 40);
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Image {
+                url: url.into(),
+                result: Ok(image::DynamicImage::new_rgb8(400, 200).into()),
+            }),
+            fetched_at: crate::app::now() - 8 * 86_400,
+            refreshing: true,
+            source: crate::cache::Source {
+                cached: true,
+                ..Default::default()
+            },
+        });
+        screen(&mut app, 100, 40);
+        let before = app.post_view.as_ref().unwrap().rendered_pictures.clone();
+        app.on_msg(Msg::Image {
+            url: url.into(),
+            result: Err("offline".into()),
+        });
+
+        press(&mut app, 'r');
+        let retrying = screen(&mut app, 100, 40);
+
+        assert!(retrying.contains('\u{10EEEE}'), "{retrying}");
+        assert!(matches!(
+            app.images.get(url),
+            Some(ImageSlot::Ready {
+                pixels: (400, 200),
+                refresh: crate::app::ImageRefresh::Loading,
+                ..
+            })
+        ));
+        assert_eq!(app.post_view.as_ref().unwrap().rendered_pictures, before);
+        app.on_msg(Msg::Image {
+            url: url.into(),
+            result: Ok(image::DynamicImage::new_rgb8(800, 400).into()),
+        });
+        screen(&mut app, 100, 40);
+        assert!(matches!(
+            app.images.get(url),
+            Some(ImageSlot::Ready {
+                pixels: (800, 400),
+                refresh: crate::app::ImageRefresh::Idle,
+                ..
+            })
+        ));
+        assert_eq!(app.post_view.as_ref().unwrap().rendered_pictures, before);
     }
 
     #[test]
@@ -3158,7 +4629,7 @@ mod tests {
                 .join("\n");
 
             assert_eq!(
-                content.contains("⌂ Home"),
+                content.contains("▦ All subs"),
                 list_visible,
                 "sidebar={sidebar}, width={width}\n{actual}"
             );
@@ -4478,7 +5949,7 @@ mod tests {
     #[test]
     fn lists_with_no_thumbnail_to_show_keep_text_only_rows() {
         let mut spoilers = feed_app(kitty());
-        for p in &mut spoilers.tabs[2].feed.posts {
+        for p in &mut spoilers.tabs[3].feed.posts {
             p.spoiler = true;
         }
         let mut images_off = feed_app(kitty());
@@ -4522,7 +5993,7 @@ mod tests {
     #[test]
     fn a_spoiler_post_lists_with_a_chip_and_no_thumbnail() {
         let mut app = feed_app(kitty());
-        app.tabs[2].feed.posts[0].spoiler = true;
+        app.tabs[3].feed.posts[0].spoiler = true;
 
         let s = screen(&mut app, 100, 20);
 
@@ -4533,7 +6004,7 @@ mod tests {
     #[test]
     fn home_shows_a_card_in_a_short_pane() {
         let mut app = app(&["s"]);
-        app.home.groups[0].posts = (1..=3)
+        app.all_subs.groups[0].posts = (1..=3)
             .map(|i| Post {
                 id: format!("p{i}"),
                 subreddit: "s".into(),
@@ -4545,6 +6016,7 @@ mod tests {
                 created: None,
                 permalink: format!("/r/s/comments/p{i}/x/"),
                 media: Media::None,
+                preview_size: None,
                 stickied: false,
                 nsfw: false,
                 spoiler: false,
@@ -4561,7 +6033,7 @@ mod tests {
     }
 
     #[allow(deprecated)]
-    fn kitty() -> Picker {
+    pub(crate) fn kitty() -> Picker {
         let mut picker = Picker::from_fontsize(ratatui_image::FontSize::new(8, 16));
         picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
         picker
@@ -4579,6 +6051,7 @@ mod tests {
             created: None,
             permalink: format!("/r/s/comments/{id}/x/"),
             media,
+            preview_size: None,
             stickied: false,
             nsfw: false,
             spoiler: false,
@@ -4586,13 +6059,13 @@ mod tests {
     }
 
     /// r/s with eight posts; all but `p2` have an image.
-    fn feed_app(picker: Picker) -> App {
+    fn card_feed_app(picker: Picker) -> App {
         let mut app = app(&["s"]);
         app.image_picker = picker;
         app.show_images = true;
-        app.switch_tab(2);
-        let tab = app.tabs[2].id;
-        let generation = app.tabs[2].feed.generation;
+        app.switch_tab(3);
+        let tab = app.tabs[3].id;
+        let generation = app.tabs[3].feed.generation;
         let posts = (1..=8)
             .map(|i| {
                 let media = if i == 2 {
@@ -4609,13 +6082,1386 @@ mod tests {
             tab,
             generation,
             append: false,
+            result: Ok(crate::model::Listing { posts, after: None }),
+        });
+        app
+    }
+
+    fn feed_app(picker: Picker) -> App {
+        let mut app = card_feed_app(picker);
+        app.state.toggle_list_view();
+        app
+    }
+
+    fn feed_with_next_page(view: ListView) -> App {
+        let mut app = app(&["s"]);
+        app.switch_tab(3);
+        if app.state.list_view() != view {
+            app.state.toggle_list_view();
+        }
+        let mut post = post_with("existing", Media::None);
+        post.title = "Existing post".into();
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: false,
             result: Ok(crate::model::Listing {
-                posts,
-                after: None,
-                icon: None,
+                posts: vec![post],
+                after: Some("next".into()),
             }),
         });
         app
+    }
+
+    fn card_with_decoded_image() -> App {
+        let mut app = card_feed_app(kitty());
+        let url = "https://i.redd.it/p1.jpeg";
+        app.card_pictures_drawn(&[url]);
+        app.on_msg(Msg::Image {
+            url: url.into(),
+            result: Ok(image::DynamicImage::new_rgb8(640, 640).into()),
+        });
+        app
+    }
+
+    #[test]
+    fn when_sidebar_navigation_shows_decoded_card_pixels_it_should_defer_missing_preparation() {
+        let mut app = card_with_decoded_image();
+        app.focus_sidebar();
+        app.switch_tab(1);
+        app.switch_tab(3);
+
+        let actual = first_screen(&mut app, 100, 24);
+
+        assert!(actual.contains("preparing image"), "{actual}");
+        assert!(
+            !app.card_renderer.pending(),
+            "preparation must wait for settling"
+        );
+    }
+
+    #[test]
+    fn when_sidebar_navigation_shows_cached_card_graphics_they_should_stay_visible_immediately() {
+        let mut app = card_with_decoded_image();
+        screen(&mut app, 100, 24);
+        app.focus_sidebar();
+        app.switch_tab(1);
+        app.switch_tab(3);
+
+        let actual = first_screen(&mut app, 100, 24);
+
+        assert!(actual.contains('\u{10EEEE}'), "{actual}");
+        assert!(!actual.contains("preparing image"), "{actual}");
+        assert!(!app.card_renderer.pending());
+    }
+
+    #[test]
+    fn when_sidebar_navigation_settles_missing_card_graphics_should_resume_preparation() {
+        let mut app = card_with_decoded_image();
+        app.focus_sidebar();
+        app.switch_tab(1);
+        app.switch_tab(3);
+        first_screen(&mut app, 100, 24);
+
+        std::thread::sleep(crate::app::NAV_SETTLE);
+        assert!(app.tick());
+        let actual = screen(&mut app, 100, 24);
+
+        assert!(actual.contains('\u{10EEEE}'), "{actual}");
+        assert!(!actual.contains("preparing image"), "{actual}");
+    }
+
+    #[test]
+    fn when_a_card_feed_waits_for_more_posts_it_should_label_the_loaded_content_boundary() {
+        let mut app = feed_with_next_page(ListView::Card);
+        screen(&mut app, 80, 20);
+        let geometry = app.active_tab().feed.cards.clone();
+        app.load_feed(3, true);
+
+        let actual = screen(&mut app, 80, 20);
+
+        assert!(
+            actual.contains("Existing post") && actual.contains("Loading more posts…"),
+            "{actual}"
+        );
+        assert!(
+            actual.lines().last().unwrap().contains("⋯ more posts"),
+            "{actual}"
+        );
+        let cards = &app.active_tab().feed.cards;
+        assert_eq!(
+            (cards.height, cards.viewport, cards.line),
+            (geometry.height, geometry.viewport, geometry.line)
+        );
+    }
+
+    #[test]
+    fn when_a_compact_feed_waits_for_more_posts_it_should_label_the_loaded_content_boundary() {
+        let mut app = feed_with_next_page(ListView::Compact);
+        app.load_feed(3, true);
+
+        let actual = screen(&mut app, 80, 20);
+
+        assert!(
+            actual.contains("Existing post") && actual.contains("Loading more posts…"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_a_notification_is_visible_pagination_activity_should_remain_visible() {
+        let mut app = feed_with_next_page(ListView::Card);
+        app.load_feed(3, true);
+        app.info("Still browsing");
+
+        let actual = screen(&mut app, 80, 20);
+
+        let footer = actual.lines().last().unwrap();
+        assert!(
+            footer.contains("⋯ more posts") && footer.contains("Still browsing"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_a_new_query_waits_in_a_narrow_pane_its_activity_should_remain_visible() {
+        let mut app = feed_with_next_page(ListView::Card);
+        app.search("a query long enough to fill the header".into());
+
+        let actual = screen(&mut app, 50, 12);
+
+        assert!(
+            actual.lines().last().unwrap().contains("⋯ posts"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_a_page_finishes_it_should_remove_the_loading_boundary() {
+        let mut app = feed_with_next_page(ListView::Card);
+        app.load_feed(3, true);
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: true,
+            result: Ok(crate::model::Listing {
+                posts: vec![post_with("next", Media::None)],
+                after: None,
+            }),
+        });
+
+        let actual = screen(&mut app, 80, 20);
+
+        assert!(actual.contains("next"), "{actual}");
+        assert!(
+            !actual.contains("Loading more posts") && !actual.contains("⋯ more posts"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_a_page_fails_it_should_replace_loading_with_the_retry_action() {
+        let mut app = feed_with_next_page(ListView::Card);
+        app.load_feed(3, true);
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: true,
+            result: Err("offline".into()),
+        });
+
+        let actual = screen(&mut app, 80, 20);
+
+        assert!(actual.contains("Next page failed · L retries"), "{actual}");
+        assert!(
+            !actual.contains("Loading more posts") && !actual.contains("⋯ more posts"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_cached_posts_are_refreshing_the_footer_should_keep_the_activity_visible() {
+        let mut app = feed_with_next_page(ListView::Card);
+        app.load_feed(3, false);
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Feed {
+                tab: app.active_tab().id,
+                generation: app.active_tab().feed.generation,
+                append: false,
+                result: Ok(crate::model::Listing {
+                    posts: app.active_tab().feed.posts.clone(),
+                    after: Some("next".into()),
+                }),
+            }),
+            fetched_at: crate::app::now() - 600,
+            refreshing: true,
+            source: crate::cache::Source {
+                cached: true,
+                ..Default::default()
+            },
+        });
+        assert!(!app.active_tab().feed.loading() && app.active_tab().feed.refreshing());
+
+        let actual = screen(&mut app, 80, 20);
+
+        assert!(
+            actual.contains("Existing post") && actual.contains("Refreshing posts…"),
+            "{actual}"
+        );
+        assert!(
+            actual.lines().last().unwrap().contains("⋯ refresh"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_navigation_defers_a_card_image_its_reserved_space_should_show_loading() {
+        let mut app = card_feed_app(kitty());
+        app.move_selection(1);
+        app.move_selection(1);
+
+        let actual = first_screen(&mut app, 100, 24);
+
+        assert!(actual.contains("loading image"), "{actual}");
+        assert!(
+            !app.card_images.contains_key("https://i.redd.it/p3.jpeg"),
+            "navigation must still defer the request"
+        );
+    }
+
+    #[test]
+    fn when_card_pixels_wait_for_graphics_preparation_the_first_frame_should_explain_the_wait() {
+        let mut app = card_with_decoded_image();
+
+        let actual = first_screen(&mut app, 100, 24);
+
+        assert!(actual.contains("preparing image"), "{actual}");
+    }
+
+    #[test]
+    fn when_card_graphics_finish_they_should_replace_the_preparation_indicator() {
+        let mut app = card_with_decoded_image();
+
+        let actual = screen(&mut app, 100, 24);
+
+        assert!(actual.contains('\u{10EEEE}'), "{actual}");
+        assert!(!actual.contains("preparing image"), "{actual}");
+    }
+
+    #[test]
+    fn when_a_card_refreshes_its_image_it_should_show_activity_while_preserving_pixels() {
+        let mut app = card_with_decoded_image();
+        screen(&mut app, 100, 24);
+        let url = "https://i.redd.it/p1.jpeg";
+        let Some(CardImageSlot::Ready { image, protocol }) = app.card_images.remove(url) else {
+            panic!("loaded card image")
+        };
+        app.card_images.insert(
+            url.into(),
+            CardImageSlot::Cached {
+                image,
+                protocol,
+                refreshing: true,
+            },
+        );
+
+        let actual = first_screen(&mut app, 100, 24);
+
+        assert!(actual.contains('\u{10EEEE}'), "{actual}");
+        assert!(!actual.contains("preparing image"), "{actual}");
+        assert!(
+            actual.lines().last().unwrap().contains("⋯ images"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_compact_thumbnails_are_pending_their_reserved_slots_should_show_activity() {
+        let mut app = feed_app(kitty());
+
+        let actual = first_screen(&mut app, 100, 20);
+
+        assert!(actual.contains('◌'), "{actual}");
+    }
+
+    fn refreshing_thumbnail_app() -> App {
+        let mut app = feed_app(kitty());
+        app.tabs[3].feed.posts.truncate(1);
+        app.thumbs_drawn(&["https://i.redd.it/p1.jpeg"]);
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Thumb {
+                url: "https://i.redd.it/p1.jpeg".into(),
+                result: Ok(image::DynamicImage::new_rgb8(32, 32)),
+            }),
+            fetched_at: crate::app::now() - 600,
+            refreshing: true,
+            source: crate::cache::Source {
+                cached: true,
+                ..Default::default()
+            },
+        });
+        app
+    }
+
+    #[test]
+    fn when_a_cached_thumbnail_is_refreshing_the_footer_should_show_activity_and_keep_pixels() {
+        let mut app = refreshing_thumbnail_app();
+
+        let actual = first_screen(&mut app, 100, 20);
+
+        assert!(actual.contains('\u{10EEEE}'), "{actual}");
+        assert!(
+            actual.lines().last().unwrap().contains("⋯ images"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_a_skipped_thumbnail_returns_its_first_frame_should_show_resumed_refresh_activity() {
+        let mut app = refreshing_thumbnail_app();
+        app.on_msg(Msg::ThumbSkipped {
+            url: "https://i.redd.it/p1.jpeg".into(),
+        });
+
+        let actual = first_screen(&mut app, 100, 20);
+
+        assert!(actual.contains('\u{10EEEE}'), "{actual}");
+        assert!(
+            actual.lines().last().unwrap().contains("⋯ images"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_a_skipped_thumbnail_stays_offscreen_the_footer_should_not_show_refresh_activity() {
+        let mut app = refreshing_thumbnail_app();
+        app.on_msg(Msg::ThumbSkipped {
+            url: "https://i.redd.it/p1.jpeg".into(),
+        });
+        app.tabs[3].feed.posts.clear();
+
+        let actual = first_screen(&mut app, 100, 20);
+
+        assert!(!actual.contains('\u{10EEEE}'), "{actual}");
+        assert!(
+            !actual.lines().last().unwrap().contains("⋯ images"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_a_cached_thumbnail_refresh_finishes_the_footer_should_stop_activity() {
+        let mut app = refreshing_thumbnail_app();
+        app.on_msg(Msg::Thumb {
+            url: "https://i.redd.it/p1.jpeg".into(),
+            result: Ok(image::DynamicImage::new_rgb8(32, 32)),
+        });
+
+        let actual = first_screen(&mut app, 100, 20);
+
+        assert!(actual.contains('\u{10EEEE}'), "{actual}");
+        assert!(
+            !actual.lines().last().unwrap().contains("⋯ images"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_a_cached_thumbnail_refresh_fails_the_footer_should_stop_activity_and_keep_pixels() {
+        let mut app = refreshing_thumbnail_app();
+        app.on_msg(Msg::Thumb {
+            url: "https://i.redd.it/p1.jpeg".into(),
+            result: Err("offline".into()),
+        });
+
+        let actual = first_screen(&mut app, 100, 20);
+
+        assert!(actual.contains('\u{10EEEE}'), "{actual}");
+        assert!(
+            !actual.lines().last().unwrap().contains("⋯ images"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_images_are_disabled_thumbnail_refresh_should_not_show_activity() {
+        let mut app = refreshing_thumbnail_app();
+        app.show_images = false;
+
+        let actual = first_screen(&mut app, 100, 20);
+
+        assert!(!actual.contains('\u{10EEEE}'), "{actual}");
+        assert!(
+            !actual.lines().last().unwrap().contains("⋯ images"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_thumbnails_are_unsupported_their_refresh_should_not_show_activity() {
+        let mut app = refreshing_thumbnail_app();
+        app.image_picker = Picker::halfblocks();
+
+        let actual = first_screen(&mut app, 100, 20);
+
+        assert!(!actual.contains('\u{10EEEE}'), "{actual}");
+        assert!(
+            !actual.lines().last().unwrap().contains("⋯ images"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_media_opening_outlasts_its_notification_the_footer_should_keep_showing_activity() {
+        let mut app = feed_with_next_page(ListView::Card);
+        app.tabs[3].feed.posts[0].media = Media::Video {
+            url: None,
+            poster: None,
+        };
+        app.open_media();
+        app.status.as_mut().unwrap().at = Instant::now() - std::time::Duration::from_secs(7);
+        app.tick();
+        assert!(app.status.is_none());
+
+        let actual = screen(&mut app, 80, 20);
+
+        assert!(
+            actual.lines().last().unwrap().contains("⋯ media"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_media_loading_fails_the_footer_should_show_the_error_and_stop_activity() {
+        let mut app = feed_with_next_page(ListView::Card);
+        app.tabs[3].feed.posts[0].media = Media::Video {
+            url: None,
+            poster: None,
+        };
+        app.open_media();
+        app.on_msg(Msg::MediaResolved {
+            permalink: app.tabs[3].feed.posts[0].permalink.clone(),
+            result: Err("offline".into()),
+        });
+
+        let actual = screen(&mut app, 80, 20);
+
+        let footer = actual.lines().last().unwrap();
+        assert!(
+            footer.contains("media: offline") && !footer.contains("⋯ media"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_a_feed_opens_it_should_default_to_cards_with_wrapped_titles() {
+        let mut app = card_feed_app(Picker::halfblocks());
+        app.show_images = false;
+        app.tabs[3].feed.posts[0].title =
+            "First line of the title followed by a second line ending in 東京".into();
+
+        let actual = screen(&mut app, 70, 20);
+
+        assert!(actual.contains("V Card"), "{actual}");
+        assert!(actual.contains("First line of the title"), "{actual}");
+        assert!(actual.contains("ending in 東"), "{actual}");
+        assert!(actual.contains('京'), "{actual}");
+        assert!(actual.contains("comments"), "{actual}");
+    }
+
+    #[test]
+    fn when_view_is_toggled_it_should_keep_the_selected_post_and_restore_cards() {
+        let mut app = card_feed_app(Picker::halfblocks());
+        app.move_selection(4);
+        let state_path = std::env::temp_dir().join(format!(
+            "redtab-ui-test-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let before = app.current_post().unwrap().id;
+
+        press(&mut app, 'V');
+        let compact = screen(&mut app, 100, 20);
+        let (saved, warning) = crate::state::State::load(&state_path);
+        assert!(warning.is_none());
+        assert_eq!(saved.list_view(), ListView::Compact);
+        assert!(compact.contains("V Compact"), "{compact}");
+        assert_eq!(app.current_post().unwrap().id, before);
+
+        press(&mut app, 'V');
+        let cards = screen(&mut app, 100, 20);
+        std::fs::remove_file(&state_path).unwrap();
+        std::fs::remove_file(state_path.with_extension("json.lock")).unwrap();
+        assert!(cards.contains("V Card"), "{cards}");
+        assert!(cards.contains("p5"), "{cards}");
+        assert!(!cards.contains("……"), "{cards}");
+        assert_eq!(app.current_post().unwrap().id, before);
+    }
+
+    #[test]
+    fn when_cards_show_media_they_should_load_only_visible_full_size_previews() {
+        let mut app = card_feed_app(kitty());
+
+        screen(&mut app, 100, 20);
+        app.on_msg(Msg::Image {
+            url: "https://i.redd.it/p1.jpeg".into(),
+            result: Ok(image::DynamicImage::new_rgb8(640, 320).into()),
+        });
+        let cells = placeholder_cells(&mut app, 100, 20);
+
+        assert_eq!(app.card_images.len(), 1);
+        assert!(matches!(
+            app.card_images.get("https://i.redd.it/p1.jpeg"),
+            Some(CardImageSlot::Ready { image, .. }) if (image.width(), image.height()) == (640, 320)
+        ));
+        assert!(app.thumbs.is_empty());
+        assert!(
+            cells.len() > 8,
+            "card preview should exceed the compact 4×2 thumbnail"
+        );
+    }
+
+    fn card_with_image(width: u32, height: u32) -> App {
+        let mut app = card_feed_app(kitty());
+        app.tabs[3].feed.posts.truncate(1);
+        app.tabs[3].feed.posts[0].title = "Full width image".into();
+        screen(&mut app, 100, 20);
+        app.on_msg(Msg::Image {
+            url: "https://i.redd.it/p1.jpeg".into(),
+            result: Ok(image::DynamicImage::new_rgb8(width, height).into()),
+        });
+        app
+    }
+
+    #[test]
+    fn when_card_style_marks_new_posts_the_dot_should_stay_orange_in_a_highlighted_title() {
+        let mut app = feed_with_next_page(ListView::Card);
+        let mut post = post_with("fresh", Media::None);
+        post.title = "Target ● body".into();
+        post.stickied = true;
+        app.state.toggle_bookmark(&post, 1);
+        app.tabs[3].feed.posts[0] = post;
+        app.config.highlight.keywords = vec!["Target".into()];
+
+        let actual = screen_buffer(&mut app, 100, 20);
+
+        let dots: Vec<_> = (25..98)
+            .map(|x| &actual[(x, 4)])
+            .filter(|cell| cell.symbol() == "●")
+            .map(|cell| cell.fg)
+            .collect();
+        assert_eq!(dots, vec![ACCENT, YELLOW]);
+    }
+
+    #[test]
+    fn when_card_style_wraps_bookmark_and_pin_prefixes_the_new_post_dot_should_stay_orange() {
+        let mut app = feed_with_next_page(ListView::Card);
+        app.show_sidebar = false;
+        let mut post = post_with("fresh", Media::None);
+        post.title = "New title".into();
+        post.stickied = true;
+        app.state.toggle_bookmark(&post, 1);
+        app.tabs[3].feed.posts[0] = post;
+
+        let actual = screen_buffer(&mut app, 14, 20);
+
+        let dots: Vec<_> = (4..7)
+            .flat_map(|y| (1..12).map(move |x| (x, y)))
+            .map(|at| &actual[at])
+            .filter(|cell| cell.symbol() == "●")
+            .map(|cell| cell.fg)
+            .collect();
+        assert_eq!(dots, vec![ACCENT]);
+    }
+
+    #[test]
+    fn when_card_style_dims_read_posts_it_should_not_add_a_new_post_dot_or_recolor_body_dots() {
+        let mut app = feed_with_next_page(ListView::Card);
+        let mut post = post_with("fresh", Media::None);
+        post.title = "Read ● body".into();
+        app.state.mark_read(&post, 1);
+        app.tabs[3].feed.posts[0] = post;
+
+        let actual = screen_buffer(&mut app, 100, 20);
+
+        let dots: Vec<_> = (25..98)
+            .map(|x| &actual[(x, 4)])
+            .filter(|cell| cell.symbol() == "●")
+            .map(|cell| cell.fg)
+            .collect();
+        assert_eq!(dots, vec![SUBTEXT]);
+    }
+
+    #[test]
+    fn when_card_style_selects_an_image_the_bar_should_cover_every_card_row() {
+        let mut app = card_with_image(640, 320);
+
+        let actual = screen_buffer(&mut app, 100, 40);
+
+        assert!(
+            (3..23).all(|y| actual[(25, y)].symbol() == "▌" && actual[(25, y)].fg == ACCENT),
+            "{}",
+            buffer_text(&actual)
+        );
+        assert!(actual[(27, 5)].symbol().contains('\u{10EEEE}'));
+        assert_eq!(actual[(25, 23)].symbol(), " ", "inter-card gap stays clear");
+    }
+
+    #[test]
+    fn when_card_style_leaves_the_list_unfocused_the_whole_bar_should_use_its_muted_color() {
+        let mut app = card_with_image(640, 320);
+        app.focus = Focus::Sidebar;
+
+        let actual = screen_buffer(&mut app, 100, 40);
+
+        assert!(
+            (3..23).all(|y| actual[(25, y)].symbol() == "▌" && actual[(25, y)].fg == OVERLAY),
+            "{}",
+            buffer_text(&actual)
+        );
+    }
+
+    #[test]
+    fn when_card_style_scrolls_into_an_image_the_bar_should_remain_visible_with_native_pixels() {
+        let mut app = card_with_image(320, 640);
+        app.scroll_card(16);
+
+        let actual = screen_buffer(&mut app, 100, 20);
+
+        assert!(
+            (3..19).all(|y| actual[(25, y)].symbol() == "▌" && actual[(25, y)].fg == ACCENT),
+            "{}",
+            buffer_text(&actual)
+        );
+        assert!(actual[(27, 3)].symbol().contains('\u{10EEEE}'));
+        assert_eq!(app.active_tab().feed.cards.line, 16);
+    }
+
+    fn assert_centered_page_loading(actual: &ratatui::buffer::Buffer) {
+        let text = buffer_text(actual);
+        let y = text
+            .lines()
+            .position(|line| line.contains("Loading more posts…"))
+            .unwrap() as u16;
+        let x = (25..78).find(|&x| actual[(x, y)].symbol() == "L").unwrap();
+        assert!((12..=22).contains(&y), "{text}");
+        assert!((2 * x + 19).abs_diff(102) <= 1, "{text}");
+        assert_eq!(actual[(x, y)].bg, MANTLE);
+        assert!(actual[(x, y)].modifier.contains(Modifier::BOLD));
+        assert_eq!(actual[(25, 8)].bg, MANTLE);
+        assert_eq!(actual[(25, 28)].bg, MANTLE);
+    }
+
+    #[test]
+    fn when_card_style_waits_for_more_posts_the_loading_panel_should_fill_and_center_in_empty_space()
+     {
+        let mut app = feed_with_next_page(ListView::Card);
+        app.load_feed(3, true);
+
+        let actual = screen_buffer(&mut app, 80, 30);
+
+        assert_centered_page_loading(&actual);
+        assert_eq!(app.active_tab().feed.cards.height, 3);
+        assert_eq!(app.active_tab().feed.cards.line, 0);
+    }
+
+    #[test]
+    fn when_compact_style_waits_for_more_posts_the_loading_panel_should_fill_and_center_in_empty_space()
+     {
+        let mut app = feed_with_next_page(ListView::Compact);
+        app.load_feed(3, true);
+
+        let actual = screen_buffer(&mut app, 80, 30);
+
+        assert_centered_page_loading(&actual);
+        assert_eq!(app.active_tab().feed.offset, 0);
+    }
+
+    #[test]
+    fn when_card_style_has_no_room_for_a_panel_pagination_should_stay_visible_in_the_footer() {
+        let mut app = feed_with_next_page(ListView::Card);
+        app.load_feed(3, true);
+
+        let actual = screen(&mut app, 50, 5);
+
+        assert!(
+            actual.lines().last().unwrap().contains("⋯ more posts"),
+            "{actual}"
+        );
+        assert!(actual.contains("Existing po"), "{actual}");
+    }
+
+    #[test]
+    fn when_a_large_card_image_arrives_it_should_leave_the_ui_thread_responsive() {
+        let mut app = card_feed_app(kitty());
+        app.tabs[3].feed.posts.truncate(1);
+        screen(&mut app, 100, 20);
+        let message = Msg::Image {
+            url: "https://i.redd.it/p1.jpeg".into(),
+            result: Ok(image::DynamicImage::new_rgb8(1600, 1600).into()),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+
+        let started = Instant::now();
+        app.on_msg(message);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.scroll_card(1);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "image preparation blocked input for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(app.active_tab().feed.cards.line, 1);
+    }
+
+    #[test]
+    fn when_revisiting_a_card_after_pixel_eviction_its_geometry_should_stay_reserved() {
+        let mut app = card_with_image(320, 640);
+        app.tabs[3].feed.posts.push(post_with("p2", Media::None));
+        screen(&mut app, 100, 20);
+        app.card_images.clear();
+        app.move_selection(1);
+        screen(&mut app, 100, 20);
+        app.move_selection(-1);
+
+        let actual = screen(&mut app, 100, 20);
+
+        assert_eq!(app.active_tab().feed.cards.height, 71, "{actual}");
+        assert!(!actual.contains("p2"), "{actual}");
+    }
+
+    #[test]
+    fn when_returning_to_card_media_after_eviction_its_preview_should_stay_visible() {
+        for video in [false, true] {
+            let mut app = card_with_image(320, 640);
+            if video {
+                app.tabs[3].feed.posts[0].media = Media::Video {
+                    url: Some("https://v.redd.it/example/HLSPlaylist.m3u8".into()),
+                    poster: Some("https://i.redd.it/p1.jpeg".into()),
+                };
+            }
+            screen(&mut app, 100, 20);
+            for number in 0..9 {
+                let url = format!("https://i.redd.it/pressure-{number}.png");
+                app.card_pictures_drawn(&[&url]);
+                app.on_msg(Msg::Image {
+                    url,
+                    result: Ok(image::DynamicImage::new_rgb8(1, 1).into()),
+                });
+            }
+            app.card_pictures_drawn(&[]);
+            assert!(!app.card_images.contains_key("https://i.redd.it/p1.jpeg"));
+            app.move_selection(0);
+            app.move_selection(0);
+
+            let actual = screen(&mut app, 100, 20);
+
+            assert!(
+                actual.contains('\u{10EEEE}'),
+                "retained image/poster must render immediately: {actual}"
+            );
+            assert!(!actual.contains("loading image"), "{actual}");
+            assert_eq!(app.active_tab().feed.cards.height, 71);
+            std::thread::sleep(crate::app::NAV_SETTLE);
+            app.tick();
+            screen(&mut app, 100, 20);
+            app.on_msg(Msg::Image {
+                url: "https://i.redd.it/p1.jpeg".into(),
+                result: Err("offline".into()),
+            });
+            let failed_upgrade = screen(&mut app, 100, 20);
+            assert!(failed_upgrade.contains('\u{10EEEE}'), "{failed_upgrade}");
+            assert!(
+                !failed_upgrade.contains("loading image")
+                    && !failed_upgrade.contains("image unavailable"),
+                "{failed_upgrade}"
+            );
+            app.reload();
+            screen(&mut app, 100, 20);
+            app.on_msg(Msg::Image {
+                url: "https://i.redd.it/p1.jpeg".into(),
+                result: Ok(image::DynamicImage::new_rgb8(320, 640).into()),
+            });
+            screen(&mut app, 100, 20);
+            assert!(matches!(
+                app.card_images.get("https://i.redd.it/p1.jpeg"),
+                Some(CardImageSlot::Ready { .. })
+            ));
+            assert_eq!(app.active_tab().feed.cards.height, 71);
+        }
+    }
+
+    #[test]
+    fn when_a_card_has_listing_dimensions_loading_and_failure_should_keep_its_height() {
+        let mut app = card_feed_app(kitty());
+        app.tabs[3].feed.posts.truncate(1);
+        app.tabs[3].feed.posts[0].title = "Reserved portrait".into();
+        app.tabs[3].feed.posts[0].preview_size = Some((320, 640));
+        screen(&mut app, 100, 20);
+        assert_eq!(app.active_tab().feed.cards.height, 71);
+        app.scroll_card(16);
+
+        app.on_msg(Msg::Image {
+            url: "https://i.redd.it/p1.jpeg".into(),
+            result: Err("offline".into()),
+        });
+        let actual = screen(&mut app, 100, 20);
+
+        assert_eq!(app.active_tab().feed.cards.height, 71, "{actual}");
+        assert_eq!(app.active_tab().feed.cards.line, 16);
+        assert!(actual.contains("image unavailable"), "{actual}");
+    }
+
+    #[test]
+    fn when_a_reserved_image_finishes_loading_the_selected_card_should_not_move() {
+        let mut app = card_feed_app(kitty());
+        app.tabs[3].feed.posts.truncate(1);
+        app.tabs[3].feed.posts[0].title = "Reserved landscape".into();
+        app.tabs[3].feed.posts[0].preview_size = Some((640, 320));
+        let before = screen(&mut app, 100, 40);
+        let row = |screen: &str| screen.lines().position(|line| line.contains("comments"));
+        assert_eq!(app.active_tab().feed.cards.height, 20);
+
+        app.on_msg(Msg::Image {
+            url: "https://i.redd.it/p1.jpeg".into(),
+            result: Ok(image::DynamicImage::new_rgb8(320, 160).into()),
+        });
+        let actual = screen(&mut app, 100, 40);
+
+        assert_eq!(app.active_tab().feed.cards.height, 20);
+        assert_eq!(row(&before), row(&actual));
+        assert!(row(&actual).is_some());
+    }
+
+    #[test]
+    fn when_neighboring_images_load_navigating_back_should_keep_the_same_card_positions() {
+        let mut app = card_feed_app(kitty());
+        app.tabs[3].feed.posts.iter_mut().for_each(|post| {
+            post.title = post.id.clone();
+            post.preview_size = Some((640, 320));
+        });
+        screen(&mut app, 100, 60);
+        app.move_selection(1);
+        let before = screen(&mut app, 100, 60);
+        let row = |screen: &str| screen.lines().position(|line| line.contains("p2"));
+        assert!(matches!(
+            app.card_images.get("https://i.redd.it/p1.jpeg"),
+            Some(CardImageSlot::Loading)
+        ));
+        app.on_msg(Msg::Image {
+            url: "https://i.redd.it/p1.jpeg".into(),
+            result: Ok(image::DynamicImage::new_rgb8(640, 320).into()),
+        });
+        screen(&mut app, 100, 60);
+        app.move_selection(-1);
+        screen(&mut app, 100, 60);
+        app.move_selection(1);
+
+        let actual = screen(&mut app, 100, 60);
+
+        assert!(matches!(
+            app.card_images.get("https://i.redd.it/p1.jpeg"),
+            Some(CardImageSlot::Ready { .. })
+        ));
+        assert_eq!(row(&before), row(&actual));
+        assert!(row(&actual).is_some());
+    }
+
+    #[test]
+    fn when_scrolling_a_placeholder_by_hand_it_should_cancel_pending_bottom_restoration() {
+        let mut app = card_feed_app(kitty());
+        app.tabs[3].feed.posts.truncate(1);
+        app.tabs[3].feed.posts[0].title = "Loading image".into();
+        app.tabs[3].feed.cards.bottom = true;
+        screen(&mut app, 100, 20);
+        assert_eq!(app.active_tab().feed.cards.line, 21);
+
+        app.scroll_card(-1);
+        screen(&mut app, 100, 20);
+
+        assert_eq!(app.active_tab().feed.cards.line, 20);
+        assert!(!app.active_tab().feed.cards.bottom);
+    }
+
+    #[test]
+    fn when_paging_a_bookmark_before_its_image_loads_it_should_scroll_reserved_space() {
+        let mut app = card_feed_app(kitty());
+        app.tabs[3].feed.posts[0].title = "Reserved bookmark".into();
+        app.tabs[3].feed.posts[0].preview_size = Some((320, 640));
+        app.state.toggle_bookmark(&app.current_post().unwrap(), 1);
+        app.switch_tab(1);
+        screen(&mut app, 100, 20);
+
+        app.page_list(1, 1);
+        screen(&mut app, 100, 20);
+
+        assert_eq!(app.active_tab().feed.cards.line, 16);
+        assert_eq!(app.active_tab().feed.cards.height, 71);
+        assert_eq!(app.current_post().unwrap().id, "p1");
+    }
+
+    #[test]
+    fn when_a_landscape_card_image_loads_it_should_fill_the_available_width() {
+        let mut app = card_with_image(640, 320);
+
+        let cells = placeholder_cells(&mut app, 100, 20);
+
+        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(27));
+        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(94));
+        assert!(matches!(app.card_images.get("https://i.redd.it/p1.jpeg"),
+            Some(CardImageSlot::Ready { protocol: Some(protocol), .. })
+                if protocol.size == Size::new(68, 17)));
+    }
+
+    #[test]
+    fn when_a_portrait_card_image_loads_it_should_fill_width_and_extend_beyond_the_viewport() {
+        let mut app = card_with_image(320, 640);
+
+        let cells = placeholder_cells(&mut app, 100, 20);
+
+        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(27));
+        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(94));
+        assert!(matches!(app.card_images.get("https://i.redd.it/p1.jpeg"),
+            Some(CardImageSlot::Ready { protocol: Some(protocol), .. })
+                if protocol.size == Size::new(68, 68)));
+    }
+
+    #[test]
+    fn when_a_small_card_image_loads_it_should_fill_width_without_the_detail_upscaling_limit() {
+        let mut app = card_with_image(16, 8);
+
+        let cells = placeholder_cells(&mut app, 100, 20);
+
+        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(27));
+        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(94));
+    }
+
+    fn card_png(protocol: &ratatui_image::protocol::Protocol) -> image::RgbImage {
+        use base64::Engine;
+        let ratatui_image::protocol::Protocol::ITerm2(protocol) = protocol else {
+            panic!("iTerm2 card protocol");
+        };
+        let png = protocol.data.split("doNotMoveCursor=1:").nth(1).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(png.split('\u{7}').next().unwrap())
+            .unwrap();
+        image::load_from_memory(&bytes).unwrap().to_rgb8()
+    }
+
+    #[test]
+    fn when_scrolling_an_upscaled_card_its_pixels_should_keep_the_same_scale() {
+        let mut picker = kitty();
+        picker.set_protocol_type(ProtocolType::Iterm2);
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(2, 2, |x, y| {
+            image::Rgb([(x * 255) as u8, (y * 255) as u8, 0])
+        }));
+        let tile = |start| {
+            let protocol = encode_tile(
+                &picker,
+                &image,
+                None,
+                (Size::new(68, 34), (2, 2)),
+                start,
+                16,
+                0,
+            )
+            .unwrap();
+            card_png(&protocol)
+        };
+
+        let first = tile(14);
+        let next = tile(15);
+
+        // A square 2×2 source fills 544×544 pixels, even when only a slice is visible.
+        assert_eq!(first.dimensions(), (544, 256));
+        assert!((82..=84).contains(&first.get_pixel(272, 0)[1]));
+        assert_ne!(first.get_pixel(272, 0), next.get_pixel(272, 0));
+        assert_eq!(
+            image::imageops::crop_imm(&first, 0, 16, 544, 240).to_image(),
+            image::imageops::crop_imm(&next, 0, 0, 544, 240).to_image()
+        );
+    }
+
+    #[test]
+    fn when_a_retained_preview_is_rounded_to_one_pixel_wide_it_should_keep_the_original_aspect() {
+        let mut picker = kitty();
+        picker.set_protocol_type(ProtocolType::Iterm2);
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(1, 256, |_, y| {
+            image::Rgb([y as u8, 0, 0])
+        }));
+
+        let encoded = encode_tile(
+            &picker,
+            &image,
+            None,
+            (Size::new(68, 32767), (2, 1600)),
+            16384,
+            1,
+            0,
+        )
+        .unwrap();
+        let actual = card_png(&encoded);
+
+        assert_eq!(actual.dimensions(), (544, 16));
+        assert!((153..=154).contains(&actual.get_pixel(272, 0)[0]));
+    }
+
+    #[test]
+    fn when_a_card_shrinks_fine_detail_it_should_filter_all_contributing_pixels() {
+        let mut app = card_with_image(2176, 64);
+        app.image_picker.set_protocol_type(ProtocolType::Iterm2);
+        let CardImageSlot::Ready { image, .. } = app
+            .card_images
+            .get_mut("https://i.redd.it/p1.jpeg")
+            .unwrap()
+        else {
+            panic!("card image");
+        };
+        *image = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(2176, 64, |x, _| {
+            let value = if matches!(x % 4, 1 | 2) { 255 } else { 0 };
+            image::Rgb([value; 3])
+        }))
+        .into();
+
+        screen(&mut app, 100, 20);
+
+        let CardImageSlot::Ready {
+            protocol: Some(protocol),
+            ..
+        } = app.card_images.get("https://i.redd.it/p1.jpeg").unwrap()
+        else {
+            panic!("card protocol");
+        };
+        let pixels = card_png(&protocol.tiles[&(0, 0, 1)]);
+        assert_eq!(pixels.dimensions(), (544, 16));
+        assert!((120..=136).contains(&pixels.get_pixel(272, 8)[0]));
+    }
+
+    #[test]
+    fn when_paging_inside_a_tall_card_it_should_keep_the_selected_post() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = card_with_image(320, 640);
+        screen(&mut app, 100, 20);
+
+        crate::keys::handle(
+            &mut app,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        );
+        let cells = placeholder_cells(&mut app, 100, 20);
+
+        assert_eq!(app.current_post().unwrap().id, "p1");
+        assert_eq!(app.active_tab().feed.cards.line, 16);
+        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(94));
+    }
+
+    #[test]
+    fn when_paging_to_a_tall_cards_bottom_it_should_expose_the_footer_and_keep_the_last_post() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = card_with_image(320, 640);
+        screen(&mut app, 100, 20);
+        app.scroll_card(1000);
+        screen(&mut app, 100, 20);
+
+        crate::keys::handle(
+            &mut app,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        );
+        let actual = screen(&mut app, 100, 20);
+
+        assert!(actual.contains("comments"), "{actual}");
+        assert_eq!(app.active_tab().feed.cards.line, 55);
+        assert_eq!(app.current_post().unwrap().id, "p1");
+    }
+
+    #[test]
+    fn when_scrolling_up_a_card_by_control_y_it_should_move_one_line_without_copying() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = card_with_image(320, 640);
+        screen(&mut app, 100, 20);
+        app.scroll_card(5);
+
+        crate::keys::handle(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(app.active_tab().feed.cards.line, 4);
+        assert!(app.status.is_none(), "Ctrl+y must not copy a link");
+    }
+
+    #[test]
+    fn when_pressing_g_inside_the_first_card_it_should_return_to_its_top() {
+        let mut app = card_with_image(320, 640);
+        screen(&mut app, 100, 20);
+        app.scroll_card(5);
+
+        press(&mut app, 'g');
+        let actual = screen(&mut app, 100, 20);
+
+        assert!(actual.contains("Full width image"), "{actual}");
+        assert_eq!(app.active_tab().feed.cards.line, 0);
+    }
+
+    #[test]
+    fn when_resizing_a_card_it_should_refit_the_image_to_the_new_width() {
+        let mut app = card_with_image(640, 320);
+        placeholder_cells(&mut app, 100, 20);
+
+        let cells = placeholder_cells(&mut app, 80, 20);
+
+        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(27));
+        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(74));
+        assert!(matches!(app.card_images.get("https://i.redd.it/p1.jpeg"),
+            Some(CardImageSlot::Ready { protocol: Some(protocol), .. })
+                if protocol.size == Size::new(48, 12)));
+    }
+
+    #[test]
+    fn when_a_compact_list_pages_it_should_still_move_ten_posts() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = feed_app(kitty());
+
+        crate::keys::handle(
+            &mut app,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        );
+
+        assert_eq!(app.current_post().unwrap().id, "p8");
+    }
+
+    #[test]
+    fn when_card_mode_uses_compact_rows_in_a_tiny_terminal_paging_should_still_work() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = card_feed_app(kitty());
+        screen(&mut app, 100, 6);
+
+        crate::keys::handle(
+            &mut app,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        );
+
+        assert_eq!(app.current_post().unwrap().id, "p8");
+    }
+
+    #[test]
+    fn when_returning_from_fullscreen_detail_a_reloading_card_should_keep_its_scroll() {
+        let mut app = card_with_image(320, 640);
+        screen(&mut app, 100, 20);
+        app.scroll_card(16);
+        screen(&mut app, 100, 20);
+        app.open_current_post();
+        screen(&mut app, 100, 20);
+        app.close_post();
+        screen(&mut app, 100, 20);
+        assert_eq!(app.active_tab().feed.cards.line, 16);
+
+        app.on_msg(Msg::Image {
+            url: "https://i.redd.it/p1.jpeg".into(),
+            result: Ok(image::DynamicImage::new_rgb8(320, 640).into()),
+        });
+        placeholder_cells(&mut app, 100, 20);
+
+        assert_eq!(app.active_tab().feed.cards.line, 16);
+        assert_eq!(app.current_post().unwrap().id, "p1");
+    }
+
+    #[test]
+    fn when_scrolling_below_kittys_row_limit_image_tiles_should_use_local_coordinates() {
+        let mut app = card_with_image(100, 1000);
+        screen(&mut app, 100, 20);
+        app.scroll_card(300);
+        screen(&mut app, 100, 20);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let CardImageSlot::Ready {
+            protocol: Some(protocol),
+            ..
+        } = app.card_images.get("https://i.redd.it/p1.jpeg").unwrap()
+        else {
+            panic!("card protocol");
+        };
+        assert_eq!(protocol.size, Size::new(68, 340));
+        assert!(protocol.tiles.contains_key(&(298, 0, 6)));
+        assert_eq!(protocol.tiles.len(), 2);
+        assert_eq!(protocol.tiles[&(298, 0, 6)].size(), Size::new(68, 6));
+        assert_eq!(protocol.tiles[&(304, 0, 10)].size(), Size::new(68, 10));
+        let row = terminal.backend().buffer()[(27, 3)]
+            .symbol()
+            .split_once('\u{10EEEE}')
+            .unwrap()
+            .1
+            .chars()
+            .next();
+        assert_eq!(row, Some('\u{305}'));
+    }
+
+    #[test]
+    fn when_a_card_is_wider_than_kittys_column_limit_it_should_render_its_right_edge() {
+        let mut app = card_with_image(640, 320);
+
+        let cells = placeholder_cells(&mut app, 340, 20);
+
+        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(33));
+        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(334));
+    }
+
+    #[test]
+    fn when_scrolling_an_iterm2_card_it_should_encode_only_the_visible_image_rows() {
+        let mut app = card_with_image(320, 640);
+        app.image_picker.set_protocol_type(ProtocolType::Iterm2);
+        screen(&mut app, 100, 20);
+        app.scroll_card(16);
+
+        screen(&mut app, 100, 20);
+
+        let CardImageSlot::Ready {
+            protocol: Some(protocol),
+            ..
+        } = app.card_images.get("https://i.redd.it/p1.jpeg").unwrap()
+        else {
+            panic!("card protocol");
+        };
+        assert_eq!(protocol.tiles.len(), 2);
+        assert_eq!(protocol.tiles[&(14, 0, 2)].size(), Size::new(68, 2));
+        assert_eq!(protocol.tiles[&(16, 0, 14)].size(), Size::new(68, 14));
+        assert!(matches!(
+            *protocol.tiles[&(14, 0, 2)],
+            ratatui_image::protocol::Protocol::ITerm2(_)
+        ));
+    }
+
+    #[test]
+    fn when_scrolling_a_sixel_card_it_should_encode_only_the_visible_image_rows() {
+        let mut app = card_with_image(320, 640);
+        app.image_picker.set_protocol_type(ProtocolType::Sixel);
+        screen(&mut app, 100, 20);
+        app.scroll_card(16);
+
+        screen(&mut app, 100, 20);
+
+        let CardImageSlot::Ready {
+            protocol: Some(protocol),
+            ..
+        } = app.card_images.get("https://i.redd.it/p1.jpeg").unwrap()
+        else {
+            panic!("card protocol");
+        };
+        assert_eq!(protocol.tiles.len(), 2);
+        assert_eq!(protocol.tiles[&(14, 0, 2)].size(), Size::new(68, 2));
+        assert_eq!(protocol.tiles[&(16, 0, 14)].size(), Size::new(68, 14));
+        assert!(matches!(
+            *protocol.tiles[&(14, 0, 2)],
+            ratatui_image::protocol::Protocol::Sixel(_)
+        ));
+    }
+
+    #[test]
+    fn when_bookmarks_page_a_tall_card_the_saved_post_should_stay_selected() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = card_with_image(320, 640);
+        app.state.toggle_bookmark(&app.current_post().unwrap(), 1);
+        app.switch_tab(1);
+        screen(&mut app, 100, 20);
+
+        crate::keys::handle(
+            &mut app,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        );
+        screen(&mut app, 100, 20);
+
+        assert_eq!(app.current_post().unwrap().id, "p1");
+        assert_eq!(app.active_tab().feed.cards.line, 16);
+    }
+
+    #[test]
+    fn when_paging_back_to_a_card_that_reloads_it_should_reach_its_bottom_after_loading() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = card_with_image(320, 640);
+        app.tabs[3].feed.posts.push(post_with("p2", Media::None));
+        screen(&mut app, 100, 20);
+        app.move_selection(1);
+        screen(&mut app, 100, 20);
+        crate::keys::handle(&mut app, KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        screen(&mut app, 100, 20);
+        std::thread::sleep(crate::app::NAV_SETTLE);
+        app.tick();
+        screen(&mut app, 100, 20);
+
+        app.on_msg(Msg::Image {
+            url: "https://i.redd.it/p1.jpeg".into(),
+            result: Ok(image::DynamicImage::new_rgb8(320, 640).into()),
+        });
+        let actual = screen(&mut app, 100, 20);
+
+        assert!(actual.contains("comments"), "{actual}");
+        assert_eq!(app.active_tab().feed.cards.line, 55);
+        assert_eq!(app.current_post().unwrap().id, "p1");
+    }
+
+    #[test]
+    fn when_a_card_is_a_spoiler_it_should_show_the_tag_without_loading_its_image() {
+        let mut app = card_feed_app(kitty());
+        app.tabs[3].feed.posts[0].spoiler = true;
+
+        let actual = screen(&mut app, 100, 20);
+
+        assert!(actual.contains("spoiler"), "{actual}");
+        assert!(!app.card_images.contains_key("https://i.redd.it/p1.jpeg"));
+    }
+
+    #[test]
+    fn when_cards_scroll_in_a_short_pane_the_selected_post_should_stay_visible() {
+        let mut app = card_feed_app(Picker::halfblocks());
+        app.move_selection(7);
+
+        let actual = screen(&mut app, 60, 9);
+
+        assert!(actual.contains("p8"), "{actual}");
+        assert_eq!(app.current_post().unwrap().id, "p8");
+    }
+
+    #[test]
+    fn when_card_images_are_switched_off_their_previews_should_be_released() {
+        let mut app = card_feed_app(kitty());
+        screen(&mut app, 100, 20);
+        assert!(!app.card_images.is_empty());
+
+        press(&mut app, 'i');
+        screen(&mut app, 100, 20);
+
+        assert!(app.card_images.is_empty());
+    }
+
+    #[test]
+    fn when_a_card_is_a_gallery_it_should_preview_the_first_image_instead_of_its_thumbnail() {
+        let mut app = card_feed_app(kitty());
+        app.tabs[3].feed.posts[0].media = Media::Gallery {
+            images: vec!["https://i.redd.it/full.jpeg".into()],
+            thumb: Some("https://i.redd.it/small.jpeg".into()),
+        };
+
+        screen(&mut app, 100, 20);
+
+        assert!(app.card_images.contains_key("https://i.redd.it/full.jpeg"));
+        assert!(!app.card_images.contains_key("https://i.redd.it/small.jpeg"));
+    }
+
+    #[test]
+    fn when_a_bookmark_list_opens_it_should_use_the_card_layout() {
+        let mut app = card_feed_app(Picker::halfblocks());
+        app.state
+            .toggle_bookmark(&post_with("saved", Media::None), 1);
+        app.switch_tab(1);
+
+        let actual = screen(&mut app, 100, 20);
+
+        assert!(actual.contains("V Card"), "{actual}");
+        assert!(actual.contains("saved"), "{actual}");
+        assert!(actual.contains("comments"), "{actual}");
     }
 
     /// Length of the `x` run in the title line of post `id`.
@@ -4631,6 +7477,11 @@ mod tests {
     fn placeholder_cells(app: &mut App, w: u16, h: u16) -> Vec<(u16, u16)> {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal.draw(|f| draw(f, app)).unwrap();
+        while app.card_renderer.pending() {
+            app.card_renderer.wait_for_completion();
+            app.card_renderer.poll();
+            terminal.draw(|f| draw(f, app)).unwrap();
+        }
         let buf = terminal.backend().buffer().clone();
         let mut cells = Vec::new();
         for y in 0..h {
@@ -4647,17 +7498,13 @@ mod tests {
     fn an_empty_feed_says_whether_the_config_hid_the_posts_or_a_search_found_none() {
         let mut app = feed_app(Picker::halfblocks());
         let answer = |app: &mut App, posts: Vec<Post>| {
-            let tab = app.tabs[2].id;
-            let generation = app.tabs[2].feed.generation;
+            let tab = app.tabs[3].id;
+            let generation = app.tabs[3].feed.generation;
             app.on_msg(Msg::Feed {
                 tab,
                 generation,
                 append: false,
-                result: Ok(crate::model::Listing {
-                    posts,
-                    after: None,
-                    icon: None,
-                }),
+                result: Ok(crate::model::Listing { posts, after: None }),
             });
         };
 
@@ -4736,7 +7583,7 @@ mod tests {
     }
 
     #[test]
-    fn subreddit_icon_from_a_listing_shows_in_sidebar_and_home_card() {
+    fn a_subreddit_icon_shows_in_sidebar_and_home_card() {
         let mut app = app(&["s"]);
         app.image_picker = kitty();
         app.show_images = true;
@@ -4746,13 +7593,16 @@ mod tests {
             result: Ok(crate::model::Listing {
                 posts: vec![post_with("p1", Media::None)],
                 after: None,
-                icon: Some("/icon/s.png".into()),
             }),
         });
-        // A later listing without an icon (search, error page) keeps the known one.
-        app.switch_tab(2);
-        let generation = app.tabs[2].feed.generation;
-        let id = app.tabs[2].id;
+        app.on_msg(Msg::Icon {
+            subreddit: "s".into(),
+            result: Ok(Some("/icon/s.png".into())),
+        });
+        // A later load of the subreddit keeps the known icon.
+        app.switch_tab(3);
+        let generation = app.tabs[3].feed.generation;
+        let id = app.tabs[3].id;
         app.on_msg(Msg::Feed {
             tab: id,
             generation,
@@ -4760,10 +7610,9 @@ mod tests {
             result: Ok(crate::model::Listing {
                 posts: vec![post_with("p1", Media::None)],
                 after: None,
-                icon: None,
             }),
         });
-        app.switch_tab(0);
+        app.switch_tab(crate::app::ALL_SUBS_TAB);
         // Two quick tab switches hold new icons until they settle.
         std::thread::sleep(crate::app::NAV_SETTLE);
 
@@ -4896,7 +7745,7 @@ mod tests {
         let mut app = app(&["s"]);
         app.image_picker = kitty();
         app.show_images = true;
-        app.home.groups[0].posts = (1..=3)
+        app.all_subs.groups[0].posts = (1..=3)
             .map(|i| {
                 post_with(
                     &format!("p{i}"),
@@ -4921,7 +7770,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tab_opened_by_name_learns_its_icon_from_its_own_feed() {
+    fn a_tab_opened_by_name_shows_its_icon_whatever_the_letter_case() {
         let mut app = app(&[]);
         app.image_picker = kitty();
         app.show_images = true;
@@ -4936,8 +7785,11 @@ mod tests {
             result: Ok(crate::model::Listing {
                 posts: vec![post_with("p1", Media::None)],
                 after: None,
-                icon: Some("/icon/pics.png".into()),
             }),
+        });
+        app.on_msg(Msg::Icon {
+            subreddit: "pics".into(),
+            result: Ok(Some("/icon/pics.png".into())),
         });
 
         assert_eq!(app.shown_icon("Pics"), Some("/icon/pics.png"));
@@ -5034,10 +7886,10 @@ mod tests {
     #[test]
     fn when_detail_is_split_h_should_focus_the_list_without_leaving_the_comment() {
         let (mut app, _) = open_long_post(|_| {});
-        let mut other = app.home.groups[0].posts[0].clone();
+        let mut other = app.all_subs.groups[0].posts[0].clone();
         other.id = "other".into();
         other.permalink = "/r/s/comments/other/x/".into();
-        app.home.groups[0].posts.push(other);
+        app.all_subs.groups[0].posts.push(other);
         screen(&mut app, 180, 30);
         press(&mut app, 'j');
         screen(&mut app, 180, 30);
@@ -5052,7 +7904,7 @@ mod tests {
         press(&mut app, 'j');
 
         assert_eq!(actual, expected, "h must not leave or reset the comment");
-        assert_eq!(app.home.post, 1, "j now moves the list selection");
+        assert_eq!(app.all_subs.post, 1, "j now moves the list selection");
         assert_eq!(app.current_post().unwrap().id, "other");
     }
 
@@ -5074,10 +7926,10 @@ mod tests {
     fn when_a_resize_hides_the_list_the_next_key_should_target_detail() {
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
         let (mut app, _) = open_long_post(|_| {});
-        let mut other = app.home.groups[0].posts[0].clone();
+        let mut other = app.all_subs.groups[0].posts[0].clone();
         other.id = "other".into();
         other.permalink = "/r/s/comments/other/x/".into();
-        app.home.groups[0].posts.push(other);
+        app.all_subs.groups[0].posts.push(other);
         screen(&mut app, 180, 30);
         press(&mut app, 'h');
         press(&mut app, 'j');
@@ -5089,17 +7941,17 @@ mod tests {
         );
 
         assert_eq!(app.post_view.as_ref().unwrap().post.id, "other");
-        assert_eq!(app.home.post, 1, "the hidden list selection stays put");
+        assert_eq!(app.all_subs.post, 1, "the hidden list selection stays put");
     }
 
     #[test]
     fn when_a_resize_shows_the_list_h_should_focus_it_before_the_next_key() {
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
         let (mut app, _) = open_long_post(|_| {});
-        let mut other = app.home.groups[0].posts[0].clone();
+        let mut other = app.all_subs.groups[0].posts[0].clone();
         other.id = "other".into();
         other.permalink = "/r/s/comments/other/x/".into();
-        app.home.groups[0].posts.push(other);
+        app.all_subs.groups[0].posts.push(other);
         press(&mut app, 'j');
         screen(&mut app, 100, 30);
 
@@ -5114,7 +7966,7 @@ mod tests {
         );
         press(&mut app, 'j');
 
-        assert_eq!(app.home.post, 1);
+        assert_eq!(app.all_subs.post, 1);
     }
 
     #[test]
@@ -5141,7 +7993,7 @@ mod tests {
         let (mut app, _) = open_long_post(|_| {});
         screen(&mut app, 180, 30);
         press(&mut app, 'h');
-        app.home.groups[0].posts.clear();
+        app.all_subs.groups[0].posts.clear();
         screen(&mut app, 180, 30);
 
         press(&mut app, 'l');
@@ -5197,7 +8049,7 @@ mod tests {
 
         press(&mut app, 'h');
         let mut seen = vec![name(&app)];
-        for _ in 0..5 {
+        for _ in 0..6 {
             press(&mut app, 'j');
             seen.push(name(&app));
         }
@@ -5206,7 +8058,10 @@ mod tests {
         press(&mut app, 'g');
         let first = name(&app);
 
-        assert_eq!(seen, ["Home", "Bookmarks", "r/a", "r/b", "r/c", "r/c"]);
+        assert_eq!(
+            seen,
+            ["Home", "Bookmarks", "All subs", "r/a", "r/b", "r/c", "r/c"]
+        );
         assert_eq!(after_k, "r/b");
         assert_eq!(first, "Home");
         assert_eq!(app.focus, Focus::Sidebar);
@@ -5215,6 +8070,7 @@ mod tests {
     #[test]
     fn h_shows_a_hidden_sidebar_only_while_it_has_focus() {
         let mut app = app(&["a"]);
+        app.switch_tab(0);
         app.toggle_sidebar();
 
         press(&mut app, 'h');
@@ -5339,7 +8195,7 @@ mod tests {
     fn search_input_takes_ctrl_h_as_backspace_and_pastes_as_text() {
         use crossterm::event::{KeyCode, KeyModifiers};
         let mut app = app(&["s"]);
-        app.switch_tab(2);
+        app.switch_tab(3);
         let tabs = app.tabs.len();
         app.overlay = Some(Overlay::Search { input: "ab".into() });
         let input = |app: &App| match &app.overlay {

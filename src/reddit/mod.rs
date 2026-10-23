@@ -1,33 +1,85 @@
-//! Direct, read-only Reddit access using an anonymous mobile guest session.
+//! Direct Reddit access using an exported browser session.
 
+mod accounts;
+mod credentials;
+mod home;
+mod membership;
 pub mod parse;
 mod relay;
+mod session;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod text;
 mod transport;
 
-use std::collections::HashMap;
+pub use accounts::SavedAccount;
+pub(crate) use accounts::saved_revision;
+pub(crate) use membership::is_community;
+
+use std::collections::HashSet;
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use image::DynamicImage;
 use parking_lot::Mutex;
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use url::Url;
-use wreq::header::{HeaderMap, HeaderValue};
 
 use crate::model::{Listing, PostPage, ReplyPage, Sort, TimeRange};
 use transport::{RUNTIME, Reader, Transport};
 
-const API: &str = "https://oauth.reddit.com/";
-const AUTH: &str = "https://www.reddit.com/auth/v2/oauth/access-token/loid";
-// Public Android application identifier, not a user credential or application secret.
-const CLIENT_ID: &str = "ohXpoqrZYub1kg";
-const USER_AGENT: &str = "Reddit/Version 2024.47.0/Build 2029755/Android 14";
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Account {
+    pub id: String,
+    pub name: String,
+}
+
+impl Account {
+    fn valid(&self) -> bool {
+        !self.id.is_empty()
+            && self.id.len() <= 64
+            && self.id.bytes().all(|c| c.is_ascii_alphanumeric())
+            && !self.name.is_empty()
+            && self.name.len() <= 64
+            && self
+                .name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+    }
+}
+
+pub fn sign_in(input: impl Read) -> Result<Account> {
+    let text = session::read_import(input)?;
+    let candidate = Reddit::from_export(&text, false)?;
+    let account = candidate.verify_account()?;
+    candidate.save_connection(None)?;
+    Ok(account)
+}
+
+pub(crate) fn read_store() -> Result<String> {
+    accounts::load(None)
+}
+pub(crate) fn saved_accounts() -> Result<Vec<SavedAccount>> {
+    accounts::list()
+}
+pub(crate) fn read_account(id: &str) -> Result<String> {
+    accounts::load(Some(id))
+}
+pub(crate) fn remove_store(id: &str) -> Result<()> {
+    accounts::remove(id)
+}
+pub(crate) fn write_store(text: &str) -> Result<()> {
+    accounts::save(text)
+}
+pub(crate) fn activate_account(id: &str, expected: &str, text: &str) -> Result<()> {
+    accounts::activate(id, expected, text)
+}
+
+const API: &str = "https://www.reddit.com/";
+const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 const IMAGE_LIMIT: u64 = 64 * 1024 * 1024;
 const DECODE_LIMIT: u64 = 512 * 1024 * 1024;
 
@@ -37,14 +89,16 @@ pub struct Reddit(Arc<Inner>);
 struct Inner {
     transport: Transport,
     api: Url,
-    auth: String,
     show_nsfw: bool,
-    session: Mutex<Option<Token>>,
+    session: session::Session,
+    account: Mutex<Option<Account>>,
+    source: Mutex<Option<crate::auth::Source>>,
+    saved_key: Mutex<Option<String>>,
+    retired: AtomicBool,
     /// Never held across a request, so the UI can read it while one is in flight.
     status: Mutex<Status>,
     /// Reddit's morechildren contract allows one in-flight expansion per client.
     expansion: Mutex<()>,
-    icons: Mutex<HashMap<String, (Instant, Option<String>)>>,
     relay: OnceLock<relay::Relay>,
 }
 
@@ -53,14 +107,26 @@ struct Status {
     /// Whether the latest request found Reddit up; `None` before the first.
     up: Option<bool>,
     cooldown: Option<Instant>,
-    /// A sign-in got no answer: until then, requests fail at once instead of each
-    /// waiting out its own attempt.
-    unreachable: Option<Instant>,
+    rejected: bool,
 }
+
+/// Reddit has no such resource (HTTP 404): an answer, unlike a refusal (403 can block the
+/// account) or a failed request.
+#[derive(Debug)]
+struct NotFound;
+
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Reddit content not found (HTTP 404)")
+    }
+}
+
+impl std::error::Error for NotFound {}
 
 /// The connection status, from the requests redtab already makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Health {
+    SignedOut,
     Unknown,
     Up,
     /// Requests wait out a cooldown, usually Reddit's rate limit.
@@ -68,33 +134,128 @@ pub enum Health {
     Down,
 }
 
-#[derive(Clone)]
-struct Token {
-    headers: HeaderMap,
-    expires: Instant,
-    id: uuid::Uuid,
-}
-
 impl Reddit {
+    pub fn disconnected(show_nsfw: bool) -> Result<Self> {
+        Self::with_transport(
+            Transport::new()?,
+            show_nsfw,
+            API,
+            session::Session::disconnected(),
+        )
+    }
+
+    pub fn from_export(text: &str, show_nsfw: bool) -> Result<Self> {
+        Self::with_transport(
+            Transport::new()?,
+            show_nsfw,
+            API,
+            session::Session::parse(text, session::now())?,
+        )
+    }
+
+    pub fn account(&self) -> Option<Account> {
+        self.0.account.lock().clone()
+    }
+
+    pub(crate) fn saved_id(&self) -> Option<String> {
+        self.0.saved_key.lock().clone()
+    }
+
+    pub(crate) fn from_saved(text: &str, show_nsfw: bool) -> Result<Self> {
+        Self::with_transport(
+            Transport::new()?,
+            show_nsfw,
+            API,
+            session::Session::stored(text, session::now())?,
+        )
+    }
+
+    pub fn source(&self) -> Option<crate::auth::Source> {
+        self.0.source.lock().clone()
+    }
+
+    pub fn session_fingerprint(&self) -> &str {
+        &self.0.session.fingerprint
+    }
+
+    pub fn needs_sign_in(&self) -> bool {
+        !self.0.session.valid() || self.0.status.lock().rejected
+    }
+
+    pub fn retire(&self) {
+        self.0.retired.store(true, Ordering::Release);
+    }
+
+    pub fn verify_account(&self) -> Result<Account> {
+        let me = self.get(self.0.api.join("api/me.json")?)?;
+        let account = Account {
+            id: me["data"]["id"].as_str().unwrap_or_default().into(),
+            name: me["data"]["name"].as_str().unwrap_or_default().into(),
+        };
+        if !account.valid() {
+            bail!(
+                "Reddit did not confirm a signed-in account; sign in in your browser and try again"
+            );
+        }
+        *self.0.account.lock() = Some(account.clone());
+        Ok(account)
+    }
+
+    pub(crate) fn verify_saved_account(&self) -> Result<()> {
+        let expected = self.account();
+        let actual = self.verify_account()?;
+        if expected.is_some_and(|account| account.id != actual.id) {
+            bail!("Saved session belongs to a different account; reconnect it from your browser");
+        }
+        Ok(())
+    }
+
+    pub fn save_connection(&self, source: Option<crate::auth::Source>) -> Result<()> {
+        self.save_connection_with(source, crate::auth::save_export)
+    }
+
+    pub(crate) fn save_connection_with(
+        &self,
+        source: Option<crate::auth::Source>,
+        save: impl FnOnce(&str) -> Result<()>,
+    ) -> Result<()> {
+        let account = self
+            .account()
+            .context("Verify the Reddit account before saving")?;
+        save(&self.0.session.export(session::Connection {
+            account: account.clone(),
+            source: source.clone(),
+        })?)?;
+        *self.0.source.lock() = source;
+        *self.0.saved_key.lock() = Some(account.id);
+        Ok(())
+    }
     pub fn new(show_nsfw: bool) -> Result<Self> {
-        Self::with_transport(Transport::new()?, show_nsfw, API, AUTH)
+        let session = session::Session::load()?;
+        Self::with_transport(Transport::new()?, show_nsfw, API, session)
     }
 
     fn with_transport(
         transport: Transport,
         show_nsfw: bool,
         api: &str,
-        auth: &str,
+        session: session::Session,
     ) -> Result<Self> {
+        let account = Mutex::new(session.connection.as_ref().map(|c| c.account.clone()));
+        let source = Mutex::new(session.connection.as_ref().and_then(|c| c.source.clone()));
+        let saved_key =
+            Mutex::new((session.fingerprint != "disconnected").then(|| session.saved_id()));
         Ok(Self(Arc::new(Inner {
             transport,
             api: Url::parse(api)?,
-            auth: auth.to_owned(),
             show_nsfw,
-            session: Mutex::new(None),
+            session,
+            account,
+            source,
+            saved_key,
+            retired: AtomicBool::new(false),
             status: Mutex::new(Status::default()),
             expansion: Mutex::new(()),
-            icons: Mutex::new(HashMap::new()),
             relay: OnceLock::new(),
         })))
     }
@@ -104,24 +265,28 @@ impl Reddit {
     pub fn test_at(base: &str, show_nsfw: bool) -> Self {
         let mut transport = Transport::new().unwrap();
         transport.media_origin = Some(Url::parse(base).unwrap());
-        let reddit = Self::with_transport(
+        Self::with_transport(
             transport,
             show_nsfw,
             &format!("{}/", base.trim_end_matches('/')),
-            base,
+            session::Session::parse(
+                ".reddit.com\tTRUE\t/\tTRUE\t0\treddit_session\tfixture-session\n",
+                0,
+            )
+            .unwrap(),
         )
-        .unwrap();
-        *reddit.0.session.lock() = Some(Token {
-            headers: HeaderMap::new(),
-            expires: Instant::now() + Duration::from_secs(3600),
-            id: uuid::Uuid::new_v4(),
-        });
-        reddit
+        .unwrap()
     }
 
     pub fn cache_namespace(&self) -> String {
-        // Deliberately excludes tokens and the temporary relay URL.
-        format!("reddit-json-v1\n{}\nnsfw={}", self.0.api, self.0.show_nsfw)
+        let identity = self.account().map_or_else(
+            || self.0.session.fingerprint.clone(),
+            |a| format!("account:{}", a.id),
+        );
+        format!(
+            "reddit-web-v1\n{}\nnsfw={}\nsession={}",
+            self.0.api, self.0.show_nsfw, identity
+        )
     }
 
     pub fn listing(
@@ -131,7 +296,55 @@ impl Reddit {
         time: TimeRange,
         after: Option<&str>,
     ) -> Result<Listing> {
-        let mut url = self.subreddit_url(subreddit, &format!("{}.json", sort.as_str()))?;
+        if sort == Sort::Best {
+            bail!("Best is available on Home only");
+        }
+        let url = self.subreddit_url(subreddit, &format!("{}.json", sort.as_str()))?;
+        self.fetch_listing(url, sort, time, after)
+    }
+
+    pub fn home(&self, sort: Sort, time: TimeRange, after: Option<&str>) -> Result<Listing> {
+        if sort == Sort::Best {
+            return self.browser_home(after);
+        }
+        let url = self.0.api.join(&format!("{}.json", sort.as_str()))?;
+        self.fetch_listing(url, sort, time, after)
+    }
+
+    fn browser_home(&self, after: Option<&str>) -> Result<Listing> {
+        let url = home::url(
+            &self.0.api,
+            after.unwrap_or("/svc/shreddit/feeds/home-feed?sort=BEST"),
+        )?;
+        let html = transport::html(self.request(url, home::ACCEPT)?)?;
+        let page = home::parse(&html, &self.0.api)?;
+        let mut details = std::collections::HashMap::new();
+        for ids in page.ids.chunks(100) {
+            let mut url = self.0.api.join(&format!("by_id/{}.json", ids.join(",")))?;
+            url.query_pairs_mut().append_pair("raw_json", "1");
+            for post in parse::parse_listing_value(self.get(url)?)?.posts {
+                details.insert(format!("t3_{}", post.id), post);
+            }
+        }
+        let posts = page
+            .ids
+            .into_iter()
+            .filter_map(|id| details.remove(&id))
+            .filter(|post| self.0.show_nsfw || !post.nsfw)
+            .collect();
+        Ok(Listing {
+            posts,
+            after: page.after,
+        })
+    }
+
+    fn fetch_listing(
+        &self,
+        mut url: Url,
+        sort: Sort,
+        time: TimeRange,
+        after: Option<&str>,
+    ) -> Result<Listing> {
         self.listing_params(&mut url, after);
         if sort.takes_time() {
             url.query_pairs_mut().append_pair("t", time.as_str());
@@ -140,10 +353,36 @@ impl Reddit {
         if !self.0.show_nsfw {
             listing.posts.retain(|p| !p.nsfw);
         }
-        if after.is_none() && !matches!(subreddit, "all" | "popular") {
-            listing.icon = self.icon(subreddit);
-        }
         Ok(listing)
+    }
+
+    /// Follow every page before replacing the account's last complete subscription list.
+    pub fn subscriptions(&self) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        let mut seen_names = HashSet::new();
+        let mut cursors = HashSet::new();
+        let mut after: Option<String> = None;
+        loop {
+            let mut url = self.0.api.join("subreddits/mine/subscriber.json")?;
+            url.query_pairs_mut()
+                .append_pair("limit", "100")
+                .append_pair("raw_json", "1");
+            if let Some(cursor) = &after {
+                url.query_pairs_mut().append_pair("after", cursor);
+            }
+            let (page, next) = parse::parse_subscriptions(self.get(url)?)?;
+            names.extend(
+                page.into_iter()
+                    .filter(|name| seen_names.insert(name.to_ascii_lowercase())),
+            );
+            let Some(next) = next else { break };
+            if !cursors.insert(next.clone()) {
+                bail!("Reddit repeated a subscription cursor");
+            }
+            after = Some(next);
+        }
+        names.sort_by_key(|name| name.to_ascii_lowercase());
+        Ok(names)
     }
 
     pub fn search(&self, subreddit: &str, query: &str, after: Option<&str>) -> Result<Listing> {
@@ -185,43 +424,21 @@ impl Reddit {
         }
     }
 
-    fn icon(&self, subreddit: &str) -> Option<String> {
-        let key = subreddit.to_ascii_lowercase();
-        {
-            let icons = self.0.icons.lock();
-            if let Some((until, icon)) = icons.get(&key)
-                && Instant::now() < *until
-            {
-                return icon.clone();
-            }
-        }
-        let result = self
-            .subreddit_url(subreddit, "about.json")
-            .and_then(|mut url| {
-                url.query_pairs_mut().append_pair("raw_json", "1");
-                self.get(url)
-            });
-        let seconds = if result.is_ok() { 900 } else { 60 };
-        let icon = result.ok().and_then(|v| {
-            ["community_icon", "icon_img"].into_iter().find_map(|key| {
-                v["data"][key]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-            })
-        });
-        let mut icons = self.0.icons.lock();
-        if icons.len() >= 256 {
-            icons.retain(|_, (until, _)| *until > Instant::now());
-        }
-        if icons.len() >= 256 {
-            icons.clear();
-        }
-        icons.insert(
-            key,
-            (Instant::now() + Duration::from_secs(seconds), icon.clone()),
-        );
-        icon
+    /// The subreddit's icon URL, if it has one.
+    pub fn icon(&self, subreddit: &str) -> Result<Option<String>> {
+        let mut url = self.subreddit_url(subreddit, "about.json")?;
+        url.query_pairs_mut().append_pair("raw_json", "1");
+        let about = match self.get(url) {
+            // The subreddit's answer, kept like an icon: asking again gets the same 404.
+            Err(e) if e.is::<NotFound>() => return Ok(None),
+            result => result?,
+        };
+        Ok(["community_icon", "icon_img"].into_iter().find_map(|key| {
+            about["data"][key]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        }))
     }
 
     pub fn post(&self, permalink: &str) -> Result<PostPage> {
@@ -270,16 +487,25 @@ impl Reddit {
     }
 
     pub fn image(&self, url: &str) -> Result<Vec<u8>> {
+        if self.0.retired.load(Ordering::Acquire) {
+            bail!("This Reddit connection was replaced");
+        }
         let mut bytes = Vec::new();
         Reader::new(self.0.transport.media(url, None)?, IMAGE_LIMIT).read_to_end(&mut bytes)?;
         Ok(bytes)
     }
 
     pub fn still_image(&self, url: &str) -> Result<DynamicImage> {
+        if self.0.retired.load(Ordering::Acquire) {
+            bail!("This Reddit connection was replaced");
+        }
         decode_still(Reader::new(self.0.transport.media(url, None)?, IMAGE_LIMIT))
     }
 
     pub fn media_url(&self, url: &str) -> Result<String> {
+        if self.0.retired.load(Ordering::Acquire) {
+            bail!("This Reddit connection was replaced");
+        }
         let parsed = Url::parse(url).context("invalid media URL")?;
         if !self.0.transport.media_allowed(&parsed) {
             bail!("unsupported media host or protocol");
@@ -297,8 +523,12 @@ impl Reddit {
     }
 
     pub fn health(&self) -> Health {
+        if self.needs_sign_in() {
+            return Health::SignedOut;
+        }
         let status = self.0.status.lock();
         match status.up {
+            _ if status.rejected => Health::Down,
             Some(false) => Health::Down,
             _ if status.cooldown.is_some_and(|until| Instant::now() < until) => Health::Paused,
             Some(true) => Health::Up,
@@ -312,55 +542,79 @@ impl Reddit {
 
     /// Asks Reddit for one listing, for `--check`, and returns the health it showed.
     pub fn check(&self) -> Health {
-        let mut url = self.0.api.join("r/popular/hot.json").expect("static path");
-        url.query_pairs_mut()
-            .append_pair("limit", "1")
-            .append_pair("raw_json", "1");
-        // A refused `r/popular` means no feed loads, though Reddit answered.
-        match (self.get(url), self.health()) {
+        let listing = self.home(Sort::Best, TimeRange::Day, None);
+        match (listing, self.health()) {
             (Err(_), Health::Up) => Health::Down,
             (_, health) => health,
         }
     }
 
     fn get(&self, url: Url) -> Result<Value> {
-        let mut retried = false;
-        loop {
-            let token = self.token()?;
-            let response = RUNTIME
-                .block_on(
-                    self.0
-                        .transport
-                        .client
-                        .get(url.as_str())
-                        .headers(token.headers.clone())
-                        .timeout(Duration::from_secs(20))
-                        .send(),
-                )
-                .map_err(|_| {
-                    self.record(false);
-                    transport::network_error()
-                })?;
-            let status = response.status().as_u16();
-            self.observe_limits(&response);
-            if status == 401 && !retried {
-                retried = true;
-                let mut session = self.0.session.lock();
-                if session.as_ref().is_some_and(|t| t.id == token.id) {
-                    *session = None;
-                }
-                continue;
+        transport::json(self.request(url, "application/json")?)
+    }
+
+    fn request(&self, url: Url, accept: &str) -> Result<wreq::Response> {
+        self.send(url, accept, |client, url| client.get(url))
+    }
+
+    fn send(
+        &self,
+        url: Url,
+        accept: &str,
+        request: impl FnOnce(&wreq::Client, &str) -> wreq::RequestBuilder,
+    ) -> Result<wreq::Response> {
+        if self.0.retired.load(Ordering::Acquire) {
+            bail!("This Reddit connection was replaced");
+        }
+        if url.origin() != self.0.api.origin() {
+            bail!("refusing to send Reddit cookies to another origin");
+        }
+        {
+            let status = self.0.status.lock();
+            if status.rejected {
+                bail!(session::SIGN_IN);
             }
-            // Refusing one resource, such as a private subreddit, is Reddit answering.
-            self.record(!matches!(status, 401 | 500..));
-            match status {
-                200..=299 => return transport::json(response),
-                401 => bail!("Reddit rejected the guest session"),
-                403 => bail!("Reddit denied guest access (HTTP 403)"),
-                404 => bail!("Reddit content not found (HTTP 404)"),
-                429 => bail!("Reddit rate limit reached; wait before retrying"),
-                _ => bail!("Reddit: HTTP {status}"),
+            if status.cooldown.is_some_and(|until| Instant::now() < until) {
+                bail!("Reddit requests paused; wait before retrying");
             }
+        }
+        let cookie = self
+            .0
+            .session
+            .header(url.path(), session::now())
+            .inspect_err(|_| {
+                self.record(false);
+            })?;
+        let mut request = request(&self.0.transport.client, url.as_str())
+            .header("Cookie", cookie)
+            .header("Accept", accept)
+            .header("User-Agent", USER_AGENT)
+            .timeout(Duration::from_secs(20));
+        if accept == home::ACCEPT {
+            request = request.header("Referer", self.0.api.as_str());
+        }
+        let response = RUNTIME.block_on(request.send()).map_err(|_| {
+            self.record(false);
+            transport::network_error()
+        })?;
+        let status = response.status().as_u16();
+        self.observe_limits(&response);
+        self.record(!matches!(status, 401 | 500..));
+        match status {
+            200..=299 => Ok(response),
+            401 => {
+                self.0.status.lock().rejected = true;
+                bail!(session::SIGN_IN);
+            }
+            403 => bail!(
+                "Reddit denied this request (HTTP 403); check your sign-in or access to this content"
+            ),
+            404 => Err(NotFound.into()),
+            429 => bail!("Reddit rate limit reached; wait before retrying"),
+            300..=399 => bail!(
+                "Reddit redirected the request (HTTP {status}); reconnect with A or redtab --signin"
+            ),
+            _ => bail!("Reddit: HTTP {status}"),
         }
     }
 
@@ -383,114 +637,6 @@ impl Reddit {
             self.0.status.lock().cooldown = Some(Instant::now() + Duration::from_secs_f64(seconds));
         }
     }
-
-    fn token(&self) -> Result<Token> {
-        // Single flight across worker threads, including failures. Only expired/rejected
-        // tokens refresh; rate limits never generate new guest identities.
-        let mut session = self.0.session.lock();
-        let now = Instant::now();
-        {
-            let status = self.0.status.lock();
-            if status.unreachable.is_some_and(|until| now < until) {
-                return Err(transport::network_error());
-            }
-            if status.cooldown.is_some_and(|until| now < until) {
-                bail!("Reddit requests paused; wait before retrying");
-            }
-        }
-        if let Some(token) = &*session
-            && now < token.expires
-        {
-            return Ok(token.clone());
-        }
-        let token = self.authenticate()?;
-        *session = Some(token.clone());
-        Ok(token)
-    }
-
-    fn authenticate(&self) -> Result<Token> {
-        let device = uuid::Uuid::new_v4().to_string();
-        let response = RUNTIME
-            .block_on(
-                self.0
-                    .transport
-                    .client
-                    .post(&self.0.auth)
-                    .basic_auth(CLIENT_ID, Some(""))
-                    .header("User-Agent", USER_AGENT)
-                    .header("client-vendor-id", &device)
-                    .header("X-Reddit-Device-Id", &device)
-                    .header("x-reddit-retry", "algo=no-retries")
-                    .header("x-reddit-compression", "1")
-                    .header("x-reddit-qos", "10.000")
-                    .header(
-                        "x-reddit-media-codecs",
-                        "available-codecs=video/avc, video/hevc, video/x-vnd.on2.vp9",
-                    )
-                    .header("Content-Type", "application/json; charset=UTF-8")
-                    .json(&json!({"scopes": ["*", "email", "pii"]}))
-                    .timeout(Duration::from_secs(10))
-                    .send(),
-            )
-            .map_err(|_| {
-                let mut status = self.0.status.lock();
-                status.up = Some(false);
-                status.unreachable = Some(Instant::now() + Duration::from_secs(5));
-                transport::network_error()
-            })?;
-        self.observe_limits(&response);
-        if !response.status().is_success() {
-            // A rate limit is Reddit answering; any other refusal leaves no guest session.
-            self.record(response.status().as_u16() == 429);
-            self.hold_sign_in();
-            bail!("guest authentication: HTTP {}", response.status().as_u16());
-        }
-        guest_token(response).inspect_err(|_| {
-            self.record(false);
-            self.hold_sign_in();
-        })
-    }
-
-    /// Reddit refused a guest session: requests wait at least a minute, longer when a rate
-    /// limit asked for it, so retries do not keep asking for new guest identities.
-    fn hold_sign_in(&self) {
-        let mut status = self.0.status.lock();
-        let floor = Instant::now() + Duration::from_secs(60);
-        status.cooldown = Some(status.cooldown.map_or(floor, |until| until.max(floor)));
-    }
-}
-
-/// The guest session a successful authentication response carries.
-fn guest_token(response: wreq::Response) -> Result<Token> {
-    #[derive(Deserialize)]
-    struct Reply {
-        access_token: String,
-        expires_in: u64,
-    }
-    let mut headers = HeaderMap::new();
-    headers.insert("User-Agent", HeaderValue::from_static(USER_AGENT));
-    for name in ["x-reddit-loid", "x-reddit-session"] {
-        if let Some(value) = response.headers().get(name) {
-            let mut value = value.clone();
-            value.set_sensitive(true);
-            headers.insert(name, value);
-        }
-    }
-    let reply: Reply = serde_json::from_value(transport::json(response)?)
-        .map_err(|_| anyhow::anyhow!("invalid guest authentication response"))?;
-    if reply.access_token.is_empty() || reply.expires_in < 2 {
-        bail!("invalid guest token or expiry");
-    }
-    let mut bearer = HeaderValue::from_str(&format!("Bearer {}", reply.access_token))
-        .map_err(|_| anyhow::anyhow!("invalid guest token"))?;
-    bearer.set_sensitive(true);
-    headers.insert("Authorization", bearer);
-    Ok(Token {
-        headers,
-        expires: Instant::now()
-            + Duration::from_secs(reply.expires_in.saturating_sub(30).clamp(1, 86400)),
-        id: uuid::Uuid::new_v4(),
-    })
 }
 
 /// Decodes an image; a GIF only up to its first frame, reading nothing past it.

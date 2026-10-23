@@ -104,6 +104,9 @@ pub struct Post {
     /// e.g. `/r/neovim/comments/abc/title/`.
     pub permalink: String,
     pub media: Media,
+    /// Width and height of the card's preview, before its pixels are downloaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_size: Option<(u32, u32)>,
     pub stickied: bool,
     pub nsfw: bool,
     /// Media and body stay hidden until revealed.
@@ -151,8 +154,6 @@ pub struct Listing {
     pub posts: Vec<Post>,
     /// Cursor for the next page (`t3_…`), absent on the last page.
     pub after: Option<String>,
-    /// Only subreddit listings carry one.
-    pub icon: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -235,6 +236,7 @@ pub struct PostPage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Sort {
+    Best,
     #[default]
     Hot,
     New,
@@ -244,7 +246,8 @@ pub enum Sort {
 }
 
 impl Sort {
-    pub const ALL: [Sort; 5] = [
+    pub const ALL: [Sort; 6] = [
+        Sort::Best,
         Sort::Hot,
         Sort::New,
         Sort::Top,
@@ -254,6 +257,7 @@ impl Sort {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Sort::Best => "best",
             Sort::Hot => "hot",
             Sort::New => "new",
             Sort::Top => "top",

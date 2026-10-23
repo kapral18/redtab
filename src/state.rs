@@ -11,8 +11,29 @@ use crate::model::Post;
 /// Seen/read marks not refreshed for this long are dropped on save.
 const RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListView {
+    #[default]
+    Card,
+    Compact,
+}
+
+impl ListView {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Card => "Card",
+            Self::Compact => "Compact",
+        }
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
+    #[serde(default)]
+    list_view: ListView,
+    #[serde(default)]
+    list_view_changed_at: i64,
     /// Per subreddit (lowercase): post id → unix time it was last seen listed.
     #[serde(default)]
     seen: HashMap<String, HashMap<String, i64>>,
@@ -36,6 +57,20 @@ pub struct Bookmark {
 }
 
 impl State {
+    pub fn list_view(&self) -> ListView {
+        self.list_view
+    }
+
+    pub fn toggle_list_view(&mut self) {
+        self.list_view = match self.list_view {
+            ListView::Card => ListView::Compact,
+            ListView::Compact => ListView::Card,
+        };
+        self.list_view_changed_at = chrono::Utc::now()
+            .timestamp_millis()
+            .max(self.list_view_changed_at + 1);
+    }
+
     /// Invalid JSON is moved aside; an unreadable file is left alone and saving is disabled.
     pub fn load(path: &Path) -> (Self, Option<String>) {
         // Act on a symlink's target, never the link.
@@ -290,6 +325,10 @@ impl State {
     }
 
     fn merge(&mut self, disk: State) {
+        if disk.list_view_changed_at > self.list_view_changed_at {
+            self.list_view = disk.list_view;
+            self.list_view_changed_at = disk.list_view_changed_at;
+        }
         for (sub, ids) in disk.seen {
             let mine = self.seen.entry(sub).or_default();
             for (id, t) in ids {
@@ -443,6 +482,7 @@ mod tests {
             created: None,
             permalink: format!("/r/{sub}/comments/{id}/x/"),
             media: Media::None,
+            preview_size: None,
             stickied: false,
             nsfw: false,
             spoiler: false,
@@ -454,6 +494,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn when_older_state_has_no_view_it_should_default_to_cards() {
+        let state: State = serde_json::from_str("{\"bookmarks\":[]}").unwrap();
+
+        assert_eq!(state.list_view(), ListView::Card);
+    }
+
+    #[test]
+    fn when_a_bookmark_has_preview_geometry_it_should_survive_state_serialization() {
+        let mut saved = post("p", "s");
+        saved.preview_size = Some((320, 640));
+        let mut state = State::default();
+        state.toggle_bookmark(&saved, 1);
+
+        let actual: State = serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+
+        assert_eq!(actual.bookmarks()[0].post.preview_size, Some((320, 640)));
+    }
+
+    #[test]
+    fn when_a_saved_post_predates_preview_geometry_it_should_still_load() {
+        let saved = post("p", "s");
+        let mut value = serde_json::to_value(&saved).unwrap();
+        value.as_object_mut().unwrap().remove("preview_size");
+
+        let actual: Post = serde_json::from_value(value).unwrap();
+
+        assert_eq!(actual, saved);
+        assert_eq!(actual.preview_size, None);
+    }
+
+    #[test]
+    fn when_an_unchanged_instance_saves_it_should_keep_the_latest_list_view() {
+        let dir = scratch("list-view-東京");
+        let path = dir.join("state.json");
+        let mut first = State::default();
+        first.save(&path, 1).unwrap();
+        let (mut second, _) = State::load(&path);
+        second.toggle_list_view();
+        second.save(&path, 2).unwrap();
+
+        first.save(&path, 3).unwrap();
+        let (saved, warning) = State::load(&path);
+        std::fs::remove_dir_all(dir).unwrap();
+
+        assert!(warning.is_none());
+        assert_eq!(saved.list_view(), ListView::Compact);
+        assert_eq!(first.list_view(), ListView::Compact);
+    }
+
+    #[test]
+    fn when_both_instances_change_view_the_latest_choice_should_survive_a_symlink_save() {
+        let dir = scratch("list-view-merge");
+        let path = dir.join("state.json");
+        let link = dir.join("linked.json");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        let mut first = State::default();
+        first.toggle_list_view();
+        first.save(&link, 1).unwrap();
+        let (mut second, _) = State::load(&link);
+        first.toggle_list_view();
+        first.toggle_list_view();
+        second.toggle_list_view();
+        second.list_view_changed_at = first.list_view_changed_at + 1;
+        second.save(&link, 2).unwrap();
+
+        first.save(&link, 3).unwrap();
+        let (saved, warning) = State::load(&path);
+        assert!(link.is_symlink());
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(warning.is_none());
+        assert_eq!(saved.list_view(), ListView::Card);
     }
 
     #[test]

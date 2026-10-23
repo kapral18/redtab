@@ -55,8 +55,27 @@ pub(super) fn parse_listing_value(value: Value) -> Result<Listing> {
     Ok(Listing {
         posts,
         after: data.after.filter(|s| !s.is_empty()),
-        icon: None,
     })
+}
+
+pub(super) fn parse_subscriptions(value: Value) -> Result<(Vec<String>, Option<String>)> {
+    let data = listing(value)?;
+    let mut names = Vec::new();
+    for thing in data.children {
+        let name = thing.data["display_name"]
+            .as_str()
+            .filter(|name| {
+                !name.is_empty()
+                    && name.len() <= 50
+                    && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            })
+            .context("invalid Reddit subscription name")?;
+        if thing.kind != "t5" {
+            bail!("expected Reddit subreddit in subscriptions");
+        }
+        names.push(name.to_string());
+    }
+    Ok((names, data.after.filter(|s| !s.is_empty())))
 }
 
 #[derive(Deserialize)]
@@ -142,6 +161,7 @@ fn post(value: Value) -> Result<(Post, String)> {
             comments: data.num_comments,
             created: created(data.created_utc),
             permalink: data.permalink,
+            preview_size: preview_size(&value, &media),
             media,
             stickied: data.stickied,
             nsfw: data.over_18,
@@ -158,11 +178,50 @@ fn media_url(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn media(value: &Value) -> Media {
-    let source = value["crosspost_parent_list"]
+fn media_source(value: &Value) -> &Value {
+    value["crosspost_parent_list"]
         .as_array()
         .and_then(|p| p.first())
-        .unwrap_or(value);
+        .unwrap_or(value)
+}
+
+fn dimensions(value: &Value, width: &str, height: &str) -> Option<(u32, u32)> {
+    let width = u32::try_from(value[width].as_u64()?).ok()?;
+    let height = u32::try_from(value[height].as_u64()?).ok()?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+fn preview_size(value: &Value, media: &Media) -> Option<(u32, u32)> {
+    let url = media.preview_image().or_else(|| media.list_thumb())?;
+    let source = media_source(value);
+    if let Some(items) = source["gallery_data"]["items"].as_array() {
+        for item in items {
+            let Some(id) = item["media_id"].as_str() else {
+                continue;
+            };
+            let image = &source["media_metadata"][id]["s"];
+            if media_url(&image["u"])
+                .or_else(|| media_url(&image["gif"]))
+                .as_deref()
+                == Some(url)
+            {
+                return dimensions(image, "x", "y");
+            }
+        }
+    }
+    let preview = &source["preview"]["images"][0]["source"];
+    if (matches!(media, Media::Image { .. }) || preview["url"].as_str() == Some(url))
+        && let Some(size) = dimensions(preview, "width", "height")
+    {
+        return Some(size);
+    }
+    (source["thumbnail"].as_str() == Some(url))
+        .then(|| dimensions(source, "thumbnail_width", "thumbnail_height"))
+        .flatten()
+}
+
+fn media(value: &Value) -> Media {
+    let source = media_source(value);
     let thumb = media_url(&source["preview"]["images"][0]["source"]["url"])
         .or_else(|| media_url(&source["thumbnail"]));
     if let Some(items) = source["gallery_data"]["items"].as_array() {
@@ -718,6 +777,68 @@ mod tests {
             media(&external).preview_image(),
             Some("https://preview.redd.it/post.jpg?s=x")
         );
+    }
+
+    #[test]
+    fn when_listing_media_has_dimensions_its_selected_preview_should_preserve_them() {
+        for (mut fields, expected) in [
+            (
+                json!({"url":"https://i.redd.it/p.jpg","preview":{"images":[{"source":{"url":"https://preview.redd.it/p.jpg","width":640,"height":320}}]}}),
+                Some((640, 320)),
+            ),
+            (
+                json!({"url":"https://i.redd.it/p.gif","preview":{"images":[{"source":{"url":"https://preview.redd.it/p.gif","width":400,"height":600}}]}}),
+                Some((400, 600)),
+            ),
+            (
+                json!({"url":"https://example.com/photo","post_hint":"image","preview":{"images":[{"source":{"url":"https://preview.redd.it/p.jpg","width":640,"height":480}}]}}),
+                Some((640, 480)),
+            ),
+            (
+                json!({"gallery_data":{"items":[{"media_id":"bad"},{"media_id":"good"}]},"media_metadata":{"bad":{"s":{"u":"https://example.com/not-allowed.jpg","x":1,"y":1}},"good":{"s":{"u":"https://i.redd.it/gallery.jpg","x":320,"y":640}}}}),
+                Some((320, 640)),
+            ),
+            (
+                json!({"gallery_data":{"items":[]},"thumbnail":"https://preview.redd.it/thumb.jpg","thumbnail_width":160,"thumbnail_height":90}),
+                Some((160, 90)),
+            ),
+            (
+                json!({"secure_media":{"reddit_video":{"hls_url":"https://v.redd.it/p/HLSPlaylist.m3u8","width":720,"height":1280}},"preview":{"images":[{"source":{"url":"https://preview.redd.it/poster.jpg","width":640,"height":360}}]}}),
+                Some((640, 360)),
+            ),
+            (
+                json!({"url":"https://example.com/article","preview":{"images":[{"source":{"url":"https://preview.redd.it/link.jpg","width":800,"height":400}}]}}),
+                Some((800, 400)),
+            ),
+            (
+                json!({"url":"https://example.com/article","thumbnail":"https://preview.redd.it/thumb.jpg","thumbnail_width":160,"thumbnail_height":120}),
+                Some((160, 120)),
+            ),
+            (
+                json!({"preview":{"images":[{"source":{"url":"https://preview.redd.it/wrong.jpg","width":1,"height":1}}]},"crosspost_parent_list":[{"url":"https://i.redd.it/parent.jpg","preview":{"images":[{"source":{"url":"https://preview.redd.it/parent.jpg","width":800,"height":1200}}]}}]}),
+                Some((800, 1200)),
+            ),
+            (
+                json!({"url":"https://i.redd.it/p.jpg","preview":{"images":[{"source":{"url":"https://preview.redd.it/p.jpg","width":0,"height":320}}]}}),
+                None,
+            ),
+            (
+                json!({"url":"https://i.redd.it/p.jpg","preview":{"images":[{"source":{"url":"https://preview.redd.it/p.jpg","width":4294967296u64,"height":320}}]}}),
+                None,
+            ),
+        ] {
+            fields.as_object_mut().unwrap().extend(json!({"id":"p","title":"preview","subreddit":"s","permalink":"/r/s/comments/p/x/"}).as_object().unwrap().clone());
+            let actual = parse_listing_value(
+                json!({"kind":"Listing","data":{"children":[{"kind":"t3","data":fields}]}}),
+            )
+            .unwrap();
+
+            assert_eq!(actual.posts[0].preview_size, expected, "{fields}");
+            assert_eq!(
+                serde_json::from_value::<Listing>(serde_json::to_value(&actual).unwrap()).unwrap(),
+                actual
+            );
+        }
     }
 
     #[test]

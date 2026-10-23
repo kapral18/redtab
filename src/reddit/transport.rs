@@ -1,5 +1,5 @@
 //! The only transport allowed to contact Reddit. Errors deliberately omit URLs and
-//! underlying library errors, which can contain guest tokens.
+//! underlying library errors, which can contain credentials.
 
 use std::io::{self, Read};
 use std::sync::LazyLock;
@@ -178,4 +178,10 @@ pub(super) fn json(response: Response) -> Result<serde_json::Value> {
     let mut bytes = Vec::new();
     Reader::new(response, 16 * 1024 * 1024).read_to_end(&mut bytes)?;
     serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("Reddit returned invalid JSON"))
+}
+
+pub(super) fn html(response: Response) -> Result<String> {
+    let mut bytes = Vec::new();
+    Reader::new(response, 16 * 1024 * 1024).read_to_end(&mut bytes)?;
+    String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("Reddit returned invalid Home HTML"))
 }
