@@ -82,6 +82,13 @@ impl FeedQuery {
 pub struct LoadedImage {
     pub image: Arc<DynamicImage>,
     pub preview: Arc<DynamicImage>,
+    pub metadata: ImageMetadata,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImageMetadata {
+    pub size: (u32, u32),
+    pub flat: bool,
 }
 
 impl From<DynamicImage> for LoadedImage {
@@ -91,15 +98,34 @@ impl From<DynamicImage> for LoadedImage {
         } else {
             image.clone()
         };
+        let preview = preview.to_rgba8();
+        let flat = preview.pixels().next().is_none_or(|first| {
+            preview.pixels().all(|pixel| pixel == first)
+                || preview.pixels().all(|pixel| pixel[3] == 0)
+        });
         Self {
+            metadata: ImageMetadata {
+                size: (image.width(), image.height()),
+                flat,
+            },
             image: Arc::new(image),
-            preview: Arc::new(DynamicImage::ImageRgba8(preview.to_rgba8())),
+            preview: Arc::new(DynamicImage::ImageRgba8(preview)),
         }
     }
 }
 
 #[derive(Debug)]
 pub enum Job {
+    Experience {
+        generation: u64,
+        request: crate::reddit::experience::Request,
+        invalidations: Vec<Invalidation>,
+    },
+    SortedPost {
+        generation: u64,
+        permalink: String,
+        sort: String,
+    },
     Subscriptions {
         generation: u64,
     },
@@ -156,10 +182,51 @@ pub enum Job {
     },
 }
 
+#[derive(Debug, Clone)]
+pub enum Invalidation {
+    Feed {
+        target: FeedTarget,
+        query: FeedQuery,
+        after: Option<String>,
+    },
+    Post(String),
+    Replies(String),
+}
+
+impl Invalidation {
+    fn request(&self) -> Option<String> {
+        match self {
+            Self::Feed {
+                target,
+                query,
+                after,
+            } => query.cache_request(target, after.as_deref()),
+            Self::Post(link) => post_cache_request(link),
+            Self::Replies(cursor) => serde_json::to_string(&("replies", cursor)).ok(),
+        }
+    }
+}
+
+fn post_cache_request(link: &str) -> Option<String> {
+    let (path, _) = crate::reddit::experience::thread_location(link).ok()?;
+    serde_json::to_string(&("post-v2", crate::reddit::parse::post_id(&path)?)).ok()
+}
+
 impl Job {
     /// This job's reply for error `e`; used on panic so whatever waits still gets an answer.
     fn failed(&self, e: String) -> Msg {
         match self {
+            Job::Experience { generation, .. } => Msg::Experience {
+                generation: *generation,
+                result: Err(e),
+            },
+            Job::SortedPost {
+                generation, sort, ..
+            } => Msg::SortedPost {
+                generation: *generation,
+                sort: sort.clone(),
+                result: Err(e),
+            },
             Job::Subscriptions { generation } => Msg::Subscriptions {
                 generation: *generation,
                 result: Err(e),
@@ -225,6 +292,15 @@ impl Job {
 }
 
 pub enum Msg {
+    SortedPost {
+        generation: u64,
+        sort: String,
+        result: Result<Box<PostPage>, String>,
+    },
+    Experience {
+        generation: u64,
+        result: Result<crate::reddit::experience::Response, String>,
+    },
     Membership {
         generation: u64,
         result: Result<(), String>,
@@ -814,10 +890,9 @@ impl Job {
                     .cache_request(&FeedTarget::Subreddit(subreddit.clone()), None)?,
                 CONTENT_TTL,
             ),
-            Job::Post { permalink, .. } | Job::ResolveMedia { permalink } => (
-                serde_json::to_string(&("post", permalink)).ok()?,
-                CONTENT_TTL,
-            ),
+            Job::Post { permalink, .. } | Job::ResolveMedia { permalink } => {
+                (post_cache_request(permalink)?, CONTENT_TTL)
+            }
             Job::MoreReplies { cursor, .. } => (
                 serde_json::to_string(&("replies", cursor)).ok()?,
                 CONTENT_TTL,
@@ -898,7 +973,7 @@ impl Job {
 /// A post page load for a post no longer shown (moved past in the list, or closed): queued
 /// behind other loads it would only delay the one you wait for, so it is dropped unanswered.
 fn superseded_post(job: &Job, wanted: &Wanted) -> bool {
-    matches!(job, Job::Post { generation, .. }
+    matches!(job, Job::Post { generation, .. } | Job::SortedPost { generation, .. }
         if wanted.post.lock().is_ok_and(|post| *post != Some(*generation)))
 }
 
@@ -922,6 +997,27 @@ fn cache_result(
     tx: &SyncSender<Msg>,
     source: Source,
 ) -> Msg {
+    if let Job::Experience {
+        request: crate::reddit::experience::Request::Write(_),
+        invalidations,
+        ..
+    } = job
+    {
+        if let Some(cache) = cache {
+            let result = cache.reserve_request().and_then(|order| {
+                for key in invalidations.iter().filter_map(Invalidation::request) {
+                    cache.store(&Cache::key(namespace, &key), &[], crate::app::now(), order)?;
+                }
+                Ok(())
+            });
+            if let Err(error) = result {
+                let _ = tx.send(Msg::CacheWarning(format!(
+                    "Could not invalidate changed content: {error}"
+                )));
+            }
+        }
+        return msg;
+    }
     if matches!(msg, Msg::Membership { .. }) {
         if let Some(cache) = cache
             && let Some((key, _)) = job.cache_key(namespace)
@@ -1014,6 +1110,26 @@ fn run(reddit: &Reddit, job: &Job, wanted: &Wanted) -> Msg {
         return message;
     }
     match job {
+        Job::Experience {
+            generation,
+            request,
+            ..
+        } => Msg::Experience {
+            generation: *generation,
+            result: reddit.experience(request).map_err(err_string),
+        },
+        Job::SortedPost {
+            generation,
+            permalink,
+            sort,
+        } => Msg::SortedPost {
+            generation: *generation,
+            sort: sort.clone(),
+            result: reddit
+                .sorted_post(permalink, sort)
+                .map(Box::new)
+                .map_err(err_string),
+        },
         Job::Membership {
             generation,
             subreddit,
@@ -1306,6 +1422,75 @@ fn download_images(reddit: &Reddit, urls: &[String]) -> anyhow::Result<Vec<PathB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn when_a_write_finishes_a_cached_target_post_should_be_invalidated_even_after_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::new(directory.path().to_path_buf());
+        let post = Job::Post {
+            generation: 1,
+            permalink: "/r/rust/comments/post/title/".into(),
+        };
+        let key = post.cache_key("account").unwrap().0;
+        let old_order = cache.reserve_request().unwrap();
+        cache
+            .store(&key, b"old post", crate::app::now(), old_order)
+            .unwrap();
+        let job = Job::Experience {
+            generation: 2,
+            request: crate::reddit::experience::Request::Write(
+                crate::reddit::experience::Action::Delete {
+                    id: "t3_post".into(),
+                },
+            ),
+            invalidations: vec![Invalidation::Post("/comments/post/_/comment/".into())],
+        };
+        let (sender, _) = std::sync::mpsc::sync_channel(1);
+        cache_result(
+            Msg::Experience {
+                generation: 2,
+                result: Err("ambiguous write".into()),
+            },
+            &job,
+            Some(&cache),
+            "account",
+            &sender,
+            Source::default(),
+        );
+        assert!(
+            cache
+                .load(&key, crate::app::now())
+                .unwrap()
+                .bytes
+                .is_empty()
+        );
+        cache
+            .store(&key, b"late old response", crate::app::now(), old_order)
+            .unwrap();
+        assert!(
+            cache
+                .load(&key, crate::app::now())
+                .unwrap()
+                .bytes
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn when_a_comment_link_invalidates_a_post_it_should_use_the_same_key_as_the_canonical_post_link()
+     {
+        let original = Job::Post {
+            generation: 1,
+            permalink: "/r/rust/comments/post/title/".into(),
+        }
+        .cache_key("account")
+        .unwrap()
+        .0;
+        let invalidation =
+            Invalidation::Post("https://www.reddit.com/comments/post/_/comment/?context=3".into());
+        let actual = Cache::key("account", &invalidation.request().unwrap());
+        assert_eq!(actual, original);
+    }
 
     #[test]
     fn pictures_in_text_should_wait_on_the_background_queue_not_the_one_the_reader_waits_on() {

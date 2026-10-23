@@ -1,5 +1,7 @@
 //! Application state and key actions; rendering is in `ui`, dispatch in `keys`.
 
+pub mod experience;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -18,7 +20,7 @@ use crate::model::{
 use crate::reddit::{Health, Reddit, is_community};
 use crate::state::{ListView, State};
 use crate::video::{self, Player};
-use crate::worker::{FeedQuery, FeedTarget, Job, Msg, Pool};
+use crate::worker::{FeedQuery, FeedTarget, ImageMetadata, Job, Msg, Pool};
 
 const SAVE_INTERVAL: Duration = Duration::from_secs(60);
 const STATUS_TTL: Duration = Duration::from_secs(6);
@@ -139,11 +141,12 @@ fn fill_slot(img: image::DynamicImage, font: ratatui_image::FontSize) -> image::
 
 #[derive(Debug, Default, Clone)]
 pub struct CardScroll {
+    /// First visible card, independent of the selected post.
     pub post: Option<String>,
     pub line: usize,
     pub height: usize,
     pub viewport: usize,
-    pub bottom: bool,
+    pub pending: isize,
 }
 
 #[derive(Debug, Default)]
@@ -241,6 +244,21 @@ impl Feed {
 
     fn accepts(&self, generation: u64) -> bool {
         generation == self.generation || self.requests.contains_key(&generation)
+    }
+
+    fn remove_post(&mut self, id: &str) {
+        let Some(index) = self.posts.iter().position(|post| post.id == id) else {
+            return;
+        };
+        self.posts.remove(index);
+        let mut start = 0;
+        for page in &mut self.pages {
+            if index < start + page.len {
+                page.len -= 1;
+                break;
+            }
+            start += page.len;
+        }
     }
 
     /// Replace this cursor's page, not the entire feed or an append-only union.
@@ -451,6 +469,8 @@ pub struct PostView {
     pub page_height: usize,
     /// `v` shows spoilers: a spoiler-tagged post's body and image, and `>!…!<` text.
     pub reveal_spoilers: bool,
+    pub gallery_index: usize,
+    pub comment_sort: String,
 }
 
 pub enum RowKind<'a> {
@@ -470,6 +490,14 @@ pub struct Row<'a> {
 }
 
 impl PostView {
+    pub fn preview_image(&self) -> Option<&str> {
+        match &self.shown_post().media {
+            Media::Gallery { images, .. } => images
+                .get(self.gallery_index % images.len().max(1))
+                .map(String::as_str),
+            media => media.preview_image(),
+        }
+    }
     pub fn shown_post(&self) -> &Post {
         self.page.as_ref().map_or(&self.post, |page| &page.post)
     }
@@ -798,6 +826,7 @@ pub struct PickerState {
 }
 
 pub enum Overlay {
+    Experience,
     Auth,
     Membership {
         subreddit: String,
@@ -888,6 +917,7 @@ struct MembershipChange {
 }
 
 pub struct App {
+    pub experience: experience::Experience,
     pub config: Config,
     pub reddit: Reddit,
     pool: Pool,
@@ -899,6 +929,7 @@ pub struct App {
     pub active: usize,
     next_id: u64,
     next_generation: u64,
+    content_generation_floor: u64,
     pub all_subs: AllSubs,
     membership: Option<MembershipChange>,
     pub post_view: Option<PostView>,
@@ -919,8 +950,8 @@ pub struct App {
     pub images: HashMap<String, ImageSlot>,
     /// Full-size list previews have their own protocols so split detail can draw the same URL.
     pub card_images: HashMap<String, CardImageSlot>,
-    /// Measured geometry survives eviction of the much larger decoded pixels.
-    pub card_image_sizes: HashMap<String, (u32, u32)>,
+    /// Measured geometry and preview classification survive decoded-pixel eviction.
+    pub card_image_metadata: HashMap<String, ImageMetadata>,
     card_image_order: VecDeque<String>,
     card_previews: HashMap<String, std::sync::Arc<image::DynamicImage>>,
     pub card_renderer: crate::card_image::Renderer,
@@ -969,6 +1000,7 @@ impl App {
         let (state, warning) = State::load(&state_path);
         let show_images = config.image_preview;
         let mut app = Self {
+            experience: experience::Experience::default(),
             config,
             reddit,
             pool,
@@ -980,6 +1012,7 @@ impl App {
             active: 0,
             next_id: 0,
             next_generation: 0,
+            content_generation_floor: 0,
             all_subs: AllSubs::default(),
             post_view: None,
             overlay: None,
@@ -995,7 +1028,7 @@ impl App {
             image_picker,
             images: HashMap::new(),
             card_images: HashMap::new(),
-            card_image_sizes: HashMap::new(),
+            card_image_metadata: HashMap::new(),
             card_image_order: VecDeque::new(),
             card_previews: HashMap::new(),
             card_renderer: crate::card_image::Renderer::default(),
@@ -1038,8 +1071,8 @@ impl App {
     }
 
     pub fn show_auth(&mut self) {
-        if self.membership.is_some() {
-            self.info("Wait for the pending community change before reconnecting");
+        if self.membership.is_some() || self.experience.writing() {
+            self.info("Wait for the pending Reddit action before reconnecting");
             return;
         }
         self.auth.active_id = self.reddit.saved_id();
@@ -1208,6 +1241,7 @@ impl App {
     }
 
     fn reset_pending_loads(&mut self) {
+        self.experience = experience::Experience::default();
         self.membership = None;
         self.all_subs.loading = false;
         self.all_subs.error = None;
@@ -2040,10 +2074,18 @@ impl App {
         view.error = None;
         view.loading_more.clear();
         self.pool.want_post(Some(generation));
-        self.pool.refresh(Job::Post {
-            generation,
-            permalink: view.post.permalink.clone(),
-        });
+        if view.comment_sort.is_empty() {
+            self.pool.refresh(Job::Post {
+                generation,
+                permalink: view.post.permalink.clone(),
+            });
+        } else {
+            self.pool.refresh(Job::SortedPost {
+                generation,
+                permalink: view.post.permalink.clone(),
+                sort: view.comment_sort.clone(),
+            });
+        }
     }
 
     /// The open post's pictures that failed load again: its own image now, pictures in
@@ -2148,16 +2190,9 @@ impl App {
                     .count();
                 let feed = &mut self.tabs[self.active].feed;
                 feed.selected = step(feed.selected, delta, len);
-                // After a failed page load, wait for L or r instead of retrying on every key.
-                if feed.selected + PREFETCH_MARGIN >= len
-                    && feed.after.is_some()
-                    && !feed.loading()
-                    && !feed.page_failed()
-                {
-                    self.load_feed(self.active, true);
-                }
             }
         }
+        self.prefetch_list(self.active_tab().feed.selected);
         if self.active_tab().feed.selected != before {
             self.tabs[self.active].feed.cards = CardScroll::default();
         }
@@ -2180,26 +2215,51 @@ impl App {
     pub fn scroll_card(&mut self, delta: isize) {
         if self.state.list_view() != ListView::Card
             || matches!(self.active_tab().kind, TabKind::AllSubs)
-            || self.current_post().as_ref().map(|post| &post.id)
-                != self.active_tab().feed.cards.post.as_ref()
+            || self.current_post().is_none()
+            || self.active_tab().feed.cards.post.is_none()
         {
             return;
         }
         self.engage();
         let cards = &mut self.tabs[self.active].feed.cards;
-        let next = cards
-            .line
-            .saturating_add_signed(delta)
-            .min(cards.height.saturating_sub(cards.viewport));
-        if next != cards.line {
-            cards.line = next;
-            cards.bottom = false;
+        cards.pending = cards.pending.saturating_add(delta);
+    }
+
+    fn prefetch_list(&mut self, last_visible: usize) {
+        if !matches!(
+            self.active_tab().kind,
+            TabKind::Home | TabKind::Subreddit { .. }
+        ) {
             return;
         }
+        let feed = &self.active_tab().feed;
+        let len = self.config.visible(&feed.posts).count();
+        // Failed pages wait for L or r.
+        if last_visible.saturating_add(PREFETCH_MARGIN) >= len
+            && feed.after.is_some()
+            && !feed.loading()
+            && !feed.page_failed()
+        {
+            self.load_feed(self.active, true);
+        }
+    }
+
+    pub fn set_list_viewport(
+        &mut self,
+        selected: usize,
+        offset: usize,
+        scroll: CardScroll,
+        scrolled_end: Option<usize>,
+    ) {
         let before = self.active_tab().feed.selected;
-        self.move_selection(delta.signum());
-        if delta < 0 && self.active_tab().feed.selected != before {
-            self.tabs[self.active].feed.cards.bottom = true;
+        if selected != before {
+            self.move_selection(selected as isize - before as isize);
+        }
+        let feed = &mut self.tabs[self.active].feed;
+        feed.offset = offset;
+        feed.cards = scroll;
+        if let Some(last) = scrolled_end {
+            self.prefetch_list(last);
         }
     }
 
@@ -2490,6 +2550,8 @@ impl App {
             row_starts: Vec::new(),
             page_height: 0,
             reveal_spoilers: false,
+            gallery_index: 0,
+            comment_sort: String::new(),
         });
         Some(generation)
     }
@@ -3161,6 +3223,10 @@ impl App {
     // ----- actions: current post, Reddit ------------------------------------
 
     pub fn open_in_browser(&mut self) {
+        if let Some(target) = self.comment_target() {
+            self.open_reddit_link(&target.permalink);
+            return;
+        }
         let Some(post) = self.current_post() else {
             return;
         };
@@ -3171,6 +3237,13 @@ impl App {
     }
 
     pub fn copy_link(&mut self) {
+        if let Some(target) = self.comment_target() {
+            match target.url().and_then(|url| media::copy(&url)) {
+                Ok(tool) => self.info(format!("Copied comment link ({tool})")),
+                Err(e) => self.error(format!("copy failed: {e:#}")),
+            }
+            return;
+        }
         let Some(post) = self.current_post() else {
             return;
         };
@@ -3366,6 +3439,20 @@ impl App {
 
     fn on_result(&mut self, msg: Msg, source: Source, refreshing: bool) {
         match msg {
+            Msg::SortedPost {
+                generation,
+                sort,
+                result,
+            } => {
+                if self
+                    .post_view
+                    .as_ref()
+                    .is_some_and(|view| view.generation == generation && view.comment_sort == sort)
+                {
+                    self.on_result(Msg::Post { generation, result }, source, refreshing);
+                }
+            }
+            Msg::Experience { generation, result } => self.on_experience(generation, result),
             Msg::Membership { generation, result } => self.on_membership(generation, result),
             Msg::Subscriptions { generation, result } => self.on_subscriptions(
                 generation,
@@ -3437,6 +3524,8 @@ impl App {
                                 .freshness
                                 .is_some_and(|f| f.source.cached && source.may_replace(f.source)));
                     let same_post = !source.cached
+                        && view.comment_sort.is_empty()
+                        && generation > self.content_generation_floor
                         && waiting
                         && result.as_ref().is_ok_and(|page| {
                             !page.post.id.is_empty() && page.post.id == view.post.id
@@ -3677,8 +3766,7 @@ impl App {
                     }
                     let slot = match result {
                         Ok(image) => {
-                            self.card_image_sizes
-                                .insert(url.clone(), (image.image.width(), image.image.height()));
+                            self.card_image_metadata.insert(url.clone(), image.metadata);
                             self.card_previews.insert(url.clone(), image.preview);
                             let image = image.image;
                             self.card_preview_order.retain(|cached| cached != &url);
@@ -4993,8 +5081,10 @@ mod tests {
         assert!(!app.card_images.contains_key("https://i.redd.it/1.png"));
         assert!(app.card_images.contains_key("https://i.redd.it/2.png"));
         assert_eq!(
-            app.card_image_sizes.get("https://i.redd.it/0.png"),
-            Some(&(1, 1))
+            app.card_image_metadata
+                .get("https://i.redd.it/0.png")
+                .map(|metadata| metadata.size),
+            Some((1, 1))
         );
     }
 
@@ -5023,7 +5113,12 @@ mod tests {
 
         assert!(!app.card_images.contains_key(large));
         assert!(app.card_images.contains_key(small));
-        assert_eq!(app.card_image_sizes.get(large), Some(&(4096, 4096)));
+        assert_eq!(
+            app.card_image_metadata
+                .get(large)
+                .map(|metadata| metadata.size),
+            Some((4096, 4096))
+        );
     }
 
     #[test]

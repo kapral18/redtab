@@ -13,7 +13,8 @@ held in your OS credential store. No Reddit API registration is needed.
 - **Home**: Reddit’s browser Best feed, including recommendations from communities you
   haven't joined. Short initial batches continue automatically.
 - **List views**: cards by default, with wrapped titles and full-width media previews that
-  preserve their aspect ratio. `Page Up/Down` scrolls tall cards; `Ctrl+e/y` scrolls by line.
+  preserve their aspect ratio. `Page Up/Down` scrolls a page, `Ctrl+d/u` half a page,
+  and `Ctrl+e/y` one line, continuing across card boundaries. `j/k` selects posts.
   `V` switches between Card and Compact in Home, subreddit feeds, search and Bookmarks;
   your choice is saved across restarts. Previews reserve their space while loading,
   and retained previews stay visible while full-quality images return from the disk cache.
@@ -37,6 +38,31 @@ held in your OS credential store. No Reddit API registration is needed.
 - **Connection status** in the sidebar: up, down, or paused on a rate limit.
 - **Saved accounts** (`A`): switch between saved Reddit logins, add an account or reconnect
   an expired session. Each account keeps its own bookmarks, history and content cache.
+- **Reddit tools** (`:`): Reddit-synced saved posts and comments, hidden/upvoted/downvoted
+  posts, profiles and contribution history, unread notifications, replies and mentions.
+  Browse custom feeds and community discovery; search posts across Reddit with sort/time
+  controls, or search communities and people.
+- **Participation** (`;`): actions for the selected post or comment: vote, save/unsave,
+  reply, report, hide/unhide, follow post notifications, or edit/delete your own content.
+  Create text/link posts and private custom feeds from `:`. In a custom feed, `a` adds a
+  community, `d` removes one and `x` deletes the feed after confirmation.
+- **More reading tools**: `B` opens community information, rules, moderators and wiki.
+  In a post, `f` offers comment sorting and search within loaded comments, `{`/`}` browse
+  gallery images, and `o`/`y` open/copy the selected comment's link. Gallery captions,
+  crosspost attribution and available per-option poll counts appear in the post body.
+
+In a composer, `Tab` changes fields, `Enter` adds a line to a multiline body, and
+`Ctrl+s` submits to Reddit. Arrow keys, Home/End and Backspace edit text; pasted Markdown
+and line breaks are preserved. Failed submissions keep their draft and show an error.
+Actions wait for Reddit's acknowledgment and are never retried automatically. Account
+switching waits for pending writes. Deleting content or a custom feed requires confirmation.
+
+Chat and private-message archives, media uploads, poll voting, user follows/blocks,
+community muting/favorites, flair, awards/gold and advanced moderation open Reddit in your
+configured browser. These menu items say **open Reddit ↗**; the browser uses its own signed-in
+account. `Ctrl+o` in Reddit tools opens the corresponding page. Rich search for comments and
+media also uses Reddit. Server-side community requirements such as mandatory post flair may
+require finishing a post in the browser. Draft text is not transferred to the browser.
 
 Honors `NO_COLOR`.
 
@@ -195,7 +221,7 @@ Press `?` in redtab for the full list.
 | `Enter` `l` | open the selected post, or resume its retained detail |
 | `V` | switch Card / Compact list view (saved across restarts) |
 | `A` | saved accounts: switch, add, reconnect or remove a login |
-| `Page Down/Up`, `C-d` `C-u`, `C-e` `C-y` | cards: scroll by page, half page, line; at an edge, move to the next / previous post |
+| `Page Down/Up`, `C-d` `C-u`, `C-e` `C-y` | cards: scroll by page, half page, line, continuing across card boundaries |
 | `J` `K` | All subs: next / previous card |
 | `Space` | list: open the selected community; post: page down |
 | `S` | community: Join/Leave on Reddit (`Enter` confirms, `Esc` cancels) |

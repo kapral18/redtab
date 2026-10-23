@@ -2,6 +2,7 @@
 
 mod accounts;
 mod credentials;
+pub mod experience;
 mod home;
 mod membership;
 pub mod parse;
@@ -442,6 +443,25 @@ impl Reddit {
     }
 
     pub fn post(&self, permalink: &str) -> Result<PostPage> {
+        self.sorted_post(permalink, "")
+    }
+
+    pub fn sorted_post(&self, permalink: &str, sort: &str) -> Result<PostPage> {
+        self.focused_post(permalink, sort, None)
+    }
+
+    pub fn focused_post(
+        &self,
+        permalink: &str,
+        sort: &str,
+        comment: Option<&str>,
+    ) -> Result<PostPage> {
+        if !matches!(
+            sort,
+            "" | "confidence" | "top" | "new" | "old" | "controversial" | "qa"
+        ) {
+            bail!("Invalid comment sort");
+        }
         // Use only the post id; no slug or external URL can change the authenticated origin.
         let id = parse::post_id(permalink).context("invalid post permalink")?;
         let mut url = self.0.api.join(&format!("comments/{id}.json"))?;
@@ -449,7 +469,19 @@ impl Reddit {
             .append_pair("raw_json", "1")
             .append_pair("limit", "100")
             .append_pair("depth", "10");
-        let page = parse::parse_post_page_value(self.get(url)?)?;
+        if !sort.is_empty() {
+            url.query_pairs_mut().append_pair("sort", sort);
+        }
+        if let Some(comment) = comment {
+            if comment.is_empty() || !comment.bytes().all(|c| c.is_ascii_alphanumeric()) {
+                bail!("Invalid comment identity");
+            }
+            url.query_pairs_mut()
+                .append_pair("comment", comment)
+                .append_pair("context", "3");
+        }
+        let mut page = parse::parse_post_page_value(self.get(url)?)?;
+        parse::set_reply_sort(&mut page.comments, sort)?;
         if page.post.nsfw && !self.0.show_nsfw {
             bail!("this is NSFW; set show_nsfw = true in config.toml to see it");
         }
@@ -468,7 +500,13 @@ impl Reddit {
                 .append_pair("depth", "10")
                 .append_pair("limit", "100")
                 .append_pair("raw_json", "1");
-            return parse::focused_replies(self.get(url)?, &more);
+            if !more.sort.is_empty() {
+                url.query_pairs_mut().append_pair("sort", &more.sort);
+            }
+            let mut page = parse::focused_replies(self.get(url)?, &more)?;
+            parse::set_reply_sort(&mut page.comments, &more.sort)?;
+            parse::set_more_sort(&mut page.more, &more.sort)?;
+            return Ok(page);
         }
         let mut url = self.0.api.join("api/morechildren.json")?;
         url.query_pairs_mut()
@@ -479,11 +517,17 @@ impl Reddit {
                 "children",
                 &more.children[..more.children.len().min(100)].join(","),
             );
+        if !more.sort.is_empty() {
+            url.query_pairs_mut().append_pair("sort", &more.sort);
+        }
         let response = {
             let _expansion = self.0.expansion.lock();
             self.get(url)?
         };
-        parse::expanded_replies(response, &more)
+        let mut page = parse::expanded_replies(response, &more)?;
+        parse::set_reply_sort(&mut page.comments, &more.sort)?;
+        parse::set_more_sort(&mut page.more, &more.sort)?;
+        Ok(page)
     }
 
     pub fn image(&self, url: &str) -> Result<Vec<u8>> {

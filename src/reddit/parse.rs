@@ -122,7 +122,7 @@ fn optional(s: Option<String>) -> Option<String> {
     s.map(|s| clean(&s)).filter(|s| !s.is_empty())
 }
 
-fn post(value: Value) -> Result<(Post, String)> {
+pub(super) fn post(value: Value) -> Result<(Post, String)> {
     let data = PostData::deserialize(&value).context("invalid Reddit post")?;
     if !id_valid(&data.id) || post_id(&data.permalink) != Some(data.id.as_str()) {
         bail!("invalid Reddit post identity");
@@ -143,7 +143,36 @@ fn post(value: Value) -> Result<(Post, String)> {
             for option in options {
                 if let Some(label) = option["text"].as_str() {
                     body.push_str(&format!("\n• {}", clean(label)));
+                    if let Some(votes) = option["vote_count"].as_u64() {
+                        body.push_str(&format!(" — {votes} votes"));
+                    }
                 }
+            }
+        }
+    }
+    if let Some(original) = value["crosspost_parent_list"]
+        .as_array()
+        .and_then(|items| items.first())
+    {
+        body.push_str(&format!(
+            "\n\nCrossposted from r/{} by u/{}: {}\n{}",
+            clean(original["subreddit"].as_str().unwrap_or_default()),
+            clean(original["author"].as_str().unwrap_or_default()),
+            clean(original["title"].as_str().unwrap_or_default()),
+            clean(original["permalink"].as_str().unwrap_or_default())
+        ));
+    }
+    if let Some(items) = media_source(&value)["gallery_data"]["items"].as_array() {
+        for (index, item) in items.iter().enumerate() {
+            let caption = item["caption"].as_str().unwrap_or_default();
+            let link = item["outbound_url"].as_str().unwrap_or_default();
+            if !caption.is_empty() || !link.is_empty() {
+                body.push_str(&format!(
+                    "\n\nImage {}: {}\n{}",
+                    index + 1,
+                    clean(caption),
+                    clean(link)
+                ));
             }
         }
     }
@@ -381,6 +410,25 @@ pub(super) struct MoreRequest {
     pub post: String,
     pub parent: String,
     pub children: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sort: String,
+}
+
+pub(super) fn set_more_sort(more: &mut Option<MoreReplies>, sort: &str) -> Result<()> {
+    if let Some(more) = more {
+        let mut request: MoreRequest = serde_json::from_str(&more.cursor)?;
+        request.sort = sort.into();
+        more.cursor = serde_json::to_string(&request)?;
+    }
+    Ok(())
+}
+
+pub(super) fn set_reply_sort(comments: &mut [Comment], sort: &str) -> Result<()> {
+    for comment in comments {
+        set_more_sort(&mut comment.more, sort)?;
+        set_reply_sort(&mut comment.replies, sort)?;
+    }
+    Ok(())
 }
 
 /// Ids one reply cursor keeps; replies past them are not offered.
@@ -388,7 +436,10 @@ const MORE_LIMIT: usize = 10_000;
 
 impl MoreRequest {
     pub fn validate(&self) -> Result<()> {
-        if !id_valid(&self.post)
+        if !matches!(
+            self.sort.as_str(),
+            "" | "confidence" | "top" | "new" | "old" | "controversial" | "qa"
+        ) || !id_valid(&self.post)
             || !self
                 .parent
                 .strip_prefix("t1_")
@@ -460,6 +511,7 @@ fn comments_from(
             post: post.to_owned(),
             parent: parent.to_owned(),
             children,
+            sort: String::new(),
         }
         .cursor((count > 0).then_some(count))
     });
@@ -614,7 +666,7 @@ fn id_valid(id: &str) -> bool {
 }
 
 /// The id in `/r/<sub>/comments/<id>/…`, `/user/<name>/comments/<id>/…` or `/comments/<id>`.
-pub(super) fn post_id(permalink: &str) -> Option<&str> {
+pub(crate) fn post_id(permalink: &str) -> Option<&str> {
     match *permalink.split('/').collect::<Vec<_>>() {
         ["", "r" | "user" | "u", _, "comments", id, ..] | ["", "comments", id, ..] => Some(id),
         _ => None,
@@ -634,6 +686,7 @@ mod tests {
                 post: "p".into(),
                 parent: "t3_p".into(),
                 children: (0..9_000).map(|i| format!("{prefix}{i}")).collect(),
+                sort: String::new(),
             }
             .cursor(None)
         };
@@ -847,6 +900,7 @@ mod tests {
             post: "p".into(),
             parent: "t3_p".into(),
             children: (0..101).map(|i| format!("c{i}")).collect(),
+            sort: String::new(),
         };
         let response = json!({"json":{"errors":[],"data":{"things":[
             {"kind":"t1","data":{"id":"c1","parent_id":"t1_c0","body":"child"}},

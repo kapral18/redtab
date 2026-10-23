@@ -1,6 +1,8 @@
 //! Rendering: tab sidebar, the active list and, when it fits, the open post beside it.
 //! Takes `&mut App` to keep scroll offsets in sync and to load the thumbnails it draws.
 
+mod experience;
+
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
@@ -75,7 +77,6 @@ struct PostCard {
     style: Style,
     image: Option<String>,
     image_rows: u16,
-    geometry_known: bool,
     pixels: (u32, u32),
 }
 
@@ -105,6 +106,7 @@ struct CardPicture {
     size: Size,
     skipped: u16,
     pixels: (u32, u32),
+    video: bool,
 }
 
 #[derive(Default)]
@@ -172,6 +174,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
     match &app.overlay {
+        Some(Overlay::Experience) => experience::draw(f, app),
         Some(Overlay::Auth) => draw_auth(f, app),
         Some(Overlay::Picker(p)) => draw_picker(f, app, &p.input, p.selected),
         Some(Overlay::Sort { selected }) => draw_sort(f, app, *selected),
@@ -760,7 +763,11 @@ fn expanded_card(
     let image_size = image.as_deref().and_then(|url| {
         post.preview_size
             .filter(|&(width, height)| width > 0 && height > 0)
-            .or_else(|| app.card_image_sizes.get(url).copied())
+            .or_else(|| {
+                app.card_image_metadata
+                    .get(url)
+                    .map(|metadata| metadata.size)
+            })
             .filter(|&(width, height)| width > 0 && height > 0)
     });
     let image_rows = image.as_ref().map_or(0, |_| {
@@ -785,17 +792,11 @@ fn expanded_card(
         ),
     ])
     .style(bg);
-    let geometry_known = image.is_none()
-        || image_size.is_some()
-        || image
-            .as_deref()
-            .is_some_and(|url| matches!(app.card_images.get(url), Some(CardImageSlot::Failed(_))));
     PostCard {
         lines,
         footer,
         marker,
         style: bg,
-        geometry_known,
         pixels: image_size.unwrap_or((1, 1)),
         image,
         image_rows,
@@ -860,24 +861,74 @@ fn card_title(
         .collect()
 }
 
+fn shift_card_rows(
+    mut index: usize,
+    mut line: usize,
+    delta: isize,
+    count: usize,
+    height: impl Fn(usize) -> usize,
+) -> (usize, usize) {
+    if delta < 0 {
+        let mut remaining = delta.unsigned_abs();
+        while remaining > line && index > 0 {
+            remaining -= line + 1;
+            index -= 1;
+            line = height(index);
+        }
+        line = line.saturating_sub(remaining);
+    } else {
+        line = line.saturating_add(delta as usize);
+    }
+    while index + 1 < count && line > height(index) {
+        line -= height(index) + 1;
+        index += 1;
+    }
+    (index, line.min(height(index)))
+}
+
+fn card_viewport_end(
+    index: usize,
+    line: usize,
+    viewport: usize,
+    count: usize,
+    height: impl Fn(usize) -> usize,
+) -> (usize, usize) {
+    let mut used = 0;
+    let mut last = index;
+    for i in index..count {
+        let rows = height(i).saturating_sub(if i == index { line } else { 0 });
+        if rows > 0 {
+            last = i;
+            used += rows;
+        }
+        if i + 1 < count && used < viewport {
+            used += 1;
+        }
+        if used >= viewport {
+            break;
+        }
+    }
+    (used.min(viewport), last)
+}
+
 fn draw_card_list(
     f: &mut Frame,
     app: &App,
     area: Rect,
     spec: &mut ListSpec<'_>,
     pictures: &mut ListPictures,
-) {
+) -> Option<usize> {
     if area.is_empty() || spec.posts.is_empty() {
-        return;
+        return None;
     }
     let width = area.width.saturating_sub(2) as usize;
-    let card_at = |i| {
+    let card_at = |i, selected| {
         expanded_card(
             app,
             spec.posts[i],
             width,
             &CardOpts {
-                selected: i == spec.selected,
+                selected: i == selected,
                 seen_key: spec.seen_key,
                 show_subreddit: spec.show_subreddit,
                 reserve: 0,
@@ -885,43 +936,72 @@ fn draw_card_list(
             area.height,
         )
     };
-    let selected = card_at(spec.selected);
-    let post_id = &spec.posts[spec.selected].id;
     let scroll = &mut spec.scroll;
     let offset = &mut spec.offset;
-    if scroll.post.as_ref() != Some(post_id) {
-        if scroll.post.is_some() {
-            scroll.line = 0;
-            scroll.height = 0;
-            scroll.bottom = false;
+    let pending = std::mem::take(&mut scroll.pending);
+    let anchor = scroll
+        .post
+        .as_ref()
+        .and_then(|id| spec.posts.iter().position(|post| &post.id == id));
+    if let Some(index) = anchor {
+        *offset = index;
+    } else {
+        scroll.line = 0;
+        *offset = (*offset).min(spec.selected);
+        if card_at(spec.selected, spec.selected).height() > usize::from(area.height) {
+            *offset = spec.selected;
         }
-        scroll.post = Some(post_id.clone());
+        let mut used = 0;
+        for i in (*offset..=spec.selected).rev() {
+            used += card_at(i, spec.selected).height() + 1;
+            if used > usize::from(area.height) {
+                *offset = (i + 1).min(spec.selected);
+                break;
+            }
+        }
     }
-    scroll.height = selected.height();
     scroll.viewport = area.height as usize;
-    if scroll.bottom {
-        scroll.line = scroll.height.saturating_sub(scroll.viewport);
-        scroll.bottom = !selected.geometry_known;
+    let height = |i| card_at(i, spec.selected).height();
+    let anchor_height = height(*offset);
+    scroll.line = scroll.line.min(if scroll.height != anchor_height {
+        anchor_height.saturating_sub(1)
+    } else {
+        anchor_height
+    });
+    (*offset, scroll.line) =
+        shift_card_rows(*offset, scroll.line, pending, spec.posts.len(), height);
+    let (available, _) = card_viewport_end(
+        *offset,
+        scroll.line,
+        scroll.viewport,
+        spec.posts.len(),
+        height,
+    );
+    if available < scroll.viewport {
+        let last = spec.posts.len() - 1;
+        (*offset, scroll.line) = shift_card_rows(
+            last,
+            height(last),
+            -(scroll.viewport as isize),
+            spec.posts.len(),
+            height,
+        );
     }
-    scroll.line = scroll
-        .line
-        .min(scroll.height.saturating_sub(scroll.viewport));
-    *offset = (*offset).min(spec.selected);
-    if scroll.height > scroll.viewport {
-        *offset = spec.selected;
-    }
-    let mut used = 0;
-    for i in (*offset..=spec.selected).rev() {
-        used += card_at(i).height() + 1;
-        if used > area.height as usize {
-            *offset = (i + 1).min(spec.selected);
-            break;
-        }
-    }
+    let (_, last_visible) = card_viewport_end(
+        *offset,
+        scroll.line,
+        scroll.viewport,
+        spec.posts.len(),
+        height,
+    );
+    let first_visible = (*offset + usize::from(scroll.line == height(*offset))).min(last_visible);
+    spec.selected = spec.selected.clamp(first_visible, last_visible);
+    scroll.height = card_at(*offset, spec.selected).height();
+    scroll.post = Some(spec.posts[*offset].id.clone());
     let mut y = area.y;
     let mut shown = 0;
     for i in *offset..spec.posts.len() {
-        let card = card_at(i);
+        let card = card_at(i, spec.selected);
         let skip = if i == *offset { scroll.line } else { 0 };
         let rows = card.height() - skip;
         let at = Rect::new(
@@ -950,6 +1030,8 @@ fn draw_card_list(
                     size: Size::new(area.width.saturating_sub(6), card.image_rows),
                     skipped,
                     pixels: card.pixels,
+                    video: matches!(spec.posts[i].media, Media::Video { .. })
+                        || spec.posts[i].media.video_url().is_some(),
                 });
             }
         }
@@ -976,10 +1058,19 @@ fn draw_card_list(
         }
     }
     if scroll.height > scroll.viewport {
-        draw_scrollbar(f, area, scroll.line, scroll.viewport, scroll.height);
+        draw_scrollbar(
+            f,
+            area,
+            scroll
+                .line
+                .min(scroll.height.saturating_sub(scroll.viewport)),
+            scroll.viewport,
+            scroll.height,
+        );
     } else {
         draw_scrollbar(f, area, *offset, shown, spec.posts.len());
     }
+    (pending != 0).then_some(last_visible)
 }
 
 fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture]) {
@@ -1000,6 +1091,15 @@ fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture]) {
             | CardImageSlot::Cached {
                 image, protocol, ..
             } => {
+                if spot.video
+                    && app
+                        .card_image_metadata
+                        .get(&spot.url)
+                        .is_some_and(|metadata| metadata.flat)
+                {
+                    draw_picture_wait(f, spot.area, "▶ video · open post");
+                    continue;
+                }
                 if let Err(error) = draw_card_image(
                     f,
                     &app.image_picker,
@@ -1146,10 +1246,9 @@ fn draw_post_list(
     area: Rect,
     spec: &mut ListSpec<'_>,
     pictures: &mut ListPictures,
-) {
+) -> Option<usize> {
     if app.state.list_view() == ListView::Card && area.height >= 3 {
-        draw_card_list(f, app, area, spec, pictures);
-        return;
+        return draw_card_list(f, app, area, spec, pictures);
     }
     spec.scroll.viewport = area.height as usize;
     const ITEM: usize = 3;
@@ -1204,6 +1303,7 @@ fn draw_post_list(
         );
     }
     draw_scrollbar(f, area, *offset, fits, spec.posts.len());
+    None
 }
 
 fn draw_scrollbar(f: &mut Frame, area: Rect, offset: usize, visible: usize, total: usize) {
@@ -1625,11 +1725,9 @@ fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListPictur
             feed_activity(feed, !app.reddit.needs_sign_in()).map(|(label, _)| label)
         },
     };
-    draw_post_list(f, app, body, &mut spec, pictures);
-    let (offset, scroll) = (spec.offset, spec.scroll);
-    let active = app.active;
-    app.tabs[active].feed.offset = offset;
-    app.tabs[active].feed.cards = scroll;
+    let scrolled_end = draw_post_list(f, app, body, &mut spec, pictures);
+    let (selected, offset, scroll) = (spec.selected, spec.offset, spec.scroll);
+    app.set_list_viewport(selected, offset, scroll, scrolled_end);
 }
 
 fn draw_bookmarks(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListPictures) {
@@ -1664,11 +1762,9 @@ fn draw_bookmarks(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListP
         scroll: app.active_tab().feed.cards.clone(),
         tail: None,
     };
-    draw_post_list(f, app, body, &mut spec, pictures);
-    let (offset, scroll) = (spec.offset, spec.scroll);
-    let active = app.active;
-    app.tabs[active].feed.offset = offset;
-    app.tabs[active].feed.cards = scroll;
+    let scrolled_end = draw_post_list(f, app, body, &mut spec, pictures);
+    let (selected, offset, scroll) = (spec.selected, spec.offset, spec.scroll);
+    app.set_list_viewport(selected, offset, scroll, scrolled_end);
 }
 
 // ----- post view -----------------------------------------------------------
@@ -1915,6 +2011,16 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
         ),
     ];
     match &post.media {
+        Media::Gallery { images, .. } if !images.is_empty() => {
+            stats.push(Span::styled(
+                format!(
+                    "   image {}/{} · {{ }} browse",
+                    view.gallery_index % images.len() + 1,
+                    images.len()
+                ),
+                Style::new().fg(TEAL),
+            ));
+        }
         Media::Link { url, .. } => {
             stats.push(Span::raw("   "));
             stats.push(Span::styled(
@@ -1962,10 +2068,12 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
     // scroll for the image layout first: deciding from the old scroll flashed the image
     // for one frame. A video shows its poster until its first frame.
     let video = post.media.video_url().is_some();
-    let image_url = post
-        .media
-        .shows_inline()
-        .then(|| post.media.preview_image().map(str::to_string));
+    let image_url = post.media.shows_inline().then(|| {
+        app.post_view
+            .as_ref()
+            .and_then(PostView::preview_image)
+            .map(str::to_string)
+    });
     // Until the post page arrives, a stale list copy may lack the spoiler tag.
     let hide_image = app
         .post_view
@@ -2212,8 +2320,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
     let post_image = app
         .post_view
         .as_ref()
-        .and_then(|view| view.page.as_ref())
-        .and_then(|page| page.post.media.preview_image())
+        .and_then(PostView::preview_image)
         .map(str::to_string);
     let text_pictures = || {
         app.images
@@ -3128,6 +3235,13 @@ fn popup_block(title: &str) -> Block<'static> {
 }
 
 const HELP: &[(&str, &str)] = &[
+    (":", "Reddit: saved, profiles, inbox, search"),
+    (";", "post/comment: vote, save, reply, edit"),
+    ("B", "community info, rules, wiki and actions"),
+    ("f (post)", "comment sort and find in loaded comments"),
+    ("{ } (post)", "previous / next gallery image"),
+    ("C-s (composer)", "submit to Reddit; Tab field, Esc back"),
+    ("C-o (Reddit)", "open the corresponding Reddit page"),
     ("A", "saved accounts: switch, add or reconnect"),
     ("Space (list)", "open the selected community"),
     ("S", "join or leave a community on Reddit"),
@@ -3141,10 +3255,7 @@ const HELP: &[(&str, &str)] = &[
     ("j k · g G", "sidebar: next / previous tab · first / last"),
     ("Lists", ""),
     ("V", "Card / Compact view (saved)"),
-    (
-        "PgDn/PgUp · C-d/u",
-        "cards: page / half page; then next post",
-    ),
+    ("PgDn/PgUp · C-d/u", "cards: scroll a page / half page"),
     ("C-e C-y", "cards: scroll down / up one line"),
     ("j k · C-d C-u", "move · page; a post open beside follows"),
     ("g G", "first / last"),
@@ -6633,6 +6744,146 @@ pub(crate) mod tests {
         app
     }
 
+    fn video_card_with_poster(image: image::DynamicImage) -> App {
+        let mut app = card_feed_app(kitty());
+        app.tabs[3].feed.posts.truncate(1);
+        app.tabs[3].feed.posts[0].media = Media::Video {
+            url: Some("https://v.redd.it/example/HLSPlaylist.m3u8".into()),
+            poster: Some("https://i.redd.it/p1.jpeg".into()),
+        };
+        app.tabs[3].feed.posts[0].preview_size = Some((image.width(), image.height()));
+        first_screen(&mut app, 100, 20);
+        app.on_msg(Msg::Image {
+            url: "https://i.redd.it/p1.jpeg".into(),
+            result: Ok(image.into()),
+        });
+        app
+    }
+
+    #[test]
+    fn when_a_video_poster_is_solid_dark_its_card_should_show_how_to_open_it() {
+        let mut app = video_card_with_poster(image::DynamicImage::ImageRgba8(
+            image::RgbaImage::from_pixel(404, 719, image::Rgba([2, 0, 3, 255])),
+        ));
+        let reserved_height = app.active_tab().feed.cards.height;
+
+        let actual = screen(&mut app, 100, 20);
+
+        assert!(actual.contains("▶ video · open post"), "{actual}");
+        assert!(!actual.contains('\u{10EEEE}'), "{actual}");
+        assert_eq!(app.active_tab().feed.cards.height, reserved_height);
+        assert!(!app.card_renderer.pending());
+    }
+
+    #[test]
+    fn when_a_video_poster_is_transparent_its_card_should_show_how_to_open_it() {
+        let mut app = video_card_with_poster(image::DynamicImage::ImageRgba8(
+            image::RgbaImage::from_fn(2, 2, |x, y| image::Rgba([x as u8, y as u8, 255, 0])),
+        ));
+        app.image_picker = Picker::halfblocks();
+
+        let actual = screen(&mut app, 100, 20);
+
+        assert!(actual.contains("▶ video · open post"), "{actual}");
+        assert!(!app.card_renderer.pending());
+    }
+
+    #[test]
+    fn when_a_video_poster_has_visible_content_its_card_should_render_the_pixels() {
+        let mut app = video_card_with_poster(image::DynamicImage::ImageRgb8(
+            image::RgbImage::from_fn(320, 180, |x, _| image::Rgb([x as u8, 128, 255])),
+        ));
+
+        let actual = screen(&mut app, 100, 20);
+
+        assert!(actual.contains('\u{10EEEE}'));
+        assert!(!actual.contains("▶ video · open post"));
+    }
+
+    #[test]
+    fn when_a_flat_poster_url_is_used_by_an_image_post_it_should_still_render_the_pixels() {
+        let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 180));
+        app.tabs[3].feed.posts[0].media = Media::Image {
+            url: "https://i.redd.it/p1.jpeg".into(),
+        };
+
+        let actual = screen(&mut app, 100, 20);
+
+        assert!(actual.contains('\u{10EEEE}'));
+        assert!(!actual.contains("▶ video · open post"));
+    }
+
+    #[test]
+    fn when_a_gif_card_has_a_flat_first_frame_it_should_show_how_to_open_it() {
+        let mut app = card_feed_app(kitty());
+        app.tabs[3].feed.posts.truncate(1);
+        app.tabs[3].feed.posts[0].media = Media::Image {
+            url: "https://i.redd.it/animation.gif".into(),
+        };
+        first_screen(&mut app, 100, 20);
+        app.on_msg(Msg::Image {
+            url: "https://i.redd.it/animation.gif".into(),
+            result: Ok(image::DynamicImage::new_rgba8(320, 180).into()),
+        });
+
+        let actual = screen(&mut app, 100, 20);
+
+        assert!(actual.contains("▶ video · open post"), "{actual}");
+    }
+
+    #[test]
+    fn when_a_flat_video_preview_returns_after_eviction_its_placeholder_should_stay_visible() {
+        let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 180));
+        screen(&mut app, 100, 20);
+        app.card_images.clear();
+
+        let actual = first_screen(&mut app, 100, 20);
+
+        assert!(actual.contains("▶ video · open post"), "{actual}");
+        assert!(!actual.contains("loading image"));
+    }
+
+    #[test]
+    fn when_a_retained_flat_video_preview_is_upgraded_it_should_render_the_new_pixels() {
+        let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 180));
+        screen(&mut app, 100, 20);
+        app.card_images.clear();
+        first_screen(&mut app, 100, 20);
+        app.on_msg(Msg::Image {
+            url: "https://i.redd.it/p1.jpeg".into(),
+            result: Ok(image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+                320,
+                180,
+                |x, _| image::Rgb([x as u8, 128, 255]),
+            ))
+            .into()),
+        });
+
+        let actual = screen(&mut app, 100, 20);
+
+        assert!(actual.contains('\u{10EEEE}'));
+        assert!(!actual.contains("▶ video · open post"));
+    }
+
+    #[test]
+    fn when_a_retained_video_preview_is_upgraded_to_a_flat_frame_it_should_show_the_placeholder() {
+        let mut app = video_card_with_poster(image::DynamicImage::ImageRgb8(
+            image::RgbImage::from_fn(320, 180, |x, _| image::Rgb([x as u8, 128, 255])),
+        ));
+        screen(&mut app, 100, 20);
+        app.card_images.clear();
+        first_screen(&mut app, 100, 20);
+        app.on_msg(Msg::Image {
+            url: "https://i.redd.it/p1.jpeg".into(),
+            result: Ok(image::DynamicImage::new_rgb8(320, 180).into()),
+        });
+
+        let actual = screen(&mut app, 100, 20);
+
+        assert!(actual.contains("▶ video · open post"), "{actual}");
+        assert!(!actual.contains('\u{10EEEE}'));
+    }
+
     #[test]
     fn when_card_style_marks_new_posts_the_dot_should_stay_orange_in_a_highlighted_title() {
         let mut app = feed_with_next_page(ListView::Card);
@@ -6835,11 +7086,18 @@ pub(crate) mod tests {
     #[test]
     fn when_returning_to_card_media_after_eviction_its_preview_should_stay_visible() {
         for video in [false, true] {
-            let mut app = card_with_image(320, 640);
+            let mut app = video_card_with_poster(image::DynamicImage::ImageRgb8(
+                image::RgbImage::from_fn(320, 640, |x, _| image::Rgb([x as u8, 128, 255])),
+            ));
+            app.tabs[3].feed.posts[0].title = "Full width image".into();
             if video {
                 app.tabs[3].feed.posts[0].media = Media::Video {
                     url: Some("https://v.redd.it/example/HLSPlaylist.m3u8".into()),
                     poster: Some("https://i.redd.it/p1.jpeg".into()),
+                };
+            } else {
+                app.tabs[3].feed.posts[0].media = Media::Image {
+                    url: "https://i.redd.it/p1.jpeg".into(),
                 };
             }
             screen(&mut app, 100, 20);
@@ -6970,19 +7228,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn when_scrolling_a_placeholder_by_hand_it_should_cancel_pending_bottom_restoration() {
+    fn when_a_scrolled_loading_card_receives_pixels_it_should_keep_the_visible_row() {
         let mut app = card_feed_app(kitty());
         app.tabs[3].feed.posts.truncate(1);
         app.tabs[3].feed.posts[0].title = "Loading image".into();
-        app.tabs[3].feed.cards.bottom = true;
+        screen(&mut app, 100, 20);
+        app.scroll_card(1000);
         screen(&mut app, 100, 20);
         assert_eq!(app.active_tab().feed.cards.line, 21);
-
         app.scroll_card(-1);
         screen(&mut app, 100, 20);
 
+        app.on_msg(Msg::Image {
+            url: "https://i.redd.it/p1.jpeg".into(),
+            result: Ok(image::DynamicImage::new_rgb8(640, 1280).into()),
+        });
+        screen(&mut app, 100, 20);
+
         assert_eq!(app.active_tab().feed.cards.line, 20);
-        assert!(!app.active_tab().feed.cards.bottom);
+        assert_eq!(app.active_tab().feed.cards.pending, 0);
     }
 
     #[test]
@@ -7156,6 +7420,343 @@ pub(crate) mod tests {
         assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(94));
     }
 
+    fn two_tall_media_cards() -> App {
+        let mut app = card_feed_app(kitty());
+        let mut first = app.tabs[3].feed.posts[0].clone();
+        first.title = "Full width image".into();
+        first.preview_size = Some((320, 640));
+        let mut next = post_with(
+            "p2",
+            Media::Video {
+                url: Some("https://v.redd.it/example/HLSPlaylist.m3u8".into()),
+                poster: Some("https://i.redd.it/p2.jpeg".into()),
+            },
+        );
+        next.title = "Following video".into();
+        next.preview_size = Some((320, 640));
+        app.reload();
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Ok(crate::model::Listing {
+                posts: vec![first, next],
+                after: None,
+            }),
+        });
+        first_screen(&mut app, 100, 20);
+        app.on_msg(Msg::Image {
+            url: "https://i.redd.it/p1.jpeg".into(),
+            result: Ok(image::DynamicImage::new_rgb8(320, 640).into()),
+        });
+        screen(&mut app, 100, 20);
+        app
+    }
+
+    #[test]
+    fn when_half_paging_past_a_tall_card_the_next_card_should_enter_without_snapping() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = two_tall_media_cards();
+        app.scroll_card(55);
+        screen(&mut app, 100, 20);
+
+        crate::keys::handle(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+        let actual = screen(&mut app, 100, 20);
+
+        assert_eq!(
+            actual
+                .lines()
+                .position(|line| line.contains("Following video")),
+            Some(13)
+        );
+        assert_eq!(app.active_tab().feed.cards.line, 63);
+        assert_eq!(app.current_post().unwrap().id, "p1");
+    }
+
+    #[test]
+    fn when_half_paging_back_across_a_card_header_it_should_preserve_the_remaining_distance() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = two_tall_media_cards();
+        app.move_selection(1);
+        screen(&mut app, 100, 20);
+
+        crate::keys::handle(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        let actual = screen(&mut app, 100, 20);
+
+        assert_eq!(app.active_tab().feed.offset, 0);
+        assert_eq!(app.active_tab().feed.cards.line, 64);
+        assert_eq!(
+            actual
+                .lines()
+                .position(|line| line.contains("Following video")),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn when_half_page_keys_are_batched_their_row_distances_should_accumulate() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = two_tall_media_cards();
+        app.scroll_card(55);
+        screen(&mut app, 100, 20);
+
+        crate::keys::handle(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+        crate::keys::handle(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+        let actual = screen(&mut app, 100, 20);
+
+        assert_eq!(app.active_tab().feed.offset, 0);
+        assert_eq!(app.active_tab().feed.cards.line, 71);
+        assert_eq!(
+            actual
+                .lines()
+                .position(|line| line.contains("Following video")),
+            Some(5)
+        );
+        assert_eq!(app.active_tab().feed.cards.pending, 0);
+    }
+
+    #[test]
+    fn when_line_scrolling_crosses_a_separator_it_should_move_exactly_one_row_each_way() {
+        let mut app = two_tall_media_cards();
+        app.scroll_card(71);
+        screen(&mut app, 100, 20);
+
+        app.scroll_card(1);
+        let down = screen(&mut app, 100, 20);
+        app.scroll_card(-1);
+        let up = screen(&mut app, 100, 20);
+
+        assert_eq!(
+            down.lines()
+                .position(|line| line.contains("Following video")),
+            Some(4)
+        );
+        assert_eq!(
+            up.lines().position(|line| line.contains("Following video")),
+            Some(5)
+        );
+        assert_eq!(app.active_tab().feed.cards.line, 71);
+    }
+
+    #[test]
+    fn when_a_half_page_spans_short_cards_it_should_consume_all_rows() {
+        let mut app = card_feed_app(kitty());
+        for post in &mut app.tabs[3].feed.posts {
+            post.media = Media::None;
+            post.title = post.id.clone();
+        }
+        screen(&mut app, 100, 20);
+
+        app.page_list(1, 2);
+        screen(&mut app, 100, 20);
+
+        assert_eq!(app.active_tab().feed.offset, 2);
+        assert_eq!(app.active_tab().feed.cards.line, 0);
+        assert_eq!(app.current_post().unwrap().id, "p3");
+    }
+
+    #[test]
+    fn when_scrolling_from_a_short_card_into_tall_media_it_should_keep_the_overshoot() {
+        let mut app = two_tall_media_cards();
+        app.tabs[3].feed.posts[0].media = Media::None;
+        screen(&mut app, 100, 20);
+
+        app.page_list(1, 2);
+        screen(&mut app, 100, 20);
+
+        assert_eq!(app.active_tab().feed.offset, 1);
+        assert_eq!(app.active_tab().feed.cards.line, 4);
+        assert_eq!(app.current_post().unwrap().id, "p2");
+    }
+
+    #[test]
+    fn when_item_selection_follows_continuous_scrolling_it_should_reveal_the_selected_post() {
+        let mut app = two_tall_media_cards();
+        app.scroll_card(63);
+        screen(&mut app, 100, 20);
+
+        press(&mut app, 'j');
+        let actual = screen(&mut app, 100, 20);
+
+        assert_eq!(app.current_post().unwrap().id, "p2");
+        assert_eq!(app.active_tab().feed.offset, 1);
+        assert_eq!(app.active_tab().feed.cards.line, 0);
+        assert_eq!(
+            actual
+                .lines()
+                .position(|line| line.contains("Following video")),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn when_bookmarks_half_page_across_tall_media_the_next_card_should_enter_naturally() {
+        let mut app = two_tall_media_cards();
+        app.state
+            .toggle_bookmark(&app.tabs[3].feed.posts[1].clone(), 1);
+        app.state
+            .toggle_bookmark(&app.tabs[3].feed.posts[0].clone(), 2);
+        app.switch_tab(1);
+        screen(&mut app, 100, 20);
+        app.scroll_card(55);
+        screen(&mut app, 100, 20);
+
+        app.page_list(1, 2);
+        let actual = screen(&mut app, 100, 20);
+
+        assert_eq!(app.active_tab().feed.cards.line, 63);
+        assert_eq!(
+            actual
+                .lines()
+                .position(|line| line.contains("Following video")),
+            Some(13)
+        );
+    }
+
+    #[test]
+    fn when_bookmarks_reorder_before_the_viewport_its_anchor_should_follow_the_post() {
+        let mut app = two_tall_media_cards();
+        app.state
+            .toggle_bookmark(&app.tabs[3].feed.posts[1].clone(), 1);
+        app.state
+            .toggle_bookmark(&app.tabs[3].feed.posts[0].clone(), 2);
+        app.switch_tab(1);
+        screen(&mut app, 100, 20);
+        app.scroll_card(82);
+        screen(&mut app, 100, 20);
+
+        app.state
+            .toggle_bookmark(&post_with("inserted", Media::None), 3);
+        screen(&mut app, 100, 20);
+
+        assert_eq!(app.active_tab().feed.cards.post.as_deref(), Some("p2"));
+        assert_eq!(app.active_tab().feed.offset, 2);
+        assert_eq!(app.active_tab().feed.cards.line, 10);
+    }
+
+    #[test]
+    fn when_the_scrolled_bookmark_is_removed_it_should_reveal_a_surviving_post() {
+        let mut app = two_tall_media_cards();
+        let second = app.tabs[3].feed.posts[1].clone();
+        app.state.toggle_bookmark(&second, 1);
+        app.state
+            .toggle_bookmark(&app.tabs[3].feed.posts[0].clone(), 2);
+        app.switch_tab(1);
+        screen(&mut app, 100, 20);
+        app.scroll_card(82);
+        screen(&mut app, 100, 20);
+
+        app.state.toggle_bookmark(&second, 3);
+        screen(&mut app, 100, 20);
+
+        assert_eq!(app.active_tab().feed.cards.post.as_deref(), Some("p1"));
+        assert_eq!(app.active_tab().feed.cards.line, 0);
+    }
+
+    #[test]
+    fn when_bookmarks_are_empty_row_keys_should_not_queue_a_scroll_for_future_entries() {
+        let mut app = two_tall_media_cards();
+        let first = app.tabs[3].feed.posts[0].clone();
+        app.state.toggle_bookmark(&first, 1);
+        app.switch_tab(1);
+        screen(&mut app, 100, 20);
+        app.state.toggle_bookmark(&first, 2);
+        screen(&mut app, 100, 20);
+
+        app.scroll_card(8);
+
+        assert_eq!(app.active_tab().feed.cards.pending, 0);
+    }
+
+    #[test]
+    fn when_a_refresh_inserts_posts_above_the_viewport_its_post_and_row_should_stay_anchored() {
+        let mut app = two_tall_media_cards();
+        app.scroll_card(82);
+        screen(&mut app, 100, 20);
+        let mut posts = app.tabs[3].feed.posts.clone();
+        posts.insert(0, post_with("inserted", Media::None));
+        app.reload();
+
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Ok(crate::model::Listing { posts, after: None }),
+        });
+        screen(&mut app, 100, 20);
+
+        assert_eq!(app.active_tab().feed.cards.post.as_deref(), Some("p2"));
+        assert_eq!(app.active_tab().feed.offset, 2);
+        assert_eq!(app.active_tab().feed.cards.line, 10);
+    }
+
+    #[test]
+    fn when_a_refresh_removes_the_viewport_anchor_it_should_reveal_a_surviving_post() {
+        let mut app = two_tall_media_cards();
+        app.scroll_card(82);
+        screen(&mut app, 100, 20);
+        let posts = vec![app.tabs[3].feed.posts[0].clone()];
+        app.reload();
+
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Ok(crate::model::Listing { posts, after: None }),
+        });
+        screen(&mut app, 100, 20);
+
+        assert_eq!(app.active_tab().feed.cards.post.as_deref(), Some("p1"));
+        assert_eq!(app.active_tab().feed.cards.line, 0);
+        assert_eq!(app.current_post().unwrap().id, "p1");
+    }
+
+    #[test]
+    fn when_resize_shortens_the_anchor_card_it_should_clamp_to_that_cards_content() {
+        let mut app = two_tall_media_cards();
+        app.scroll_card(55);
+        screen(&mut app, 100, 20);
+
+        screen(&mut app, 80, 20);
+
+        assert_eq!(app.active_tab().feed.cards.post.as_deref(), Some("p1"));
+        assert_eq!(app.active_tab().feed.cards.line, 50);
+        assert_eq!(app.current_post().unwrap().id, "p1");
+    }
+
+    #[test]
+    fn when_scrolling_a_short_loaded_feed_it_should_prefetch_at_the_visible_end() {
+        let mut app = card_feed_app(kitty());
+        app.tabs[3].feed.posts = (0..20)
+            .map(|i| {
+                let mut post = post_with(&format!("short{i}"), Media::None);
+                post.title = post.id.clone();
+                post
+            })
+            .collect();
+        screen(&mut app, 100, 100);
+        app.tabs[3].feed.after = Some("next".into());
+
+        app.scroll_card(1);
+        screen(&mut app, 100, 100);
+
+        assert!(app.active_tab().feed.loading());
+        assert_eq!(app.active_tab().feed.selected, 0);
+        assert_eq!(app.active_tab().feed.cards.line, 0);
+    }
+
     #[test]
     fn when_paging_to_a_tall_cards_bottom_it_should_expose_the_footer_and_keep_the_last_post() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -7186,6 +7787,7 @@ pub(crate) mod tests {
             &mut app,
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
         );
+        screen(&mut app, 100, 20);
 
         assert_eq!(app.active_tab().feed.cards.line, 4);
         assert!(app.status.is_none(), "Ctrl+y must not copy a link");
@@ -7378,7 +7980,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn when_paging_back_to_a_card_that_reloads_it_should_reach_its_bottom_after_loading() {
+    fn when_paging_back_from_a_short_card_it_should_keep_the_full_row_distance() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = card_with_image(320, 640);
         app.tabs[3].feed.posts.push(post_with("p2", Media::None));
@@ -7387,18 +7989,7 @@ pub(crate) mod tests {
         screen(&mut app, 100, 20);
         crate::keys::handle(&mut app, KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
         screen(&mut app, 100, 20);
-        std::thread::sleep(crate::app::NAV_SETTLE);
-        app.tick();
-        screen(&mut app, 100, 20);
-
-        app.on_msg(Msg::Image {
-            url: "https://i.redd.it/p1.jpeg".into(),
-            result: Ok(image::DynamicImage::new_rgb8(320, 640).into()),
-        });
-        let actual = screen(&mut app, 100, 20);
-
-        assert!(actual.contains("comments"), "{actual}");
-        assert_eq!(app.active_tab().feed.cards.line, 55);
+        assert_eq!(app.active_tab().feed.cards.line, 45);
         assert_eq!(app.current_post().unwrap().id, "p1");
     }
 

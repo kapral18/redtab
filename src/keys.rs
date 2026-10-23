@@ -23,6 +23,10 @@ pub fn handle(app: &mut App, mut key: KeyEvent) {
         app.quit = true;
         return;
     }
+    if matches!(app.overlay, Some(Overlay::Experience)) {
+        app.experience_key(key);
+        return;
+    }
     // Esc followed quickly by a key arrives as Alt+key: handle both.
     if key.modifiers.contains(KeyModifiers::ALT)
         && matches!(
@@ -106,6 +110,10 @@ fn delete_word(input: &mut String) {
 /// Paste goes only into the picker or search input, so pasted text never runs
 /// commands. In a search, line breaks and tabs become spaces.
 pub fn paste(app: &mut App, text: &str) {
+    if matches!(app.overlay, Some(Overlay::Experience)) {
+        app.experience_paste(text);
+        return;
+    }
     match &mut app.overlay {
         Some(Overlay::Picker(picker)) => {
             picker
@@ -130,6 +138,7 @@ fn handle_overlay(app: &mut App, overlay: Overlay, key: KeyEvent) -> Option<Over
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let typing = !ctrl;
     match overlay {
+        Overlay::Experience => Some(Overlay::Experience),
         Overlay::Auth => {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q')
@@ -288,6 +297,9 @@ fn handle_post(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('n') => app.jump_top_level(true),
         KeyCode::Char('v') => app.toggle_spoilers(),
         KeyCode::Char('N') => app.jump_top_level(false),
+        KeyCode::Char('f') => app.comment_tools(),
+        KeyCode::Char('{') => app.gallery_step(false),
+        KeyCode::Char('}') => app.gallery_step(true),
         KeyCode::Char('P') => app.toggle_video_pause(),
         KeyCode::Char('a') => app.toggle_video_sound(),
         KeyCode::Char(',') => app.seek_video(false),
@@ -314,6 +326,9 @@ fn handle_global(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => app.status = None,
         KeyCode::Char('?') => app.overlay = Some(Overlay::Help { scroll: 0 }),
         KeyCode::Char('A') => app.show_auth(),
+        KeyCode::Char(':') => app.reddit_menu(),
+        KeyCode::Char(';') => app.show_actions(),
+        KeyCode::Char('B') => app.community_menu(),
         KeyCode::Char('p') => app.overlay = Some(Overlay::Picker(PickerState::default())),
         KeyCode::Tab | KeyCode::Char(']') => app.cycle_tab(true),
         KeyCode::BackTab | KeyCode::Char('[') => app.cycle_tab(false),

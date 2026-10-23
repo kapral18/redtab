@@ -215,7 +215,7 @@ impl Fixture {
         Reddit::with_transport(
             Transport::new().unwrap(),
             false,
-            &format!("{}/", self.base),
+            &self.base,
             session::Session::stored(text, session::now()).unwrap(),
         )
         .unwrap()
