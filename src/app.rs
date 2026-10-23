@@ -458,10 +458,10 @@ pub struct PostView {
     pub rendered_pictures: Vec<(String, usize, usize)>,
     /// This update redirects a read More row to its first newly inserted reply.
     pub more_handoff: bool,
-    /// The inline image was scrolled away; it stays away (even if a short post clamps the
+    /// The video band was scrolled away; it stays away (even if a short post clamps the
     /// scroll back to 0) until a key returns to the top.
     pub image_away: bool,
-    /// The last draw showed the inline image (so the post was at its top).
+    /// The last draw showed part of the main image or the video band.
     pub image_shown: bool,
     /// Document line where each row starts; kept in sync by the UI.
     pub row_starts: Vec<usize>,
@@ -647,8 +647,8 @@ impl PostView {
     /// Before the document changes above what is read (loads, spoiler rewrap), keep the
     /// last-drawn text in place. Several changes before one draw keep the first anchor.
     fn pin_view(&mut self) {
-        // At the top with the image shown, stay at the top: anchoring would scroll off 0
-        // and dismiss the image, so a hold keeps scroll 0 and a selection stays in view.
+        // At the top with media shown, keep its beginning in view. For video, anchoring
+        // off 0 would also dismiss the playback band.
         // If a key in this pass already scrolled, the reading position counts instead.
         if self.image_shown && self.scroll == 0 {
             if let Some(hold) = &mut self.hold_view {

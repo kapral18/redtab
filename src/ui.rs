@@ -161,11 +161,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             TabKind::Subreddit { .. } => draw_feed(f, app, body, &mut pictures),
         }
     }
-    draw_card_pictures(f, app, &pictures.cards);
     spots.extend(pictures.thumbs);
     if let Some(detail) = detail {
-        draw_post(f, app, detail.inner(margin));
+        draw_post(f, app, detail.inner(margin), &mut pictures.cards);
     }
+    draw_card_pictures(f, app, &pictures.cards);
     draw_spots(f, app, &spots);
     draw_footer(f, app, footer);
     app.status_drawn();
@@ -741,6 +741,15 @@ fn card_marker(app: &App, selected: bool, bg: Style) -> Span<'static> {
     )
 }
 
+fn full_width_picture(pixels: (u32, u32), font: ratatui_image::FontSize, cols: u16) -> Size {
+    let rows = (f64::from(cols) * f64::from(font.width.max(1)) * f64::from(pixels.1)
+        / f64::from(pixels.0.max(1))
+        / f64::from(font.height.max(1)))
+    .ceil()
+    .clamp(1.0, f64::from(i16::MAX)) as u16;
+    Size::new(cols, rows)
+}
+
 fn expanded_card(
     app: &App,
     post: &Post,
@@ -771,14 +780,12 @@ fn expanded_card(
             .filter(|&(width, height)| width > 0 && height > 0)
     });
     let image_rows = image.as_ref().map_or(0, |_| {
-        let (image_width, image_height) = image_size.unwrap_or((1, 1));
-        let font = app.image_picker.font_size();
-        let pixels_wide = width.saturating_sub(4) as f64 * f64::from(font.width.max(1));
-        (pixels_wide * f64::from(image_height)
-            / f64::from(image_width)
-            / f64::from(font.height.max(1)))
-        .ceil()
-        .clamp(1.0, f64::from(i16::MAX)) as u16
+        full_width_picture(
+            image_size.unwrap_or((1, 1)),
+            app.image_picker.font_size(),
+            width.saturating_sub(4) as u16,
+        )
+        .height
     });
     lines.insert(0, meta);
     let image = image.filter(|_| image_rows > 0);
@@ -1860,6 +1867,7 @@ struct DocPicture {
     line: usize,
     x: u16,
     size: Option<Size>,
+    main: bool,
 }
 
 /// The URL of a picture line (`PICTURE` then the URL, maybe after a quote bar).
@@ -1902,7 +1910,7 @@ fn text_into(
         // for each place every frame; where that doesn't fit it is only named.
         let first = pictures
             .iter()
-            .find_map(|p| (p.url == url).then_some(p.size).flatten());
+            .find_map(|p| (!p.main && p.url == url).then_some(p.size).flatten());
         let cols = width.saturating_sub(lead.width()).max(1) as u16;
         let size = match (slot, first) {
             (Some(Some(ImageSlot::Ready { .. })), Some(first)) => {
@@ -1924,6 +1932,7 @@ fn text_into(
             line: lines.len(),
             x: x + lead.width() as u16,
             size,
+            main: false,
         });
         match size {
             Some(size) => {
@@ -1960,7 +1969,7 @@ fn thread_prefix(depth: usize) -> Vec<Span<'static>> {
         .collect()
 }
 
-fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
+fn draw_post(f: &mut Frame, app: &mut App, area: Rect, cards: &mut Vec<CardPicture>) {
     let Some(view) = app.post_view.as_ref() else {
         return;
     };
@@ -2064,9 +2073,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
         head_area,
     );
 
-    // The image or video shows only while the document stays at its top. Settle the
-    // scroll for the image layout first: deciding from the old scroll flashed the image
-    // for one frame. A video shows its poster until its first frame.
+    // Video keeps its playback band; still images occupy scrollable document rows.
     let video = post.media.video_url().is_some();
     let image_url = post.media.shows_inline().then(|| {
         app.post_view
@@ -2079,10 +2086,8 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
         .post_view
         .as_ref()
         .is_some_and(|v| v.spoiler_hidden() || v.page.is_none());
-    // The picture's rows follow its shape (`picture_cells`): a wide one fills the width
-    // while a few lines of text stay in view, a tall one is centred within half the post
-    // area. A video adds its status and blank rows, and decodes for its whole box so a
-    // frame arriving does not restart it.
+    // A video adds status and blank rows, and decodes for its whole box so a frame
+    // arriving does not restart it.
     let cols = rest.width.saturating_sub(2);
     let wide_max = rest.height.saturating_sub(TEXT_UNDER_PICTURE).max(1);
     let tall_max = (rest.height / 2).max(1);
@@ -2100,15 +2105,12 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
         )
         .map_or(1, |size| size.height)
     };
-    let image_rows = if video {
-        picture(video::KITTY_MAX_ROWS) + 2
-    } else {
-        picture(u16::MAX) + 1
-    };
+    let image_rows = picture(video::KITTY_MAX_ROWS) + 2;
     // A video needs a row of picture above its status line and the blank row, with a
     // line of text under them.
-    let image_url =
-        image_url.filter(|_| app.inline_images_on() && !hide_image && (!video || rest.height >= 4));
+    let image_url = image_url
+        .as_ref()
+        .filter(|_| app.inline_images_on() && !hide_image && (!video || rest.height >= 4));
     let [img_area, with_image] =
         Layout::vertical([Constraint::Length(image_rows), Constraint::Min(1)]).areas(rest);
     let margin = Margin {
@@ -2118,6 +2120,30 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
     let (full, with_image) = (rest.inner(margin), with_image.inner(margin));
     // The image changes only the height: the text wraps the same in both layouts.
     let width = full.width.saturating_sub(2) as usize;
+    let main_pixels = still_url.and_then(|url| {
+        match app.images.get(url) {
+            Some(ImageSlot::Ready { pixels, .. }) => Some(*pixels),
+            _ => app.card_image_metadata.get(url).map(|m| m.size),
+        }
+        .or_else(|| {
+            (!matches!(post.media, Media::Gallery { .. }) || view.gallery_index == 0)
+                .then_some(post.preview_size)
+                .flatten()
+        })
+        .filter(|&(w, h)| w > 0 && h > 0)
+    });
+    let main_size = main_pixels
+        .map(|pixels| full_width_picture(pixels, app.image_picker.font_size(), width as u16));
+    // Keep its identity while images are off: zero rows let geometry reconciliation
+    // remove and restore its height without losing the text being read below it.
+    let main_image = still_url.filter(|_| !video && !hide_image).map(|url| {
+        let size = if app.inline_images_on() {
+            main_size
+        } else {
+            Some(Size::new(width as u16, 0))
+        };
+        (url, size)
+    });
     let sizes = PictureSizes {
         images: app.inline_images_on().then_some(&app.images),
         font: app.image_picker.font_size(),
@@ -2131,7 +2157,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
         lines,
         spans,
         pictures,
-    } = post_document(view, width, now, Some(&mut more_lines), &sizes);
+    } = post_document(view, width, now, Some(&mut more_lines), &sizes, main_image);
     view.row_starts = spans.iter().map(|(s, _)| *s).collect();
     let requested_scroll = view.scroll;
     // Replies loaded above the text being read: put it back where it was.
@@ -2221,7 +2247,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
     {
         let shown = view.reveal_spoilers;
         view.reveal_spoilers = was;
-        let old_lines = post_document(view, width, now, None, &sizes).lines;
+        let old_lines = post_document(view, width, now, None, &sizes, main_image).lines;
         view.reveal_spoilers = shown;
         if let Some(at) = same_line(&old_lines, pinned, &lines) {
             let moved = view.scroll as isize - pinned as isize;
@@ -2233,13 +2259,13 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
     if view.free_scroll || view.hold_view.is_none_or(|h| h.row != view.cursor) {
         view.hold_view = None;
     }
-    // Scrolled away, the image stays away until a key returns to the top, even when a short
+    // Scrolled away, video stays away until a key returns to the top, even when a short
     // post clamps the scroll back to 0: otherwise frames alternate with and without it.
-    if image_url.is_some() && view.scroll != 0 {
+    if video && image_url.is_some() && view.scroll != 0 {
         view.image_away = true;
     }
     let settle = |height: usize| settle_scroll(view, &spans, lines.len(), height);
-    let mut image = image_url.filter(|_| view.scroll == 0 && !view.image_away);
+    let mut image = image_url.filter(|_| video && view.scroll == 0 && !view.image_away);
     let (mut doc_area, mut settled) = match image {
         Some(_) => (with_image, settle(with_image.height as usize)),
         None => (full, settle(full.height as usize)),
@@ -2252,14 +2278,20 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
         settled = settle(full.height as usize);
     }
     view.image_away |= image_away;
-    view.image_shown = image.is_some();
     let (scroll, held) = settled;
+    let main_visible = pictures.iter().any(|p| {
+        p.main
+            && p.rows() > 0
+            && p.line < scroll + full.height as usize
+            && p.line + p.rows() > scroll
+    });
+    view.image_shown = image.is_some() || main_visible;
     view.scroll = scroll;
     if !held {
         view.hold_view = None;
     }
     // A hold kept at the top for the image: with no image this frame, hold the text where it is.
-    if image.is_none()
+    if !view.image_shown
         && let Some(hold) = &mut view.hold_view
         && hold.top
         && let Some(&(start, _)) = spans.get(hold.row)
@@ -2288,6 +2320,27 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
     let mut wanted = Vec::new();
     let mut shown = Vec::new();
     for picture in &pictures {
+        if picture.main {
+            let start = picture.line.max(scroll);
+            let end = (picture.line + picture.rows()).min(scroll + height);
+            if start < end {
+                let size = picture.size.unwrap_or(Size::new(width as u16, 1));
+                cards.push(CardPicture {
+                    url: picture.url.clone(),
+                    area: Rect::new(
+                        doc_area.x,
+                        doc_area.y + (start - scroll) as u16,
+                        size.width,
+                        (end - start) as u16,
+                    ),
+                    size,
+                    skipped: (start - picture.line) as u16,
+                    pixels: main_pixels.unwrap_or((1, 1)),
+                    video: false,
+                });
+            }
+            continue;
+        }
         if images_on && near.contains(&picture.line) {
             wanted.push(picture.url.clone());
         }
@@ -2348,20 +2401,11 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect) {
     }
     if let Some(still) = image {
         let area = img_area.inner(margin);
-        if video {
-            let decode_box = Rect {
-                height: decode_rows,
-                ..area
-            };
-            draw_video(f, app, still.as_deref(), area, decode_box);
-        } else if let Some(url) = still {
-            // The last row stays blank.
-            let picture = Rect {
-                height: area.height.saturating_sub(1).max(1),
-                ..area
-            };
-            draw_inline_image(f, app, &url, picture);
-        }
+        let decode_box = Rect {
+            height: decode_rows,
+            ..area
+        };
+        draw_video(f, app, still.as_deref(), area, decode_box);
     }
 }
 
@@ -2555,6 +2599,7 @@ fn post_document(
     now: DateTime<Utc>,
     mut more_lines: Option<&mut Vec<(String, usize)>>,
     sizes: &PictureSizes<'_>,
+    main_image: Option<(&str, Option<Size>)>,
 ) -> PostDocument {
     let mut pictures = Vec::new();
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -2601,7 +2646,19 @@ fn post_document(
             lines,
             ..PostDocument::default()
         };
-    } else if !page.body.is_empty() {
+    }
+    if let Some((url, size)) = main_image {
+        let picture = DocPicture {
+            url: url.to_string(),
+            line: lines.len(),
+            x: 0,
+            size,
+            main: true,
+        };
+        lines.extend(std::iter::repeat_n(Line::raw(""), picture.rows() + 1));
+        pictures.push(picture);
+    }
+    if !page.body.is_empty() {
         let body = spoiler_text(&page.body, reveal);
         let style = Style::new().fg(TEXT);
         text_into(&mut lines, &mut pictures, &body, width, &[], style, sizes);
@@ -4777,48 +4834,241 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn scrolling_a_short_image_post_hides_the_image_until_the_top() {
+    fn a_tall_detail_image_should_take_its_full_width_height_in_the_document() {
+        let mut app = image_post("body below the full image");
+        let slot = ready(&app, 320, 1280);
+        app.images.insert("https://i.redd.it/big.jpeg".into(), slot);
+
+        let shown = screen(&mut app, 100, 40);
+        let view = app.post_view.as_ref().unwrap();
+
+        assert!(!shown.contains("body below the full image"));
+        assert_eq!(view.rendered_pictures.first().map(|p| p.2), Some(140));
+        assert_eq!(view.scroll, 0);
+    }
+
+    fn detail_pictures(app: &mut App, width: u16, height: u16) -> Vec<CardPicture> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut pictures = Vec::new();
+        terminal
+            .draw(|f| draw_post(f, app, f.area(), &mut pictures))
+            .unwrap();
+        pictures
+    }
+
+    #[test]
+    fn a_detail_image_should_clip_visible_rows_and_scroll_continuously_into_the_body() {
+        let mut app = image_post(&paragraphs("body after image", 1..=20));
+        let slot = ready(&app, 320, 1280);
+        app.images.insert("https://i.redd.it/big.jpeg".into(), slot);
+        let first = detail_pictures(&mut app, 80, 30);
+        assert_eq!(first[0].size, Size::new(76, 152));
+        assert_eq!(first[0].skipped, 0);
+        assert_eq!(first[0].area.width, 76);
+
+        app.scroll_post(10);
+        let middle = detail_pictures(&mut app, 80, 30);
+        assert_eq!(middle[0].skipped, 9);
+        assert_eq!(
+            middle[0].area.height as usize,
+            app.post_view.as_ref().unwrap().page_height
+        );
+        assert_eq!(app.post_view.as_ref().unwrap().scroll, 10);
+
+        app.scroll_post(130);
+        let end = detail_pictures(&mut app, 80, 30);
+        assert_eq!(end[0].skipped, 139);
+        assert_eq!(end[0].area.height, 13);
+        assert_eq!(app.post_view.as_ref().unwrap().scroll, 140);
+        app.scroll_post(-130);
+        let back = detail_pictures(&mut app, 80, 30);
+        assert_eq!(back[0].skipped, 9);
+    }
+
+    #[test]
+    fn a_detail_image_resize_should_keep_the_body_being_read_in_place() {
+        let mut app = image_post(&paragraphs("body", 1..=20));
+        let slot = ready(&app, 320, 1280);
+        app.images.insert("https://i.redd.it/big.jpeg".into(), slot);
+        detail_pictures(&mut app, 80, 30);
+        app.scroll_post(155);
+        detail_pictures(&mut app, 80, 30);
+        let old = app.post_view.as_ref().unwrap().scroll;
+
+        detail_pictures(&mut app, 100, 30);
+
+        let view = app.post_view.as_ref().unwrap();
+        assert_eq!(view.rendered_pictures[0].2, 192);
+        assert_eq!(view.scroll, old + 40);
+    }
+
+    #[test]
+    fn a_loading_detail_image_should_reserve_known_geometry_and_keep_it_after_failure() {
+        let mut app = image_post("body after image");
+        app.post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .post
+            .preview_size = Some((320, 1280));
+        let first = detail_pictures(&mut app, 80, 30);
+        assert_eq!(first[0].size, Size::new(76, 152));
+        app.images.insert(
+            "https://i.redd.it/big.jpeg".into(),
+            ImageSlot::Failed("offline".into()),
+        );
+        let failed = detail_pictures(&mut app, 80, 30);
+        assert_eq!(failed[0].size, first[0].size);
+
+        app.post_view.as_mut().unwrap().page = None;
+        assert!(detail_pictures(&mut app, 80, 30).is_empty());
+    }
+
+    #[test]
+    fn main_and_embedded_copies_of_a_detail_image_should_have_independent_sizes() {
+        let mut app = image_post(&format!("{PICTURE}https://i.redd.it/big.jpeg"));
+        let slot = ready(&app, 320, 1280);
+        app.images.insert("https://i.redd.it/big.jpeg".into(), slot);
+        detail_pictures(&mut app, 80, 30);
+
+        let pictures = &app.post_view.as_ref().unwrap().rendered_pictures;
+        assert_eq!(pictures.len(), 2);
+        assert_eq!(pictures[0].2, 152);
+        assert_eq!(pictures[1].2, TEXT_PICTURE_ROWS as usize);
+    }
+
+    #[test]
+    fn a_detail_gallery_should_use_each_selected_images_own_shape_and_hide_spoilers() {
+        let mut app = image_post("gallery caption");
+        let media = Media::Gallery {
+            thumb: None,
+            images: vec![
+                "https://i.redd.it/big.jpeg".into(),
+                "https://i.redd.it/wide.jpeg".into(),
+            ],
+        };
+        app.post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .post
+            .media = media;
+        for (url, w, h) in [("big", 320, 1280), ("wide", 1280, 320)] {
+            let slot = ready(&app, w, h);
+            app.images
+                .insert(format!("https://i.redd.it/{url}.jpeg"), slot);
+        }
+        assert_eq!(detail_pictures(&mut app, 80, 30)[0].size.height, 152);
+        app.scroll_post(20);
+        app.gallery_step(true);
+        let next = detail_pictures(&mut app, 80, 30);
+        assert_eq!(next[0].url, "https://i.redd.it/wide.jpeg");
+        assert_eq!(next[0].size, Size::new(76, 10));
+        assert_eq!(app.post_view.as_ref().unwrap().scroll, 0);
+        app.post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .post
+            .spoiler = true;
+        assert!(detail_pictures(&mut app, 80, 30).is_empty());
+        app.toggle_spoilers();
+        assert_eq!(detail_pictures(&mut app, 80, 30)[0].size.height, 10);
+    }
+
+    #[test]
+    fn detail_comment_navigation_should_move_past_the_full_image_and_return_to_it() {
+        let mut app = image_post("short");
+        let slot = ready(&app, 320, 1280);
+        app.images.insert("https://i.redd.it/big.jpeg".into(), slot);
+        detail_pictures(&mut app, 80, 30);
+        app.activate_comment();
+        detail_pictures(&mut app, 80, 30);
+        let view = app.post_view.as_ref().unwrap();
+        assert!(!view.free_scroll);
+        assert!(view.scroll > 130);
+        assert!(view.row_starts[view.cursor] < view.scroll + view.page_height);
+        press(&mut app, 'g');
+        let top = detail_pictures(&mut app, 80, 30);
+        assert_eq!(top[0].skipped, 0);
+    }
+
+    #[test]
+    fn the_detail_image_should_render_pixels_below_its_first_viewport() {
+        let mut app = image_post("body below image");
+        screen(&mut app, 100, 40);
+        app.on_msg(Msg::Image {
+            url: "https://i.redd.it/big.jpeg".into(),
+            result: Ok(image::DynamicImage::new_rgb8(320, 1280).into()),
+        });
+        screen(&mut app, 100, 40);
+        app.scroll_post(50);
+
+        let cells = placeholder_cells(&mut app, 100, 40);
+
+        assert!(cells.len() > 70 * 20);
+        assert_eq!(app.post_view.as_ref().unwrap().scroll, 50);
+    }
+
+    #[test]
+    fn toggling_a_detail_image_should_keep_body_and_comments_at_the_same_position() {
+        for comments in [false, true] {
+            let mut app = image_post_with_comments(37);
+            if !comments {
+                app.post_view.as_mut().unwrap().page.as_mut().unwrap().body =
+                    "repeated body paragraph\n\n".repeat(80);
+            }
+            let slot = ready(&app, 320, 1280);
+            app.images.insert("https://i.redd.it/big.jpeg".into(), slot);
+            detail_pictures(&mut app, 80, 30);
+            let view = app.post_view.as_mut().unwrap();
+            view.scroll = if comments {
+                view.row_starts[10] + 1
+            } else {
+                160
+            };
+            detail_pictures(&mut app, 80, 30);
+            let view = app.post_view.as_ref().unwrap();
+            let before = view.rendered_document[view.scroll].to_string();
+            let scroll = view.scroll;
+
+            app.toggle_images();
+            assert!(detail_pictures(&mut app, 80, 30).is_empty());
+            let view = app.post_view.as_ref().unwrap();
+            assert_eq!(view.rendered_document[view.scroll].to_string(), before);
+            assert_eq!(view.scroll, scroll - 152);
+
+            app.toggle_images();
+            detail_pictures(&mut app, 80, 30);
+            let view = app.post_view.as_ref().unwrap();
+            assert_eq!(view.rendered_document[view.scroll].to_string(), before);
+            assert_eq!(view.scroll, scroll);
+        }
+    }
+
+    #[test]
+    fn a_short_detail_image_should_stay_when_page_scrolling_clamps_at_the_top() {
         let mut app = image_post("short");
         let at_top = screen(&mut app, 100, 40);
-
-        // The text fits without the image: the scroll clamps back to 0.
         press(&mut app, ' ');
         let paged = screen(&mut app, 100, 40);
         let redrawn = screen(&mut app, 100, 40);
-        press(&mut app, 'g');
-        let top_again = screen(&mut app, 100, 40);
-        // Images off and on again at the top show it too.
-        press(&mut app, ' ');
-        screen(&mut app, 100, 40);
-        press(&mut app, 'i');
-        press(&mut app, 'i');
-        let images_on_again = screen(&mut app, 100, 40);
-        // A long post: `k` reading back up to the top line shows it, as C-y does.
-        let mut long = image_post("one\n\ntwo");
-        screen(&mut long, 100, 40);
-        let view = long.post_view.as_mut().unwrap();
-        view.page.as_mut().unwrap().body = "para\n\n".repeat(60);
-        screen(&mut long, 100, 40);
-        long.scroll_post(1);
-        screen(&mut long, 100, 40);
-        press(&mut long, 'k');
-        let k_to_top = screen(&mut long, 100, 40);
 
-        assert!(at_top.contains("loading image"), "{at_top}");
-        assert!(!paged.contains("loading image"), "{paged}");
-        assert_eq!(paged, redrawn, "a redraw does not bring it back");
-        assert!(top_again.contains("loading image"), "{top_again}");
-        assert!(
-            images_on_again.contains("loading image"),
-            "{images_on_again}"
-        );
-        assert!(k_to_top.contains("loading image"), "{k_to_top}");
+        assert!(at_top.contains("loading image"));
+        assert!(paged.contains("loading image"));
+        assert_eq!(paged, redrawn);
+        assert_eq!(app.post_view.as_ref().unwrap().scroll, 0);
     }
 
     #[test]
     fn when_a_post_image_is_small_the_text_should_start_right_below_it() {
-        // Reddit's 140×73 link preview grows twice: 146 px is 10 rows of 16 px (rounded
-        // up), not the most a wide picture may take.
+        // A 140×73 image fills 70 columns of 8×16 cells: 19 picture rows.
         let mut app = image_post("first line of the body");
         let slot = ready(&app, 140, 73);
         app.images.insert("https://i.redd.it/big.jpeg".into(), slot);
@@ -4827,8 +5077,8 @@ pub(crate) mod tests {
 
         let row = |text: &str| s.lines().position(|l| l.contains(text)).unwrap();
         let gap = row("first line of the body") - row("╰");
-        // 10 picture rows plus the 3 rows of spacing every inline picture has.
-        assert_eq!(gap, 13, "rows between header and text:\n{s}");
+        // 19 picture rows plus three rows of spacing.
+        assert_eq!(gap, 22, "rows between header and text");
     }
 
     #[test]
