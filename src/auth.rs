@@ -1061,4 +1061,46 @@ mod tests {
             "cancellation already reaped this owned child"
         );
     }
+
+    #[test]
+    fn ui_audit_short_verified_confirmation_should_preserve_account_and_cancel() {
+        use crate::reddit::tests::{Fixture, Reply, saved_export};
+        let fixture = Fixture::new(|_| {
+            Reply::json(serde_json::json!({"kind":"Listing","data":{"children":[],"after":null}}))
+        });
+        for name in ["reader", "abcdefghijklmnopqrst"] {
+            let reddit = fixture.saved_reddit(&saved_export(name, name));
+            for (width, height) in [(14, 6), (18, 6), (20, 6), (24, 8), (40, 12)] {
+                let (pool, _) = crate::worker::Pool::start(reddit.clone(), 1, None);
+                let dir = tempfile::tempdir().unwrap();
+                let mut app = crate::app::App::new(
+                    crate::config::Config {
+                        media: crate::config::MediaSettings {
+                            image_preview: false,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    pool,
+                    reddit.clone(),
+                    dir.path().join("state.json"),
+                    ratatui_image::picker::Picker::halfblocks(),
+                );
+                app.overlay = Some(crate::app::Overlay::Auth);
+                app.auth.phase = Phase::Confirm;
+                app.auth.candidate = Some(Candidate {
+                    reddit: reddit.clone(),
+                    source: None,
+                    activation: None,
+                });
+                let actual = crate::ui::tests::auth_content(&mut app, width, height);
+                assert!(
+                    actual.contains(&format!("u/{name}"))
+                        || (actual.contains(&format!("u/{}", &name[..1])) && actual.contains('…')),
+                    "{actual}"
+                );
+                assert!(actual.contains("Esc") || actual.contains('⎋'), "{actual}");
+            }
+        }
+    }
 }

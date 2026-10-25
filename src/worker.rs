@@ -12,11 +12,11 @@ use std::thread;
 use image::DynamicImage;
 
 use crate::cache::{CONTENT_TTL, Cache, IMAGE_TTL, Source};
-use crate::model::{Listing, Media, PostPage, ReplyPage, Sort, TimeRange};
-use crate::reddit::Reddit;
+use crate::model::{Listing, Media, Post, PostPage, ReplyPage, Sort, TimeRange};
+use crate::reddit::{AccessDenied, ListingEvent, Priority, Reddit};
 
 /// Largest image edge sent to the terminal; bigger images only cost bandwidth.
-const MAX_IMAGE_EDGE: u32 = 1600;
+const MAX_IMAGE_EDGE: u32 = crate::model::PREVIEW_EDGE;
 /// Largest list-thumbnail edge; keeps the cache small.
 const MAX_THUMB_EDGE: u32 = 128;
 /// Threads reserved for jobs the user waits on.
@@ -49,7 +49,7 @@ impl FeedQuery {
 
     fn cache_request(&self, target: &FeedTarget, after: Option<&str>) -> Option<String> {
         match target {
-            FeedTarget::Home => serde_json::to_string(&("browser-home-v1", self, after)).ok(),
+            FeedTarget::Home => serde_json::to_string(&("browser-home-v2", self, after)).ok(),
             FeedTarget::Subreddit(name) => {
                 serde_json::to_string(&("feed", name.to_lowercase(), self, after)).ok()
             }
@@ -61,19 +61,71 @@ impl FeedQuery {
         reddit: &Reddit,
         target: &FeedTarget,
         after: Option<&str>,
+        progress: &mut dyn FnMut(ListingEvent<'_>),
     ) -> anyhow::Result<Listing> {
         match (target, self) {
-            (FeedTarget::Home, Self::Listing { sort, time }) => reddit.home(*sort, *time, after),
+            (FeedTarget::Home, Self::Listing { sort, time }) => {
+                reddit.home_progress(*sort, *time, after, progress)
+            }
             (FeedTarget::Subreddit(name), Self::Listing { sort, time }) => {
-                reddit.listing(name, *sort, *time, after)
+                reddit.listing_progress(name, *sort, *time, after, progress)
             }
             (FeedTarget::Subreddit(name), Self::Search { query }) => {
-                reddit.search(name, query, after)
+                reddit.search_progress(name, query, after, progress)
             }
             (FeedTarget::Home, Self::Search { .. }) => {
                 anyhow::bail!("search runs inside a subreddit")
             }
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FeedError {
+    Access(AccessDenied),
+    Other(String),
+}
+
+impl FeedError {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Access(access) => access.message(),
+            Self::Other(message) => message,
+        }
+    }
+
+    pub fn access(&self) -> Option<AccessDenied> {
+        match self {
+            Self::Access(access) => Some(*access),
+            Self::Other(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for FeedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<anyhow::Error> for FeedError {
+    fn from(error: anyhow::Error) -> Self {
+        match error.downcast_ref::<AccessDenied>() {
+            Some(access) => Self::Access(*access),
+            None => Self::Other(err_string(error)),
+        }
+    }
+}
+
+impl From<String> for FeedError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl From<&str> for FeedError {
+    fn from(message: &str) -> Self {
+        Self::Other(message.into())
     }
 }
 
@@ -88,7 +140,6 @@ pub struct LoadedImage {
 #[derive(Debug, Clone, Copy)]
 pub struct ImageMetadata {
     pub size: (u32, u32),
-    pub flat: bool,
 }
 
 impl From<DynamicImage> for LoadedImage {
@@ -99,14 +150,9 @@ impl From<DynamicImage> for LoadedImage {
             image.clone()
         };
         let preview = preview.to_rgba8();
-        let flat = preview.pixels().next().is_none_or(|first| {
-            preview.pixels().all(|pixel| pixel == first)
-                || preview.pixels().all(|pixel| pixel[3] == 0)
-        });
         Self {
             metadata: ImageMetadata {
                 size: (image.width(), image.height()),
-                flat,
             },
             image: Arc::new(image),
             preview: Arc::new(DynamicImage::ImageRgba8(preview)),
@@ -244,7 +290,7 @@ impl Job {
                 tab: *tab,
                 generation: *generation,
                 append: after.is_some(),
-                result: Err(e),
+                result: Err(e.into()),
             },
             Job::Group {
                 subreddit,
@@ -252,7 +298,7 @@ impl Job {
             } => Msg::Group {
                 generation: *generation,
                 subreddit: subreddit.clone(),
-                result: Err(e),
+                result: Err(e.into()),
             },
             Job::Post { generation, .. } => Msg::Post {
                 generation: *generation,
@@ -292,6 +338,19 @@ impl Job {
 }
 
 pub enum Msg {
+    FeedFallback {
+        tab: u64,
+        generation: u64,
+        listing: Listing,
+        cursor: String,
+        error: String,
+    },
+    FeedProgress {
+        tab: u64,
+        generation: u64,
+        post: Box<Post>,
+        source: Source,
+    },
     SortedPost {
         generation: u64,
         sort: String,
@@ -321,12 +380,12 @@ pub enum Msg {
         tab: u64,
         generation: u64,
         append: bool,
-        result: Result<Listing, String>,
+        result: Result<Listing, FeedError>,
     },
     Group {
         subreddit: String,
         generation: u64,
-        result: Result<Listing, String>,
+        result: Result<Listing, FeedError>,
     },
     Post {
         generation: u64,
@@ -384,6 +443,8 @@ impl Drop for Pool {
 #[derive(Clone)]
 struct Queues {
     priority: Sender<Work>,
+    feeds: Sender<Work>,
+    selected: Sender<Work>,
     foreground_images: Sender<Work>,
     background: Sender<Work>,
     images: Sender<Work>,
@@ -394,6 +455,7 @@ struct Queues {
 struct Work {
     job: Job,
     force: bool,
+    cache_only: bool,
     image_ticket: Option<Arc<AtomicBool>>,
 }
 
@@ -409,6 +471,8 @@ impl Queues {
                 background: false, ..
             } => &self.foreground_images,
             Job::Group { .. } => &self.background,
+            Job::Feed { .. } => &self.feeds,
+            Job::Post { .. } | Job::SortedPost { .. } | Job::MoreReplies { .. } => &self.selected,
             _ => &self.priority,
         };
         let _ = queue.send(work);
@@ -428,6 +492,15 @@ struct Wanted {
     image_tickets: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Generation of the page load the open post waits for.
     post: Mutex<Option<u64>>,
+    // None until a view binds demand; each entry tracks its latest dispatched generation.
+    groups: Mutex<Option<HashMap<String, Option<u64>>>>,
+    icons: Mutex<Option<HashSet<String>>>,
+    feeds: Mutex<Option<FeedDemand>>,
+}
+
+struct FeedDemand {
+    active: Option<u64>,
+    requests: HashMap<u64, HashSet<u64>>,
 }
 
 impl Pool {
@@ -448,6 +521,9 @@ impl Pool {
         cache: Option<Arc<Cache>>,
     ) -> (Self, Receiver<Msg>) {
         let (priority_tx, priority_rx) = channel::<Work>();
+        let (feeds_tx, feeds_rx) = channel::<Work>();
+        let (selected_tx, selected_rx) = channel::<Work>();
+        let (foreground_images_tx, foreground_images_rx) = channel::<Work>();
         let (background_tx, background_rx) = channel::<Work>();
         let (images_tx, images_rx) = channel::<Work>();
         let (thumbs_tx, thumbs_rx) = channel::<Work>();
@@ -465,7 +541,9 @@ impl Pool {
             )
         };
         let queues = Queues {
-            foreground_images: cached(priority_tx.clone()),
+            feeds: cached(feeds_tx),
+            foreground_images: cached(foreground_images_tx),
+            selected: cached(selected_tx),
             priority: cached(priority_tx),
             background: cached(background_tx),
             images: cached(images_tx),
@@ -475,6 +553,9 @@ impl Pool {
         let background_threads = threads.saturating_sub(PRIORITY_THREADS).max(1);
         for (rx, count) in [
             (priority_rx, PRIORITY_THREADS),
+            (feeds_rx, 2),
+            (selected_rx, 2),
+            (foreground_images_rx, 2),
             (background_rx, background_threads),
             (images_rx, 2),
             (thumbs_rx, THUMB_THREADS),
@@ -508,6 +589,16 @@ impl Pool {
     }
 
     fn enqueue(&self, job: Job, force: bool) {
+        self.enqueue_policy(job, force, false);
+    }
+
+    pub fn cached(&self, job: Job) {
+        if self.cache.is_some() {
+            self.enqueue_policy(job, false, true);
+        }
+    }
+
+    fn enqueue_policy(&self, job: Job, force: bool, cache_only: bool) {
         let image_ticket = match &job {
             Job::Image { url, .. } => self.wanted.image_tickets.lock().ok().map(|mut tickets| {
                 Arc::clone(
@@ -518,9 +609,18 @@ impl Pool {
             }),
             _ => None,
         };
+        if !cache_only
+            && let Job::Group {
+                subreddit,
+                generation,
+            } = &job
+        {
+            self.want_group(subreddit, *generation);
+        }
         self.queues.submit(Work {
             job,
             force,
+            cache_only,
             image_ticket,
         });
     }
@@ -558,10 +658,36 @@ impl Pool {
         }
     }
 
-    /// The post closed: its queued image fetches are skipped.
-    pub fn forget_images(&self) {
+    /// Replace demand atomically so shared card URLs are never briefly unwanted.
+    pub fn retain_images<'a>(&self, urls: impl Iterator<Item = &'a String>) {
         if let Ok(mut set) = self.wanted.images.lock() {
-            set.clear();
+            *set = urls.cloned().collect();
+        }
+    }
+
+    pub fn set_visible_icons(&self, names: &[&str]) {
+        if let Ok(mut icons) = self.wanted.icons.lock() {
+            *icons = Some(names.iter().map(|name| name.to_ascii_lowercase()).collect());
+        }
+    }
+
+    pub fn set_visible_groups(&self, names: &[&str]) {
+        if let Ok(mut groups) = self.wanted.groups.lock() {
+            let previous = groups.take().unwrap_or_default();
+            *groups = Some(
+                names
+                    .iter()
+                    .map(|name| ((*name).to_string(), previous.get(*name).copied().flatten()))
+                    .collect(),
+            );
+        }
+    }
+
+    pub fn want_group(&self, name: &str, generation: u64) {
+        if let Ok(mut groups) = self.wanted.groups.lock()
+            && let Some(current) = groups.as_mut().and_then(|groups| groups.get_mut(name))
+        {
+            *current = Some(current.unwrap_or(generation).max(generation));
         }
     }
 
@@ -570,6 +696,12 @@ impl Pool {
     pub fn want_post(&self, generation: Option<u64>) {
         if let Ok(mut post) = self.wanted.post.lock() {
             *post = generation;
+        }
+    }
+
+    pub fn want_feeds(&self, active: Option<u64>, requests: HashMap<u64, HashSet<u64>>) {
+        if let Ok(mut feeds) = self.wanted.feeds.lock() {
+            *feeds = Some(FeedDemand { active, requests });
         }
     }
 }
@@ -595,12 +727,30 @@ fn cache_reader(
                     return;
                 }
                 let job = &work.job;
-                if superseded_post(job, &wanted)
-                    || work
-                        .image_ticket
-                        .as_ref()
-                        .is_some_and(|ticket| ticket.load(Ordering::Acquire))
+                if superseded_post(job, &wanted) {
+                    if matches!(job, Job::Post { .. })
+                        && tx
+                            .send(job.failed(crate::reddit::REQUEST_CANCELLED.into()))
+                            .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                if work
+                    .image_ticket
+                    .as_ref()
+                    .is_some_and(|ticket| ticket.load(Ordering::Acquire))
                 {
+                    continue;
+                }
+                if !work.cache_only && background_unwanted(job, &wanted) {
+                    if tx
+                        .send(job.failed(crate::reddit::REQUEST_CANCELLED.into()))
+                        .is_err()
+                    {
+                        return;
+                    }
                     continue;
                 }
                 {
@@ -620,10 +770,21 @@ fn cache_reader(
                         continue;
                     }
                     if !work.force
-                        && cached_reply(job, Some(&cache), &namespace, &tx, &wanted, &mut claim)
+                        && cached_reply(
+                            job,
+                            Some(&cache),
+                            &namespace,
+                            &tx,
+                            &wanted,
+                            &mut claim,
+                            work.cache_only,
+                        )
                     {
                         continue;
                     }
+                }
+                if work.cache_only {
+                    continue;
                 }
                 // A miss/stale image stays unclaimed until HTTP starts, allowing promotion.
                 if next.send(work).is_err() {
@@ -649,7 +810,8 @@ fn spawn_worker(
             loop {
                 let Work {
                     job,
-                    force: _,
+                    force,
+                    cache_only: _,
                     image_ticket,
                 } = {
                     let Ok(guard) = rx.lock() else { return };
@@ -674,6 +836,22 @@ fn spawn_worker(
                     continue;
                 }
                 if superseded_post(&job, &wanted) {
+                    if matches!(job, Job::Post { .. })
+                        && tx
+                            .send(job.failed(crate::reddit::REQUEST_CANCELLED.into()))
+                            .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                if background_unwanted(&job, &wanted) {
+                    if tx
+                        .send(job.failed(crate::reddit::REQUEST_CANCELLED.into()))
+                        .is_err()
+                    {
+                        return;
+                    }
                     continue;
                 }
                 if let Some(msg) = skipped_image(&job, &wanted) {
@@ -697,22 +875,130 @@ fn spawn_worker(
                 let started = NEXT_EVENT.fetch_add(1, Ordering::Relaxed);
                 // A job's panic becomes its error instead of killing the worker.
                 let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let msg = run(&reddit, &job, &wanted);
+                    let generation = job.post_generation();
+                    let group = match &job {
+                        Job::Group {
+                            subreddit,
+                            generation,
+                        } => Some((subreddit.clone(), *generation)),
+                        _ => None,
+                    };
+                    let icon = match &job {
+                        Job::Icon { subreddit } => Some(subreddit.clone()),
+                        _ => None,
+                    };
+                    let cancelled = Arc::clone(&wanted);
+                    let image = match &job {
+                        Job::Image { url, .. } => Some(url.clone()),
+                        _ => None,
+                    };
+                    let feed = match &job {
+                        Job::Feed {
+                            tab, generation, ..
+                        } => Some((*tab, *generation)),
+                        _ => None,
+                    };
+                    let retry_reads = !matches!(
+                        &job,
+                        Job::Membership { .. }
+                            | Job::Experience {
+                                request: crate::reddit::experience::Request::Write(_),
+                                ..
+                            }
+                    );
+                    let scoped = reddit.for_worker(
+                        match job {
+                            Job::Post { .. }
+                            | Job::SortedPost { .. }
+                            | Job::MoreReplies { .. }
+                            | Job::Image {
+                                background: false, ..
+                            } => Priority::Selected,
+                            Job::Group { .. } | Job::Icon { .. } => Priority::Background,
+                            Job::Subscriptions { .. } if !force => Priority::Background,
+                            Job::Feed { .. } => Priority::Listing,
+                            _ => Priority::Foreground,
+                        },
+                        retry_reads,
+                        move || {
+                            cancelled.stopped.load(Ordering::Acquire)
+                                || feed.is_some_and(|(tab, generation)| {
+                                    feed_unwanted(tab, generation, &cancelled)
+                                })
+                                || group.as_ref().is_some_and(|(name, generation)| {
+                                    group_unwanted(name, *generation, &cancelled)
+                                })
+                                || image.as_ref().is_some_and(|url| {
+                                    cancelled
+                                        .images
+                                        .lock()
+                                        .is_ok_and(|urls| !urls.contains(url))
+                                })
+                                || icon
+                                    .as_ref()
+                                    .is_some_and(|name| icon_unwanted(name, &cancelled))
+                                || generation.is_some_and(|generation| {
+                                    cancelled
+                                        .post
+                                        .lock()
+                                        .is_ok_and(|current| *current != Some(generation))
+                                })
+                        },
+                    );
+                    let source = Source {
+                        order: request_order,
+                        observed: Some((started, started)),
+                        cached: false,
+                    };
+                    let mut fallback = None;
+                    let msg = run(&scoped, &job, &wanted, &mut |event| {
+                        if let Job::Feed {
+                            tab, generation, ..
+                        } = &job
+                        {
+                            match event {
+                                ListingEvent::Post(post) => {
+                                    let _ = tx.send(Msg::FeedProgress {
+                                        tab: *tab,
+                                        generation: *generation,
+                                        post: Box::new(post.clone()),
+                                        source,
+                                    });
+                                }
+                                ListingEvent::ContinuationFailed { cursor, error } => {
+                                    fallback = Some((cursor.to_string(), error.to_string()));
+                                }
+                            }
+                        }
+                    });
+                    let msg = match (msg, fallback) {
+                        (
+                            Msg::Feed {
+                                tab,
+                                generation,
+                                result: Ok(listing),
+                                ..
+                            },
+                            Some((cursor, error)),
+                        ) => Msg::FeedFallback {
+                            tab,
+                            generation,
+                            listing,
+                            cursor,
+                            error,
+                        },
+                        (msg, _) => msg,
+                    };
+                    let msg = match &job {
+                        Job::Image { url, .. } if scoped.read_aborted() => {
+                            Msg::ImageSkipped { url: url.clone() }
+                        }
+                        _ => msg,
+                    };
                     if wanted.stopped.load(Ordering::Acquire) {
                         return job.failed("Connection replaced".into());
                     }
-                    cache_result(
-                        msg,
-                        &job,
-                        cache.as_deref(),
-                        &namespace,
-                        &tx,
-                        Source {
-                            order: request_order,
-                            observed: Some((started, started)),
-                            cached: false,
-                        },
-                    )
+                    cache_result(msg, &job, cache.as_deref(), &namespace, &tx, source)
                 }))
                 .unwrap_or_else(|_| {
                     // "panicked at file:line:col:\nmessage" → one status line.
@@ -788,6 +1074,7 @@ fn cached_reply(
     tx: &SyncSender<Msg>,
     wanted: &Wanted,
     claim: &mut ImageClaim<'_>,
+    cache_only: bool,
 ) -> bool {
     let Some(cache) = cache else {
         return false;
@@ -816,8 +1103,9 @@ fn cached_reply(
         observed: Some((read_start, NEXT_EVENT.fetch_add(1, Ordering::Relaxed))),
         cached: true,
     };
-    let refreshing = !fresh
-        || matches!(job, Job::MoreReplies { minimum: Some(minimum), .. } if !source.may_replace(*minimum));
+    let refreshing = !cache_only
+        && (!fresh
+            || matches!(job, Job::MoreReplies { minimum: Some(minimum), .. } if !source.may_replace(*minimum)));
     let message = Msg::Snapshot {
         message: Box::new(message),
         fetched_at: entry.fetched_at,
@@ -970,11 +1258,67 @@ impl Job {
     }
 }
 
-/// A post page load for a post no longer shown (moved past in the list, or closed): queued
-/// behind other loads it would only delay the one you wait for, so it is dropped unanswered.
+impl Job {
+    fn post_generation(&self) -> Option<u64> {
+        match self {
+            Self::Post { generation, .. }
+            | Self::SortedPost { generation, .. }
+            | Self::MoreReplies { generation, .. } => Some(*generation),
+            _ => None,
+        }
+    }
+}
+
 fn superseded_post(job: &Job, wanted: &Wanted) -> bool {
-    matches!(job, Job::Post { generation, .. } | Job::SortedPost { generation, .. }
-        if wanted.post.lock().is_ok_and(|post| *post != Some(*generation)))
+    job.post_generation().is_some_and(|generation| {
+        wanted
+            .post
+            .lock()
+            .is_ok_and(|post| *post != Some(generation))
+    })
+}
+
+fn background_unwanted(job: &Job, wanted: &Wanted) -> bool {
+    match job {
+        Job::Feed {
+            tab, generation, ..
+        } => feed_unwanted(*tab, *generation, wanted),
+        Job::Group {
+            subreddit,
+            generation,
+        } => group_unwanted(subreddit, *generation, wanted),
+        Job::Icon { subreddit } => icon_unwanted(subreddit, wanted),
+        _ => false,
+    }
+}
+
+fn feed_unwanted(tab: u64, generation: u64, wanted: &Wanted) -> bool {
+    wanted.feeds.lock().is_ok_and(|feeds| {
+        feeds.as_ref().is_some_and(|feeds| {
+            feeds.active != Some(tab)
+                || !feeds
+                    .requests
+                    .get(&tab)
+                    .is_some_and(|requests| requests.contains(&generation))
+        })
+    })
+}
+
+fn group_unwanted(name: &str, generation: u64, wanted: &Wanted) -> bool {
+    wanted.groups.lock().is_ok_and(|groups| {
+        groups.as_ref().is_some_and(|groups| {
+            groups
+                .get(name)
+                .is_none_or(|current| current.is_some_and(|current| current != generation))
+        })
+    })
+}
+
+fn icon_unwanted(name: &str, wanted: &Wanted) -> bool {
+    wanted
+        .icons
+        .lock()
+        .is_ok_and(|icons| icons.as_ref().is_some_and(|icons| !icons.contains(name)))
 }
 
 fn skipped_image(job: &Job, wanted: &Wanted) -> Option<Msg> {
@@ -1046,8 +1390,13 @@ fn cache_result(
             | Msg::Thumb { result: Ok(_), .. }
             | Msg::Icon { result: Ok(_), .. }
     );
-    // Feed failures keep their order too, so an older failure can't mark a newer page failed.
-    if !ok && !matches!(msg, Msg::Feed { .. }) {
+    // Listing failures retain order so late refusals cannot undo newer access or pages.
+    if !ok
+        && !matches!(
+            msg,
+            Msg::Feed { .. } | Msg::FeedFallback { .. } | Msg::Group { .. }
+        )
+    {
         return msg;
     }
     let fetched_at = crate::app::now();
@@ -1105,7 +1454,12 @@ fn encode_png(value: &DynamicImage) -> Option<Vec<u8>> {
         .map(|()| bytes.into_inner())
 }
 
-fn run(reddit: &Reddit, job: &Job, wanted: &Wanted) -> Msg {
+fn run(
+    reddit: &Reddit,
+    job: &Job,
+    wanted: &Wanted,
+    progress: &mut dyn FnMut(ListingEvent<'_>),
+) -> Msg {
     if let Some(message) = skipped_image(job, wanted) {
         return message;
     }
@@ -1155,8 +1509,8 @@ fn run(reddit: &Reddit, job: &Job, wanted: &Wanted) -> Msg {
             generation: *generation,
             append: after.is_some(),
             result: query
-                .fetch(reddit, target, after.as_deref())
-                .map_err(err_string),
+                .fetch(reddit, target, after.as_deref(), progress)
+                .map_err(FeedError::from),
         },
         Job::Group {
             subreddit,
@@ -1165,8 +1519,13 @@ fn run(reddit: &Reddit, job: &Job, wanted: &Wanted) -> Msg {
             generation: *generation,
             subreddit: subreddit.clone(),
             result: FeedQuery::DEFAULT_LISTING
-                .fetch(reddit, &FeedTarget::Subreddit(subreddit.clone()), None)
-                .map_err(err_string),
+                .fetch(
+                    reddit,
+                    &FeedTarget::Subreddit(subreddit.clone()),
+                    None,
+                    &mut |_| {},
+                )
+                .map_err(FeedError::from),
         },
         Job::Post {
             generation,
@@ -1187,7 +1546,9 @@ fn run(reddit: &Reddit, job: &Job, wanted: &Wanted) -> Msg {
         },
         Job::Image { url, .. } => {
             let result = fetch_image(reddit, url, MAX_IMAGE_EDGE);
-            if let Some(skipped) = skipped_image(job, wanted) {
+            if result.is_err()
+                && let Some(skipped) = skipped_image(job, wanted)
+            {
                 return skipped;
             }
             Msg::Image {
@@ -1424,6 +1785,265 @@ mod tests {
     use super::*;
 
     #[test]
+    fn when_a_paused_community_is_refreshed_the_old_generation_should_release_the_worker() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let reddit = Reddit::test_at(&format!("http://{}", server.server_addr()), false);
+        let (pool, messages) = Pool::start(reddit, 3, None);
+        pool.set_visible_groups(&["same"]);
+        pool.submit(Job::Group {
+            subreddit: "same".into(),
+            generation: 1,
+        });
+        data_request(&server)
+            .unwrap()
+            .respond(
+                tiny_http::Response::empty(429)
+                    .with_header(tiny_http::Header::from_bytes("Retry-After", "1").unwrap()),
+            )
+            .unwrap();
+        pool.submit(Job::Group {
+            subreddit: "same".into(),
+            generation: 2,
+        });
+        let message = messages
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("new generation should release the old paused read");
+        let message = if let Msg::Snapshot { message, .. } = message {
+            *message
+        } else {
+            message
+        };
+        assert!(
+            matches!(message, Msg::Group { generation: 1, result: Err(ref error), .. } if error.as_str() == crate::reddit::REQUEST_CANCELLED)
+        );
+        data_request(&server)
+            .unwrap()
+            .respond(tiny_http::Response::from_string(include_str!(
+                "../tests/fixtures/sub.json"
+            )))
+            .unwrap();
+        assert!(
+            matches!(next_message(&messages), Msg::Snapshot { message, .. } if matches!(*message, Msg::Group { generation: 2, result: Ok(_), .. }))
+        );
+    }
+
+    #[test]
+    fn when_missing_icons_leave_the_view_queued_and_waiting_lookups_should_be_released() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let reddit = Reddit::test_at(&format!("http://{}", server.server_addr()), false);
+        let (pool, messages) = Pool::start(reddit, 2, None);
+        pool.set_visible_icons(&["old_a", "old_b"]);
+        for name in ["old_a", "old_b"] {
+            pool.submit(Job::Icon {
+                subreddit: name.into(),
+            });
+        }
+        let first = data_request(&server).unwrap();
+        first
+            .respond(
+                tiny_http::Response::empty(429)
+                    .with_header(tiny_http::Header::from_bytes("Retry-After", "1").unwrap()),
+            )
+            .unwrap();
+        pool.set_visible_icons(&["new"]);
+        pool.submit(Job::Icon {
+            subreddit: "new".into(),
+        });
+        for _ in 0..2 {
+            let message = messages
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .expect("unused icon work should leave the queue during cooldown");
+            let message = if let Msg::Snapshot { message, .. } = message {
+                *message
+            } else {
+                message
+            };
+            assert!(
+                matches!(message, Msg::Icon { result: Err(ref error), .. } if error == crate::reddit::REQUEST_CANCELLED)
+            );
+        }
+        let next = data_request(&server).unwrap();
+        assert!(
+            next.url().starts_with("/r/new/about.json"),
+            "{}",
+            next.url()
+        );
+        next.respond(tiny_http::Response::from_string(
+            "{\"data\":{\"icon_img\":\"https://styles.redditmedia.com/new.png\"}}",
+        ))
+        .unwrap();
+        assert!(
+            matches!(next_message(&messages), Msg::Snapshot { message, .. } if matches!(*message, Msg::Icon { result: Ok(Some(_)), .. }))
+        );
+    }
+
+    #[test]
+    fn when_waiting_communities_leave_the_view_the_current_group_should_get_the_workers() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let reddit = Reddit::test_at(&format!("http://{}", server.server_addr()), false);
+        let (pool, messages) = Pool::start(reddit, 4, None);
+        pool.set_visible_groups(&["old_a", "old_b"]);
+        for name in ["old_a", "old_b"] {
+            pool.submit(Job::Group {
+                subreddit: name.into(),
+                generation: 1,
+            });
+        }
+        let first = data_request(&server).unwrap();
+        let second = data_request(&server).unwrap();
+        for request in [first, second] {
+            request
+                .respond(
+                    tiny_http::Response::empty(429)
+                        .with_header(tiny_http::Header::from_bytes("Retry-After", "1").unwrap()),
+                )
+                .unwrap();
+        }
+        pool.set_visible_groups(&["new"]);
+        pool.submit(Job::Group {
+            subreddit: "new".into(),
+            generation: 2,
+        });
+        for _ in 0..2 {
+            let message = messages
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .expect("offscreen waits should release workers during cooldown");
+            let message = if let Msg::Snapshot { message, .. } = message {
+                *message
+            } else {
+                message
+            };
+            assert!(
+                matches!(message, Msg::Group { generation: 1, result: Err(ref error), .. } if error.as_str() == crate::reddit::REQUEST_CANCELLED)
+            );
+        }
+        let next = data_request(&server).unwrap();
+        assert!(next.url().starts_with("/r/new/"), "{}", next.url());
+        next.respond(tiny_http::Response::from_string(include_str!(
+            "../tests/fixtures/sub.json"
+        )))
+        .unwrap();
+        assert!(
+            matches!(next_message(&messages), Msg::Snapshot { message, .. } if matches!(*message, Msg::Group { generation: 2, result: Ok(_), .. }))
+        );
+    }
+
+    #[test]
+    fn when_reply_expansions_are_replaced_they_should_release_workers_during_cooldown() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let reddit = Reddit::test_at(&format!("http://{}", server.server_addr()), false);
+        let (pool, messages) = Pool::start(reddit, 2, None);
+        pool.want_post(Some(1));
+        for id in ["a", "b"] {
+            pool.submit(Job::MoreReplies {
+                generation: 1,
+                comment_id: id.into(),
+                cursor: serde_json::json!({"post":"old","parent":"t3_old","children":[]})
+                    .to_string(),
+                minimum: None,
+            });
+        }
+        let first = data_request(&server).unwrap();
+        let second = data_request(&server).unwrap();
+        for request in [first, second] {
+            request
+                .respond(
+                    tiny_http::Response::empty(429)
+                        .with_header(tiny_http::Header::from_bytes("Retry-After", "1").unwrap()),
+                )
+                .unwrap();
+        }
+        pool.want_post(Some(2));
+        pool.submit(Job::Post {
+            generation: 2,
+            permalink: "/comments/new".into(),
+        });
+        for _ in 0..2 {
+            let message = messages
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .expect("obsolete reads should release workers before cooldown ends");
+            let message = if let Msg::Snapshot { message, .. } = message {
+                *message
+            } else {
+                message
+            };
+            assert!(matches!(
+                message,
+                Msg::MoreReplies {
+                    generation: 1,
+                    result: Err(_),
+                    ..
+                }
+            ));
+        }
+        let next = data_request(&server).unwrap();
+        assert!(
+            next.url().starts_with("/comments/new.json"),
+            "{}",
+            next.url()
+        );
+        next.respond(tiny_http::Response::from_string(include_str!(
+            "../tests/fixtures/post.json"
+        )))
+        .unwrap();
+        let message = next_message(&messages);
+        assert!(
+            matches!(message, Msg::Snapshot { message, .. } if matches!(*message, Msg::Post { generation: 2, result: Ok(_), .. }))
+        );
+    }
+
+    #[test]
+    fn when_offscreen_cache_is_requested_it_should_deliver_stale_data_without_any_http() {
+        use crate::reddit::tests::{Fixture, Reply};
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let fixture = Fixture::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Reply::json(serde_json::from_str(include_str!("../tests/fixtures/sub.json")).unwrap())
+        });
+        let reddit = fixture.reddit();
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::new(directory.path().to_path_buf());
+        let job = Job::Group {
+            subreddit: "rust".into(),
+            generation: 1,
+        };
+        let key = job.cache_key(&reddit.cache_namespace()).unwrap().0;
+        let listing = reddit
+            .listing(
+                "rust",
+                crate::model::Sort::Hot,
+                crate::model::TimeRange::Day,
+                None,
+            )
+            .unwrap();
+        cache
+            .store(
+                &key,
+                &serde_json::to_vec(&listing).unwrap(),
+                crate::app::now() - 600,
+                cache.reserve_request().unwrap(),
+            )
+            .unwrap();
+        calls.store(0, Ordering::SeqCst);
+        let (pool, messages) = Pool::start(reddit, 2, Some(cache));
+        pool.cached(job);
+        assert!(matches!(next_message(&messages), Msg::Snapshot {
+            refreshing: false, message, ..
+        } if matches!(*message, Msg::Group { result: Ok(ref listing), .. } if !listing.posts.is_empty())));
+        pool.cached(Job::Group {
+            subreddit: "missing".into(),
+            generation: 2,
+        });
+        assert!(
+            messages
+                .recv_timeout(std::time::Duration::from_millis(150))
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn when_a_write_finishes_a_cached_target_post_should_be_invalidated_even_after_an_error() {
         let directory = tempfile::tempdir().unwrap();
         let cache = Cache::new(directory.path().to_path_buf());
@@ -1440,7 +2060,12 @@ mod tests {
             generation: 2,
             request: crate::reddit::experience::Request::Write(
                 crate::reddit::experience::Action::Delete {
-                    id: "t3_post".into(),
+                    target: crate::reddit::experience::Target {
+                        id: "t3_post".into(),
+                        author: "reader".into(),
+                        subreddit: "rust".into(),
+                        permalink: "/r/rust/comments/post/title/".into(),
+                    },
                 },
             ),
             invalidations: vec![Invalidation::Post("/comments/post/_/comment/".into())],
@@ -1501,6 +2126,8 @@ mod tests {
         let (images, images_rx) = channel();
         let queues = Queues {
             foreground_images: priority.clone(),
+            feeds: priority.clone(),
+            selected: priority.clone(),
             images,
             priority,
             background,
@@ -1513,6 +2140,7 @@ mod tests {
                 background,
             },
             force: false,
+            cache_only: false,
             image_ticket: None,
         };
 
@@ -1554,6 +2182,8 @@ mod tests {
         let (images, _images_rx) = channel();
         let queues = Queues {
             foreground_images: priority.clone(),
+            feeds: priority.clone(),
+            selected: priority.clone(),
             images,
             priority,
             background,
@@ -1566,6 +2196,7 @@ mod tests {
                 subreddit: "s".into(),
             },
             force: false,
+            cache_only: false,
             image_ticket: None,
         });
 
@@ -1595,10 +2226,10 @@ mod tests {
             background: false,
         };
 
-        let thumb_skipped = run(&reddit, &thumb(), &none);
-        let thumb_fetched = run(&reddit, &thumb(), &all);
-        let image_skipped = run(&reddit, &image(), &none);
-        let image_fetched = run(&reddit, &image(), &all);
+        let thumb_skipped = run(&reddit, &thumb(), &none, &mut |_| {});
+        let thumb_fetched = run(&reddit, &thumb(), &all, &mut |_| {});
+        let image_skipped = run(&reddit, &image(), &none, &mut |_| {});
+        let image_fetched = run(&reddit, &image(), &all, &mut |_| {});
 
         assert!(matches!(thumb_skipped, Msg::ThumbSkipped { url: u } if u == url));
         assert!(matches!(thumb_fetched, Msg::Thumb { result: Err(_), .. }));
@@ -1744,6 +2375,8 @@ mod tests {
             Pool {
                 queues: Queues {
                     foreground_images: sender.clone(),
+                    feeds: sender.clone(),
+                    selected: sender.clone(),
                     priority: sender.clone(),
                     background: sender.clone(),
                     images: sender.clone(),
@@ -1846,6 +2479,7 @@ mod tests {
                 &sender,
                 &pool.wanted,
                 &mut claim,
+                false,
             );
             let message = next_message(&receiver);
 
@@ -1955,6 +2589,157 @@ mod tests {
         assert!(
             extra.is_none(),
             "promotion fetched again from its old queue: {extra:?}"
+        );
+    }
+
+    #[test]
+    fn when_active_detail_reads_are_superseded_the_next_post_should_not_wait_for_them() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr());
+        let (pool, messages) = Pool::start(Reddit::test_at(&base, false), 3, None);
+        pool.want_post(Some(1));
+        for _ in 0..2 {
+            pool.submit(Job::Post {
+                generation: 1,
+                permalink: "/comments/old/".into(),
+            });
+        }
+        let held = [
+            data_request(&server).unwrap(),
+            data_request(&server).unwrap(),
+        ];
+        pool.want_post(Some(2));
+        pool.submit(Job::Post {
+            generation: 2,
+            permalink: "/comments/new/".into(),
+        });
+        let selected = data_request(&server);
+        for request in held {
+            let _ = request.respond(tiny_http::Response::empty(200));
+        }
+        let selected = selected.expect("superseded active reads must release selected workers");
+        assert!(selected.url().starts_with("/comments/new.json"));
+        selected
+            .respond(tiny_http::Response::from_string(include_str!(
+                "../tests/fixtures/post.json"
+            )))
+            .unwrap();
+        for _ in 0..3 {
+            let message = match next_message(&messages) {
+                Msg::Snapshot { message, .. } => *message,
+                message => message,
+            };
+            if let Msg::Post {
+                generation: 2,
+                result,
+            } = message
+            {
+                assert!(result.is_ok());
+                return;
+            }
+        }
+        panic!("selected post result missing");
+    }
+
+    #[test]
+    fn when_feed_workers_are_occupied_selected_post_and_media_should_start_independently() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr());
+        let (pool, messages) = Pool::start(Reddit::test_at(&base, false), 3, None);
+        for tab in 0..2 {
+            pool.submit(Job::Feed {
+                tab,
+                generation: 1,
+                target: FeedTarget::Subreddit(format!("held{tab}")),
+                query: FeedQuery::DEFAULT_LISTING,
+                after: None,
+            });
+        }
+        let first = data_request(&server).unwrap();
+        let second = data_request(&server).unwrap();
+        pool.want_post(Some(7));
+        pool.submit(Job::Post {
+            generation: 7,
+            permalink: "/r/rust/comments/p/title/".into(),
+        });
+        let url = format!("{base}/selected.png");
+        pool.want_image(&url);
+        pool.submit(Job::Image {
+            url,
+            background: false,
+        });
+        let selected: Vec<_> = (0..2).filter_map(|_| data_request(&server)).collect();
+        for request in &selected {
+            assert!(request.url().contains("/comments/p.json") || request.url() == "/selected.png");
+        }
+        let count = selected.len();
+        for request in selected {
+            if request.url() == "/selected.png" {
+                poster_reply(request);
+            } else {
+                request
+                    .respond(tiny_http::Response::from_string(include_str!(
+                        "../tests/fixtures/post.json"
+                    )))
+                    .unwrap();
+            }
+        }
+        for request in [first, second] {
+            request
+                .respond(tiny_http::Response::from_string(include_str!(
+                    "../tests/fixtures/sub.json"
+                )))
+                .unwrap();
+        }
+        assert_eq!(
+            count, 2,
+            "cold selected content and media must bypass occupied feed workers"
+        );
+        for _ in 0..4 {
+            next_message(&messages);
+        }
+    }
+
+    #[test]
+    fn when_an_image_finishes_just_after_leaving_view_it_should_remain_reusable_from_cache() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr());
+        let dir = CacheDir::new();
+        let (pool, messages) = Pool::start(
+            Reddit::test_at(&base, false),
+            3,
+            Some(Cache::new(dir.0.clone())),
+        );
+        let url = format!("{base}/revisit.png");
+        pool.want_image(&url);
+        pool.submit(Job::Image {
+            url: url.clone(),
+            background: true,
+        });
+        let request = data_request(&server).unwrap();
+        pool.unwant_image(&url);
+        poster_reply(request);
+
+        assert!(
+            matches!(next_message(&messages), Msg::Snapshot { message, .. }
+            if matches!(*message, Msg::Image { result: Ok(_), .. })),
+            "a completed image should survive a brief departure"
+        );
+        pool.want_image(&url);
+        pool.submit(Job::Image {
+            url,
+            background: true,
+        });
+        assert!(
+            matches!(
+                messages.recv_timeout(std::time::Duration::from_secs(1)),
+                Ok(Msg::Snapshot {
+                    source: Source { cached: true, .. },
+                    refreshing: false,
+                    ..
+                })
+            ),
+            "returning must reuse the completed image without HTTP"
         );
     }
 
@@ -2342,6 +3127,170 @@ mod tests {
     }
 
     #[test]
+    fn when_a_feed_ends_with_incomplete_json_it_should_publish_posts_without_caching_a_partial_page()
+     {
+        use std::io::Write;
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr());
+        let dir = CacheDir::new();
+        let reddit = Reddit::test_at(&base, false);
+        let job = Job::Feed {
+            tab: 1,
+            generation: 1,
+            target: FeedTarget::Subreddit("s".into()),
+            query: FeedQuery::DEFAULT_LISTING,
+            after: None,
+        };
+        let (key, _) = job.cache_key(&reddit.cache_namespace()).unwrap();
+        let (pool, messages) = Pool::start(reddit, 3, Some(Cache::new(dir.0.clone())));
+        pool.submit(job);
+        let request = data_request(&server).unwrap();
+        let mut writer = request.into_writer();
+        let body = r#"{"kind":"Listing","data":{"children":[{"kind":"t3","data":{"id":"arrived","title":"arrived","subreddit":"s","permalink":"/comments/arrived/"}},"#;
+        write!(
+            writer,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let progress = next_message(&messages);
+        let terminal = next_message(&messages);
+
+        assert!(matches!(progress,Msg::FeedProgress{post,..} if post.id=="arrived"));
+        assert!(
+            matches!(terminal,Msg::Snapshot{message,..} if matches!(*message,Msg::Feed{result:Err(_),..}))
+        );
+        assert!(
+            Cache::new(dir.0.clone())
+                .load(&key, crate::app::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn when_home_has_an_old_cached_primer_it_should_not_replay_that_incomplete_start() {
+        let dir = CacheDir::new();
+        let reddit = Reddit::test_at("http://127.0.0.1:9", false);
+        let cache = Cache::new(dir.0.clone());
+        let legacy = r#"["browser-home-v1",{"Listing":{"sort":"Best","time":"Day"}},null]"#;
+        let key = Cache::key(&reddit.cache_namespace(), legacy);
+        let mut listing =
+            crate::reddit::parse::parse_listing(include_str!("../tests/fixtures/sub.json"))
+                .unwrap();
+        let template = listing.posts[0].clone();
+        listing.posts = ["a", "b", "c"]
+            .into_iter()
+            .map(|id| {
+                let mut p = template.clone();
+                p.id = id.into();
+                p.permalink = format!("/comments/{id}/");
+                p
+            })
+            .collect();
+        cache
+            .store(
+                &key,
+                &serde_json::to_vec(&listing).unwrap(),
+                crate::app::now(),
+                cache.reserve_request().unwrap(),
+            )
+            .unwrap();
+        let (pool, messages) = Pool::start(reddit, 3, Some(cache));
+
+        pool.submit(Job::Feed {
+            tab: 1,
+            generation: 1,
+            target: FeedTarget::Home,
+            query: FeedQuery::Listing {
+                sort: Sort::Best,
+                time: TimeRange::Day,
+            },
+            after: None,
+        });
+
+        assert!(
+            matches!(next_message(&messages),Msg::Snapshot{message,source,..} if !source.cached && matches!(*message,Msg::Feed{result:Err(_),..}))
+        );
+    }
+
+    #[test]
+    fn denied_group_responses_should_keep_their_order_after_a_newer_feed_succeeds() {
+        for disk_cache in [false, true] {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", server.server_addr());
+            let dir = CacheDir::new();
+            let (pool, messages) = Pool::start(
+                Reddit::test_at(&base, false),
+                4,
+                disk_cache.then(|| Cache::new(dir.0.clone())),
+            );
+            pool.submit(Job::Group {
+                subreddit: "private".into(),
+                generation: 1,
+            });
+            let group = data_request(&server).unwrap();
+            pool.submit(Job::Feed {
+                tab: 1,
+                generation: 2,
+                target: FeedTarget::Subreddit("private".into()),
+                query: FeedQuery::DEFAULT_LISTING,
+                after: None,
+            });
+            let feed = data_request(&server).unwrap();
+            feed.respond(tiny_http::Response::from_string(include_str!(
+                "../tests/fixtures/sub.json"
+            )))
+            .unwrap();
+            let successful = loop {
+                let message = next_message(&messages);
+                if !matches!(message, Msg::FeedProgress { .. }) {
+                    break message;
+                }
+            };
+            let Msg::Snapshot {
+                message,
+                source: newer,
+                ..
+            } = successful
+            else {
+                panic!("successful feed snapshot")
+            };
+            assert!(matches!(*message, Msg::Feed { result: Ok(_), .. }));
+            group
+                .respond(
+                    tiny_http::Response::from_string(r#"{"reason":"private"}"#)
+                        .with_status_code(403),
+                )
+                .unwrap();
+
+            let Msg::Snapshot {
+                message,
+                source: older,
+                ..
+            } = next_message(&messages)
+            else {
+                panic!("denied group must retain its request source")
+            };
+            assert!(matches!(
+                *message,
+                Msg::Group {
+                    result: Err(FeedError::Access(AccessDenied::PrivateCommunity)),
+                    ..
+                }
+            ));
+            assert!(!older.cached);
+            assert_eq!(
+                older.compare_requests(newer),
+                Some(std::cmp::Ordering::Less),
+                "disk_cache={disk_cache}"
+            );
+        }
+    }
+
+    #[test]
     fn stale_content_arrives_before_a_failed_refresh() {
         let dir = CacheDir::new();
         let reddit = Reddit::test_at("http://127.0.0.1:9", false);
@@ -2382,10 +3331,15 @@ mod tests {
             panic!("cached listing")
         };
         assert_eq!(actual, listing);
-        assert!(matches!(
-            next_message(&messages),
-            Msg::Group { result: Err(_), .. }
-        ));
+        let Msg::Snapshot {
+            message, source, ..
+        } = next_message(&messages)
+        else {
+            panic!("failed revalidation snapshot")
+        };
+        assert!(!source.cached);
+        assert!(source.order.is_some());
+        assert!(matches!(*message, Msg::Group { result: Err(_), .. }));
     }
 
     #[test]
@@ -2609,6 +3563,7 @@ mod tests {
             .unwrap();
         let (pool, messages) = Pool::start(reddit, 3, Some(cache));
 
+        pool.want_post(Some(1));
         pool.submit(job);
 
         assert!(matches!(

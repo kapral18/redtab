@@ -2,19 +2,22 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+pub mod managed;
+pub mod schema;
+pub mod store;
 
 use crate::model::Post;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Posts per subreddit island in All subs.
     pub all_subs_posts_per_group: usize,
     pub show_nsfw: bool,
-    /// Inline images, list thumbnails and subreddit icons.
-    pub image_preview: bool,
+    pub media: MediaSettings,
     pub filters: Filters,
     pub highlight: Highlight,
     pub commands: Commands,
@@ -24,7 +27,25 @@ pub struct Config {
     pub path: PathBuf,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MediaSettings {
+    /// Inline images, list thumbnails and subreddit icons.
+    pub image_preview: bool,
+    /// Automatically play the selected card or open post, without enabling sound.
+    pub video_autoplay: bool,
+}
+
+impl Default for MediaSettings {
+    fn default() -> Self {
+        Self {
+            image_preview: true,
+            video_autoplay: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Filters {
     /// Hide posts whose title contains any of these (case-insensitive).
@@ -34,14 +55,14 @@ pub struct Filters {
     pub authors: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Highlight {
     /// Emphasize posts whose title contains any of these (case-insensitive).
     pub keywords: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Commands {
     /// Opens Reddit links and external URLs.
@@ -75,7 +96,7 @@ impl Default for Config {
         Self {
             all_subs_posts_per_group: 3,
             show_nsfw: false,
-            image_preview: true,
+            media: MediaSettings::default(),
             filters: Filters::default(),
             highlight: Highlight::default(),
             commands: Commands::default(),
@@ -129,7 +150,6 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => Config::default(),
             Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
         };
-        config.all_subs_posts_per_group = config.all_subs_posts_per_group.clamp(1, 10);
         config
             .validate()
             .with_context(|| format!("invalid config {}", path.display()))?;
@@ -139,14 +159,8 @@ impl Config {
 
     /// Catch values that would only fail later, with a vaguer message.
     fn validate(&self) -> Result<()> {
-        for (key, argv) in [
-            ("browser", &self.commands.browser),
-            ("video", &self.commands.video),
-            ("image", &self.commands.image),
-        ] {
-            if argv.is_empty() {
-                bail!("commands.{key} is empty; remove it to use the default");
-            }
+        for field in schema::SETTINGS {
+            field.validate_value(&field.value(self))?;
         }
         Ok(())
     }
@@ -212,6 +226,25 @@ pub fn is_subreddit_name(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::model::Media;
+
+    #[test]
+    fn card_media_config_should_allow_disabling_autoplay() {
+        let actual: Config = toml::from_str("[media]\nvideo_autoplay = false").unwrap();
+        assert!(!actual.media.video_autoplay);
+    }
+
+    #[test]
+    fn grouped_settings_should_parse_media_and_reject_obsolete_root_keys() {
+        let grouped =
+            toml::from_str::<Config>("[media]\nimage_preview = false\nvideo_autoplay = false\n");
+        assert!(grouped.is_ok(), "{grouped:?}");
+        for old in ["image_preview = false", "video_autoplay = false"] {
+            assert!(
+                toml::from_str::<Config>(old).is_err(),
+                "accepted obsolete root key: {old}"
+            );
+        }
+    }
 
     fn post(title: &str, flair: Option<&str>, author: &str) -> Post {
         Post {

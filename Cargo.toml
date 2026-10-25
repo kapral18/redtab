@@ -14,7 +14,6 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 libc = "0.2"
 crossterm = "0.29"
-flate2 = "1"
 gif = "0.14"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 nucleo-matcher = "0.3"
@@ -26,6 +25,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 toml = "1"
+toml_edit = "0.25"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 textwrap = "0.16"

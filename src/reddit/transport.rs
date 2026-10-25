@@ -1,13 +1,35 @@
 //! The only transport allowed to contact Reddit. Errors deliberately omit URLs and
 //! underlying library errors, which can contain credentials.
 
+use std::future::Future;
 use std::io::{self, Read};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 use url::Url;
 use wreq::{Client, Response};
+
+pub(super) type Cancellation = Arc<dyn Fn() -> bool + Send + Sync>;
+pub(super) const CANCEL_POLL: Duration = Duration::from_millis(50);
+
+/// Keep one HTTP future across polls; dropping it releases an obsolete request.
+pub(super) fn wait<F: Future>(future: F, cancelled: Option<&Cancellation>) -> Result<F::Output> {
+    RUNTIME.block_on(async {
+        let mut future = std::pin::pin!(future);
+        let Some(cancelled) = cancelled else {
+            return Ok(future.await);
+        };
+        loop {
+            if cancelled() {
+                bail!(super::REQUEST_CANCELLED);
+            }
+            if let Ok(output) = tokio::time::timeout(CANCEL_POLL, future.as_mut()).await {
+                return Ok(output);
+            }
+        }
+    })
+}
 
 pub(super) static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
@@ -54,7 +76,12 @@ impl Transport {
         media_allowed(url)
     }
 
-    pub fn media(&self, url: &str, range: Option<&str>) -> Result<Response> {
+    pub fn media(
+        &self,
+        url: &str,
+        range: Option<&str>,
+        cancelled: Option<&Cancellation>,
+    ) -> Result<Response> {
         let mut url = Url::parse(url).map_err(|_| anyhow::anyhow!("invalid media URL"))?;
         for hop in 0..6 {
             #[cfg(test)]
@@ -82,9 +109,7 @@ impl Transport {
             if let Some(range) = range {
                 request = request.header("Range", range);
             }
-            let response = RUNTIME
-                .block_on(request.send())
-                .map_err(|_| network_error())?;
+            let response = wait(request.send(), cancelled)?.map_err(|_| network_error())?;
             if response.status().is_redirection() {
                 let location = response
                     .headers()
@@ -137,14 +162,16 @@ pub(super) struct Reader {
     response: Response,
     chunk: io::Cursor<Vec<u8>>,
     left: u64,
+    cancelled: Option<Cancellation>,
 }
 
 impl Reader {
-    pub fn new(response: Response, limit: u64) -> Self {
+    pub fn new(response: Response, limit: u64, cancelled: Option<Cancellation>) -> Self {
         Self {
             response,
             chunk: io::Cursor::new(Vec::new()),
             left: limit,
+            cancelled,
         }
     }
 }
@@ -154,12 +181,17 @@ impl Read for Reader {
         if buf.is_empty() {
             return Ok(0);
         }
+        if self.cancelled.as_ref().is_some_and(|cancel| cancel()) {
+            return Err(io::Error::other(super::REQUEST_CANCELLED));
+        }
         loop {
             let n = self.chunk.read(buf)?;
             if n > 0 {
                 return Ok(n);
             }
-            match RUNTIME.block_on(self.response.chunk()) {
+            match wait(self.response.chunk(), self.cancelled.as_ref())
+                .map_err(|_| io::Error::other(super::REQUEST_CANCELLED))?
+            {
                 Ok(Some(chunk)) => {
                     self.left = self
                         .left
@@ -174,14 +206,59 @@ impl Read for Reader {
     }
 }
 
-pub(super) fn json(response: Response) -> Result<serde_json::Value> {
+pub(super) fn access_denied(
+    response: Response,
+    cancelled: Option<Cancellation>,
+) -> Result<super::AccessDenied> {
     let mut bytes = Vec::new();
-    Reader::new(response, 16 * 1024 * 1024).read_to_end(&mut bytes)?;
+    let read = Reader::new(response, 64 * 1024, cancelled.clone()).read_to_end(&mut bytes);
+    if read.is_err() && cancelled.as_ref().is_some_and(|cancel| cancel()) {
+        bail!(super::REQUEST_CANCELLED);
+    }
+    let value = read
+        .ok()
+        .and_then(|_| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    if value
+        .as_ref()
+        .and_then(|v| v.get("reason"))
+        .and_then(|v| v.as_str())
+        == Some("private")
+    {
+        Ok(super::AccessDenied::PrivateCommunity)
+    } else {
+        Ok(super::AccessDenied::Forbidden)
+    }
+}
+
+pub(super) fn json(
+    response: Response,
+    cancelled: Option<Cancellation>,
+) -> Result<serde_json::Value> {
+    let mut bytes = Vec::new();
+    Reader::new(response, 16 * 1024 * 1024, cancelled).read_to_end(&mut bytes)?;
     serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("Reddit returned invalid JSON"))
 }
 
-pub(super) fn html(response: Response) -> Result<String> {
+pub(super) fn html(response: Response, cancelled: Option<Cancellation>) -> Result<String> {
     let mut bytes = Vec::new();
-    Reader::new(response, 16 * 1024 * 1024).read_to_end(&mut bytes)?;
+    Reader::new(response, 16 * 1024 * 1024, cancelled).read_to_end(&mut bytes)?;
     String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("Reddit returned invalid Home HTML"))
+}
+
+pub(super) fn listing(
+    response: Response,
+    cancelled: Cancellation,
+    progress: &mut dyn FnMut(&crate::model::Post),
+) -> Result<crate::model::Listing> {
+    super::parse::stream_listing(
+        Reader::new(response, 16 * 1024 * 1024, Some(cancelled.clone())),
+        progress,
+    )
+    .map_err(|_| {
+        if cancelled() {
+            anyhow::anyhow!(super::REQUEST_CANCELLED)
+        } else {
+            anyhow::anyhow!("Reddit returned an incomplete or invalid listing")
+        }
+    })
 }

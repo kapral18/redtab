@@ -9,6 +9,7 @@ mod media;
 mod model;
 mod reddit;
 mod state;
+mod terminal_output;
 mod ui;
 mod video;
 mod worker;
@@ -21,6 +22,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use crossterm::event::{self, Event};
+use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+use crossterm::{ExecutableCommand, QueueableCommand};
 use ratatui_image::picker::Picker;
 
 use crate::app::App;
@@ -169,7 +172,16 @@ fn main() -> Result<()> {
             return Ok(());
         }
     }
-    let config = Config::load(args.config.as_deref())?;
+    let settings_store = if args.check {
+        None
+    } else {
+        Some(config::store::Store::open(args.config.as_deref())?)
+    };
+    let config = if let Some(store) = &settings_store {
+        store.current.clone()
+    } else {
+        Config::load(args.config.as_deref())?
+    };
     let (reddit, signin_error) = match Reddit::new(config.show_nsfw) {
         Ok(reddit) => (reddit, None),
         Err(error) if !args.check => (
@@ -221,21 +233,23 @@ fn main() -> Result<()> {
     // probe makes exit restore the original, not what a killed probe left.
     crossterm::terminal::enable_raw_mode()?;
     let guard = TerminalGuard;
-    let image_picker = if config.image_preview {
-        detect_image_picker()
-    } else {
-        Picker::halfblocks()
-    };
+    let image_picker = detect_image_picker();
     let cache = cache::Cache::new(config::cache_dir());
     let (pool, mut messages) = Pool::start(reddit.clone(), WORKER_THREADS, Some(cache));
     // The terminal may have closed during the probe.
     if quit_signal.load(Ordering::Relaxed) {
         return Ok(());
     }
-    let mut terminal = ratatui::try_init()?;
-    // ratatui's hook `eprintln!`s, which panics again on a dead tty before state is
-    // saved. Restore quietly, and only on main: worker panics become job errors.
-    let _ratatui_hook = std::panic::take_hook();
+    let input_reader = spawn_input_reader();
+    let queries = input_reader.queries.clone();
+    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+    // The input thread writes cursor queries through stdout, so keep it unlocked here.
+    let backend = ratatui::backend::CrosstermBackend::new(terminal_output::Writer::new(
+        std::io::stdout(),
+        move || cursor_barrier(&queries),
+    ));
+    let mut terminal = ratatui::Terminal::new(backend)?;
+    // Restore quietly on main; worker panics become job errors.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if std::thread::current().name() == Some("main") {
@@ -253,7 +267,11 @@ fn main() -> Result<()> {
     if no_color {
         crossterm::style::force_color_output(true);
     }
-    let (input, input_failure) = spawn_input_reader();
+    let InputReader {
+        events: input,
+        failure: input_failure,
+        ..
+    } = input_reader;
     // Drop late probe replies so they aren't read as keys. Bounded, and through the
     // input thread so a closing terminal can't stall startup.
     let drain_until = Instant::now() + Duration::from_millis(300);
@@ -273,6 +291,7 @@ fn main() -> Result<()> {
         auth::account_state_path(&state_root, reddit.account().as_ref())
     };
     let mut app = App::new(config, pool, reddit, state_path, image_picker);
+    app.settings = app::settings::Settings::new(settings_store.unwrap());
     app.no_color = no_color;
     app.start();
     if args.signin || app.reddit.needs_sign_in() {
@@ -295,7 +314,7 @@ fn main() -> Result<()> {
                 break;
             }
             if dirty {
-                terminal.draw(|f| {
+                draw_synchronized(&mut terminal, |f| {
                     ui::draw(f, &mut app);
                     if no_color {
                         ui::strip_colors(f.buffer_mut());
@@ -347,6 +366,20 @@ fn main() -> Result<()> {
     }
 }
 
+/// Hold text/placeholder changes until the complete draw has been written.
+fn draw_synchronized<W: std::io::Write>(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<W>>,
+    draw: impl FnOnce(&mut ratatui::Frame),
+) -> std::io::Result<()> {
+    terminal.backend_mut().queue(BeginSynchronizedUpdate)?;
+    let drawn = terminal.draw(draw).map(|_| ());
+    let ended = terminal
+        .backend_mut()
+        .execute(EndSynchronizedUpdate)
+        .map(|_| ());
+    drawn.and(ended)
+}
+
 fn open_startup_subreddit(app: &mut App, pending: &mut Option<String>) -> bool {
     if app.reddit.needs_sign_in() {
         return false;
@@ -390,6 +423,13 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), EndSynchronizedUpdate);
+        if Picker::halfblocks().tmux_detected() {
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::style::Print(terminal_output::TMUX_END)
+            );
+        }
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::DisableBracketedPaste,
@@ -399,18 +439,60 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Reads terminal input on its own thread: crossterm 0.29 spins in `poll`/`read`
-/// after tty EOF, which would stall the loop that handles SIGHUP. The returned slot
-/// receives the thread's panic message.
-fn spawn_input_reader() -> (Receiver<Event>, Arc<std::sync::Mutex<Option<String>>>) {
+type CursorQuery = std::sync::mpsc::SyncSender<std::io::Result<()>>;
+
+struct InputReader {
+    events: Receiver<Event>,
+    failure: Arc<std::sync::Mutex<Option<String>>>,
+    queries: std::sync::mpsc::Sender<CursorQuery>,
+}
+
+/// Bound the frame wait; the input thread owns crossterm's reply parser.
+fn cursor_barrier(queries: &std::sync::mpsc::Sender<CursorQuery>) -> std::io::Result<()> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    queries.send(tx).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "terminal input stopped before graphics acknowledgment",
+        )
+    })?;
+    rx.recv_timeout(Duration::from_millis(100))
+        .map_err(|error| {
+            std::io::Error::new(
+                if error == RecvTimeoutError::Timeout {
+                    std::io::ErrorKind::TimedOut
+                } else {
+                    std::io::ErrorKind::BrokenPipe
+                },
+                "tmux did not acknowledge the graphics upload",
+            )
+        })?
+}
+
+/// Keep reads off main because crossterm can spin on tty EOF. Poll between reads
+/// so cursor queries run on this same thread without competing for terminal input.
+fn spawn_input_reader() -> InputReader {
     let (tx, rx) = std::sync::mpsc::channel();
+    let (queries, requests) = std::sync::mpsc::channel::<CursorQuery>();
     let failure = Arc::new(std::sync::Mutex::new(None));
     let report = Arc::clone(&failure);
     std::thread::spawn(move || {
         let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            while let Ok(ev) = event::read() {
-                if tx.send(ev).is_err() {
-                    return;
+            loop {
+                if let Ok(reply) = requests.try_recv() {
+                    let _ = reply.send(crossterm::cursor::position().map(|_| ()));
+                }
+                match event::poll(Duration::from_millis(5)) {
+                    Ok(false) => continue,
+                    Ok(true) => match event::read() {
+                        Ok(event) => {
+                            if tx.send(event).is_err() {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    },
+                    Err(_) => break,
                 }
             }
         }));
@@ -419,9 +501,12 @@ fn spawn_input_reader() -> (Receiver<Event>, Arc<std::sync::Mutex<Option<String>
         {
             *slot = Some(worker::take_panic().unwrap_or_else(|| "a bug in redtab".into()));
         }
-        // `tx` drops only after the report is stored.
     });
-    (rx, failure)
+    InputReader {
+        events: rx,
+        failure,
+        queries,
+    }
 }
 
 /// Child side: prints `<protocol> <font width> <font height>` to stderr; stdout is the terminal.
@@ -663,6 +748,98 @@ mod auth_cli_tests {
 #[cfg(test)]
 mod event_loop_tests {
     use super::*;
+
+    #[test]
+    fn terminal_draw_should_hold_graphics_and_placeholders_until_complete() {
+        let mut bytes = Vec::<u8>::new();
+        let backend = ratatui::backend::CrosstermBackend::new(&mut bytes);
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 4, 2)),
+            },
+        )
+        .unwrap();
+        draw_synchronized(&mut terminal, |frame| {
+            frame.buffer_mut()[(0, 0)].set_symbol("frame");
+        })
+        .unwrap();
+        drop(terminal);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.starts_with("\x1b[?2026h"), "{text:?}");
+        assert!(text.contains("frame"));
+        assert!(text.rfind("\x1b[?2026l").unwrap() > text.find("frame").unwrap());
+    }
+
+    #[test]
+    fn a_failed_terminal_draw_should_end_synchronization() {
+        #[derive(Default)]
+        struct Writer {
+            bytes: Vec<u8>,
+            fail_draw: bool,
+            fail_once: bool,
+        }
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if std::mem::take(&mut self.fail_once) {
+                    return Err(std::io::Error::other("draw failed"));
+                }
+                self.bytes.extend_from_slice(bytes);
+                if self.fail_draw && self.bytes.ends_with(b"\x1b[?2026h") {
+                    self.fail_draw = false;
+                    self.fail_once = true;
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = Writer {
+            fail_draw: true,
+            ..Writer::default()
+        };
+        let backend = ratatui::backend::CrosstermBackend::new(&mut writer);
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 4, 2)),
+            },
+        )
+        .unwrap();
+        assert!(
+            draw_synchronized(&mut terminal, |frame| {
+                frame.buffer_mut()[(0, 0)].set_symbol("frame");
+            })
+            .is_err()
+        );
+        drop(terminal);
+        assert!(writer.bytes.ends_with(b"\x1b[?2026l"));
+    }
+
+    #[test]
+    fn cursor_barrier_should_require_a_successful_reply_and_fail_closed() {
+        let (tx, rx) = std::sync::mpsc::channel::<CursorQuery>();
+        let worker = std::thread::spawn(move || {
+            rx.recv()
+                .unwrap()
+                .send(Err(std::io::Error::other("query failed")))
+                .unwrap();
+        });
+        assert!(cursor_barrier(&tx).is_err());
+        worker.join().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<CursorQuery>();
+        drop(rx);
+        assert_eq!(
+            cursor_barrier(&tx).unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        let (tx, _rx) = std::sync::mpsc::channel::<CursorQuery>();
+        assert_eq!(
+            cursor_barrier(&tx).unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
 
     fn graphics_window() -> crossterm::terminal::WindowSize {
         crossterm::terminal::WindowSize {

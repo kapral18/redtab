@@ -6,6 +6,7 @@ use crate::reddit::experience::{
     UserFeed, name, reddit_url, thread_location,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Default)]
 pub struct Experience {
@@ -18,6 +19,30 @@ impl Experience {
     pub fn writing(&self) -> bool {
         matches!(&self.pending, Some((_, Request::Write(_))))
     }
+    pub(super) fn reset_reads(&mut self, has_post: bool) {
+        let keep = |screen: &Screen| match screen {
+            Screen::Input(form) => match &form.kind {
+                FormKind::Find => has_post,
+                FormKind::Search(_)
+                | FormKind::Profile
+                | FormKind::Reply(_)
+                | FormKind::Edit(_)
+                | FormKind::Report(_)
+                | FormKind::Submit { .. }
+                | FormKind::Wiki(_)
+                | FormKind::CreateMulti
+                | FormKind::MultiCommunity { .. } => true,
+            },
+            _ => false,
+        };
+        let keep_error = self.screens.last().is_some_and(keep);
+        self.pending = None;
+        self.screens.retain(keep);
+        if !keep_error {
+            self.error = None;
+        }
+    }
+
     pub fn input(&mut self) -> Option<&mut Form> {
         match self.screens.last_mut() {
             Some(Screen::Input(form)) => Some(form),
@@ -52,7 +77,17 @@ pub enum Screen {
 #[derive(Clone)]
 pub struct Choice {
     pub label: String,
+    pub section: &'static str,
     command: Command,
+}
+
+#[derive(Clone, Copy)]
+enum MenuScope {
+    Reddit,
+    Content,
+    Community,
+    Comments,
+    Message,
 }
 
 #[derive(Clone)]
@@ -73,6 +108,7 @@ pub struct Field {
     pub value: String,
     pub multiline: bool,
     pub cursor: usize,
+    pub required: bool,
 }
 
 #[derive(Clone)]
@@ -110,25 +146,42 @@ fn field(label: &str, value: &str, multiline: bool) -> Field {
         value: value.into(),
         multiline,
         cursor: value.len(),
+        required: true,
     }
 }
 
 impl Field {
-    fn insert(&mut self, text: &str) {
+    pub(crate) fn insert(&mut self, text: &str) {
         self.value.insert_str(self.cursor, text);
         self.cursor += text.len();
     }
-    fn previous(&self) -> usize {
+    pub(crate) fn previous(&self) -> usize {
         self.value[..self.cursor]
-            .char_indices()
+            .grapheme_indices(true)
             .next_back()
             .map_or(0, |(index, _)| index)
     }
-    fn next(&self) -> usize {
+    pub(crate) fn next(&self) -> usize {
         self.value[self.cursor..]
-            .chars()
+            .graphemes(true)
             .next()
-            .map_or(self.cursor, |c| self.cursor + c.len_utf8())
+            .map_or(self.cursor, |c| self.cursor + c.len())
+    }
+}
+
+impl Form {
+    pub fn submit_label(&self) -> &'static str {
+        match self.kind {
+            FormKind::Search(_) | FormKind::Find => "search",
+            FormKind::Profile | FormKind::Wiki(_) => "open",
+            FormKind::Reply(_) => "reply",
+            FormKind::Edit(_) => "save",
+            FormKind::Report(_) => "report",
+            FormKind::Submit { .. } => "post",
+            FormKind::CreateMulti => "create",
+            FormKind::MultiCommunity { add: true, .. } => "add",
+            FormKind::MultiCommunity { add: false, .. } => "remove",
+        }
     }
 }
 
@@ -145,8 +198,71 @@ fn form(title: &str, kind: FormKind, fields: Vec<Field>, native: &str) -> Form {
 fn choice(label: &str, command: Command) -> Choice {
     Choice {
         label: label.into(),
+        section: "",
         command,
     }
+}
+
+fn ordered_choices(choices: Vec<Choice>, scope: MenuScope) -> Vec<Choice> {
+    let mut ranked: Vec<_> = choices
+        .into_iter()
+        .map(|mut choice| {
+            let (rank, section) = match scope {
+                MenuScope::Reddit => match &choice.command {
+                    Command::Read(Query::Inbox(_)) => (0, "Notifications"),
+                    Command::Native(path) if path == "/notifications" => (0, "Notifications"),
+                    Command::Native(path) if path == "/chat/" => (1, "Messages"),
+                    Command::Read(Query::User { .. } | Query::Profile(_)) => (2, "Your account"),
+                    Command::Input(Form {
+                        kind: FormKind::Search(_) | FormKind::Profile,
+                        ..
+                    }) => (3, "Search"),
+                    Command::Read(Query::Multis | Query::Communities) | Command::Subreddit(_) => {
+                        (4, "Explore")
+                    }
+                    Command::Input(_) => (5, "Create"),
+                    _ => (6, "On Reddit"),
+                },
+                MenuScope::Content => match &choice.command {
+                    Command::Input(Form {
+                        kind: FormKind::Reply(_) | FormKind::Edit(_),
+                        ..
+                    }) => (0, "Reply and edit"),
+                    Command::Write(Action::Vote { .. } | Action::Save { .. }) => {
+                        (1, "Vote and save")
+                    }
+                    Command::Write(Action::Read { .. }) => (2, "Notifications"),
+                    Command::Write(_) => (3, "Post controls"),
+                    Command::Read(_) => (4, "Related"),
+                    Command::Input(Form {
+                        kind: FormKind::Report(_),
+                        ..
+                    }) => (5, "Report"),
+                    Command::Confirm(_, _) => (7, "Destructive"),
+                    _ => (6, "On Reddit"),
+                },
+                MenuScope::Community => match &choice.command {
+                    Command::Subreddit(_) => (0, "Community"),
+                    Command::Read(Query::Community(_) | Query::Rules(_)) => (1, "About"),
+                    Command::Read(Query::Wiki { .. }) | Command::Input(_) => (2, "Wiki"),
+                    Command::Read(Query::Moderators(_)) => (3, "Moderators"),
+                    _ => (4, "On Reddit"),
+                },
+                MenuScope::Comments => match &choice.command {
+                    Command::Input(_) => (0, "Find"),
+                    _ => (1, "Sort comments"),
+                },
+                MenuScope::Message => match &choice.command {
+                    Command::Write(_) => (0, "Notifications"),
+                    _ => (1, "On Reddit"),
+                },
+            };
+            choice.section = section;
+            (rank, choice)
+        })
+        .collect();
+    ranked.sort_by_key(|(rank, _)| *rank);
+    ranked.into_iter().map(|(_, choice)| choice).collect()
 }
 fn read(label: &str, query: Query) -> Choice {
     choice(label, Command::Read(query))
@@ -294,24 +410,31 @@ impl App {
                 Command::Input(form(
                     "Create private custom feed",
                     FormKind::CreateMulti,
-                    vec![field("Name", "", false), field("Description", "", true)],
+                    vec![
+                        field("Name", "", false),
+                        Field {
+                            required: false,
+                            ..field("Description", "", true)
+                        },
+                    ],
                     "/",
                 )),
             ),
             native("Upload media, create a poll or AMA", "/submit"),
             native("Chat", "/chat/"),
-            native("Private-message archive", "/notifications"),
+            native("Notifications", "/notifications"),
             native("Following and favorite communities", "/"),
             native(
                 "Privacy, blocked users and profile settings",
                 "/settings/privacy",
             ),
             native("Notification settings", "/settings/notifications"),
-            native("Moderation queue and mod mail", "/mod/queue"),
+            native("Moderation queue", "/mod/queue"),
+            native("Mod mail", "/mod/mail"),
         ]);
         self.experience.screens.push(Screen::Menu {
             title: "Reddit".into(),
-            choices,
+            choices: ordered_choices(choices, MenuScope::Reddit),
             selected: 0,
             native: "/".into(),
         });
@@ -365,20 +488,20 @@ impl App {
                         read: false,
                     }),
                 ),
-                native("View message or reply in chat", "/notifications"),
+                native("Notifications", "/notifications"),
             ];
-            self.push_menu("Message actions", choices);
+            self.push_menu("Message actions", choices, MenuScope::Message);
         } else {
             self.read_experience(Query::Inspect(target), None);
         }
     }
 
-    fn push_menu(&mut self, title: &str, choices: Vec<Choice>) {
+    fn push_menu(&mut self, title: &str, choices: Vec<Choice>, scope: MenuScope) {
         let native = self.experience_native_path();
         self.experience.error = None;
         self.experience.screens.push(Screen::Menu {
             title: title.into(),
-            choices,
+            choices: ordered_choices(choices, scope),
             selected: 0,
             native,
         });
@@ -517,7 +640,7 @@ impl App {
                 Command::Confirm(
                     "Delete this content from Reddit? This cannot be undone.".into(),
                     Action::Delete {
-                        id: target.id.clone(),
+                        target: target.clone(),
                     },
                 ),
             ));
@@ -533,12 +656,27 @@ impl App {
                 &target.permalink,
             ),
             native("Crosspost or manage post notifications", &target.permalink),
-            native("Follow/unfollow or block/unblock author", &profile),
-            native("Chat with author", &profile),
+            native("Author profile: follow, block or chat", &profile),
             native("Mute/favorite community or select flair", &sub),
             native("Moderate this content", &target.permalink),
         ]);
-        self.push_menu(&format!("{} · u/{}", target.id, target.author), choices);
+        if name(&target.author).is_err() {
+            choices.retain(|choice| match &choice.command {
+                Command::Read(Query::Profile(_)) => false,
+                Command::Native(path) => path != &profile,
+                _ => true,
+            });
+        }
+        let kind = if target.comment().is_some() {
+            "Comment"
+        } else {
+            "Post"
+        };
+        self.push_menu(
+            &format!("{kind} · u/{}", target.author),
+            choices,
+            MenuScope::Content,
+        );
         if let Some(Screen::Menu { native, .. }) = self.experience.screens.last_mut() {
             *native = target.permalink.clone();
         }
@@ -579,6 +717,7 @@ impl App {
                 native("Moderation queue", &format!("{path}/about/modqueue")),
                 native("Mod mail", "/mod/mail"),
             ],
+            MenuScope::Community,
         );
         if let Some(Screen::Menu { native, .. }) = self.experience.screens.last_mut() {
             *native = path;
@@ -666,9 +805,15 @@ impl App {
         let (_, request) = self.experience.pending.take().unwrap();
         match result {
             Err(error) => {
-                self.experience.error = Some(format!(
-                    "{error}. Open Reddit with Ctrl+o to check before submitting again."
-                ));
+                self.experience.error = Some(match request {
+                    Request::Read { after: Some(_), .. } => {
+                        format!("{error}. L retries the next page; Ctrl+o opens Reddit.")
+                    }
+                    Request::Read { .. } => format!("{error}. r retries; Ctrl+o opens Reddit."),
+                    Request::Write(_) => format!(
+                        "{error}. Open Reddit with Ctrl+o to check before submitting again."
+                    ),
+                });
             }
             Ok(Response::Details(details)) => {
                 self.experience.screens.pop();
@@ -773,6 +918,8 @@ impl App {
             tab.feed.requests.clear();
             tab.feed.pending.clear();
             tab.feed.refreshing.clear();
+            tab.feed.forced.clear();
+            tab.feed.deferred.clear();
             tab.feed.loaded = false;
         }
         let target_post = thread_location(&self.experience_native_path())
@@ -786,11 +933,16 @@ impl App {
             {
                 let generation = self.all_subs.next_group_generation;
                 self.all_subs.next_group_generation += 1;
-                Self::refresh_group(&self.pool, group, generation);
+                group.generation = generation;
+                group.loading = false;
+                group.needs_refresh = true;
             }
         }
-        if let Action::Hide { id, hide: true } | Action::Report { id, .. } | Action::Delete { id } =
-            action
+        if let Action::Hide { id, hide: true }
+        | Action::Report { id, .. }
+        | Action::Delete {
+            target: Target { id, .. },
+        } = action
             && let Some(id) = id.strip_prefix("t3_")
         {
             for tab in &mut self.tabs {
@@ -810,6 +962,7 @@ impl App {
         if self.active_tab().feed_target().is_some() {
             self.fetch_feed(self.active, None, true);
         }
+        self.sync_feed_demand();
     }
 
     fn execute_experience(&mut self, command: Command) {
@@ -934,6 +1087,21 @@ impl App {
         if self.experience.pending.is_some() {
             return;
         }
+        if ctrl && matches!(key.code, KeyCode::Char('d' | 'u' | 'e' | 'y')) {
+            if let Some(Screen::Browse { scroll, .. }) = self.experience.screens.last_mut() {
+                let rows = if matches!(key.code, KeyCode::Char('d' | 'u')) {
+                    5
+                } else {
+                    1
+                };
+                *scroll = if matches!(key.code, KeyCode::Char('d' | 'e')) {
+                    scroll.saturating_add(rows)
+                } else {
+                    scroll.saturating_sub(rows)
+                };
+            }
+            return;
+        }
         let mut command = None;
         let mut read_next = None;
         match self.experience.screens.last_mut() {
@@ -964,12 +1132,21 @@ impl App {
                 scroll,
             }) => match key.code {
                 KeyCode::Char('j') | KeyCode::Down => {
-                    *selected = (*selected + 1).min(page.entries.len().saturating_sub(1));
-                    *scroll += usize::from(page.entries.is_empty());
+                    let next = (*selected + 1).min(page.entries.len().saturating_sub(1));
+                    if next != *selected {
+                        *selected = next;
+                        *scroll = 0;
+                    } else if page.entries.is_empty() {
+                        *scroll += 1;
+                    }
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    *selected = selected.saturating_sub(1);
-                    *scroll = scroll.saturating_sub(1);
+                    if *selected > 0 {
+                        *selected -= 1;
+                        *scroll = 0;
+                    } else if page.entries.is_empty() {
+                        *scroll = scroll.saturating_sub(1);
+                    }
                 }
                 KeyCode::PageDown => *scroll += 10,
                 KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
@@ -978,7 +1155,11 @@ impl App {
                     *scroll = 0;
                 }
                 KeyCode::Char('G') | KeyCode::End => {
-                    *selected = page.entries.len().saturating_sub(1)
+                    let next = page.entries.len().saturating_sub(1);
+                    if next != *selected {
+                        *selected = next;
+                        *scroll = 0;
+                    }
                 }
                 KeyCode::Enter => {
                     command = page.entries.get(*selected).and_then(|entry| {
@@ -1107,12 +1288,15 @@ impl App {
         let Some(Screen::Input(form)) = self.experience.screens.last().cloned() else {
             return;
         };
-        if form
+        if let Some(index) = form
             .fields
             .iter()
-            .any(|field| field.value.trim().is_empty() && field.label != "Description")
+            .position(|field| field.required && field.value.trim().is_empty())
         {
-            self.experience.error = Some("Fill in every field before submitting".into());
+            self.experience.error = Some(format!("{} is required", form.fields[index].label));
+            if let Some(current) = self.experience.input() {
+                current.active = index;
+            }
             return;
         }
         let v = |index: usize| form.fields[index].value.clone();
@@ -1142,10 +1326,7 @@ impl App {
                 parent: target.id,
                 text: v(0),
             },
-            FormKind::Edit(target) => Action::Edit {
-                id: target.id,
-                text: v(0),
-            },
+            FormKind::Edit(target) => Action::Edit { target, text: v(0) },
             FormKind::Report(target) => Action::Report {
                 id: target.id,
                 reason: v(0),
@@ -1226,7 +1407,7 @@ impl App {
                 Command::Sort(sort.into()),
             ));
         }
-        self.push_menu("Comments", choices);
+        self.push_menu("Comments", choices, MenuScope::Comments);
     }
 
     fn sort_comments(&mut self, sort: &str) {
@@ -1333,7 +1514,6 @@ impl App {
             (view.gallery_index + len - 1) % len
         };
         view.scroll = 0;
-        view.image_away = false;
         view.free_scroll = true;
         let url = view.preview_image().map(str::to_string);
         if let Some(url) = url {
@@ -1404,7 +1584,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = App::new(
             Config {
-                image_preview: false,
+                media: crate::config::MediaSettings {
+                    image_preview: false,
+                    ..Default::default()
+                },
                 ..Config::default()
             },
             pool,
@@ -1417,6 +1600,122 @@ mod tests {
 
     fn key(app: &mut App, code: KeyCode) {
         crate::keys::handle(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn intent_order_should_put_unread_notifications_first_in_the_reddit_menu() {
+        let (mut app, _dir, _fixture) = app();
+        app.reddit_menu();
+        let Some(Screen::Menu { choices, .. }) = app.experience.screens.last() else {
+            panic!("menu missing")
+        };
+        assert!(matches!(
+            choices[0].command,
+            Command::Read(Query::Inbox(Inbox::Unread))
+        ));
+    }
+
+    #[test]
+    fn intent_order_should_put_reply_first_and_destructive_delete_last() {
+        let (mut app, _dir, _fixture) = app();
+        app.details_menu(Details {
+            target: Target {
+                id: "t1_comment".into(),
+                author: "reader".into(),
+                subreddit: "rust".into(),
+                permalink: "/comments/post/_/comment".into(),
+            },
+            raw_text: "body".into(),
+            saved: false,
+            hidden: false,
+            vote: 0,
+            editable: true,
+            crosspost: None,
+        });
+        let Some(Screen::Menu { choices, .. }) = app.experience.screens.last() else {
+            panic!("menu missing")
+        };
+        assert!(matches!(
+            &choices[0].command,
+            Command::Input(Form {
+                kind: FormKind::Reply(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            &choices.last().unwrap().command,
+            Command::Confirm(_, Action::Delete { .. })
+        ));
+    }
+
+    #[test]
+    fn deleted_authors_should_not_offer_profile_or_chat_actions() {
+        let (mut app, _dir, _fixture) = app();
+        app.details_menu(Details {
+            target: Target {
+                id: "t1_comment".into(),
+                author: "[deleted]".into(),
+                subreddit: "rust".into(),
+                permalink: "/comments/post/_/comment".into(),
+            },
+            raw_text: "body".into(),
+            saved: false,
+            hidden: false,
+            vote: 0,
+            editable: true,
+            crosspost: None,
+        });
+        let Some(Screen::Menu { choices, .. }) = app.experience.screens.last() else {
+            panic!("menu missing")
+        };
+        assert!(
+            !choices
+                .iter()
+                .any(|choice| matches!(&choice.command, Command::Read(Query::Profile(_))))
+        );
+        assert!(!choices.iter().any(
+            |choice| matches!(&choice.command,Command::Native(path) if path.contains("[deleted]"))
+        ));
+    }
+
+    #[test]
+    fn when_browsing_to_another_item_its_preview_should_start_at_the_top() {
+        for (selected, code, expected) in [
+            (0, KeyCode::Char('j'), 1),
+            (1, KeyCode::Char('k'), 0),
+            (0, KeyCode::Char('G'), 1),
+        ] {
+            let (mut app, _dir, _fixture) = app();
+            app.overlay = Some(Overlay::Experience);
+            app.experience.screens.push(Screen::Browse {
+                query: Query::Inbox(crate::reddit::experience::Inbox::All),
+                page: Page {
+                    title: "Inbox".into(),
+                    text: String::new(),
+                    entries: ["first", "second"]
+                        .map(|title| Entry {
+                            title: title.into(),
+                            body: "short preview".into(),
+                            target: None,
+                            query: None,
+                            post: None,
+                        })
+                        .into(),
+                    after: None,
+                    url: "/message/inbox/".into(),
+                },
+                selected,
+                scroll: 30,
+            });
+
+            key(&mut app, code);
+
+            assert!(
+                matches!(app.experience.screens.last(), Some(Screen::Browse {
+                selected, scroll: 0, ..
+            }) if *selected == expected)
+            );
+        }
     }
 
     #[test]
@@ -1585,6 +1884,7 @@ mod tests {
             error: None,
             freshness: None,
             generation: 7,
+            needs_refresh: false,
         });
         app.after_experience_write(&Action::Save {
             id: "t3_post".into(),
@@ -1603,7 +1903,12 @@ mod tests {
         let link = post.permalink.clone();
         let old = app.show_post(post, &link).unwrap();
         app.after_experience_write(&Action::Edit {
-            id: "t3_1x4v4sn".into(),
+            target: Target {
+                id: "t3_1x4v4sn".into(),
+                author: "reader".into(),
+                subreddit: "rust".into(),
+                permalink: "/comments/1x4v4sn".into(),
+            },
             text: "edited body".into(),
         });
         let current = app.post_view.as_ref().unwrap().generation;
@@ -1722,6 +2027,36 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_action_read_should_keep_the_target_and_offer_read_retry_advice() {
+        let (mut app, _dir, _fixture) = app();
+        let target = Target {
+            id: "t1_original".into(),
+            author: "author".into(),
+            subreddit: "rust".into(),
+            permalink: "/comments/post/_/original".into(),
+        };
+        let query = Query::Inspect(target.clone());
+        app.overlay = Some(Overlay::Experience);
+        app.experience.screens.push(Screen::Loading(query.clone()));
+        app.experience.pending = Some((91, Request::Read { query, after: None }));
+
+        app.on_experience(91, Err("Reddit denied this request (HTTP 403)".into()));
+
+        let error = app.experience.error.as_ref().unwrap();
+        assert!(error.contains("HTTP 403"));
+        assert!(error.contains("r retries"));
+        assert!(!error.contains("submitting"));
+        assert!(
+            matches!(app.experience.screens.last(), Some(Screen::Loading(Query::Inspect(actual))) if actual == &target)
+        );
+        assert!(app.experience.pending.is_none());
+        key(&mut app, KeyCode::Char('r'));
+        assert!(
+            matches!(&app.experience.pending, Some((_, Request::Read { query: Query::Inspect(actual), after: None })) if actual == &target)
+        );
+    }
+
+    #[test]
     fn when_a_write_fails_it_should_keep_the_draft_and_display_the_error() {
         let (mut app, _dir, _fixture) = app();
         reply_form(&mut app);
@@ -1739,6 +2074,13 @@ mod tests {
             "unsent draft"
         );
         assert!(app.experience.error.as_ref().unwrap().contains("HTTP 403"));
+        assert!(
+            app.experience
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("before submitting again")
+        );
         assert!(!app.experience.writing());
     }
 
@@ -1857,6 +2199,11 @@ mod tests {
         let actual = app.comment_target().unwrap();
         assert!(actual.id.starts_with("t1_"));
         assert!(actual.permalink.starts_with("/comments/1x4v4sn/_/"));
+        app.show_actions();
+        assert!(matches!(
+            &app.experience.pending,
+            Some((_, Request::Read { query: Query::Inspect(target), after: None })) if target == &actual
+        ));
         app.post_view.as_mut().unwrap().free_scroll = true;
         assert!(app.comment_target().is_none());
     }
@@ -1870,6 +2217,10 @@ mod tests {
                 "https://i.redd.it/a.png".into(),
                 "https://i.redd.it/b.png".into(),
             ],
+            previews: vec![
+                Some("https://preview.redd.it/a.png?width=1080".into()),
+                Some("https://preview.redd.it/b.png?width=1080".into()),
+            ],
             thumb: None,
         };
         let post = page.post.clone();
@@ -1882,12 +2233,12 @@ mod tests {
         app.gallery_step(false);
         assert_eq!(
             app.post_view.as_ref().unwrap().preview_image(),
-            Some("https://i.redd.it/b.png")
+            Some("https://preview.redd.it/b.png?width=1080")
         );
         app.gallery_step(true);
         assert_eq!(
             app.post_view.as_ref().unwrap().preview_image(),
-            Some("https://i.redd.it/a.png")
+            Some("https://preview.redd.it/a.png?width=1080")
         );
     }
 
@@ -1909,5 +2260,254 @@ mod tests {
         assert!(view.page.is_none());
         assert!(view.loading);
         assert_ne!(view.generation, generation);
+    }
+    #[test]
+    fn ui_audit_required_field_validation_should_name_and_focus_the_field() {
+        let (mut app, _dir, _fixture) = app();
+        let mut input = app.post_form(true);
+        input.fields[0].value = "rust".into();
+        input.fields[2].value = "https://example.com".into();
+        app.experience.screens.push(Screen::Input(input));
+        app.overlay = Some(Overlay::Experience);
+
+        app.experience_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.experience.input().unwrap().active, 1);
+        assert_eq!(app.experience.error.as_deref(), Some("Title is required"));
+        assert!(app.experience.pending.is_none());
+    }
+
+    #[test]
+    fn ui_audit_editor_navigation_and_deletion_should_preserve_grapheme_boundaries() {
+        let (mut app, _dir, _fixture) = app();
+        app.experience.screens.push(Screen::Input(form(
+            "Search people",
+            FormKind::Search(SearchKind::People),
+            vec![field("Query", "a👩‍💻b", false)],
+            "/search",
+        )));
+        app.overlay = Some(Overlay::Experience);
+
+        key(&mut app, KeyCode::Left);
+        key(&mut app, KeyCode::Left);
+        key(&mut app, KeyCode::Right);
+        key(&mut app, KeyCode::Delete);
+        key(&mut app, KeyCode::Backspace);
+
+        assert_eq!(app.experience.input().unwrap().fields[0].value, "a");
+    }
+
+    #[test]
+    fn ui_audit_next_page_errors_should_offer_the_next_page_retry_key() {
+        let (mut app, _dir, _fixture) = app();
+        app.experience.pending = Some((
+            71,
+            Request::Read {
+                query: Query::Search {
+                    text: "rust".into(),
+                    kind: SearchKind::Posts,
+                    sort: SearchSort::Relevance,
+                    time: TimeRange::All,
+                },
+                after: Some("next".into()),
+            },
+        ));
+
+        app.on_experience(71, Err("Page failed".into()));
+
+        assert!(
+            app.experience
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("L retries the next page")
+        );
+    }
+    #[test]
+    fn settings_draft_reload_should_keep_reply_edit_and_submit_fields_for_both_change_paths() {
+        for external in [false, true] {
+            for kind in 0..3 {
+                let (mut app, directory, _fixture) = app();
+                let path = directory.path().join("config.toml");
+                std::fs::write(&path, "[media]\nimage_preview=false\n").unwrap();
+                app.settings = super::super::settings::Settings::new(
+                    crate::config::store::Store::open(Some(&path)).unwrap(),
+                );
+                let target = Target {
+                    id: "t1_original".into(),
+                    author: "reader".into(),
+                    subreddit: "rust".into(),
+                    permalink: "/comments/post/_/original".into(),
+                };
+                let mut draft = match kind {
+                    0 => form(
+                        "Reply",
+                        FormKind::Reply(target),
+                        vec![field("Reply", "", true)],
+                        "/comments/post",
+                    ),
+                    1 => form(
+                        "Edit",
+                        FormKind::Edit(target),
+                        vec![field("Body", "", true)],
+                        "/comments/post",
+                    ),
+                    _ => app.post_form(false),
+                };
+                draft.active = draft.fields.len() - 1;
+                draft.fields[draft.active].value = "unsent café\nsecond line".into();
+                draft.fields[draft.active].cursor = 5;
+                app.experience.screens = vec![
+                    Screen::Browse {
+                        query: Query::Communities,
+                        page: Page {
+                            title: "old collection".into(),
+                            text: String::new(),
+                            entries: vec![],
+                            after: None,
+                            url: "/".into(),
+                        },
+                        selected: 0,
+                        scroll: 0,
+                    },
+                    Screen::Input(draft.clone()),
+                ];
+                app.overlay = Some(Overlay::Experience);
+                if external {
+                    std::fs::write(&path, "show_nsfw=true\n[media]\nimage_preview=false\n")
+                        .unwrap();
+                    assert!(app.poll_settings(Instant::now() + Duration::from_secs(1)));
+                } else {
+                    crate::keys::handle(&mut app, KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+                    crate::keys::handle(
+                        &mut app,
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    );
+                    crate::keys::handle(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                }
+                assert!(app.config.show_nsfw);
+                assert!(
+                    matches!(app.overlay, Some(Overlay::Experience)),
+                    "composer lost: external={external} kind={kind}"
+                );
+                let current = app
+                    .experience
+                    .input()
+                    .expect("draft must survive policy reload");
+                assert_eq!(current.active, draft.active);
+                for (actual, expected) in current.fields.iter().zip(&draft.fields) {
+                    assert_eq!(actual.value, expected.value);
+                    assert_eq!(actual.cursor, expected.cursor);
+                }
+                assert_eq!(
+                    app.experience.screens.len(),
+                    1,
+                    "policy-dependent browse data must be invalidated"
+                );
+            }
+        }
+    }
+    #[test]
+    fn settings_draft_errors_should_follow_retained_inputs_not_removed_read_screens() {
+        for write_error in [false, true] {
+            let (mut app, _directory, _fixture) = app();
+            reply_form(&mut app);
+            app.experience_paste("retained draft");
+            let generation = if write_error {
+                app.experience.pending = Some((
+                    95,
+                    Request::Write(Action::Save {
+                        id: "t3_post".into(),
+                        save: true,
+                    }),
+                ));
+                95
+            } else {
+                app.read_experience(Query::Communities, None);
+                app.experience.pending.as_ref().unwrap().0
+            };
+            app.on_experience(generation, Err("fixture error".into()));
+            assert!(app.experience.error.is_some());
+            app.change_setting("show_nsfw", toml::Value::Boolean(true));
+            assert!(app.experience.input().is_some());
+            assert_eq!(
+                app.experience.error.is_some(),
+                write_error,
+                "read-screen feedback must not migrate onto a text field"
+            );
+        }
+    }
+    #[test]
+    fn settings_find_should_follow_its_backing_post_for_nsfw_and_filter_changes() {
+        for external in [false, true] {
+            for (adult, filter, keep) in [
+                (true, false, false),
+                (false, false, true),
+                (false, true, false),
+            ] {
+                let (mut app, directory, _fixture) = app();
+                app.change_setting("show_nsfw", toml::Value::Boolean(true));
+                let mut page = post_page();
+                page.post.nsfw = adult;
+                page.post.title = "needle".into();
+                let generation = app
+                    .show_post(page.post.clone(), &page.post.permalink)
+                    .unwrap();
+                app.on_msg(Msg::Post {
+                    generation,
+                    result: Ok(Box::new(page)),
+                });
+                let path = directory.path().join("config.toml");
+                std::fs::write(&path, "show_nsfw=true\n[media]\nimage_preview=false\n").unwrap();
+                app.settings = super::super::settings::Settings::new(
+                    crate::config::store::Store::open(Some(&path)).unwrap(),
+                );
+                app.experience.screens = vec![Screen::Input(form(
+                    "Find in loaded comments",
+                    FormKind::Find,
+                    vec![field("Query", "needle", false)],
+                    "/comments/post",
+                ))];
+                app.overlay = Some(Overlay::Experience);
+                if external {
+                    std::fs::write(&path, if filter { "show_nsfw=true\n[media]\nimage_preview=false\n[filters]\nkeywords=[\"needle\"]\n" } else { "show_nsfw=false\n[media]\nimage_preview=false\n" }).unwrap();
+                    app.poll_settings(Instant::now() + Duration::from_secs(1));
+                } else {
+                    crate::keys::handle(&mut app, KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+                    if filter {
+                        app.settings.selected = 4;
+                        crate::keys::handle(
+                            &mut app,
+                            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        );
+                        crate::keys::handle(
+                            &mut app,
+                            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                        );
+                        crate::keys::paste(&mut app, "[\"needle\"]");
+                    }
+                    crate::keys::handle(
+                        &mut app,
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    );
+                    crate::keys::handle(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                }
+                assert_eq!(app.post_view.is_some(), keep);
+                assert_eq!(
+                    matches!(app.overlay, Some(Overlay::Experience)),
+                    keep,
+                    "Find must close with its post: external={external} adult={adult} filter={filter}"
+                );
+                if keep {
+                    key(&mut app, KeyCode::Enter);
+                    assert!(matches!(
+                        app.experience.screens.last(),
+                        Some(Screen::Browse { .. })
+                    ));
+                } else {
+                    assert!(app.experience.screens.is_empty());
+                }
+            }
+        }
     }
 }

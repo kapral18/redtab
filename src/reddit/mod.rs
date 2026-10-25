@@ -6,6 +6,7 @@ pub mod experience;
 mod home;
 mod membership;
 pub mod parse;
+mod rate;
 mod relay;
 mod session;
 #[cfg(test)]
@@ -16,6 +17,8 @@ mod transport;
 pub use accounts::SavedAccount;
 pub(crate) use accounts::saved_revision;
 pub(crate) use membership::is_community;
+pub(crate) use parse::merge_reply_continuations;
+pub use rate::Pause;
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -29,8 +32,8 @@ use parking_lot::Mutex;
 use serde_json::Value;
 use url::Url;
 
-use crate::model::{Listing, PostPage, ReplyPage, Sort, TimeRange};
-use transport::{RUNTIME, Reader, Transport};
+use crate::model::{Listing, Post, PostPage, ReplyPage, Sort, TimeRange};
+use transport::{Reader, Transport};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Account {
@@ -79,18 +82,37 @@ pub(crate) fn activate_account(id: &str, expected: &str, text: &str) -> Result<(
     accounts::activate(id, expected, text)
 }
 
+pub(crate) use rate::Priority;
+
+pub(crate) const REQUEST_CANCELLED: &str = "Reddit request is no longer needed";
+
+pub(crate) enum ListingEvent<'a> {
+    Post(&'a Post),
+    ContinuationFailed { cursor: &'a str, error: &'a str },
+}
+
 const API: &str = "https://www.reddit.com/";
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 const IMAGE_LIMIT: u64 = 64 * 1024 * 1024;
 const DECODE_LIMIT: u64 = 512 * 1024 * 1024;
+const STILL_DECODE_LIMIT: u64 = 128 * 1024 * 1024;
+const READ_REUSE_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
-pub struct Reddit(Arc<Inner>);
+pub struct Reddit(Arc<Inner>, bool, RequestContext);
+
+#[derive(Clone, Default)]
+struct RequestContext {
+    priority: rate::Priority,
+    retry_reads: bool,
+    cancelled: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    active_cancelled: Option<transport::Cancellation>,
+    read_aborted: Arc<AtomicBool>,
+}
 
 struct Inner {
     transport: Transport,
     api: Url,
-    show_nsfw: bool,
     session: session::Session,
     account: Mutex<Option<Account>>,
     source: Mutex<Option<crate::auth::Source>>,
@@ -98,8 +120,7 @@ struct Inner {
     retired: AtomicBool,
     /// Never held across a request, so the UI can read it while one is in flight.
     status: Mutex<Status>,
-    /// Reddit's morechildren contract allows one in-flight expansion per client.
-    expansion: Mutex<()>,
+    rate: rate::Rate,
     relay: OnceLock<relay::Relay>,
 }
 
@@ -107,9 +128,36 @@ struct Inner {
 struct Status {
     /// Whether the latest request found Reddit up; `None` before the first.
     up: Option<bool>,
-    cooldown: Option<Instant>,
     rejected: bool,
 }
+
+/// Access refusals carry only an allowlisted reason, never the response body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessDenied {
+    PrivateCommunity,
+    Forbidden,
+}
+
+impl AccessDenied {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::PrivateCommunity => {
+                "This community is private; only approved members can view its posts"
+            }
+            Self::Forbidden => {
+                "Reddit denied this request (HTTP 403); check your sign-in or access to this content"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for AccessDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for AccessDenied {}
 
 /// Reddit has no such resource (HTTP 404): an answer, unlike a refusal (403 can block the
 /// account) or a failed request.
@@ -185,6 +233,66 @@ impl Reddit {
 
     pub fn retire(&self) {
         self.0.retired.store(true, Ordering::Release);
+        self.0.rate.wake();
+    }
+
+    pub(crate) fn for_worker(
+        &self,
+        priority: rate::Priority,
+        retry_reads: bool,
+        cancelled: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        let cancelled: transport::Cancellation = Arc::new(cancelled);
+        let demand = Arc::clone(&cancelled);
+        let since = Mutex::new(None);
+        let read_aborted = Arc::new(AtomicBool::new(false));
+        let aborted = Arc::clone(&read_aborted);
+        let active_cancelled: transport::Cancellation = Arc::new(move || {
+            if aborted.load(Ordering::Acquire) {
+                return true;
+            }
+            let obsolete = demand();
+            let mut since = since.lock();
+            if !obsolete {
+                *since = None;
+                return false;
+            }
+            let now = Instant::now();
+            let expired =
+                now.saturating_duration_since(*since.get_or_insert(now)) >= READ_REUSE_GRACE;
+            if expired {
+                aborted.store(true, Ordering::Release);
+            }
+            expired
+        });
+        Self(
+            Arc::clone(&self.0),
+            self.1,
+            RequestContext {
+                priority,
+                retry_reads,
+                cancelled: Some(cancelled),
+                active_cancelled: Some(active_cancelled),
+                read_aborted,
+            },
+        )
+    }
+
+    pub(crate) fn read_aborted(&self) -> bool {
+        self.2.read_aborted.load(Ordering::Acquire)
+    }
+
+    pub fn pause(&self) -> Option<Pause> {
+        self.0.rate.pause()
+    }
+
+    fn read_cancellation(&self) -> transport::Cancellation {
+        let inner = Arc::clone(&self.0);
+        let cancelled = self.2.active_cancelled.clone();
+        Arc::new(move || {
+            inner.retired.load(Ordering::Acquire)
+                || cancelled.as_ref().is_some_and(|cancel| cancel())
+        })
     }
 
     pub fn verify_account(&self) -> Result<Account> {
@@ -246,19 +354,26 @@ impl Reddit {
         let source = Mutex::new(session.connection.as_ref().and_then(|c| c.source.clone()));
         let saved_key =
             Mutex::new((session.fingerprint != "disconnected").then(|| session.saved_id()));
-        Ok(Self(Arc::new(Inner {
-            transport,
-            api: Url::parse(api)?,
+        Ok(Self(
+            Arc::new(Inner {
+                transport,
+                api: Url::parse(api)?,
+                session,
+                account,
+                source,
+                saved_key,
+                retired: AtomicBool::new(false),
+                status: Mutex::new(Status::default()),
+                rate: rate::Rate::new(if cfg!(test) {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(1)
+                }),
+                relay: OnceLock::new(),
+            }),
             show_nsfw,
-            session,
-            account,
-            source,
-            saved_key,
-            retired: AtomicBool::new(false),
-            status: Mutex::new(Status::default()),
-            expansion: Mutex::new(()),
-            relay: OnceLock::new(),
-        })))
+            RequestContext::default(),
+        ))
     }
 
     /// Local HTTP fixtures exercise the same client/parser without contacting Reddit.
@@ -279,6 +394,18 @@ impl Reddit {
         .unwrap()
     }
 
+    #[cfg(test)]
+    pub fn test_at_paced(base: &str, interval: Duration) -> Self {
+        let mut reddit = Self::test_at(base, false);
+        Arc::get_mut(&mut reddit.0).unwrap().rate = rate::Rate::new(interval);
+        reddit
+    }
+
+    /// Reuse the same account, transport and health without rereading credentials.
+    pub fn with_nsfw(&self, show_nsfw: bool) -> Self {
+        Self(Arc::clone(&self.0), show_nsfw, self.2.clone())
+    }
+
     pub fn cache_namespace(&self) -> String {
         let identity = self.account().map_or_else(
             || self.0.session.fingerprint.clone(),
@@ -286,10 +413,11 @@ impl Reddit {
         );
         format!(
             "reddit-web-v1\n{}\nnsfw={}\nsession={}",
-            self.0.api, self.0.show_nsfw, identity
+            self.0.api, self.1, identity
         )
     }
 
+    #[cfg(test)]
     pub fn listing(
         &self,
         subreddit: &str,
@@ -297,42 +425,126 @@ impl Reddit {
         time: TimeRange,
         after: Option<&str>,
     ) -> Result<Listing> {
+        self.listing_progress(subreddit, sort, time, after, &mut |_| {})
+    }
+
+    pub(crate) fn listing_progress(
+        &self,
+        subreddit: &str,
+        sort: Sort,
+        time: TimeRange,
+        after: Option<&str>,
+        progress: &mut dyn FnMut(ListingEvent<'_>),
+    ) -> Result<Listing> {
         if sort == Sort::Best {
             bail!("Best is available on Home only");
         }
         let url = self.subreddit_url(subreddit, &format!("{}.json", sort.as_str()))?;
-        self.fetch_listing(url, sort, time, after)
+        self.fetch_listing(url, sort, time, after, progress)
     }
 
     pub fn home(&self, sort: Sort, time: TimeRange, after: Option<&str>) -> Result<Listing> {
-        if sort == Sort::Best {
-            return self.browser_home(after);
-        }
-        let url = self.0.api.join(&format!("{}.json", sort.as_str()))?;
-        self.fetch_listing(url, sort, time, after)
+        self.home_progress(sort, time, after, &mut |_| {})
     }
 
-    fn browser_home(&self, after: Option<&str>) -> Result<Listing> {
+    pub(crate) fn home_progress(
+        &self,
+        sort: Sort,
+        time: TimeRange,
+        after: Option<&str>,
+        progress: &mut dyn FnMut(ListingEvent<'_>),
+    ) -> Result<Listing> {
+        if sort == Sort::Best {
+            return self.browser_home(after, progress);
+        }
+        let url = self.0.api.join(&format!("{}.json", sort.as_str()))?;
+        self.fetch_listing(url, sort, time, after, progress)
+    }
+
+    fn home_partial(&self, cursor: Option<&str>) -> Result<home::Page> {
         let url = home::url(
             &self.0.api,
-            after.unwrap_or("/svc/shreddit/feeds/home-feed?sort=BEST"),
+            cursor.unwrap_or("/svc/shreddit/feeds/home-feed?sort=BEST"),
         )?;
-        let html = transport::html(self.request(url, home::ACCEPT)?)?;
-        let page = home::parse(&html, &self.0.api)?;
+        let html = transport::html(
+            self.request(url, home::ACCEPT)?,
+            Some(self.read_cancellation()),
+        )?;
+        home::parse(&html, &self.0.api)
+    }
+
+    fn browser_home(
+        &self,
+        after: Option<&str>,
+        progress: &mut dyn FnMut(ListingEvent<'_>),
+    ) -> Result<Listing> {
+        let mut page = self.home_partial(after)?;
+        let mut failure = None;
+        // Hydrate a tiny starter together with its continuation, saving one quotaed JSON call.
+        if after.is_none()
+            && page.ids.len() <= 3
+            && let Some(next) = page.after.clone()
+        {
+            match self.home_partial(Some(&next)).and_then(|continuation| {
+                if continuation.after.as_deref() == Some(&next) {
+                    bail!("Reddit repeated a Home cursor");
+                }
+                Ok(continuation)
+            }) {
+                Ok(continuation) => {
+                    let mut seen: HashSet<_> = page.ids.iter().cloned().collect();
+                    page.ids.extend(
+                        continuation
+                            .ids
+                            .into_iter()
+                            .filter(|id| seen.insert(id.clone())),
+                    );
+                    page.after = continuation.after;
+                }
+                Err(error) if error.to_string() == REQUEST_CANCELLED => return Err(error),
+                Err(error) => failure = Some((next, error.to_string())),
+            }
+        }
         let mut details = std::collections::HashMap::new();
+        let mut posts = Vec::new();
+        let mut emitted = 0;
         for ids in page.ids.chunks(100) {
             let mut url = self.0.api.join(&format!("by_id/{}.json", ids.join(",")))?;
             url.query_pairs_mut().append_pair("raw_json", "1");
-            for post in parse::parse_listing_value(self.get(url)?)?.posts {
-                details.insert(format!("t3_{}", post.id), post);
+            transport::listing(
+                self.request(url, "application/json")?,
+                self.read_cancellation(),
+                &mut |post| {
+                    let id = format!("t3_{}", post.id);
+                    if ids.contains(&id) {
+                        details.insert(id, post.clone());
+                    }
+                    while let Some(id) = ids.get(emitted) {
+                        let Some(post) = details.remove(id) else {
+                            break;
+                        };
+                        if self.1 || !post.nsfw {
+                            progress(ListingEvent::Post(&post));
+                            posts.push(post);
+                        }
+                        emitted += 1;
+                    }
+                },
+            )?;
+            // A missing earlier ID cannot block later records once this response is complete.
+            for id in &ids[emitted..] {
+                if let Some(post) = details.remove(id)
+                    && (self.1 || !post.nsfw)
+                {
+                    progress(ListingEvent::Post(&post));
+                    posts.push(post);
+                }
             }
+            emitted = 0;
         }
-        let posts = page
-            .ids
-            .into_iter()
-            .filter_map(|id| details.remove(&id))
-            .filter(|post| self.0.show_nsfw || !post.nsfw)
-            .collect();
+        if let Some((cursor, error)) = &failure {
+            progress(ListingEvent::ContinuationFailed { cursor, error });
+        }
         Ok(Listing {
             posts,
             after: page.after,
@@ -345,14 +557,31 @@ impl Reddit {
         sort: Sort,
         time: TimeRange,
         after: Option<&str>,
+        progress: &mut dyn FnMut(ListingEvent<'_>),
     ) -> Result<Listing> {
         self.listing_params(&mut url, after);
         if sort.takes_time() {
             url.query_pairs_mut().append_pair("t", time.as_str());
         }
-        let mut listing = parse::parse_listing_value(self.get(url)?)?;
-        if !self.0.show_nsfw {
-            listing.posts.retain(|p| !p.nsfw);
+        self.listing_response(url, progress)
+    }
+
+    fn listing_response(
+        &self,
+        url: Url,
+        progress: &mut dyn FnMut(ListingEvent<'_>),
+    ) -> Result<Listing> {
+        let mut listing = transport::listing(
+            self.request(url, "application/json")?,
+            self.read_cancellation(),
+            &mut |post| {
+                if self.1 || !post.nsfw {
+                    progress(ListingEvent::Post(post));
+                }
+            },
+        )?;
+        if !self.1 {
+            listing.posts.retain(|post| !post.nsfw);
         }
         Ok(listing)
     }
@@ -386,7 +615,18 @@ impl Reddit {
         Ok(names)
     }
 
+    #[cfg(test)]
     pub fn search(&self, subreddit: &str, query: &str, after: Option<&str>) -> Result<Listing> {
+        self.search_progress(subreddit, query, after, &mut |_| {})
+    }
+
+    pub(crate) fn search_progress(
+        &self,
+        subreddit: &str,
+        query: &str,
+        after: Option<&str>,
+        progress: &mut dyn FnMut(ListingEvent<'_>),
+    ) -> Result<Listing> {
         let mut url = self.subreddit_url(subreddit, "search.json")?;
         self.listing_params(&mut url, after);
         url.query_pairs_mut()
@@ -394,11 +634,7 @@ impl Reddit {
             .append_pair("restrict_sr", "on")
             .append_pair("sort", "relevance")
             .append_pair("t", "all");
-        let mut listing = parse::parse_listing_value(self.get(url)?)?;
-        if !self.0.show_nsfw {
-            listing.posts.retain(|p| !p.nsfw);
-        }
-        Ok(listing)
+        self.listing_response(url, progress)
     }
 
     fn subreddit_url(&self, subreddit: &str, suffix: &str) -> Result<Url> {
@@ -416,10 +652,7 @@ impl Reddit {
         url.query_pairs_mut()
             .append_pair("limit", "25")
             .append_pair("raw_json", "1")
-            .append_pair(
-                "include_over_18",
-                if self.0.show_nsfw { "on" } else { "off" },
-            );
+            .append_pair("include_over_18", if self.1 { "on" } else { "off" });
         if let Some(after) = after {
             url.query_pairs_mut().append_pair("after", after);
         }
@@ -456,6 +689,15 @@ impl Reddit {
         sort: &str,
         comment: Option<&str>,
     ) -> Result<PostPage> {
+        let mut page = parse::parse_post_page_value(self.thread_json(permalink, sort, comment)?)?;
+        parse::set_reply_sort(&mut page.comments, sort)?;
+        if page.post.nsfw && !self.1 {
+            bail!("This is NSFW; press F2 and enable Show NSFW to see it");
+        }
+        Ok(page)
+    }
+
+    fn thread_json(&self, permalink: &str, sort: &str, comment: Option<&str>) -> Result<Value> {
         if !matches!(
             sort,
             "" | "confidence" | "top" | "new" | "old" | "controversial" | "qa"
@@ -480,51 +722,43 @@ impl Reddit {
                 .append_pair("comment", comment)
                 .append_pair("context", "3");
         }
-        let mut page = parse::parse_post_page_value(self.get(url)?)?;
-        parse::set_reply_sort(&mut page.comments, sort)?;
-        if page.post.nsfw && !self.0.show_nsfw {
-            bail!("this is NSFW; set show_nsfw = true in config.toml to see it");
-        }
-        Ok(page)
+        self.get(url)
     }
 
     pub fn more_replies(&self, cursor: &str) -> Result<ReplyPage> {
         let more: parse::MoreRequest =
             serde_json::from_str(cursor).context("invalid reply cursor")?;
         more.validate()?;
-        if more.children.is_empty() {
+        let deadline = std::cell::Cell::new(Instant::now() + Duration::from_secs(20));
+        let fetch = |comment: Option<&str>, context: &str| -> Result<Value> {
             let mut url = self.0.api.join(&format!("comments/{}.json", more.post))?;
             url.query_pairs_mut()
-                .append_pair("comment", more.parent.trim_start_matches("t1_"))
-                .append_pair("context", "0")
+                .append_pair("context", context)
                 .append_pair("depth", "10")
                 .append_pair("limit", "100")
                 .append_pair("raw_json", "1");
+            if let Some(comment) = comment {
+                url.query_pairs_mut().append_pair("comment", comment);
+            }
             if !more.sort.is_empty() {
                 url.query_pairs_mut().append_pair("sort", &more.sort);
             }
-            let mut page = parse::focused_replies(self.get(url)?, &more)?;
-            parse::set_reply_sort(&mut page.comments, &more.sort)?;
-            parse::set_more_sort(&mut page.more, &more.sort)?;
-            return Ok(page);
-        }
-        let mut url = self.0.api.join("api/morechildren.json")?;
-        url.query_pairs_mut()
-            .append_pair("api_type", "json")
-            .append_pair("raw_json", "1")
-            .append_pair("link_id", &format!("t3_{}", more.post))
-            .append_pair(
-                "children",
-                &more.children[..more.children.len().min(100)].join(","),
-            );
-        if !more.sort.is_empty() {
-            url.query_pairs_mut().append_pair("sort", &more.sort);
-        }
-        let response = {
-            let _expansion = self.0.expansion.lock();
-            self.get(url)?
+            let timeout = deadline.get().saturating_duration_since(Instant::now());
+            if timeout.is_zero() {
+                bail!("Comment expansion timed out; retry to load more replies");
+            }
+            let (response, waited) =
+                self.send_with_timeout(url, "application/json", timeout, |client, url| {
+                    client.get(url)
+                })?;
+            deadline.set(deadline.get() + waited);
+            transport::json(response, Some(self.read_cancellation()))
         };
-        let mut page = parse::expanded_replies(response, &more)?;
+        let mut page = if more.children.is_empty() {
+            parse::focused_replies(fetch(more.parent.strip_prefix("t1_"), "0")?, &more)?
+        } else {
+            parse::expanded_replies(&more, |comment| fetch(Some(comment), "8"))?
+        };
         parse::set_reply_sort(&mut page.comments, &more.sort)?;
         parse::set_more_sort(&mut page.more, &more.sort)?;
         Ok(page)
@@ -535,7 +769,13 @@ impl Reddit {
             bail!("This Reddit connection was replaced");
         }
         let mut bytes = Vec::new();
-        Reader::new(self.0.transport.media(url, None)?, IMAGE_LIMIT).read_to_end(&mut bytes)?;
+        let cancelled = self.read_cancellation();
+        Reader::new(
+            self.0.transport.media(url, None, Some(&cancelled))?,
+            IMAGE_LIMIT,
+            Some(cancelled),
+        )
+        .read_to_end(&mut bytes)?;
         Ok(bytes)
     }
 
@@ -543,7 +783,12 @@ impl Reddit {
         if self.0.retired.load(Ordering::Acquire) {
             bail!("This Reddit connection was replaced");
         }
-        decode_still(Reader::new(self.0.transport.media(url, None)?, IMAGE_LIMIT))
+        let cancelled = self.read_cancellation();
+        decode_still(Reader::new(
+            self.0.transport.media(url, None, Some(&cancelled))?,
+            IMAGE_LIMIT,
+            Some(cancelled),
+        ))
     }
 
     pub fn media_url(&self, url: &str) -> Result<String> {
@@ -574,7 +819,7 @@ impl Reddit {
         match status.up {
             _ if status.rejected => Health::Down,
             Some(false) => Health::Down,
-            _ if status.cooldown.is_some_and(|until| Instant::now() < until) => Health::Paused,
+            _ if self.pause().is_some() => Health::Paused,
             Some(true) => Health::Up,
             None => Health::Unknown,
         }
@@ -594,7 +839,10 @@ impl Reddit {
     }
 
     fn get(&self, url: Url) -> Result<Value> {
-        transport::json(self.request(url, "application/json")?)
+        transport::json(
+            self.request(url, "application/json")?,
+            Some(self.read_cancellation()),
+        )
     }
 
     fn request(&self, url: Url, accept: &str) -> Result<wreq::Response> {
@@ -607,6 +855,17 @@ impl Reddit {
         accept: &str,
         request: impl FnOnce(&wreq::Client, &str) -> wreq::RequestBuilder,
     ) -> Result<wreq::Response> {
+        self.send_with_timeout(url, accept, Duration::from_secs(20), request)
+            .map(|(response, _)| response)
+    }
+
+    fn send_with_timeout(
+        &self,
+        url: Url,
+        accept: &str,
+        timeout: Duration,
+        request: impl FnOnce(&wreq::Client, &str) -> wreq::RequestBuilder,
+    ) -> Result<(wreq::Response, Duration)> {
         if self.0.retired.load(Ordering::Acquire) {
             bail!("This Reddit connection was replaced");
         }
@@ -617,9 +876,6 @@ impl Reddit {
             let status = self.0.status.lock();
             if status.rejected {
                 bail!(session::SIGN_IN);
-            }
-            if status.cooldown.is_some_and(|until| Instant::now() < until) {
-                bail!("Reddit requests paused; wait before retrying");
             }
         }
         let cookie = self
@@ -633,52 +889,75 @@ impl Reddit {
             .header("Cookie", cookie)
             .header("Accept", accept)
             .header("User-Agent", USER_AGENT)
-            .timeout(Duration::from_secs(20));
+            .timeout(timeout);
         if accept == home::ACCEPT {
             request = request.header("Referer", self.0.api.as_str());
         }
-        let response = RUNTIME.block_on(request.send()).map_err(|_| {
-            self.record(false);
-            transport::network_error()
-        })?;
+        let request = request.build().map_err(|_| transport::network_error())?;
+        let safe = request.method() == wreq::Method::GET;
+        let retry = self.2.retry_reads && safe;
+        let cancelled = safe.then(|| self.read_cancellation());
+        let mut pending = Some(request);
+        let mut waited = Duration::ZERO;
+        let mut network = Duration::ZERO;
+        let response = loop {
+            let waiting = Instant::now();
+            let admission = self.0.rate.admit(&url, self.2.priority, retry, || {
+                self.0.retired.load(Ordering::Acquire)
+                    || self.2.cancelled.as_ref().is_some_and(|cancel| cancel())
+            })?;
+            waited += waiting.elapsed();
+            if self.needs_sign_in() {
+                bail!(session::SIGN_IN);
+            }
+            let mut outgoing = if retry {
+                pending.as_ref().and_then(wreq::Request::try_clone)
+            } else {
+                pending.take()
+            }
+            .context("Cannot repeat this Reddit request")?;
+            outgoing
+                .headers_mut()
+                .insert("Cookie", self.0.session.header(url.path(), session::now())?);
+            let available = timeout.saturating_sub(network);
+            if available.is_zero() {
+                bail!("Reddit request timed out; retry when ready");
+            }
+            let sent = Instant::now();
+            let response = transport::wait(
+                wreq::RequestBuilder::from_parts(self.0.transport.client.clone(), outgoing)
+                    .timeout(available)
+                    .send(),
+                cancelled.as_ref(),
+            )?
+            .map_err(|_| {
+                self.record(false);
+                transport::network_error()
+            })?;
+            network += sent.elapsed();
+            self.0
+                .rate
+                .observe(&response, &url, sent, admission.sequence, admission.older);
+            self.record(!matches!(response.status().as_u16(), 401 | 500..));
+            if response.status().as_u16() == 429 && retry {
+                continue;
+            }
+            break response;
+        };
         let status = response.status().as_u16();
-        self.observe_limits(&response);
-        self.record(!matches!(status, 401 | 500..));
         match status {
-            200..=299 => Ok(response),
+            200..=299 => Ok((response, waited)),
             401 => {
                 self.0.status.lock().rejected = true;
                 bail!(session::SIGN_IN);
             }
-            403 => bail!(
-                "Reddit denied this request (HTTP 403); check your sign-in or access to this content"
-            ),
+            403 => Err(transport::access_denied(response, cancelled)?.into()),
             404 => Err(NotFound.into()),
             429 => bail!("Reddit rate limit reached; wait before retrying"),
             300..=399 => bail!(
                 "Reddit redirected the request (HTTP {status}); reconnect with A or redtab --signin"
             ),
             _ => bail!("Reddit: HTTP {status}"),
-        }
-    }
-
-    fn observe_limits(&self, response: &wreq::Response) {
-        let number = |name: &str| {
-            response
-                .headers()
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<f64>().ok())
-                .filter(|n| n.is_finite())
-        };
-        if response.status().as_u16() == 429
-            || number("x-ratelimit-remaining").is_some_and(|n| n < 1.0)
-        {
-            let seconds = number("retry-after")
-                .or_else(|| number("x-ratelimit-reset"))
-                .unwrap_or(60.0)
-                .clamp(1.0, 86400.0);
-            self.0.status.lock().cooldown = Some(Instant::now() + Duration::from_secs_f64(seconds));
         }
     }
 }
@@ -691,7 +970,16 @@ fn decode_still(mut r: impl Read) -> Result<DynamicImage> {
         return first_gif_frame(bytes.as_slice().chain(r));
     }
     r.read_to_end(&mut bytes)?;
-    Ok(image::load_from_memory(&bytes)?)
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(STILL_DECODE_LIMIT);
+    reader.limits(limits);
+    reader.decode().map_err(|error| match error {
+        image::ImageError::Limits(_) => {
+            anyhow::anyhow!("Image too large for inline preview; o opens Reddit")
+        }
+        error => error.into(),
+    })
 }
 
 /// A GIF's first frame on its canvas, as `image` decodes GIFs.
@@ -752,6 +1040,22 @@ mod image_tests {
 
     const RED: [u8; 4] = [255, 0, 0, 255];
     const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+    #[test]
+    fn when_an_original_exceeds_inline_memory_limits_it_should_offer_the_reddit_handoff() {
+        // RGB8000×6000 header (144MB), with a deliberately short pixel stream: reject
+        // the declared allocation before attempting to decode those pixels.
+        let png = [
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 31, 64, 0, 0, 23,
+            112, 8, 2, 0, 0, 0, 190, 6, 115, 105, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 96,
+            96, 96, 0, 0, 0, 4, 0, 1, 246, 23, 56, 85, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96,
+            130,
+        ];
+
+        let error = decode_still(png.as_slice()).unwrap_err().to_string();
+
+        assert_eq!(error, "Image too large for inline preview; o opens Reddit");
+    }
 
     #[test]
     fn when_a_gif_streams_its_first_frame_should_decode_without_reading_further() {

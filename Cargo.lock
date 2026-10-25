@@ -3451,7 +3451,6 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "crossterm",
- "flate2",
  "gif",
  "image",
  "libc",
@@ -3471,6 +3470,7 @@ dependencies = [
  "tiny_http",
  "tokio",
  "toml",
+ "toml_edit",
  "tungstenite",
  "unicode-segmentation",
  "unicode-width",
@@ -4453,6 +4453,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

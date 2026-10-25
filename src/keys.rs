@@ -1,6 +1,7 @@
 //! Key bindings: overlays first, then the focused pane.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{App, Focus, Overlay, PickerState, TabKind};
 use crate::model::Sort;
@@ -21,6 +22,42 @@ pub fn handle(app: &mut App, mut key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     if ctrl && key.code == KeyCode::Char('c') {
         app.quit = true;
+        return;
+    }
+    if let Some(scroll) = &mut app.help_scroll {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1),
+            KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
+            _ => app.help_scroll = None,
+        }
+        return;
+    }
+    let typing = matches!(
+        app.overlay,
+        Some(Overlay::Picker(_) | Overlay::Search { .. })
+    ) || (matches!(app.overlay, Some(Overlay::Settings))
+        && app.settings.editing.is_some())
+        || (matches!(app.overlay, Some(Overlay::Experience))
+            && matches!(
+                app.experience.screens.last(),
+                Some(crate::app::experience::Screen::Input(_))
+            ));
+    if key.code == KeyCode::F(1)
+        || (key.code == KeyCode::Char('?')
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+            && !typing)
+    {
+        app.help_scroll = Some(0);
+        return;
+    }
+    if key.code == KeyCode::F(2) && !matches!(app.overlay, Some(Overlay::Settings)) {
+        app.show_settings();
+        return;
+    }
+    if matches!(app.overlay, Some(Overlay::Settings)) {
+        app.settings_key(key);
         return;
     }
     if matches!(app.overlay, Some(Overlay::Experience)) {
@@ -107,9 +144,22 @@ fn delete_word(input: &mut String) {
     input.truncate(kept);
 }
 
+fn backspace(input: &mut String) {
+    if let Some((start, _)) = input.grapheme_indices(true).next_back() {
+        input.truncate(start);
+    }
+}
+
 /// Paste goes only into the picker or search input, so pasted text never runs
 /// commands. In a search, line breaks and tabs become spaces.
 pub fn paste(app: &mut App, text: &str) {
+    if app.help_scroll.is_some() {
+        return;
+    }
+    if matches!(app.overlay, Some(Overlay::Settings)) {
+        app.settings_paste(text);
+        return;
+    }
     if matches!(app.overlay, Some(Overlay::Experience)) {
         app.experience_paste(text);
         return;
@@ -138,6 +188,7 @@ fn handle_overlay(app: &mut App, overlay: Overlay, key: KeyEvent) -> Option<Over
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let typing = !ctrl;
     match overlay {
+        Overlay::Settings => Some(Overlay::Settings),
         Overlay::Experience => Some(Overlay::Experience),
         Overlay::Auth => {
             match key.code {
@@ -187,13 +238,6 @@ fn handle_overlay(app: &mut App, overlay: Overlay, key: KeyEvent) -> Option<Over
             }
             _ => Some(Overlay::Membership { subreddit, join }),
         },
-        Overlay::Help { scroll } => match key.code {
-            KeyCode::Char('j') | KeyCode::Down => Some(Overlay::Help { scroll: scroll + 1 }),
-            KeyCode::Char('k') | KeyCode::Up => Some(Overlay::Help {
-                scroll: scroll.saturating_sub(1),
-            }),
-            _ => None,
-        },
         Overlay::Picker(mut picker) => {
             match (key.code, ctrl) {
                 (KeyCode::Esc, _) => return None,
@@ -209,7 +253,7 @@ fn handle_overlay(app: &mut App, overlay: Overlay, key: KeyEvent) -> Option<Over
                     picker.selected = (picker.selected + 1).min(count.saturating_sub(1));
                 }
                 (KeyCode::Backspace, _) => {
-                    picker.input.pop();
+                    backspace(&mut picker.input);
                     picker.selected = 0;
                 }
                 (KeyCode::Char('u'), true) => {
@@ -261,7 +305,7 @@ fn handle_overlay(app: &mut App, overlay: Overlay, key: KeyEvent) -> Option<Over
                     return None;
                 }
                 KeyCode::Backspace => {
-                    input.pop();
+                    backspace(&mut input);
                 }
                 KeyCode::Char('u') if ctrl => input.clear(),
                 KeyCode::Char(c) if typing => input.push(c),
@@ -324,7 +368,6 @@ fn handle_global(app: &mut App, key: KeyEvent) {
         KeyCode::Esc if on_sub && app.clear_search() => {}
         KeyCode::Esc if app.post_view.is_some() => app.close_post(),
         KeyCode::Esc => app.status = None,
-        KeyCode::Char('?') => app.overlay = Some(Overlay::Help { scroll: 0 }),
         KeyCode::Char('A') => app.show_auth(),
         KeyCode::Char(':') => app.reddit_menu(),
         KeyCode::Char(';') => app.show_actions(),
@@ -340,6 +383,10 @@ fn handle_global(app: &mut App, key: KeyEvent) {
         KeyCode::Char('o') => app.open_in_browser(),
         KeyCode::Char('y') if !ctrl => app.copy_link(),
         KeyCode::Char('m') => app.open_media(),
+        KeyCode::Char('P') if app.video_controls_available() => app.toggle_video_pause(),
+        KeyCode::Char('a') if app.video_controls_available() => app.toggle_video_sound(),
+        KeyCode::Char(',') if app.video_controls_available() => app.seek_video(false),
+        KeyCode::Char('.') if app.video_controls_available() => app.seek_video(true),
         KeyCode::Char('b') => app.toggle_bookmark(),
         KeyCode::Char('\\') => app.toggle_sidebar(),
         KeyCode::Char('S') => app.show_membership(),

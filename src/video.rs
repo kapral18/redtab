@@ -1,6 +1,5 @@
-//! Inline video. ffmpeg decodes PPM frames sized for the area and the UI shows each when
-//! due. kitty terminals get one image per frame under a fixed id; others get a
-//! ratatui-image protocol encoded off the UI thread. ffplay plays sound in its own process.
+//! Inline video: ffmpeg decodes raw frames for the scrolling tile renderer. One
+//! player owns playback; ffplay plays optional sound in its own process.
 
 use std::io::{self, BufRead, BufReader};
 use std::process::{Child, Stdio};
@@ -11,21 +10,16 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use parking_lot::Mutex;
 use ratatui::buffer::{Buffer, CellDiffOption};
-use ratatui::layout::{Rect, Size};
+use ratatui::layout::{Position, Rect, Size};
 use ratatui::style::Color;
-use ratatui_image::picker::{Picker, ProtocolType};
-use ratatui_image::protocol::Protocol;
-use ratatui_image::{FontSize, Resize};
+use ratatui_image::FontSize;
 
 const FPS: f64 = 24.0;
-/// Largest decoded frame: every frame crosses the terminal connection.
-const MAX_FRAME: (u32, u32) = (1280, 720);
-/// Sixel encoding takes about 45 ms at 1280×720, longer than a frame lasts.
-const MAX_SIXEL_FRAME: (u32, u32) = (640, 360);
-/// Most pixels in a kitty frame; the terminal scales it to its cells. A 461×576 GIF frame
-/// (about 420 KB zlib, ~15 fps) put 6 MB/s through tmux, with tmux at 33% and Ghostty at
-/// 126% CPU; at this size, 1-2 MB/s with 9-14% and 75%.
-const MAX_KITTY_PIXELS: f64 = 120_000.0;
+/// Decode at most this width; the pixel budget bounds tall frames.
+const MAX_FRAME_WIDTH: u32 = 1280;
+/// Pixel budget shared by decoder and tiled/native output; portrait frames receive
+/// the same source detail as landscape frames.
+pub(crate) const MAX_VIDEO_PIXELS: f64 = 921_600.0;
 /// A kitty frame comes from a rendition at least a third larger than it, so the stream's
 /// own compression shows less in the picture the terminal enlarges.
 const RENDITION_HEADROOM: f64 = 0.75;
@@ -45,17 +39,10 @@ pub struct Frame {
 }
 
 pub enum Pixels {
-    /// zlib-compressed RGB, ready for the kitty protocol.
-    Zlib(Vec<u8>),
-    Image(Protocol),
-}
-
-#[derive(Clone)]
-pub enum Output {
-    Kitty,
-    /// Any other protocol, for an area this many cells big; a frame that is not wider
-    /// than tall gets at most the last many rows (its cells are fixed once encoded).
-    Image(Picker, Size, u16),
+    /// Lossless PNG, ready for the kitty protocol.
+    Png(Vec<u8>),
+    /// Unencoded frames use scrolling tiles on every terminal protocol.
+    Raw(Arc<image::DynamicImage>),
 }
 
 /// What ffmpeg's log said about the stream.
@@ -81,8 +68,8 @@ struct Decoder {
 }
 
 impl Decoder {
-    fn spawn(url: &str, start: f64, frame_box: (u32, u32), output: Output) -> io::Result<Self> {
-        let filter = video_filter(frame_box, &output);
+    fn spawn(url: &str, start: f64, frame_box: (u32, u32)) -> io::Result<Self> {
+        let filter = video_filter(frame_box);
         let mut child = crate::media::local_command("ffmpeg")
             .args([
                 "-nostdin",
@@ -110,26 +97,13 @@ impl Decoder {
             let mut first = FirstFrame::default();
             while let Ok(Some((width, height, rgb))) = read_ppm(&mut out) {
                 let same_as_first = first.same(&rgb);
-                let pixels = match &output {
-                    Output::Kitty => {
-                        let pixels = Pixels::Zlib(zlib(&rgb));
-                        first.keep(rgb);
-                        pixels
-                    }
-                    Output::Image(picker, cells, _) => {
-                        if first.wants() {
-                            first.keep(rgb.clone());
-                        }
-                        let Some(img) = image::RgbImage::from_raw(width, height, rgb) else {
-                            return;
-                        };
-                        let image = image::DynamicImage::ImageRgb8(img);
-                        match picker.new_protocol(image, *cells, Resize::Fit(None)) {
-                            Ok(protocol) => Pixels::Image(protocol),
-                            Err(_) => return,
-                        }
-                    }
+                if first.wants() {
+                    first.keep(rgb.clone());
+                }
+                let Some(img) = image::RgbImage::from_raw(width, height, rgb) else {
+                    return;
                 };
+                let pixels = Pixels::Raw(Arc::new(image::DynamicImage::ImageRgb8(img)));
                 let frame = Frame {
                     width,
                     height,
@@ -339,14 +313,6 @@ fn ppm_number(r: &mut impl BufRead) -> io::Result<u32> {
             return Ok(value);
         }
     }
-}
-
-fn zlib(raw: &[u8]) -> Vec<u8> {
-    use std::io::Write as _;
-    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
-    // Writing into a Vec cannot fail.
-    let _ = enc.write_all(raw);
-    enc.finish().unwrap_or_default()
 }
 
 /// Media time against wall time.
@@ -612,73 +578,40 @@ pub struct Player {
     notice: Option<(String, bool)>,
 }
 
-/// Largest frame, in pixels, for `area` at `font`, within the output's cap.
-fn frame_box(area: Size, font: FontSize, output: &Output) -> (u32, u32) {
-    let max = match output {
-        Output::Image(picker, ..) if picker.protocol_type() == ProtocolType::Sixel => {
-            MAX_SIXEL_FRAME
-        }
-        _ => MAX_FRAME,
-    };
+/// Full document geometry, independent of its visible slice. The pixel budget in
+/// the decoder filter bounds memory even for tall reservations.
+fn frame_box(area: Size, font: FontSize) -> (u32, u32) {
     (
-        (u32::from(area.width) * u32::from(font.width)).clamp(2, max.0),
-        (u32::from(area.height) * u32::from(font.height)).clamp(2, max.1),
+        (u32::from(area.width) * u32::from(font.width)).clamp(2, MAX_FRAME_WIDTH),
+        (u32::from(area.height) * u32::from(font.height)).max(2),
     )
 }
 
-/// ffmpeg's filters: `FPS` frames fitted into `frame_box` by their shape. For kitty, which
-/// scales frames itself, also within `MAX_KITTY_PIXELS` of their own (so a tall or square
-/// frame gets the same detail as a wide one) and never above the source's size. For other
-/// protocols a frame not wider than tall fits `tall_height`, as a still picture would.
-/// eof_action=pass keeps the last frame of a stream shorter than one output frame (a
-/// one-frame GIF with a 1 cs delay), which `fps` would otherwise drop.
-fn video_filter(frame_box: (u32, u32), output: &Output) -> String {
-    let (w, h) = frame_box;
-    let fit = format!("min({w}/iw,{h}/ih)");
-    let scale = match output {
-        Output::Kitty => format!("min(1,min({fit},sqrt({MAX_KITTY_PIXELS}/(iw*ih))))"),
-        Output::Image(..) => {
-            let tall = tall_height(frame_box, output);
-            format!("if(gt(iw,ih),{fit},min({w}/iw,{tall}/ih))")
-        }
-    };
+/// Preserve source detail up to the displayed size and shared pixel budget.
+/// eof_action=pass retains one-frame GIFs shorter than one output frame.
+fn video_filter((w, h): (u32, u32)) -> String {
+    let scale = format!("min(1,min(min({w}/iw,{h}/ih),sqrt({MAX_VIDEO_PIXELS}/(iw*ih))))");
     format!(
         "fps={FPS}:eof_action=pass,scale=w='max(2,trunc(iw*{scale}))':h='max(2,trunc(ih*{scale}))':flags=bilinear"
     )
 }
 
-/// How high, in pixels, a frame not wider than tall may be decoded: its tall rows where
-/// frames show at their decoded size, the box's height for kitty, which scales them.
-fn tall_height(frame_box: (u32, u32), output: &Output) -> u32 {
-    match output {
-        Output::Kitty => frame_box.1,
-        Output::Image(picker, _, rows) => {
-            (u32::from(*rows) * u32::from(picker.font_size().height)).clamp(2, frame_box.1)
-        }
-    }
-}
-
 impl Player {
     /// Plays `url` (absolute) for an `area` cells big at `font`, from `resume`.
-    pub fn start(
-        url: String,
-        area: Size,
-        font: FontSize,
-        output: Output,
-        resume: Resume,
-        now: Instant,
-    ) -> Self {
-        let frame_box = frame_box(area, font, &output);
-        let tall = tall_height(frame_box, &output);
-        let pixels = matches!(output, Output::Kitty).then_some(MAX_KITTY_PIXELS);
+    pub fn start(url: String, area: Size, font: FontSize, resume: Resume, now: Instant) -> Self {
+        let frame_box = frame_box(area, font);
         let (tx, rx) = sync_channel(1);
         let target = url.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(resolve(&target, frame_box, tall, pixels));
+            let _ = tx.send(resolve(
+                &target,
+                frame_box,
+                frame_box.1,
+                Some(MAX_VIDEO_PIXELS),
+            ));
         });
-        let spawn: Spawn = Box::new(move |sources: &Sources, at| {
-            Decoder::spawn(&sources.video, at, frame_box, output.clone())
-        });
+        let spawn: Spawn =
+            Box::new(move |sources: &Sources, at| Decoder::spawn(&sources.video, at, frame_box));
         Self::new(url, area, Some(rx), None, spawn, resume, now)
     }
 
@@ -1179,6 +1112,23 @@ impl Player {
         )
     }
 
+    #[cfg(test)]
+    pub fn unavailable(url: &str, area: Size) -> Self {
+        Self::new(
+            url.into(),
+            area,
+            None,
+            Some(Sources {
+                video: url.into(),
+                audio: None,
+                audio_in_file: false,
+            }),
+            Box::new(|_, _| Err(io::Error::other("fixture decoder unavailable"))),
+            Resume::default(),
+            Instant::now(),
+        )
+    }
+
     /// ffplay failing to start, as the sound would see it.
     #[cfg(test)]
     pub fn fail_sound(&mut self) {
@@ -1245,12 +1195,6 @@ const PLACEHOLDER: char = '\u{10EEEE}';
 
 pub const KITTY_MAX_ROWS: u16 = DIACRITICS.len() as u16;
 
-/// This process's kitty image id, so redtabs in several panes don't replace each other's
-/// frames. The high byte is 0, so the cell color carries the whole id.
-pub fn kitty_id() -> u32 {
-    (std::process::id() & 0x00FF_FFFF).max(1)
-}
-
 /// Most bytes in one tmux passthrough: tmux resets the terminal's modes, showing the
 /// cursor, after each one, so a frame goes in as few as fit well under tmux's default
 /// 1 MiB `input-buffer-size` (longer sequences are dropped).
@@ -1259,7 +1203,7 @@ const PASSTHROUGH_MAX: usize = 256 * 1024;
 /// Sends `frame` as kitty image `id`, replacing the last, with a virtual `cols`×`rows`
 /// placement; inside tmux the chunks go in as few passthroughs as `PASSTHROUGH_MAX` allows.
 pub fn kitty_transmit(id: u32, frame: &Frame, cols: u16, rows: u16, tmux: bool) -> String {
-    let Pixels::Zlib(data) = &frame.pixels else {
+    let Pixels::Png(data) = &frame.pixels else {
         return String::new();
     };
     let escape = if tmux { "\x1b\x1b" } else { "\x1b" };
@@ -1278,7 +1222,7 @@ pub fn kitty_transmit(id: u32, frame: &Frame, cols: u16, rows: u16, tmux: bool) 
             // p=1: each frame replaces the one virtual placement. Without an id Ghostty
             // kept the first one's size, so the next post's video showed in the last's box.
             chunk_escape.push_str(&format!(
-                "a=T,U=1,i={id},p=1,f=24,o=z,t=d,s={},v={},c={cols},r={rows},q=2,",
+                "a=T,U=1,i={id},p=1,f=100,t=d,s={},v={},c={cols},r={rows},q=2,",
                 frame.width, frame.height
             ));
         }
@@ -1307,13 +1251,20 @@ pub fn kitty_transmit(id: u32, frame: &Frame, cols: u16, rows: u16, tmux: bool) 
 
 /// Fills `area` with kitty placeholder cells; `transmit` rides in the first cell so it
 /// goes out with the draw.
-pub fn kitty_cells(buf: &mut Buffer, area: Rect, id: u32, transmit: Option<String>) {
-    let [_, r, g, b] = id.to_be_bytes();
-    let rows = area.height.min(KITTY_MAX_ROWS);
+pub fn kitty_cells(
+    buf: &mut Buffer,
+    area: Rect,
+    id: u32,
+    source: Position,
+    transmit: Option<String>,
+) {
+    let [extra, r, g, b] = id.to_be_bytes();
+    let rows = area.height.min(KITTY_MAX_ROWS.saturating_sub(source.y));
+    let cols = area.width.min(KITTY_MAX_ROWS.saturating_sub(source.x));
     let mut transmit = transmit;
     let mut symbol = String::new();
     for y in 0..rows {
-        for x in 0..area.width {
+        for x in 0..cols {
             let Some(cell) = buf.cell_mut((area.x + x, area.y + y)) else {
                 continue;
             };
@@ -1326,8 +1277,9 @@ pub fn kitty_cells(buf: &mut Buffer, area: Rect, id: u32, transmit: Option<Strin
             text.push(PLACEHOLDER);
             // Later cells of a row continue from the first one.
             if x == 0 {
-                text.push(DIACRITICS[usize::from(y)]);
-                text.push(DIACRITICS[0]);
+                text.push(DIACRITICS[usize::from(source.y + y)]);
+                text.push(DIACRITICS[usize::from(source.x)]);
+                text.push(DIACRITICS[usize::from(extra)]);
             }
             cell.set_symbol(text)
                 .set_fg(Color::Rgb(r, g, b))
@@ -1460,7 +1412,7 @@ mod tests {
 
     /// The first frame ffmpeg decodes from a one-frame `w`×`h` GIF, or None without ffmpeg
     /// (an optional dependency).
-    fn first_frame(w: u16, h: u16, frame_box: (u32, u32), output: Output) -> Option<(u32, u32)> {
+    fn first_frame(w: u16, h: u16, frame_box: (u32, u32)) -> Option<(u32, u32)> {
         if std::process::Command::new("ffmpeg")
             .arg("-version")
             .output()
@@ -1490,7 +1442,7 @@ mod tests {
             ))
             .unwrap();
         drop(encoder);
-        let decoder = Decoder::spawn(path.to_str().unwrap(), 0.0, frame_box, output).unwrap();
+        let decoder = Decoder::spawn(path.to_str().unwrap(), 0.0, frame_box).unwrap();
         let frame = decoder
             .frames
             .recv_timeout(Duration::from_secs(20))
@@ -1501,70 +1453,40 @@ mod tests {
     }
 
     #[test]
-    fn kitty_frames_get_the_same_detail_whatever_their_shape_and_never_grow() {
-        let decoded = |w, h| first_frame(w, h, (856, 1170), Output::Kitty);
+    fn video_width_regression_card_decode_should_retain_display_resolution() {
+        let Some(actual) = first_frame(1280, 720, (1280, 720)) else {
+            return;
+        };
+        assert_eq!(actual, (1280, 720));
+    }
+
+    #[test]
+    fn video_frames_should_keep_source_detail_up_to_the_display_size() {
+        let decoded = |w, h| first_frame(w, h, (856, 1170));
         if decoded(2, 2).is_none() {
             return;
         }
 
-        // About 120,000 pixels each, in the source's shape: r/educationalgifs' 16:9,
-        // portrait and square GIFs.
-        assert_eq!(decoded(1280, 720), Some((461, 259)));
-        assert_eq!(decoded(540, 674), Some((310, 387)));
-        assert_eq!(decoded(900, 900), Some((346, 346)));
+        assert_eq!(decoded(1280, 720), Some((856, 481)));
+        assert_eq!(decoded(540, 674), Some((540, 674)));
+        assert_eq!(decoded(900, 900), Some((856, 856)));
         // Smaller than that: as it is; the terminal enlarges it.
         assert_eq!(decoded(100, 80), Some((100, 80)));
     }
 
     #[test]
-    #[allow(deprecated)]
-    fn a_frame_encoded_for_cells_should_keep_within_its_tall_rows_unless_wide() {
-        let mut picker = Picker::from_fontsize(FontSize::new(8, 16));
-        picker.set_protocol_type(ProtocolType::Iterm2);
-        // A 98×45-cell box is 784×720 px; tall frames get 25 rows, 400 px.
-        let decoded = |w, h| {
-            first_frame(
-                w,
-                h,
-                (784, 720),
-                Output::Image(picker.clone(), Size::new(98, 45), 25),
-            )
-        };
-        if decoded(2, 2).is_none() {
+    fn video_frames_should_keep_portrait_width_for_scrolling() {
+        let Some(actual) = first_frame(1080, 1920, (608, 1088)) else {
             return;
-        }
-
-        assert_eq!(decoded(1080, 1920), Some((225, 400)));
-        assert_eq!(decoded(1920, 1080), Some((784, 441)));
+        };
+        assert_eq!(actual, (608, 1080));
     }
 
     #[test]
-    #[allow(deprecated)]
-    fn frames_are_sized_for_the_area_and_only_sixel_kept_small() {
-        let font = FontSize::new(16, 36);
-        let area = Size::new(100, 20);
-        let image = |protocol| {
-            let mut picker = Picker::from_fontsize(font);
-            picker.set_protocol_type(protocol);
-            Output::Image(picker, area, area.height)
-        };
-
+    fn video_decode_box_should_follow_full_document_height() {
         assert_eq!(
-            frame_box(Size::new(10, 5), font, &Output::Kitty),
-            (160, 180)
-        );
-        assert_eq!(frame_box(area, font, &Output::Kitty), (1280, 720));
-        assert_eq!(
-            frame_box(area, font, &image(ProtocolType::Iterm2)),
-            (1280, 720)
-        );
-        assert_eq!(
-            frame_box(area, font, &image(ProtocolType::Halfblocks)),
-            (1280, 720)
-        );
-        assert_eq!(
-            frame_box(area, font, &image(ProtocolType::Sixel)),
-            (640, 360)
+            frame_box(Size::new(100, 100), FontSize::new(16, 36)),
+            (1280, 3600)
         );
     }
 
@@ -1573,14 +1495,14 @@ mod tests {
         let frame = Frame {
             width: 2,
             height: 1,
-            pixels: Pixels::Zlib(vec![7; 5000]),
+            pixels: Pixels::Png(vec![7; 5000]),
             same_as_first: false,
         };
         let plain = kitty_transmit(42, &frame, 3, 2, false);
         let escapes: Vec<&str> = plain.split("\x1b\\").filter(|s| !s.is_empty()).collect();
         assert_eq!(escapes.len(), 2, "5000 bytes are 6668 base64 characters");
         assert!(
-            escapes[0].starts_with("\x1b_Ga=T,U=1,i=42,p=1,f=24,o=z,t=d,s=2,v=1,c=3,r=2,q=2,m=1;")
+            escapes[0].starts_with("\x1b_Ga=T,U=1,i=42,p=1,f=100,t=d,s=2,v=1,c=3,r=2,q=2,m=1;")
         );
         assert!(escapes[1].starts_with("\x1b_Gm=0;"));
         assert!(
@@ -1606,7 +1528,7 @@ mod tests {
 
         // A frame too big for one passthrough splits between whole escapes.
         let big = Frame {
-            pixels: Pixels::Zlib(vec![7; 600_000]),
+            pixels: Pixels::Png(vec![7; 600_000]),
             ..frame
         };
         let plain = kitty_transmit(42, &big, 3, 2, false);
@@ -1628,15 +1550,44 @@ mod tests {
     }
 
     #[test]
+    fn kitty_cells_should_encode_the_full_id_like_the_upstream_protocol() {
+        use ratatui::widgets::Widget;
+        let id = 0xab12_3456;
+        let protocol = ratatui_image::protocol::Protocol::Kitty(
+            ratatui_image::protocol::kitty::Kitty::new(
+                image::DynamicImage::new_rgba8(1, 1),
+                Size::new(1, 1),
+                id,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
+        let mut reference = Buffer::empty(Rect::new(0, 0, 1, 1));
+        ratatui_image::Image::new(&protocol).render(reference.area, &mut reference);
+        let mut actual = Buffer::empty(reference.area);
+        kitty_cells(&mut actual, reference.area, id, Position::ORIGIN, None);
+        let (_, suffix) = reference[(0, 0)].symbol().split_once('\u{10EEEE}').unwrap();
+        assert_eq!(actual[(0, 0)].symbol(), format!("\u{10EEEE}{suffix}"));
+        assert_eq!(actual[(0, 0)].fg, reference[(0, 0)].fg);
+    }
+
+    #[test]
     fn kitty_cells_carry_the_id_the_rows_and_the_frame_once() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 4, 3));
         let id = 0x0001_0203;
-        kitty_cells(&mut buf, Rect::new(1, 0, 2, 2), id, Some("DATA".into()));
+        kitty_cells(
+            &mut buf,
+            Rect::new(1, 0, 2, 2),
+            id,
+            Position::ORIGIN,
+            Some("DATA".into()),
+        );
         let cell = |x, y| buf.cell((x, y)).unwrap();
 
-        assert_eq!(cell(1, 0).symbol(), "DATA\u{10EEEE}\u{305}\u{305}");
+        assert_eq!(cell(1, 0).symbol(), "DATA\u{10EEEE}\u{305}\u{305}\u{305}");
         assert_eq!(cell(2, 0).symbol(), "\u{10EEEE}");
-        assert_eq!(cell(1, 1).symbol(), "\u{10EEEE}\u{30D}\u{305}");
+        assert_eq!(cell(1, 1).symbol(), "\u{10EEEE}\u{30D}\u{305}\u{305}");
         assert_eq!(cell(2, 1).symbol(), "\u{10EEEE}");
         for (x, y) in [(1, 0), (2, 0), (1, 1), (2, 1)] {
             assert_eq!(
@@ -1731,7 +1682,7 @@ mod tests {
         Frame {
             width: 1,
             height: 1,
-            pixels: Pixels::Zlib(Vec::new()),
+            pixels: Pixels::Png(Vec::new()),
             same_as_first: false,
         }
     }
@@ -2384,19 +2335,19 @@ CMAF_720.m3u8
         assert_eq!(pick((600, 2000)).0, "CMAF_360.m3u8");
         // Larger than every rendition: the largest.
         assert_eq!(pick((4000, 3000)).0, "CMAF_720.m3u8");
-        // kitty decodes 120,000 pixels at most: in a full-width post 640×360 is enough.
-        let kitty = |master| {
-            pick_rendition(master, (856, 1170), 1170, Some(MAX_KITTY_PIXELS))
+        // The display budget retains enough detail to choose the 720p rendition.
+        let bounded = |master| {
+            pick_rendition(master, (856, 1170), 1170, Some(MAX_VIDEO_PIXELS))
                 .unwrap()
                 .0
         };
-        assert_eq!(kitty(MASTER), "CMAF_360.m3u8");
+        assert_eq!(bounded(MASTER), "CMAF_720.m3u8");
         assert_eq!(pick((856, 1170)).0, "CMAF_720.m3u8");
-        // 480×270 holds about 120,000 pixels: too close to them, 640×360 is taken.
+        // If both streams are smaller than the display, choose the larger one.
         let with_270 = "#EXTM3U\n\
             #EXT-X-STREAM-INF:BANDWIDTH=300000,RESOLUTION=480x270\nCMAF_270.m3u8\n\
             #EXT-X-STREAM-INF:BANDWIDTH=500000,RESOLUTION=640x360\nCMAF_360.m3u8\n";
-        assert_eq!(kitty(with_270), "CMAF_360.m3u8");
+        assert_eq!(bounded(with_270), "CMAF_360.m3u8");
     }
 
     #[test]
@@ -2418,5 +2369,63 @@ CMAF_720.m3u8
         let split =
             "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4,\nseg1.m4s\n#EXTINF:4,\nseg2.m4s\n";
         assert_eq!(media_file(split), None);
+    }
+    #[test]
+    fn when_video_waits_for_graphics_the_input_poll_should_not_spin_on_overdue_frames() {
+        use crate::app::App;
+        use crate::card_image::Key;
+        use crate::config::Config;
+        use crate::reddit::Reddit;
+        use crate::worker::Pool;
+        use ratatui_image::picker::Picker;
+        let directory = tempfile::tempdir().unwrap();
+        let start = Instant::now() - Duration::from_secs(1);
+        let (mut player, runs) = fed_player(Some(10.0), start);
+        runs.borrow()[0].1.send(blank()).unwrap();
+        runs.borrow()[0].1.send(blank()).unwrap();
+        player.tick(start);
+        assert_eq!(player.wake_in(Instant::now()), Some(Duration::ZERO));
+        let reddit = Reddit::test_at("http://127.0.0.1:9", false);
+        let (pool, _messages) = Pool::start(reddit.clone(), 1, None);
+        let picker = Picker::halfblocks();
+        let mut app = App::new(
+            Config::default(),
+            pool,
+            reddit,
+            directory.path().join("state.json"),
+            picker.clone(),
+        );
+        app.video = Some(player);
+        let image = Arc::new(image::DynamicImage::new_rgb8(16, 16));
+        let key = Key::new("lag-probe", &picker, Size::new(2, 1), (16, 16), 0, 1, 0);
+        app.card_renderer.begin();
+        app.card_renderer.tile(
+            key,
+            &image,
+            &picker,
+            crate::card_image::Preparation::Refresh,
+        );
+        app.card_renderer.finish();
+        assert!(app.card_renderer.pending());
+        assert!(
+            app.wake_in() >= Duration::from_millis(10),
+            "cannot advance a frame while graphics are pending; an overdue deadline must not spin"
+        );
+        let (input, events) = std::sync::mpsc::channel();
+        input
+            .send(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('q'),
+                crossterm::event::KeyModifiers::NONE,
+            ))
+            .unwrap();
+        let key = events.recv_timeout(app.wake_in()).unwrap();
+        crate::keys::handle(&mut app, key);
+        assert!(app.quit, "graphics preparation must not consume quit input");
+        app.card_renderer.clear();
+        assert_eq!(
+            app.wake_in(),
+            Duration::ZERO,
+            "ready graphics allow the overdue frame immediately"
+        );
     }
 }

@@ -237,6 +237,27 @@ fn empty_listing() -> Value {
 }
 
 #[test]
+fn membership_changes_should_not_write_through_a_different_signed_in_account() {
+    let writes = std::sync::Arc::new(AtomicUsize::new(0));
+    let actual = writes.clone();
+    let fixture = Fixture::new(move |request| {
+        if request.url == "/api/me.json" {
+            return Reply::json(json!({"data":{"name":"someoneelse","modhash":"fixture-csrf"}}));
+        }
+        assert_eq!(request.url, "/api/subscribe");
+        actual.fetch_add(1, Ordering::SeqCst);
+        Reply::json(json!({}))
+    });
+    let reddit = fixture.saved_reddit(&saved_export("reader", "reader"));
+
+    for join in [true, false] {
+        let result = reddit.set_subscription("rust", join);
+        assert!(result.unwrap_err().to_string().contains("account changed"));
+    }
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn when_community_membership_changes_it_should_mutate_the_server_for_join_leave_and_rejoin() {
     let joined = Arc::new(AtomicBool::new(false));
     let actual = joined.clone();
@@ -244,7 +265,7 @@ fn when_community_membership_changes_it_should_mutate_the_server_for_join_leave_
         "/api/me.json" => {
             assert_eq!(request.method, "GET");
             assert!(!request.headers.contains_key("x-modhash"));
-            Reply::json(json!({"kind":"t2","data":{"name":"reader","modhash":"fixture-csrf"}}))
+            Reply::json(json!({"kind":"t2","data":{"name":"READER","modhash":"fixture-csrf"}}))
         }
         "/api/subscribe" => {
             assert_eq!(request.method, "POST");
@@ -267,7 +288,7 @@ fn when_community_membership_changes_it_should_mutate_the_server_for_join_leave_
         }
         _ => panic!("unexpected membership request"),
     });
-    let reddit = fixture.reddit();
+    let reddit = fixture.saved_reddit(&saved_export("reader", "reader"));
 
     reddit.set_subscription("armenia", true).unwrap();
     assert!(joined.load(Ordering::SeqCst));
@@ -434,6 +455,37 @@ fn home_post(id: &str, subreddit: &str) -> Value {
 }
 
 #[test]
+fn when_nsfw_is_disabled_streamed_callbacks_should_only_publish_visible_posts() {
+    let fixture = Fixture::new(|_| {
+        let mut hidden = home_post("hidden", "s");
+        hidden["data"]["over_18"] = json!(true);
+        Reply::json(
+            json!({"kind":"Listing","data":{"children":[hidden,home_post("safe","s")],"after":null}}),
+        )
+    });
+    let mut published = Vec::new();
+
+    let actual = fixture
+        .reddit()
+        .listing_progress("s", Sort::Hot, TimeRange::Day, None, &mut |event| {
+            if let ListingEvent::Post(post) = event {
+                published.push(post.id.clone());
+            }
+        })
+        .unwrap();
+
+    assert_eq!(published, ["safe"]);
+    assert_eq!(
+        actual
+            .posts
+            .iter()
+            .map(|post| post.id.as_str())
+            .collect::<Vec<_>>(),
+        ["safe"]
+    );
+}
+
+#[test]
 fn when_best_home_loads_it_should_preserve_browser_recommendations_and_order() {
     let fixture = Fixture::new(|request| {
         let url = Url::parse(&format!("http://fixture{}", request.url)).unwrap();
@@ -446,9 +498,9 @@ fn when_best_home_loads_it_should_preserve_browser_recommendations_and_order() {
                     url.query_pairs()
                         .any(|(key, value)| key == "sort" && value == "BEST")
                 );
-                Reply { status: 200, body: r#"<shreddit-post id="t3_recommended" recommendation-source="discovery"></shreddit-post><shreddit-ad-post id="t3_ad"></shreddit-ad-post><shreddit-post id="t3_joined"></shreddit-post><faceplate-partial id="feed-next-page-partial" src="/svc/shreddit/feeds/home-feed?sort=BEST&amp;after=t3_joined&amp;cursor=opaque%26next"></faceplate-partial>"#.into(), headers: vec![] }
+                Reply { status: 200, body: r#"<shreddit-post id="t3_recommended" recommendation-source="discovery"></shreddit-post><shreddit-ad-post id="t3_ad"></shreddit-ad-post><shreddit-post id="t3_joined"></shreddit-post><shreddit-post id="t3_gonea"></shreddit-post><shreddit-post id="t3_goneb"></shreddit-post><faceplate-partial id="feed-next-page-partial" src="/svc/shreddit/feeds/home-feed?sort=BEST&amp;after=t3_joined&amp;cursor=opaque%26next"></faceplate-partial>"#.into(), headers: vec![] }
             }
-            "/by_id/t3_recommended,t3_joined.json" => Reply::json(
+            "/by_id/t3_recommended,t3_joined,t3_gonea,t3_goneb.json" => Reply::json(
                 json!({"kind":"Listing","data":{"children":[home_post("joined","rust"),home_post("recommended","unjoined")],"after":null}}),
             ),
             _ => panic!("unexpected Home request: {}", url.path()),
@@ -574,14 +626,503 @@ fn when_rate_limited_requests_should_pause_without_retrying() {
     );
     assert!(
         reddit
-            .search("rust", "x", None)
+            .request(reddit.0.api.join(home::PATH).unwrap(), home::ACCEPT)
             .unwrap_err()
             .to_string()
             .contains("paused")
     );
     assert_eq!(requests.load(Ordering::Relaxed), 1);
     assert_eq!(reddit.health(), Health::Paused);
-    assert!(reddit.0.status.lock().cooldown.unwrap() > Instant::now() + Duration::from_secs(500));
+    assert!(reddit.pause().unwrap().seconds > 500);
+}
+
+#[test]
+fn when_json_and_home_have_separate_budgets_home_should_not_wait_for_json() {
+    let fixture = Fixture::new(|_| Reply {
+        status: 200,
+        body: empty_listing().to_string(),
+        headers: vec![
+            ("X-Ratelimit-Remaining".into(), "2".into()),
+            ("X-Ratelimit-Reset".into(), "1.2".into()),
+        ],
+    });
+    let reddit = fixture.reddit();
+    reddit.search("rust", "first", None).unwrap();
+    let url = reddit.0.api.join(home::PATH).unwrap();
+
+    let started = Instant::now();
+    reddit.request(url, home::ACCEPT).unwrap();
+
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "Home inherited JSON's600ms quota interval: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn when_json_and_home_have_separate_budgets_home_should_not_reset_json() {
+    let fixture = Fixture::new(|request| Reply {
+        status: 200,
+        body: empty_listing().to_string(),
+        headers: vec![
+            (
+                "X-Ratelimit-Remaining".into(),
+                if request.url.starts_with(home::PATH) {
+                    "100"
+                } else {
+                    "2"
+                }
+                .into(),
+            ),
+            ("X-Ratelimit-Reset".into(), "1.2".into()),
+        ],
+    });
+    let reddit = fixture
+        .reddit()
+        .for_worker(Priority::Background, true, || false);
+    reddit.search("rust", "first", None).unwrap();
+    reddit
+        .request(reddit.0.api.join(home::PATH).unwrap(), home::ACCEPT)
+        .unwrap();
+
+    let started = Instant::now();
+    reddit.search("rust", "next", None).unwrap();
+
+    assert!(
+        started.elapsed() >= Duration::from_millis(450),
+        "Home's budget erased JSON pacing: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn when_a_response_takes_longer_than_base_pacing_the_next_request_should_not_wait_again() {
+    let fixture = Fixture::new(|_| {
+        std::thread::sleep(Duration::from_millis(600));
+        Reply {
+            status: 200,
+            body: empty_listing().to_string(),
+            headers: vec![
+                ("X-Ratelimit-Remaining".into(), "100".into()),
+                ("X-Ratelimit-Reset".into(), "1".into()),
+            ],
+        }
+    });
+    let mut reddit = fixture.reddit();
+    Arc::get_mut(&mut reddit.0).unwrap().rate = rate::Rate::new(Duration::from_millis(500));
+    reddit.search("rust", "first", None).unwrap();
+
+    let (_, waited) = reddit
+        .send_with_timeout(
+            reddit.0.api.join("next.json").unwrap(),
+            "application/json",
+            Duration::from_secs(5),
+            |client, url| client.get(url),
+        )
+        .unwrap();
+
+    assert!(
+        waited < Duration::from_millis(300),
+        "pacing added after response: {waited:?}"
+    );
+}
+
+#[test]
+fn when_a_new_response_reports_recovered_quota_old_slow_pacing_should_not_stick() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let fixture = Fixture::new(move |_| Reply {
+        status: 200,
+        body: empty_listing().to_string(),
+        headers: if count.fetch_add(1, Ordering::SeqCst) == 0 {
+            vec![
+                ("X-Ratelimit-Remaining".into(), "2".into()),
+                ("X-Ratelimit-Reset".into(), "1.2".into()),
+            ]
+        } else {
+            vec![
+                ("X-Ratelimit-Remaining".into(), "100".into()),
+                ("X-Ratelimit-Reset".into(), "1".into()),
+            ]
+        },
+    });
+    let reddit = fixture
+        .reddit()
+        .for_worker(Priority::Background, true, || false);
+    reddit.search("rust", "first", None).unwrap();
+    reddit.search("rust", "second", None).unwrap();
+
+    let started = Instant::now();
+    reddit.search("rust", "third", None).unwrap();
+
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "recovered budget kept an old600ms interval: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn when_startup_reports_quota_initial_navigation_should_use_reserved_capacity() {
+    let fixture = Fixture::new(|_| Reply {
+        status: 200,
+        body: empty_listing().to_string(),
+        headers: vec![
+            ("X-Ratelimit-Remaining".into(), "10".into()),
+            ("X-Ratelimit-Reset".into(), "30".into()),
+        ],
+    });
+    let reddit = fixture.reddit();
+    reddit.subscriptions().unwrap();
+    let visible = reddit.for_worker(Priority::Listing, true, || false);
+    let started = Instant::now();
+
+    visible
+        .listing("rust", Sort::Hot, TimeRange::Day, None)
+        .unwrap();
+
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "initial navigation inherited the full three-second quota interval: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn when_every_response_repeats_quota_navigation_should_not_get_unlimited_bursts() {
+    let fixture = Fixture::new(|_| Reply {
+        status: 200,
+        body: empty_listing().to_string(),
+        headers: vec![
+            ("X-Ratelimit-Remaining".into(), "10".into()),
+            ("X-Ratelimit-Reset".into(), "30".into()),
+        ],
+    });
+    let reddit = fixture.reddit();
+    reddit.subscriptions().unwrap();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let visible = reddit.for_worker(Priority::Listing, true, move || Instant::now() >= deadline);
+    visible.search("rust", "first", None).unwrap();
+    visible.search("rust", "second", None).unwrap();
+    visible.search("rust", "third", None).unwrap();
+
+    let actual = visible.search("rust", "fourth", None);
+
+    assert_eq!(actual.unwrap_err().to_string(), REQUEST_CANCELLED);
+}
+
+#[test]
+fn when_a_worker_waits_for_a_long_quota_interval_the_wait_should_be_visible() {
+    let fixture = Fixture::new(|_| Reply {
+        status: 200,
+        body: empty_listing().to_string(),
+        headers: vec![
+            ("X-Ratelimit-Remaining".into(), "2".into()),
+            ("X-Ratelimit-Reset".into(), "30".into()),
+        ],
+    });
+    let reddit = fixture.reddit();
+    reddit.search("rust", "first", None).unwrap();
+    reddit.search("rust", "second", None).unwrap();
+    reddit.search("rust", "third", None).unwrap();
+    let (entered, waiting) = std::sync::mpsc::channel();
+    let scoped = reddit.for_worker(Priority::Foreground, true, move || {
+        let _ = entered.send(());
+        false
+    });
+    let worker = std::thread::spawn(move || scoped.search("rust", "next", None));
+    waiting.recv_timeout(Duration::from_secs(1)).unwrap();
+    let pause = reddit.pause();
+    reddit.retire();
+    assert!(worker.join().unwrap().is_err());
+
+    let pause = pause.expect("quota pacing must explain the pending15s wait");
+    assert!((14..=15).contains(&pause.seconds));
+    assert!(pause.cause.contains("quota"));
+}
+
+#[test]
+fn when_success_reports_a_small_budget_the_next_request_should_be_paced() {
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let arrivals = starts.clone();
+    let fixture = Fixture::new(move |_| {
+        arrivals.lock().push(Instant::now());
+        Reply {
+            status: 200,
+            body: empty_listing().to_string(),
+            headers: vec![
+                ("X-Ratelimit-Remaining".into(), "2".into()),
+                ("X-Ratelimit-Reset".into(), "0.4".into()),
+            ],
+        }
+    });
+    let reddit = fixture
+        .reddit()
+        .for_worker(Priority::Background, true, || false);
+    reddit.search("rust", "first", None).unwrap();
+
+    reddit.search("rust", "second", None).unwrap();
+
+    let starts = starts.lock();
+    let spacing = starts[1].duration_since(starts[0]);
+    assert!(
+        spacing >= Duration::from_millis(150),
+        "quota must space request starts, not response completions: {spacing:?}"
+    );
+}
+
+#[test]
+fn when_a_success_reports_negative_remaining_quota_it_should_pause() {
+    let fixture = Fixture::new(|_| Reply {
+        status: 200,
+        body: empty_listing().to_string(),
+        headers: vec![
+            ("X-Ratelimit-Remaining".into(), "-1".into()),
+            ("X-Ratelimit-Reset".into(), "2".into()),
+        ],
+    });
+    let reddit = fixture.reddit();
+    reddit.search("rust", "x", None).unwrap();
+    assert!(
+        reddit.pause().is_some(),
+        "negative remaining quota is exhausted"
+    );
+}
+
+#[test]
+fn when_rate_headers_are_dates_exhausted_or_malformed_the_wait_should_follow_valid_hints() {
+    let future = (chrono::Utc::now() + chrono::Duration::seconds(4))
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
+    for (status, headers, maximum) in [
+        (429, vec![("Retry-After", future)], Some(4)),
+        (
+            429,
+            vec![
+                ("Retry-After", "-3".into()),
+                ("X-Ratelimit-Reset", "2".into()),
+            ],
+            Some(2),
+        ),
+        (
+            200,
+            vec![
+                ("X-Ratelimit-Remaining", "0".into()),
+                ("X-Ratelimit-Reset", "2".into()),
+            ],
+            Some(2),
+        ),
+        (
+            200,
+            vec![
+                ("X-Ratelimit-Remaining", "NaN".into()),
+                ("X-Ratelimit-Reset", "2".into()),
+            ],
+            None,
+        ),
+    ] {
+        let fixture = Fixture::new(move |_| Reply {
+            status,
+            body: empty_listing().to_string(),
+            headers: headers
+                .iter()
+                .map(|(key, value)| ((*key).into(), value.clone()))
+                .collect(),
+        });
+        let reddit = fixture.reddit();
+        let result = reddit.search("rust", "x", None);
+        assert_eq!(result.is_ok(), status == 200);
+        match maximum {
+            Some(max) => assert!((1..=max).contains(&reddit.pause().unwrap().seconds)),
+            None => assert!(reddit.pause().is_none()),
+        }
+    }
+}
+
+#[test]
+fn when_a_safe_read_becomes_obsolete_it_should_release_header_and_body_waits() {
+    use std::io::{BufRead, Write};
+    use std::sync::mpsc::channel;
+    for media in [false, true] {
+        for body in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}/", listener.local_addr().unwrap());
+            let reddit = Reddit::test_at(&base, false);
+            let obsolete = Arc::new(AtomicBool::new(false));
+            let cancelled = obsolete.clone();
+            let scoped = reddit.for_worker(Priority::Foreground, true, move || {
+                cancelled.load(Ordering::Acquire)
+            });
+            let (started_tx, started_rx) = channel();
+            let (release_tx, release_rx) = channel();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                if body {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                        .unwrap();
+                    socket.flush().unwrap();
+                }
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            });
+            let (done_tx, done_rx) = channel();
+            let read = std::thread::spawn(move || {
+                let result = if media {
+                    scoped.still_image(&format!("{base}poster.png")).map(|_| ())
+                } else {
+                    scoped.search("rust", "x", None).map(|_| ())
+                };
+                done_tx.send(result).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            obsolete.store(true, Ordering::Release);
+            let result = done_rx.recv_timeout(Duration::from_millis(1200));
+            release_tx.send(()).unwrap();
+            server.join().unwrap();
+            read.join().unwrap();
+            assert!(
+                matches!(result, Ok(Err(_))),
+                "obsolete read must stop before server releases it: media={media}, body={body}, {result:?}"
+            );
+            assert_ne!(
+                reddit.health(),
+                Health::Down,
+                "cancellation is not a connection failure"
+            );
+        }
+    }
+}
+
+#[test]
+fn when_a_safe_worker_read_is_limited_it_should_stay_pending_then_resume() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let calls = count.clone();
+    let fixture = Fixture::new(move |_| {
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Reply {
+                status: 429,
+                body: String::new(),
+                headers: vec![("Retry-After".into(), "1".into())],
+            }
+        } else {
+            Reply::json(empty_listing())
+        }
+    });
+    let reddit = fixture.reddit();
+    let scoped = reddit.for_worker(Priority::Foreground, true, || false);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        tx.send(scoped.search("rust", "PRIVATE_QUERY", None))
+            .unwrap()
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while reddit.pause().is_none() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let pause = reddit.pause().unwrap();
+    assert!((1..=2).contains(&pause.seconds));
+    assert!(pause.cause.contains("r/rust listing") && pause.cause.contains("HTTP 429"));
+    assert!(!pause.cause.contains("PRIVATE_QUERY") && !pause.cause.contains("fixture-session"));
+    assert!(
+        rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "read must remain pending during cooldown"
+    );
+    assert!(rx.recv_timeout(Duration::from_secs(3)).unwrap().is_ok());
+    thread.join().unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+    assert!(reddit.pause().is_none());
+}
+
+#[test]
+fn when_a_waiting_read_is_retired_it_should_stop_without_another_request() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let calls = count.clone();
+    let fixture = Fixture::new(move |_| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Reply {
+            status: 429,
+            body: String::new(),
+            headers: vec![("Retry-After".into(), "600".into())],
+        }
+    });
+    let reddit = fixture.reddit();
+    let scoped = reddit.for_worker(Priority::Foreground, true, || false);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || tx.send(scoped.search("rust", "x", None)).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while reddit.pause().is_none() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "the read must stay pending before retirement"
+    );
+    reddit.retire();
+    assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+    thread.join().unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn when_a_transmitted_write_becomes_obsolete_its_acknowledgment_should_still_finish() {
+    let obsolete = Arc::new(AtomicBool::new(false));
+    let after_send = obsolete.clone();
+    let fixture = Fixture::new(move |request| {
+        if request.method == "GET" {
+            Reply::json(json!({"data":{"name":"reader","modhash":"fixture-token"}}))
+        } else {
+            after_send.store(true, Ordering::Release);
+            Reply::json(json!({}))
+        }
+    });
+    let scoped = fixture
+        .reddit()
+        .for_worker(Priority::Foreground, false, move || {
+            obsolete.load(Ordering::Acquire)
+        });
+
+    assert!(scoped.set_subscription("rust", true).is_ok());
+}
+
+#[test]
+fn when_a_write_receives429_even_a_read_retry_context_should_not_replay_it() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let calls = count.clone();
+    let fixture = Fixture::new(move |request| {
+        if request.method == "GET" {
+            Reply::json(json!({"data":{"name":"reader","modhash":"fixture-token"}}))
+        } else {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Reply {
+                status: 429,
+                body: String::new(),
+                headers: vec![("Retry-After".into(), "1".into())],
+            }
+        }
+    });
+    assert!(
+        fixture
+            .reddit()
+            .for_worker(Priority::Foreground, true, || false)
+            .set_subscription("rust", true)
+            .is_err()
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -709,16 +1250,136 @@ fn when_expanding_replies_the_client_should_use_the_same_signed_in_session() {
             r.headers.get("cookie").map(String::as_str),
             Some("reddit_session=fixture-session")
         );
-        assert!(r.url.starts_with("/api/morechildren.json?"));
-        Reply::json(
-            json!({"json":{"errors":[],"data":{"things":[{"kind":"t1","data":{"id":"def","parent_id":"t3_abc","body":"expanded reply"}}]}}}),
-        )
+        assert!(r.url.starts_with("/comments/abc.json?"));
+        Reply::json(json!([
+            {"kind":"Listing","data":{"children":[{"kind":"t3","data":{"id":"abc","title":"post","subreddit":"rust","permalink":"/comments/abc/"}}]}},
+            {"kind":"Listing","data":{"children":[{"kind":"t1","data":{"id":"def","parent_id":"t3_abc","body":"expanded reply"}}]}}
+        ]))
     });
     let actual = fixture
         .reddit()
         .more_replies(&json!({"post":"abc","parent":"t3_abc","children":["def"]}).to_string())
         .unwrap();
     assert_eq!(actual.comments[0].body, "expanded reply");
+}
+
+#[test]
+fn when_the_morechildren_api_is_denied_expansion_should_read_focused_comments() {
+    let fixture = Fixture::new(|request| {
+        if request.url.starts_with("/api/morechildren") {
+            return Reply::status(403);
+        }
+        assert_eq!(request.headers["cookie"], "reddit_session=fixture-session");
+        let url = Url::parse("http://localhost")
+            .unwrap()
+            .join(&request.url)
+            .unwrap();
+        assert_eq!(url.path(), "/comments/1x4v4sn.json");
+        let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(query["comment"], "c3");
+        assert_eq!(query["sort"], "new");
+        let mut value: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/post.json")).unwrap();
+        value[1]["data"]["children"] = json!([{"kind":"t1","data":{
+            "id":"c3","name":"t1_c3","parent_id":"t3_1x4v4sn","link_id":"t3_1x4v4sn",
+            "body":"expanded without the denied API","replies":""
+        }}]);
+        Reply::json(value)
+    });
+    let cursor = json!({"post":"1x4v4sn","parent":"t3_1x4v4sn","children":["c3"],"sort":"new"});
+
+    let actual = fixture.reddit().more_replies(&cursor.to_string()).unwrap();
+
+    assert_eq!(actual.comments[0].id, "c3");
+    assert_eq!(actual.comments[0].body, "expanded without the denied API");
+    assert_eq!(actual.refreshed, Some(vec!["c3".into()]));
+    assert!(actual.more.is_none());
+}
+
+#[test]
+fn private_community_explicit_reason_should_survive_the_denied_listing() {
+    let fixture = Fixture::new(|_| Reply {
+        status: 403,
+        body: json!({"error":403,"message":"Forbidden","reason":"private"}).to_string(),
+        headers: vec![],
+    });
+    let reddit = fixture.reddit();
+
+    let actual = reddit
+        .listing("doit", Sort::Hot, TimeRange::Day, None)
+        .unwrap_err();
+
+    assert!(actual.to_string().contains("private"), "{actual}");
+    assert_eq!(reddit.health(), Health::Up);
+    assert!(!reddit.needs_sign_in());
+}
+
+#[test]
+fn private_community_unknown_reason_should_remain_a_generic_denial() {
+    let fixture = Fixture::new(|_| Reply {
+        status: 403,
+        body: json!({"reason":"quarantined","message":"private SECRET"}).to_string(),
+        headers: vec![],
+    });
+    let actual = fixture
+        .reddit()
+        .listing("doit", Sort::Hot, TimeRange::Day, None)
+        .unwrap_err();
+    assert_eq!(
+        actual.downcast_ref::<AccessDenied>(),
+        Some(&AccessDenied::Forbidden)
+    );
+    assert!(!actual.to_string().contains("SECRET"));
+    assert!(!actual.to_string().contains("private"));
+}
+
+#[test]
+fn private_community_malformed_body_should_remain_a_generic_denial() {
+    let fixture = Fixture::new(|_| Reply {
+        status: 403,
+        body: "<html>private SECRET</html>".into(),
+        headers: vec![],
+    });
+    let actual = fixture.reddit().search("doit", "query", None).unwrap_err();
+    assert_eq!(
+        actual.downcast_ref::<AccessDenied>(),
+        Some(&AccessDenied::Forbidden)
+    );
+    assert!(!actual.to_string().contains("SECRET"));
+}
+
+#[test]
+fn private_community_oversized_body_should_stay_bounded_and_redacted() {
+    let fixture = Fixture::new(|_| Reply {
+        status: 403,
+        body: json!({"reason":"private","message":"SECRET".repeat(12_000)}).to_string(),
+        headers: vec![],
+    });
+    let reddit = fixture.reddit();
+    let actual = reddit
+        .listing("doit", Sort::Hot, TimeRange::Day, None)
+        .unwrap_err();
+    assert_eq!(
+        actual.downcast_ref::<AccessDenied>(),
+        Some(&AccessDenied::Forbidden)
+    );
+    assert!(!actual.to_string().contains("SECRET"));
+    assert_eq!(reddit.health(), Health::Up);
+}
+
+#[test]
+fn private_community_reason_in_a_server_error_should_preserve_service_failure() {
+    let fixture = Fixture::new(|_| Reply {
+        status: 500,
+        body: json!({"reason":"private"}).to_string(),
+        headers: vec![],
+    });
+    let reddit = fixture.reddit();
+    let actual = reddit
+        .listing("doit", Sort::Hot, TimeRange::Day, None)
+        .unwrap_err();
+    assert!(actual.downcast_ref::<AccessDenied>().is_none());
+    assert_eq!(reddit.health(), Health::Down);
 }
 
 #[test]
@@ -800,7 +1461,7 @@ fn when_browser_home_pages_it_should_keep_the_entire_opaque_cursor() {
 fn when_home_post_details_hide_nsfw_or_disappear_it_should_keep_the_browser_cursor() {
     let fixture = Fixture::new(|request| {
         if request.url.starts_with("/svc/shreddit/feeds/home-feed") {
-            Reply { status: 200, body: "<shreddit-post id='t3_hidden'></shreddit-post><shreddit-post id='t3_gone'></shreddit-post><faceplate-partial id='feed-next-page-partial' src='/svc/shreddit/feeds/home-feed?cursor=more'></faceplate-partial>".into(), headers: vec![] }
+            Reply { status: 200, body: "<shreddit-post id='t3_hidden'></shreddit-post><shreddit-post id='t3_gone'></shreddit-post><shreddit-post id='t3_gonea'></shreddit-post><shreddit-post id='t3_goneb'></shreddit-post><faceplate-partial id='feed-next-page-partial' src='/svc/shreddit/feeds/home-feed?cursor=more'></faceplate-partial>".into(), headers: vec![] }
         } else {
             let mut hidden = home_post("hidden", "unjoined");
             hidden["data"]["over_18"] = json!(true);
@@ -863,7 +1524,7 @@ fn a_missing_icon_is_an_answer_and_a_refused_or_failed_one_is_not() {
 }
 
 #[test]
-fn continuing_a_thread_does_not_wait_for_a_morechildren_request() {
+fn continuing_a_thread_should_request_its_focused_parent() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = seen.clone();
     let fixture = Fixture::new(move |r| {
@@ -871,19 +1532,8 @@ fn continuing_a_thread_does_not_wait_for_a_morechildren_request() {
         Reply::status(404)
     });
     let reddit = Reddit::test_at(&fixture.base, false);
-    let in_flight = reddit.0.expansion.lock();
-    let (done, finished) = std::sync::mpsc::channel();
-    let worker = {
-        let reddit = reddit.clone();
-        std::thread::spawn(move || {
-            let cursor = json!({"post": "abc", "parent": "t1_def", "children": []});
-            let _ = done.send(reddit.more_replies(&cursor.to_string()).is_err());
-        })
-    };
-    let answered = finished.recv_timeout(Duration::from_secs(5));
-    drop(in_flight);
-    worker.join().unwrap();
-    assert_eq!(answered, Ok(true));
+    let cursor = json!({"post": "abc", "parent": "t1_def", "children": []});
+    assert!(reddit.more_replies(&cursor.to_string()).is_err());
     assert!(seen.lock()[0].starts_with("/comments/abc.json?"));
 }
 
@@ -924,8 +1574,146 @@ fn when_reddit_is_unreachable_requests_should_fail_without_a_rate_limit() {
         reddit.search("rust", "x", None).unwrap_err().to_string(),
         "Reddit connection failed"
     );
-    assert_eq!(reddit.0.status.lock().cooldown, None);
+    assert_eq!(reddit.pause(), None);
     assert_eq!(reddit.health(), Health::Down);
+}
+
+#[test]
+fn clip_relay_should_serve_manifests_while_four_streams_are_stalled() {
+    let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+    let base = format!("http://{}/", server.server_addr());
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
+    let upstream = server.clone();
+    let accept = std::thread::spawn(move || {
+        while !stopped.load(Ordering::Relaxed) {
+            let Ok(Some(request)) = upstream.recv_timeout(Duration::from_millis(20)) else {
+                continue;
+            };
+            std::thread::spawn(move || {
+                if request.url().ends_with(".m3u8") {
+                    let _ = request.respond(Response::from_string("#EXTM3U\n#EXT-X-ENDLIST\n"));
+                } else {
+                    let response = Response::new(
+                        tiny_http::StatusCode(200),
+                        vec![],
+                        std::io::Read::take(std::io::repeat(0), 64 * 1024 * 1024),
+                        Some(64 * 1024 * 1024),
+                        None,
+                    );
+                    let _ = request.respond(response);
+                }
+            });
+        }
+    });
+    let reddit = Reddit::test_at(&base, false);
+    let video = reddit.media_url(&format!("{base}video.mp4")).unwrap();
+    let manifest = reddit.media_url(&format!("{base}next.m3u8")).unwrap();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .proxy(None)
+        .timeout_global(Some(Duration::from_secs(1)))
+        .build()
+        .into();
+    let held: Vec<_> = (0..4).map(|_| agent.get(&video).call().unwrap()).collect();
+    let result = agent
+        .get(&manifest)
+        .call()
+        .and_then(|mut r| r.body_mut().read_to_string());
+    drop(held);
+    stop.store(true, Ordering::Relaxed);
+    accept.join().unwrap();
+    assert_eq!(
+        result.expect("paused video responses must not starve another playlist"),
+        "#EXTM3U\n#EXT-X-ENDLIST\n"
+    );
+}
+
+#[test]
+fn clip_relay_acceptor_should_resume_after_capacity_frees_with_a_pipelined_client() {
+    let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+    let base = format!("http://{}/", server.server_addr());
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
+    let upstream = server.clone();
+    let accept = std::thread::spawn(move || {
+        while !stopped.load(Ordering::Relaxed) {
+            let Ok(Some(request)) = upstream.recv_timeout(Duration::from_millis(20)) else {
+                continue;
+            };
+            std::thread::spawn(move || {
+                if request.url().ends_with(".m3u8") {
+                    let _ = request.respond(Response::from_string("#EXTM3U\n#EXT-X-ENDLIST\n"));
+                } else {
+                    let response = Response::new(
+                        tiny_http::StatusCode(200),
+                        vec![],
+                        std::io::Read::take(std::io::repeat(0), 64 * 1024 * 1024),
+                        Some(64 * 1024 * 1024),
+                        None,
+                    );
+                    let _ = request.respond(response);
+                }
+            });
+        }
+    });
+    let reddit = Reddit::test_at(&base, false);
+    let video = reddit.media_url(&format!("{base}video.mp4")).unwrap();
+    let manifest = reddit.media_url(&format!("{base}next.m3u8")).unwrap();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .proxy(None)
+        .timeout_global(Some(Duration::from_secs(1)))
+        .build()
+        .into();
+    use std::io::{BufRead, Write};
+    let video_url = url::Url::parse(&video).unwrap();
+    let host = format!("127.0.0.1:{}", video_url.port().unwrap());
+    let mut pipelined = std::net::TcpStream::connect(&host).unwrap();
+    pipelined
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    write!(
+        pipelined,
+        "GET {} HTTP/1.1\r\nHost: {host}\r\n\r\n",
+        video_url.path()
+    )
+    .unwrap();
+    let mut reader = std::io::BufReader::new(pipelined.try_clone().unwrap());
+    loop {
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).unwrap() > 0);
+        if line == "\r\n" {
+            break;
+        }
+    }
+    let mut held: Vec<_> = (0..31).map(|_| agent.get(&video).call().unwrap()).collect();
+    let manifest_url = url::Url::parse(&manifest).unwrap();
+    write!(
+        pipelined,
+        "GET {} HTTP/1.1\r\nHost: {host}\r\n\r\n",
+        manifest_url.path()
+    )
+    .unwrap();
+    // Wait at capacity before freeing slots. If the old acceptor handles this
+    // probe first it returns503; if it handles the pipeline first it stays blocked
+    // and the final request below times out even after capacity becomes available.
+    let overloaded = agent.get(&manifest).call();
+    // The pipelined response cannot finish until its paused first response finishes.
+    // Free two other slots so that client and an independent request can proceed.
+    held.pop();
+    held.pop();
+    let result = agent
+        .get(&manifest)
+        .call()
+        .and_then(|mut r| r.body_mut().read_to_string());
+    let _ = pipelined.shutdown(std::net::Shutdown::Both);
+    drop(held);
+    stop.store(true, Ordering::Relaxed);
+    accept.join().unwrap();
+    assert!(matches!(overloaded, Err(ureq::Error::Timeout(_))));
+    assert_eq!(
+        result.expect("paused video responses must not starve another playlist"),
+        "#EXTM3U\n#EXT-X-ENDLIST\n"
+    );
 }
 
 #[test]
@@ -1014,4 +1802,36 @@ fn disallowed_media_hosts_and_protocols_are_refused() {
     ] {
         assert!(!transport::media_allowed(&Url::parse(url).unwrap()));
     }
+}
+
+#[test]
+fn card_media_converted_reddit_gif_should_keep_its_gif_label() {
+    let actual = parse::parse_listing_value(json!({"kind":"Listing","data":{"children":[{"kind":"t3","data":{
+        "id":"animated","title":"animation","subreddit":"s","permalink":"/comments/animated/",
+        "secure_media":{"reddit_video":{"hls_url":"https://v.redd.it/clip/HLSPlaylist.m3u8","is_gif":true}}
+    }}]}})).unwrap();
+    assert_eq!(actual.posts[0].media.tag().as_deref(), Some("gif"));
+}
+
+#[test]
+fn card_media_converted_preview_animation_should_keep_its_gif_label() {
+    let actual = parse::parse_listing_value(json!({"kind":"Listing","data":{"children":[{"kind":"t3","data":{
+        "id":"animated","title":"animation","subreddit":"s","permalink":"/comments/animated/",
+        "preview":{"images":[{"variants":{"mp4":{"source":{"url":"https://i.redd.it/animation.mp4"}}}}]}
+    }}]}})).unwrap();
+    assert_eq!(actual.posts[0].media.tag().as_deref(), Some("gif"));
+}
+
+#[test]
+fn settings_policy_clone_should_share_session_health_and_identity_but_isolate_nsfw_namespace() {
+    let fixture = Fixture::new(|_| panic!("Policy rebinding must not use HTTP"));
+    let original = fixture.saved_reddit(&saved_export("reader", "reader"));
+    let adult = original.with_nsfw(true);
+    assert_eq!(adult.session_fingerprint(), original.session_fingerprint());
+    assert_eq!(adult.account(), original.account());
+    assert_eq!(adult.source(), original.source());
+    assert_ne!(adult.cache_namespace(), original.cache_namespace());
+    assert!(original.cache_namespace().contains("nsfw=false"));
+    assert!(adult.cache_namespace().contains("nsfw=true"));
+    assert!(Arc::ptr_eq(&adult.0, &original.0));
 }

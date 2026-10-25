@@ -88,6 +88,17 @@ pub enum UserFeed {
 }
 
 impl UserFeed {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Posts => "Posts",
+            Self::Comments => "Comments",
+            Self::Saved => "Saved on Reddit",
+            Self::Upvoted => "Upvoted posts",
+            Self::Downvoted => "Downvoted posts",
+            Self::Hidden => "Hidden posts",
+        }
+    }
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Overview => "overview",
@@ -111,6 +122,15 @@ pub enum Inbox {
 }
 
 impl Inbox {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unread => "Unread notifications",
+            Self::Replies => "Comment replies",
+            Self::PostReplies => "Post replies",
+            Self::Mentions => "Mentions",
+            Self::All => "Inbox",
+        }
+    }
     fn as_str(self) -> &'static str {
         match self {
             Self::Unread => "unread",
@@ -144,6 +164,16 @@ impl Target {
     }
     pub fn url(&self) -> Result<String> {
         reddit_url(&self.permalink)
+    }
+
+    fn inspection_permalink(&self) -> Result<String> {
+        fullname(&self.id, true)?;
+        if let Some(post) = self.id.strip_prefix("t3_") {
+            return Ok(format!("/comments/{post}"));
+        }
+        let url = Url::parse(&self.url()?)?;
+        let post = parse::post_id(url.path()).context("Comment has no post location")?;
+        Ok(format!("/comments/{post}"))
     }
 }
 
@@ -201,11 +231,11 @@ pub enum Action {
         link: bool,
     },
     Edit {
-        id: String,
+        target: Target,
         text: String,
     },
     Delete {
-        id: String,
+        target: Target,
     },
     Report {
         id: String,
@@ -338,11 +368,7 @@ impl Query {
             Self::Multi { owner, name: multi } => {
                 format!("user/{}/m/{}/hot.json", name(owner)?, name(multi)?)
             }
-            Self::Inspect(target) => {
-                params.push(("id", fullname(&target.id, true)?.into()));
-                "api/info.json".into()
-            }
-            Self::Thread(_) => bail!("Threads use the comment reader"),
+            Self::Inspect(_) | Self::Thread(_) => bail!("Threads use the comment reader"),
         };
         Ok((path, params))
     }
@@ -359,7 +385,9 @@ impl Query {
         let (path, params) = self.route()?;
         let path = path.strip_suffix(".json").unwrap_or(&path);
         let mut url = Url::parse(&reddit_url(path)?).unwrap();
-        url.query_pairs_mut().extend_pairs(params);
+        if !params.is_empty() {
+            url.query_pairs_mut().extend_pairs(params);
+        }
         Ok(url.into())
     }
 }
@@ -381,6 +409,10 @@ impl Reddit {
     }
 
     fn experience_read(&self, query: &Query, after: Option<&str>) -> Result<Response> {
+        if let Query::Inspect(target) = query {
+            let value = self.thread_json(&target.inspection_permalink()?, "", target.comment())?;
+            return inspect(value, target).map(Response::Details);
+        }
         let (path, params) = query.route()?;
         let mut url = self.0.api.join(&path)?;
         url.query_pairs_mut()
@@ -390,11 +422,21 @@ impl Reddit {
         if let Some(after) = after {
             url.query_pairs_mut().append_pair("after", after);
         }
-        let value = self.get(url)?;
-        if let Query::Inspect(target) = query {
-            return inspect(value, target).map(Response::Details);
-        }
-        read_page(query, value, self.0.show_nsfw).map(Response::Page)
+        let value = match self.get(url) {
+            Ok(value) => value,
+            Err(error) if error.is::<super::NotFound>() && matches!(query, Query::Wiki { .. }) => {
+                let Query::Wiki { subreddit, page } = query else {
+                    unreachable!()
+                };
+                return Ok(Response::Page(Page {
+                    title: format!("r/{subreddit} wiki/{page}"),
+                    text: "This wiki page is unavailable. Reddit did not find a public page at this address.".into(),
+                    entries: Vec::new(), after:None, url:query.url()?,
+                }));
+            }
+            Err(error) => return Err(error),
+        };
+        read_page(query, value, self.1).map(Response::Page)
     }
 
     fn csrf(&self) -> Result<HeaderValue> {
@@ -424,20 +466,8 @@ impl Reddit {
         let (path, fields, method) =
             action.form(self.account().as_ref().map(|a| a.name.as_str()))?;
         let token = self.csrf()?;
-        if matches!(action, Action::Edit { .. } | Action::Delete { .. }) {
-            let id = match action {
-                Action::Edit { id, .. } | Action::Delete { id } => id,
-                _ => unreachable!(),
-            };
-            let details = match self.experience_read(
-                &Query::Inspect(Target {
-                    id: id.clone(),
-                    author: String::new(),
-                    subreddit: String::new(),
-                    permalink: String::new(),
-                }),
-                None,
-            )? {
+        if let Action::Edit { target, .. } | Action::Delete { target } = action {
+            let details = match self.experience_read(&Query::Inspect(target.clone()), None)? {
                 Response::Details(details) => details,
                 _ => unreachable!(),
             };
@@ -472,7 +502,7 @@ impl Reddit {
         let value = if method == "DELETE" {
             let mut bytes = Vec::new();
             use std::io::Read;
-            let mut reader = transport::Reader::new(response, 1024 * 1024);
+            let mut reader = transport::Reader::new(response, 1024 * 1024, None);
             reader.by_ref().take(1024 * 1024).read_to_end(&mut bytes)?;
             if bytes.is_empty() {
                 json!({})
@@ -481,7 +511,7 @@ impl Reddit {
                     .context("Reddit returned an invalid acknowledgment")?
             }
         } else {
-            transport::json(response)?
+            transport::json(response, None)?
         };
         acknowledge(action, &value)?;
         let url = value["json"]["data"]["url"]
@@ -554,7 +584,9 @@ impl Action {
                 }
                 "api/submit".into()
             }
-            Self::Edit { id, text } => {
+            Self::Edit { target, text } => {
+                target.inspection_permalink()?;
+                let id = &target.id;
                 fields.extend([
                     ("thing_id", fullname(id, true)?.into()),
                     (
@@ -565,8 +597,9 @@ impl Action {
                 ]);
                 "api/editusertext".into()
             }
-            Self::Delete { id } => {
-                fields.push(("id", fullname(id, true)?.into()));
+            Self::Delete { target } => {
+                target.inspection_permalink()?;
+                fields.push(("id", fullname(&target.id, true)?.into()));
                 "api/del".into()
             }
             Self::Report { id, reason } => {
@@ -708,18 +741,15 @@ fn acknowledge(action: &Action, value: &Value) -> Result<()> {
 }
 
 fn inspect(value: Value, fallback: &Target) -> Result<Details> {
-    let things = value["data"]["children"]
+    let listings = value
+        .as_array()
+        .filter(|v| v.len() == 2)
+        .context("Invalid content details")?;
+    let listing = &listings[usize::from(fallback.comment().is_some())];
+    let things = listing["data"]["children"]
         .as_array()
         .context("Invalid content details")?;
-    let thing = things
-        .iter()
-        .find(|thing| {
-            thing["kind"].as_str() == fallback.id.split_once('_').map(|(kind, _)| kind)
-                && (thing["data"]["name"].as_str() == Some(&fallback.id)
-                    || thing["data"]["id"]
-                        .as_str()
-                        .is_some_and(|id| fallback.id.ends_with(&format!("_{id}"))))
-        })
+    let thing = find_inspected_thing(things, &fallback.id)
         .context("Content was deleted or is unavailable")?;
     let data = &thing["data"];
     let mut target = target(data, fallback.id.clone());
@@ -747,6 +777,22 @@ fn inspect(value: Value, fallback: &Target) -> Result<Details> {
         crosspost: data["crosspost_parent_list"][0]["permalink"]
             .as_str()
             .map(str::to_string),
+    })
+}
+
+fn find_inspected_thing<'a>(things: &'a [Value], fullname: &str) -> Option<&'a Value> {
+    let (kind, id) = fullname.split_once('_')?;
+    things.iter().find_map(|thing| {
+        let data = &thing["data"];
+        let identity_matches = data["name"]
+            .as_str()
+            .map_or_else(|| data["id"].as_str() == Some(id), |name| name == fullname);
+        if thing["kind"].as_str() == Some(kind) && identity_matches {
+            return Some(thing);
+        }
+        data["replies"]["data"]["children"]
+            .as_array()
+            .and_then(|children| find_inspected_thing(children, fullname))
     })
 }
 
@@ -800,7 +846,11 @@ fn read_page(query: &Query, value: Value, show_nsfw: bool) -> Result<Page> {
                 .into_iter()
                 .map(|feed| {
                     navigation(
-                        feed.as_str(),
+                        match feed {
+                            UserFeed::Overview => "Overview",
+                            UserFeed::Posts => "Posts",
+                            _ => "Comments",
+                        },
                         Query::User {
                             name: user.clone(),
                             feed,
@@ -918,9 +968,18 @@ fn read_page(query: &Query, value: Value, show_nsfw: bool) -> Result<Page> {
                     kind,
                     sort,
                     time,
-                } => format!("{kind:?}: {text} · {} · {}", sort.as_str(), time.as_str()),
-                Query::User { name, feed } => format!("u/{name} · {}", feed.as_str()),
-                Query::Inbox(kind) => format!("Inbox · {kind:?}"),
+                } => format!(
+                    "{}: {text} · {} · {}",
+                    match kind {
+                        SearchKind::Posts => "Posts",
+                        SearchKind::Communities => "Communities",
+                        SearchKind::People => "People",
+                    },
+                    sort.as_str(),
+                    time.as_str()
+                ),
+                Query::User { name, feed } => format!("u/{name} · {}", feed.label()),
+                Query::Inbox(kind) => kind.label().into(),
                 Query::Multi { owner, name } => format!("u/{owner}/m/{name}"),
                 _ => "Discover communities".into(),
             };
@@ -1045,6 +1104,265 @@ mod tests {
             .unwrap()
     }
 
+    fn comment_target() -> Target {
+        Target {
+            id: "t1_comment".into(),
+            author: "reader".into(),
+            subreddit: "rust".into(),
+            permalink: "/r/rust/comments/post/title/comment/".into(),
+        }
+    }
+
+    fn action_thread() -> Value {
+        json!([
+            {"kind":"Listing","data":{"children":[{"kind":"t3","data":{
+                "name":"t3_post","id":"post","author":"reader","subreddit":"rust",
+                "permalink":"/r/rust/comments/post/title/","selftext":"post source",
+                "saved":false,"likes":null,"hidden":true,"is_self":true
+            }}]}},
+            {"kind":"Listing","data":{"children":[{"kind":"t1","data":{
+                "name":"t1_ancestor","id":"ancestor","author":"other","body":"ancestor",
+                "replies":{"kind":"Listing","data":{"children":[{"kind":"t1","data":{
+                    "name":"t1_comment","id":"comment","author":"reader","subreddit":"rust",
+                    "permalink":"/r/rust/comments/post/title/comment/","body":">!spoiler!<\n**bold**",
+                    "saved":true,"likes":true
+                }}]}}
+            }}]}}
+        ])
+    }
+
+    #[test]
+    fn when_info_is_forbidden_comment_actions_should_load_through_the_focused_thread() {
+        let fixture = Fixture::new(|request| {
+            if request.url.starts_with("/api/info.json") {
+                return Reply::status(403);
+            }
+            let url = Url::parse(&format!("http://fixture{}", request.url)).unwrap();
+            let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+            assert_eq!(request.method, "GET");
+            assert_eq!(url.path(), "/comments/post.json");
+            assert_eq!(query["comment"], "comment");
+            assert_eq!(query["context"], "3");
+            assert_eq!(query["raw_json"], "1");
+            assert_eq!(query["limit"], "100");
+            assert_eq!(query["depth"], "10");
+            Reply::json(action_thread())
+        });
+
+        let Response::Details(actual) = read(&fixture.reddit(), Query::Inspect(comment_target()))
+        else {
+            panic!("Expected comment actions");
+        };
+
+        assert_eq!(actual.target.id, "t1_comment");
+        assert_eq!(
+            actual.target.permalink,
+            "/r/rust/comments/post/title/comment/"
+        );
+        assert_eq!(actual.raw_text, ">!spoiler!<\n**bold**");
+        assert!(actual.saved);
+        assert_eq!(actual.vote, 1);
+        assert!(actual.editable);
+    }
+
+    #[test]
+    fn post_actions_should_use_the_post_fullname_and_preserve_its_metadata() {
+        let fixture = Fixture::new(|request| {
+            assert!(request.url.starts_with("/comments/post.json?"));
+            assert!(!request.url.contains("comment="));
+            let mut thread = action_thread();
+            thread[0]["data"]["children"][0]["data"]["crosspost_parent_list"] =
+                json!([{"permalink":"/comments/original/title/"}]);
+            Reply::json(thread)
+        });
+        let target = Target {
+            id: "t3_post".into(),
+            permalink: String::new(),
+            ..comment_target()
+        };
+
+        let Response::Details(actual) = read(&fixture.reddit(), Query::Inspect(target)) else {
+            panic!("Expected post actions");
+        };
+
+        assert_eq!(actual.target.id, "t3_post");
+        assert_eq!(actual.raw_text, "post source");
+        assert!(actual.hidden);
+        assert!(!actual.saved);
+        assert_eq!(actual.vote, 0);
+        assert!(actual.editable);
+        assert_eq!(
+            actual.crosspost.as_deref(),
+            Some("/comments/original/title/")
+        );
+    }
+
+    #[test]
+    fn a_missing_comment_should_not_borrow_the_ancestors_action_state() {
+        let fixture = Fixture::new(|_| Reply::json(action_thread()));
+        let target = Target {
+            id: "t1_missing".into(),
+            ..comment_target()
+        };
+
+        let actual = fixture.reddit().experience(&Request::Read {
+            query: Query::Inspect(target),
+            after: None,
+        });
+
+        assert!(
+            actual
+                .unwrap_err()
+                .to_string()
+                .contains("deleted or is unavailable")
+        );
+    }
+
+    #[test]
+    fn a_conflicting_fullname_should_not_match_only_the_bare_comment_id() {
+        let fixture = Fixture::new(|_| {
+            let mut thread = action_thread();
+            thread[1]["data"]["children"][0]["data"]["replies"]["data"]["children"][0]["data"]["name"] =
+                json!("t1_other");
+            Reply::json(thread)
+        });
+
+        let actual = fixture.reddit().experience(&Request::Read {
+            query: Query::Inspect(comment_target()),
+            after: None,
+        });
+
+        assert!(
+            actual
+                .unwrap_err()
+                .to_string()
+                .contains("deleted or is unavailable")
+        );
+    }
+
+    #[test]
+    fn malformed_thread_metadata_should_not_create_an_actions_menu() {
+        let fixture =
+            Fixture::new(|_| Reply::json(json!({"kind":"Listing","data":{"children":[]}})));
+
+        let actual = fixture.reddit().experience(&Request::Read {
+            query: Query::Inspect(comment_target()),
+            after: None,
+        });
+
+        assert!(
+            actual
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid content details")
+        );
+    }
+
+    #[test]
+    fn invalid_comment_locations_should_fail_before_contacting_reddit() {
+        let fixture = Fixture::new(|_| panic!("Invalid location reached HTTP"));
+        for permalink in [
+            "",
+            "https://other.example/comments/post/title/comment/",
+            "/comments/../title/comment/",
+        ] {
+            let target = Target {
+                permalink: permalink.into(),
+                ..comment_target()
+            };
+            assert!(
+                fixture
+                    .reddit()
+                    .experience(&Request::Read {
+                        query: Query::Inspect(target),
+                        after: None
+                    })
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn editing_then_deleting_a_comment_should_recheck_the_captured_thread_target() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let actual = writes.clone();
+        let fixture = Fixture::new(move |request| {
+            if request.url == "/api/me.json" {
+                return me();
+            }
+            if request.method == "GET" {
+                assert!(request.url.starts_with("/comments/post.json?"));
+                assert!(request.url.contains("comment=comment"));
+                return Reply::json(action_thread());
+            }
+            let form: HashMap<_, _> = url::form_urlencoded::parse(request.body.as_bytes())
+                .into_owned()
+                .collect();
+            match request.url.as_str() {
+                "/api/editusertext" => {
+                    assert_eq!(form["thing_id"], "t1_comment");
+                    assert_eq!(form["text"], "changed text");
+                    actual.lock().unwrap().push("edit");
+                    Reply::json(
+                        json!({"json":{"errors":[],"data":{"things":[{"kind":"t1","data":{"id":"comment"}}]}}}),
+                    )
+                }
+                "/api/del" => {
+                    assert_eq!(form["id"], "t1_comment");
+                    actual.lock().unwrap().push("delete");
+                    Reply::json(json!({}))
+                }
+                _ => panic!("Unexpected mutation route"),
+            }
+        });
+        let reddit = fixture.saved_reddit(&saved_export("reader", "reader"));
+
+        reddit
+            .experience(&Request::Write(Action::Edit {
+                target: comment_target(),
+                text: "changed text".into(),
+            }))
+            .unwrap();
+        reddit
+            .experience(&Request::Write(Action::Delete {
+                target: comment_target(),
+            }))
+            .unwrap();
+
+        assert_eq!(*writes.lock().unwrap(), ["edit", "delete"]);
+    }
+
+    #[test]
+    fn editing_a_link_post_should_be_rejected_after_fresh_metadata_is_read() {
+        let fixture = Fixture::new(|request| {
+            if request.url == "/api/me.json" {
+                return me();
+            }
+            assert_eq!(request.method, "GET");
+            let mut thread = action_thread();
+            thread[0]["data"]["children"][0]["data"]["is_self"] = json!(false);
+            Reply::json(thread)
+        });
+        let reddit = fixture.saved_reddit(&saved_export("reader", "reader"));
+        let target = Target {
+            id: "t3_post".into(),
+            permalink: "/comments/post".into(),
+            ..comment_target()
+        };
+
+        let actual = reddit.experience(&Request::Write(Action::Edit {
+            target,
+            text: "changed".into(),
+        }));
+
+        assert!(
+            actual
+                .unwrap_err()
+                .to_string()
+                .contains("Only comments and text-post bodies")
+        );
+    }
+
     #[test]
     fn when_a_subreddit_is_named_comments_the_context_link_should_still_target_the_comment() {
         assert_eq!(
@@ -1072,6 +1390,39 @@ mod tests {
             panic!("Expected moderators");
         };
         assert!(matches!(&actual.entries[0].query, Some(Query::Profile(user)) if user == "mod"));
+    }
+
+    #[test]
+    fn when_a_wiki_page_is_missing_it_should_show_an_unavailable_page_without_a_request_error() {
+        let fixture = Fixture::new(|_| Reply::status(404));
+        let actual = read(
+            &fixture.reddit(),
+            Query::Wiki {
+                subreddit: "rust".into(),
+                page: "index".into(),
+            },
+        );
+        assert!(
+            matches!(actual, Response::Page(page) if page.entries.is_empty()
+            && page.text == "This wiki page is unavailable. Reddit did not find a public page at this address."
+            && page.url == "https://www.reddit.com/r/rust/wiki/index")
+        );
+    }
+
+    #[test]
+    fn when_a_wiki_request_is_denied_it_should_preserve_the_permission_error() {
+        let fixture = Fixture::new(|_| Reply::status(403));
+        let actual = fixture
+            .reddit()
+            .experience(&Request::Read {
+                query: Query::Wiki {
+                    subreddit: "rust".into(),
+                    page: "index".into(),
+                },
+                after: None,
+            })
+            .unwrap_err();
+        assert!(actual.to_string().contains("HTTP 403"));
     }
 
     #[test]
@@ -1252,6 +1603,114 @@ mod tests {
     }
 
     #[test]
+    fn when_submitting_a_text_post_its_markdown_should_remain_in_the_text_field() {
+        let fixture = Fixture::new(|request| {
+            if request.url == "/api/me.json" {
+                return me();
+            }
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.url, "/api/submit");
+            let form: HashMap<_, _> = url::form_urlencoded::parse(request.body.as_bytes())
+                .into_owned()
+                .collect();
+            assert_eq!(form["kind"], "self");
+            assert_eq!(form["sr"], "rust");
+            assert_eq!(form["title"], "A text post");
+            assert_eq!(form["text"], "**Հայերեն**\nA & B");
+            assert!(!form.contains_key("url"));
+            Reply::json(json!({"json":{"errors":[],"data":{"url":"/r/rust/comments/post/text/"}}}))
+        });
+
+        let actual = fixture
+            .reddit()
+            .experience(&Request::Write(Action::Submit {
+                subreddit: "rust".into(),
+                title: "A text post".into(),
+                text: "**Հայերեն**\nA & B".into(),
+                link: false,
+            }))
+            .unwrap();
+
+        assert!(matches!(actual, Response::Written { url: Some(url) }
+            if url == "https://www.reddit.com/r/rust/comments/post/text/"));
+    }
+
+    #[test]
+    fn when_reporting_a_comment_the_reason_should_be_sent_with_its_fullname() {
+        let fixture = Fixture::new(|request| {
+            if request.url == "/api/me.json" {
+                return me();
+            }
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.url, "/api/report");
+            assert_eq!(request.headers["x-modhash"], "fixture-csrf");
+            let form: HashMap<_, _> = url::form_urlencoded::parse(request.body.as_bytes())
+                .into_owned()
+                .collect();
+            assert_eq!(form["thing_id"], "t1_comment");
+            assert_eq!(form["reason"], "Spam & unwanted promotion");
+            Reply::json(json!({}))
+        });
+
+        let actual = fixture
+            .reddit()
+            .experience(&Request::Write(Action::Report {
+                id: "t1_comment".into(),
+                reason: "Spam & unwanted promotion".into(),
+            }))
+            .unwrap();
+
+        assert!(matches!(actual, Response::Written { url: None }));
+    }
+
+    #[test]
+    fn when_inbox_items_are_marked_read_unread_and_read_the_explicit_state_should_be_sent() {
+        let actual = Arc::new(Mutex::new(Vec::new()));
+        let requests = actual.clone();
+        let fixture = Fixture::new(move |request| {
+            if request.url == "/api/me.json" {
+                return me();
+            }
+            assert_eq!(request.method, "POST");
+            let form: HashMap<_, _> = url::form_urlencoded::parse(request.body.as_bytes())
+                .into_owned()
+                .collect();
+            requests
+                .lock()
+                .unwrap()
+                .push((request.url, form["id"].clone()));
+            Reply::json(json!({}))
+        });
+        let reddit = fixture.reddit();
+
+        for (id, read) in [
+            ("t4_message", true),
+            ("t4_message", false),
+            ("t4_message", true),
+            ("t1_comment", true),
+            ("t1_comment", false),
+        ] {
+            reddit
+                .experience(&Request::Write(Action::Read {
+                    id: id.into(),
+                    read,
+                }))
+                .unwrap();
+        }
+
+        assert_eq!(
+            *actual.lock().unwrap(),
+            [
+                ("/api/read_message".into(), "t4_message".into()),
+                ("/api/unread_message".into(), "t4_message".into()),
+                ("/api/read_message".into(), "t4_message".into()),
+                ("/api/read_message".into(), "t1_comment".into()),
+                ("/api/unread_message".into(), "t1_comment".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn when_the_api_reports_an_error_the_write_should_not_claim_success_or_echo_submitted_text() {
         let fixture = Fixture::new(|request| {
             if request.url == "/api/me.json" {
@@ -1300,15 +1759,16 @@ mod tests {
                 return me();
             }
             assert_eq!(request.method, "GET");
-            Reply::json(
-                json!({"kind":"Listing","data":{"children":[{"kind":"t1","data":{"name":"t1_comment","id":"comment","author":"other","body":"original"}}]}}),
-            )
+            let mut thread = action_thread();
+            thread[1]["data"]["children"][0]["data"]["replies"]["data"]["children"][0]["data"]["author"] =
+                json!("other");
+            Reply::json(thread)
         });
         let reddit = fixture.saved_reddit(&saved_export("reader", "reader"));
         assert!(
             reddit
                 .experience(&Request::Write(Action::Edit {
-                    id: "t1_comment".into(),
+                    target: comment_target(),
                     text: "changed".into()
                 }))
                 .unwrap_err()

@@ -16,10 +16,16 @@ impl Reddit {
             bail!("Choose an individual subreddit to join or leave");
         }
         let me = self.get(self.0.api.join("api/me.json")?)?;
-        me["data"]["name"]
+        let account = me["data"]["name"]
             .as_str()
             .filter(|name| !name.is_empty())
             .context("Reddit did not confirm the signed-in account")?;
+        if self
+            .account()
+            .is_some_and(|expected| !expected.name.eq_ignore_ascii_case(account))
+        {
+            bail!("Reddit account changed; reconnect before writing");
+        }
         let token = me["data"]["modhash"]
             .as_str()
             .filter(|value| !value.is_empty())
@@ -46,7 +52,7 @@ impl Reddit {
                     .body(body)
             },
         )?;
-        let value = transport::json(response)?;
+        let value = transport::json(response, None)?;
         if value.as_object().is_some_and(|object| object.is_empty())
             || (value["json"]["errors"]
                 .as_array()

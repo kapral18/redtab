@@ -74,7 +74,10 @@ impl State {
     /// Invalid JSON is moved aside; an unreadable file is left alone and saving is disabled.
     pub fn load(path: &Path) -> (Self, Option<String>) {
         // Act on a symlink's target, never the link.
-        let path = &resolve_link(path);
+        Self::load_file(&resolve_link(path), false)
+    }
+
+    fn load_file(path: &Path, locked: bool) -> (Self, Option<String>) {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Self::default(), None),
@@ -95,16 +98,27 @@ impl State {
         match serde_json::from_slice(&bytes) {
             Ok(state) => (state, None),
             Err(e) => {
-                // Never overwrite an earlier backup.
-                let mut aside = path.with_extension("json.bad");
-                if aside.exists() {
-                    let stamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs());
-                    aside = path.with_extension(format!("json.bad-{stamp}"));
+                if !locked {
+                    let _lock = match lock(path) {
+                        Ok(lock) => lock,
+                        Err(lock) => {
+                            return (
+                                Self {
+                                    read_only: true,
+                                    ..Self::default()
+                                },
+                                Some(format!(
+                                    "state file was invalid ({e}) and could not be locked ({lock}); not saving"
+                                )),
+                            );
+                        }
+                    };
+                    // Another instance may have recovered and saved since the first read.
+                    return Self::load_file(path, true);
                 }
-                match std::fs::rename(path, &aside) {
-                    Ok(()) => (
+                // Never overwrite an earlier backup.
+                match move_corrupt_state(path) {
+                    Ok(aside) => (
                         Self::default(),
                         Some(format!(
                             "state file was invalid ({e}); moved to {}",
@@ -122,6 +136,30 @@ impl State {
                     ),
                 }
             }
+        }
+    }
+}
+
+fn move_corrupt_state(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    let mut aside = path.with_extension("json.bad");
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&aside)
+        {
+            Ok(reservation) => {
+                drop(reservation);
+                if let Err(error) = std::fs::rename(path, &aside) {
+                    let _ = std::fs::remove_file(&aside);
+                    return Err(error);
+                }
+                return Ok(aside);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                aside = path.with_extension(format!("json.bad-{}", uuid::Uuid::new_v4()));
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -712,11 +750,64 @@ mod tests {
         std::fs::write(&path, b"second").unwrap();
         State::load(&path);
         let first = std::fs::read_to_string(dir.join("state.json.bad")).unwrap();
-        let backups = std::fs::read_dir(&dir).unwrap().count();
+        let backups = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("state.json.bad")
+            })
+            .count();
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(first, "first");
         assert_eq!(backups, 2);
+    }
+
+    #[test]
+    fn repeated_corrupt_state_recovery_should_keep_every_backup() {
+        let dir = scratch("bad-repeat");
+        let path = dir.join("state.json");
+        for text in ["first", "second", "third", "fourth"] {
+            std::fs::write(&path, text).unwrap();
+            let (_, warning) = State::load(&path);
+            assert!(warning.unwrap().contains("moved to"));
+        }
+        let mut backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("state.json.bad")
+            })
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect();
+        backups.sort();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(backups, ["first", "fourth", "second", "third"]);
+    }
+
+    #[test]
+    fn when_another_instance_holds_the_save_lock_corrupt_recovery_should_leave_the_file_alone() {
+        let dir = scratch("bad-locked");
+        let path = dir.join("state.json");
+        std::fs::write(&path, "corrupt").unwrap();
+        let held = lock(&path).unwrap();
+
+        let (state, warning) = State::load(&path);
+
+        assert!(state.read_only);
+        assert!(warning.unwrap().contains("another redtab"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "corrupt");
+        drop(held);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

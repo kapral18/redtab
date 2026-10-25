@@ -1,34 +1,33 @@
 # redtab
 
-Reddit in your terminal, with tabs, full-size media and a keyboard-driven workflow.
+Reddit in your terminal, with tabs, inline media and keyboard controls.
 
-- Browse your personalized Home feed, subscriptions and subreddit tabs.
-- Read full-width image cards and galleries, play videos and GIFs inline, and open
-  discussions side by side.
-- Follow threaded comments, search Reddit, vote, save, reply and post.
-- Switch accounts and keep your bookmarks, reading history and cached posts close at hand.
+- Browse Home, subscriptions and subreddit tabs.
+- View images and galleries, play videos and GIFs, and read discussions side by side.
+- Search Reddit, follow comment threads, vote, save, reply and post.
+- Switch accounts, bookmark posts and pick up where you left off.
 
-Sign in with your browser's existing Reddit session, stored in your OS credential store.
+Sign in with your browser's Reddit session, saved in your OS credential store.
 No Reddit API registration is needed.
 
 ## Get started
 
 Requires Rust 1.90+, CMake, a C/C++ compiler and libclang.
-See the [installation guide](docs/guide.md#install) for platform requirements.
+See [installation](docs/guide.md#install) for platform requirements.
 
 ```sh
 cargo install --git https://github.com/kapral18/redtab --locked
 redtab
 ```
 
-On first launch, select your signed-in browser profile and confirm your Reddit account.
-Press `?` for keyboard help. Add `ffmpeg` for inline video.
+On first launch, select your signed-in browser profile and confirm your account.
+Press `?` for help. Install `ffmpeg` for inline video.
 
-## Learn more
+## Documentation
 
-[User guide](docs/guide.md) · [Accounts and sign-in](docs/guide.md#usage) ·
-[Configuration](docs/guide.md#configure) · [Keyboard shortcuts](docs/guide.md#keys) ·
-[Data and privacy](docs/guide.md#data-and-privacy) · [Development](docs/guide.md#development)
+[User guide](docs/guide.md) · [Accounts](docs/accounts.md) ·
+[Settings](docs/configuration.md) · [Keyboard shortcuts](docs/usage.md#keyboard-shortcuts) ·
+[Privacy](docs/accounts.md#data-and-privacy) · [Development](docs/development.md)
 
 ## License
 

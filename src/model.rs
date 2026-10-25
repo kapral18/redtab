@@ -1,6 +1,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub const PREVIEW_EDGE: u32 = 1600;
+pub const PREVIEW_PIXELS: u64 = 16_000_000;
+
 /// Post media. URLs are absolute upstream URLs; temporary media-relay URLs are never persisted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Media {
@@ -8,14 +11,21 @@ pub enum Media {
     None,
     Image {
         url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview: Option<String>,
     },
     Video {
         /// File or HLS playlist; `None` when Reddit has no playable source.
         url: Option<String>,
         poster: Option<String>,
+        #[serde(default)]
+        gif: bool,
     },
     Gallery {
         images: Vec<String>,
+        /// Display sources by original index; absent entries use the original.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        previews: Vec<Option<String>>,
         /// Listing thumbnail, also used when gallery entries are unavailable.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thumb: Option<String>,
@@ -32,6 +42,7 @@ impl Media {
             Media::None => None,
             Media::Image { .. } if self.video_url().is_some() => Some("gif".into()),
             Media::Image { .. } => Some("image".into()),
+            Media::Video { gif: true, .. } => Some("gif".into()),
             Media::Video { .. } => Some("video".into()),
             Media::Gallery { images, .. } if images.is_empty() => Some("gallery".into()),
             Media::Gallery { images, .. } => Some(format!("gallery {}", images.len())),
@@ -43,7 +54,7 @@ impl Media {
     pub fn video_url(&self) -> Option<&str> {
         match self {
             Media::Video { url, .. } => url.as_deref(),
-            Media::Image { url } if is_gif(url) => Some(url),
+            Media::Image { url, .. } if is_gif(url) => Some(url),
             _ => None,
         }
     }
@@ -51,10 +62,27 @@ impl Media {
     /// The best still image to preview inline. A link's preview picture is not one: shown
     /// under the post it reads as the post's own image (it stays the list thumbnail).
     pub fn preview_image(&self) -> Option<&str> {
+        self.preview_image_at(0)
+    }
+
+    pub fn preview_image_at(&self, index: usize) -> Option<&str> {
         match self {
-            Media::Image { url } => self.video_url().is_none().then_some(url),
+            Media::Image { url, preview } => self
+                .video_url()
+                .is_none()
+                .then_some(preview.as_deref().unwrap_or(url)),
             Media::Video { poster, .. } => poster.as_deref(),
-            Media::Gallery { images, .. } => images.first().map(String::as_str),
+            Media::Gallery {
+                images, previews, ..
+            } => {
+                let index = index % images.len().max(1);
+                images.get(index).map(|original| {
+                    previews
+                        .get(index)
+                        .and_then(Option::as_deref)
+                        .unwrap_or(original)
+                })
+            }
             Media::Link { .. } | Media::None => None,
         }
     }
@@ -67,10 +95,8 @@ impl Media {
     /// GIF image posts list their first frame (the fetch stops after it).
     pub fn list_thumb(&self) -> Option<&str> {
         match self {
-            Media::Gallery { images, thumb } => {
-                thumb.as_deref().or(images.first().map(String::as_str))
-            }
-            Media::Image { url } => Some(url),
+            Media::Gallery { thumb, .. } => thumb.as_deref().or_else(|| self.preview_image()),
+            Media::Image { url, preview } => Some(preview.as_deref().unwrap_or(url)),
             Media::Link { thumb, .. } => thumb.as_deref(),
             _ => self.preview_image(),
         }
@@ -314,6 +340,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn card_media_saved_video_without_a_gif_flag_should_still_be_a_video() {
+        let actual: Media =
+            serde_json::from_str(r#"{"Video":{"url":"https://v.redd.it/a.mp4","poster":null}}"#)
+                .unwrap();
+        assert_eq!(actual.tag().as_deref(), Some("video"));
+    }
+
+    #[test]
     fn when_image_urls_have_gif_extensions_they_should_play_as_video() {
         for (url, expected) in [
             ("https://i.redd.it/a.GIF", Some("https://i.redd.it/a.GIF")),
@@ -330,7 +364,10 @@ mod tests {
             ("https://i.redd.it/gif", None),
             ("", None),
         ] {
-            let media = Media::Image { url: url.into() };
+            let media = Media::Image {
+                url: url.into(),
+                preview: None,
+            };
 
             assert_eq!(media.video_url(), expected, "{url:?}");
         }
@@ -340,6 +377,7 @@ mod tests {
     fn when_a_gif_post_lists_it_should_have_a_thumbnail_but_no_still_preview() {
         let media = Media::Image {
             url: "https://i.redd.it/a.gif".into(),
+            preview: None,
         };
 
         assert_eq!(media.list_thumb(), Some("https://i.redd.it/a.gif"));
@@ -362,6 +400,33 @@ mod tests {
     }
 
     #[test]
+    fn when_a_saved_image_has_no_preview_metadata_it_should_keep_its_original() {
+        let actual: Media =
+            serde_json::from_str(r#"{"Image":{"url":"https://i.redd.it/old.png"}}"#).unwrap();
+
+        assert_eq!(actual.preview_image(), Some("https://i.redd.it/old.png"));
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::json!({"Image":{"url":"https://i.redd.it/old.png"}})
+        );
+    }
+
+    #[test]
+    fn when_a_gif_has_a_still_preview_playback_should_keep_the_original() {
+        let actual = Media::Image {
+            url: "https://i.redd.it/movie.gif".into(),
+            preview: Some("https://preview.redd.it/movie.png".into()),
+        };
+
+        assert_eq!(actual.video_url(), Some("https://i.redd.it/movie.gif"));
+        assert_eq!(actual.preview_image(), None);
+        assert_eq!(
+            actual.list_thumb(),
+            Some("https://preview.redd.it/movie.png")
+        );
+    }
+
+    #[test]
     fn gallery_media_saved_before_thumbnails_still_loads() {
         // Bookmarks in state.json store a post's media in this shape.
         let old: Media = serde_json::from_str(r#"{"Gallery":{"images":[]}}"#).unwrap();
@@ -369,12 +434,14 @@ mod tests {
             old,
             Media::Gallery {
                 images: Vec::new(),
+                previews: Vec::new(),
                 thumb: None,
             }
         );
 
         let new = Media::Gallery {
             images: Vec::new(),
+            previews: Vec::new(),
             thumb: Some("https://preview.redd.it/a.jpg".into()),
         };
         let json = serde_json::to_string(&new).unwrap();

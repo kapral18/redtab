@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Cursor, Read};
 use std::net::TcpListener;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -14,6 +14,27 @@ use tiny_http::{Header, Method, Response, Server, StatusCode};
 use url::Url;
 
 use super::transport::{Reader, Transport};
+
+const MAX_REQUESTS: usize = 32;
+
+struct RequestSlot(Arc<AtomicUsize>);
+
+impl RequestSlot {
+    fn acquire(active: &Arc<AtomicUsize>) -> Option<Self> {
+        active
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < MAX_REQUESTS).then_some(count + 1)
+            })
+            .ok()
+            .map(|_| Self(active.clone()))
+    }
+}
+
+impl Drop for RequestSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 pub(super) struct Relay {
     base: String,
@@ -28,32 +49,38 @@ impl Relay {
             listener.local_addr()?,
             uuid::Uuid::new_v4().simple()
         );
-        let server = Arc::new(
-            Server::from_listener(listener, None)
-                .map_err(|_| anyhow::anyhow!("cannot start media relay"))?,
-        );
+        let server = Server::from_listener(listener, None)
+            .map_err(|_| anyhow::anyhow!("cannot start media relay"))?;
         let stop = Arc::new(AtomicBool::new(false));
-        for _ in 0..4 {
-            let (server, stop, transport, base) = (
-                server.clone(),
-                stop.clone(),
-                transport.clone(),
-                base.clone(),
-            );
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(100)) else {
-                        continue;
-                    };
+        let stopped = stop.clone();
+        let local_base = base.clone();
+        std::thread::spawn(move || {
+            let active = Arc::new(AtomicUsize::new(0));
+            while !stopped.load(Ordering::Relaxed) {
+                // Reserve before receiving: even rejecting a pipelined request can
+                // block behind its earlier response, so only workers own requests.
+                let Some(slot) = RequestSlot::acquire(&active) else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(100)) else {
+                    continue;
+                };
+                let transport = transport.clone();
+                let base = local_base.clone();
+                // A paused player can stop reading indefinitely. Its response must not
+                // occupy the workers needed to open another rendition or audio stream.
+                std::thread::spawn(move || {
+                    let _slot = slot;
                     let response = serve(&transport, &base, &request).unwrap_or_else(|_| {
                         Response::from_string("Media unavailable")
                             .with_status_code(502)
                             .boxed()
                     });
                     let _ = request.respond(response);
-                }
-            });
-        }
+                });
+            }
+        });
         Ok(Self { base, stop })
     }
 
@@ -98,7 +125,7 @@ fn serve(
         .iter()
         .find(|h| h.field.equiv("Range"))
         .map(|h| h.value.as_str());
-    let response = transport.media(&upstream, range)?;
+    let response = transport.media(&upstream, range, None)?;
     let status = response.status().as_u16();
     let final_url = Url::parse(&response.uri().to_string())?;
     let playlist_hint = final_url.path().ends_with(".m3u8")
@@ -120,7 +147,7 @@ fn serve(
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok());
-    let mut body = BufReader::new(Reader::new(response, u64::MAX));
+    let mut body = BufReader::new(Reader::new(response, u64::MAX, None));
     let peek = body.fill_buf()?;
     let looks_like_playlist = peek.starts_with(b"#EXTM3U");
     // DASH and other XML manifests can reference remote resources too; only HLS
@@ -204,6 +231,21 @@ fn rewrite_playlist(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_slots_should_bound_active_streams_and_release_capacity() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut slots: Vec<_> = (0..MAX_REQUESTS)
+            .map(|_| RequestSlot::acquire(&active).unwrap())
+            .collect();
+        assert!(RequestSlot::acquire(&active).is_none());
+        slots.pop();
+        let replacement = RequestSlot::acquire(&active).unwrap();
+        assert!(RequestSlot::acquire(&active).is_none());
+        drop(replacement);
+        drop(slots);
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn playlists_route_segments_keys_maps_and_alternate_audio() {

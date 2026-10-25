@@ -2,6 +2,9 @@
 //! Takes `&mut App` to keep scroll offsets in sync and to load the thumbnails it draws.
 
 mod experience;
+mod help;
+mod loading;
+mod settings;
 
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
@@ -13,18 +16,18 @@ use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
+#[cfg(test)]
 use ratatui_image::picker::ProtocolType;
-use ratatui_image::{Image, Resize, StatefulImage};
+use ratatui_image::{Resize, StatefulImage};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     App, CARD_MIN_WIDTH, CardImageProtocol, CardImageSlot, CardScroll, DETAIL_MIN_WIDTH, Focus,
-    Group, ImageRefresh, ImageSlot, MAIN_MIN_WIDTH, Overlay, PickerEntry, PostView, RowKind, Tab,
-    TabKind,
+    Group, ImageSlot, MAIN_MIN_WIDTH, Overlay, PickerEntry, PostView, RowKind, Tab, TabKind,
 };
 use crate::model::{Media, PICTURE, Post, SPOILER_END, SPOILER_START, Sort};
-use crate::reddit::Health;
+use crate::reddit::{AccessDenied, Health};
 use crate::state::ListView;
 use crate::video;
 
@@ -34,7 +37,8 @@ mod theme {
     pub const ACCENT: Color = Color::Rgb(255, 99, 51);
     pub const TEXT: Color = Color::Rgb(205, 214, 244);
     pub const SUBTEXT: Color = Color::Rgb(166, 173, 200);
-    pub const OVERLAY: Color = Color::Rgb(108, 112, 134);
+    pub const OVERLAY: Color = Color::Rgb(154, 160, 185);
+    pub const BASE: Color = Color::Rgb(30, 30, 46);
     pub const SURFACE0: Color = Color::Rgb(49, 50, 68);
     pub const SURFACE1: Color = Color::Rgb(69, 71, 90);
     pub const MANTLE: Color = Color::Rgb(24, 24, 37);
@@ -59,10 +63,17 @@ pub const THUMB_ROWS: u16 = 2;
 const THUMB_RESERVE: usize = THUMB_COLS as usize + 1;
 /// A subreddit icon: one line tall.
 const ICON_COLS: u16 = 2;
+const PANEL_PAD: u16 = 1;
+const PANEL_GAP: u16 = 1;
+const POPUP_OUTER_X: u16 = 2;
+const POPUP_OUTER_Y: u16 = 1;
+const NSFW_EMPTY_HINT: &str = "NSFW is off. Press F2 and enable Show NSFW in Settings.";
 #[cfg(test)]
 use crate::card_image::encode_tile;
 /// Kitty's Unicode placeholders can address only 297 rows or columns per image.
-use crate::card_image::{Key as CardImageKey, TILE_COLS, TILE_ROWS};
+use crate::card_image::{
+    Indicator, Key as CardImageKey, Overlay as ImageOverlay, Preparation, TILE_COLS, TILE_ROWS,
+};
 
 /// A thumbnail or icon to draw once the text is down.
 struct ImageSpot {
@@ -76,13 +87,13 @@ struct PostCard {
     marker: Span<'static>,
     style: Style,
     image: Option<String>,
-    image_rows: u16,
+    image_size: Size,
     pixels: (u32, u32),
 }
 
 impl PostCard {
     fn height(&self) -> usize {
-        self.lines.len() + usize::from(self.image_rows) + 1
+        self.lines.len() + usize::from(self.image_size.height) + 1
     }
 
     fn visible(&self, skip: usize, rows: usize) -> Vec<Line<'static>> {
@@ -100,23 +111,51 @@ impl PostCard {
     }
 }
 
+#[derive(Clone)]
 struct CardPicture {
-    url: String,
+    url: Option<String>,
     area: Rect,
     size: Size,
     skipped: u16,
     pixels: (u32, u32),
-    video: bool,
+    indicator: Option<Indicator>,
+    selected: bool,
+    detail: bool,
+    post_id: Option<String>,
+    video_frame: bool,
+}
+
+impl CardPicture {
+    fn overlay(&self) -> Option<ImageOverlay> {
+        self.indicator.clone().map(|indicator| ImageOverlay {
+            indicator,
+            top: 0,
+            rows: self.size.height,
+        })
+    }
+
+    fn status(&self, label: &str) -> String {
+        let prefix = match &self.indicator {
+            Some(Indicator::Video { gif: true, .. }) => "▶ GIF ·",
+            Some(Indicator::Video { .. }) => "▶ video ·",
+            Some(Indicator::Link(_)) => "↗ link ·",
+            Some(Indicator::Gallery(_)) => "▦ gallery ·",
+            None => "▣",
+        };
+        format!("{prefix} {label}")
+    }
 }
 
 #[derive(Default)]
 struct ListPictures {
     thumbs: Vec<ImageSpot>,
     cards: Vec<CardPicture>,
+    inline: Vec<ImageSpot>,
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
+    f.render_widget(Block::default().style(Style::new().fg(TEXT).bg(BASE)), area);
     app.resize(area.width);
     let sidebar_width = app.sidebar_width();
     let [sidebar, main] =
@@ -148,39 +187,64 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         (body, None)
     };
+    if main.is_empty() || !matches!(app.active_tab().kind, TabKind::AllSubs) {
+        app.groups_drawn(&[]);
+    }
+    if let Some(name) = app.active_tab().subreddit().map(str::to_string) {
+        app.demand_icon(&name);
+    }
     let margin = Margin {
-        horizontal: 1,
+        horizontal: PANEL_PAD,
         vertical: 0,
     };
+    let mut list_loader = None;
     if !main.is_empty() {
         let body = main.inner(margin);
         match app.active_tab().kind {
-            TabKind::Home => draw_feed(f, app, body, &mut pictures),
-            TabKind::AllSubs => draw_all_subs(f, app, body, &mut spots),
+            TabKind::Home => list_loader = draw_feed(f, app, body, &mut pictures),
+            TabKind::AllSubs => list_loader = draw_all_subs(f, app, body, &mut spots),
             TabKind::Bookmarks => draw_bookmarks(f, app, body, &mut pictures),
-            TabKind::Subreddit { .. } => draw_feed(f, app, body, &mut pictures),
+            TabKind::Subreddit { .. } => list_loader = draw_feed(f, app, body, &mut pictures),
         }
     }
+    let post_loader =
+        detail.and_then(|detail| draw_post(f, app, detail.inner(margin), &mut pictures));
     spots.extend(pictures.thumbs);
-    if let Some(detail) = detail {
-        draw_post(f, app, detail.inner(margin), &mut pictures.cards);
+    let covered = draw_overlay(f, app);
+    draw_card_pictures(f, app, &pictures.cards, covered);
+    draw_spots(f, app, &spots, covered);
+    for spot in &pictures.inline {
+        draw_inline_image(f, app, &spot.url, spot.area, covered);
     }
-    draw_card_pictures(f, app, &pictures.cards);
-    draw_spots(f, app, &spots);
-    draw_footer(f, app, footer);
+    let visible = |loader: Option<Rect>| {
+        loader.is_some_and(|area| covered.is_none_or(|covered| !area.intersects(covered)))
+    };
+    let loaders = VisibleLoaders {
+        list: visible(list_loader),
+        post: visible(post_loader),
+    };
+    app.loading_drawn(app.loading_active());
+    draw_footer(f, app, footer, &loaders);
+    // On very short terminals a dialog may also cover the underlying footer.
+    if covered.is_some_and(|area| area.intersects(footer)) {
+        draw_overlay(f, app);
+    }
     app.status_drawn();
-    if let Some(Overlay::Help { scroll }) = &mut app.overlay {
-        draw_help(f, scroll);
-        return;
+}
+
+fn draw_overlay(f: &mut Frame, app: &mut App) -> Option<Rect> {
+    if app.help_scroll.is_some() {
+        return help::draw(f, app);
     }
     match &app.overlay {
+        Some(Overlay::Settings) => Some(settings::draw(f, app)),
         Some(Overlay::Experience) => experience::draw(f, app),
-        Some(Overlay::Auth) => draw_auth(f, app),
-        Some(Overlay::Picker(p)) => draw_picker(f, app, &p.input, p.selected),
-        Some(Overlay::Sort { selected }) => draw_sort(f, app, *selected),
-        Some(Overlay::Search { input }) => draw_search(f, app, input),
-        Some(Overlay::Membership { subreddit, join }) => draw_membership(f, subreddit, *join),
-        Some(Overlay::Help { .. }) | None => {}
+        Some(Overlay::Auth) => Some(draw_auth(f, app)),
+        Some(Overlay::Picker(p)) => Some(draw_picker(f, app, &p.input, p.selected)),
+        Some(Overlay::Sort { selected }) => Some(draw_sort(f, app, *selected)),
+        Some(Overlay::Search { input }) => Some(draw_search(f, app, input)),
+        Some(Overlay::Membership { subreddit, join }) => Some(draw_membership(f, subreddit, *join)),
+        None => None,
     }
 }
 
@@ -196,19 +260,17 @@ pub fn strip_colors(buf: &mut ratatui::buffer::Buffer) {
 }
 
 /// Draw loaded thumbnails and icons; start loading the missing ones.
-fn draw_spots(f: &mut Frame, app: &mut App, spots: &[ImageSpot]) {
-    // Nothing under an overlay: kitty sends image data once, in the first cell, and
-    // sixel and iTerm2 would leave stale pixels.
-    if app.overlay.is_none() {
-        for spot in spots {
-            if let Some(ImageSlot::Ready { protocol, .. }) = app.thumbs.get_mut(&spot.url) {
-                // Cut to the slot's shape on arrival (`fill_slot`): scaled, it fills it.
-                let fill = StatefulImage::default()
-                    .resize(Resize::Scale(Some(ratatui_image::FilterType::Triangle)));
-                f.render_stateful_widget(fill, spot.area, protocol.as_mut());
-            } else if !matches!(app.thumbs.get(&spot.url), Some(ImageSlot::Failed(_))) {
-                draw_picture_wait(f, spot.area, "◌");
-            }
+fn draw_spots(f: &mut Frame, app: &mut App, spots: &[ImageSpot], covered: Option<Rect>) {
+    for spot in spots {
+        if covered.is_some_and(|area| area.intersects(spot.area)) {
+            continue;
+        }
+        if let Some(ImageSlot::Ready { protocol, .. }) = app.thumbs.get_mut(&spot.url) {
+            let fill = StatefulImage::default()
+                .resize(Resize::Scale(Some(ratatui_image::FilterType::Triangle)));
+            f.render_stateful_widget(fill, spot.area, protocol.as_mut());
+        } else if !matches!(app.thumbs.get(&spot.url), Some(ImageSlot::Failed(_))) {
+            loading::draw(f, spot.area, loading::Kind::Media, "", app.loading_frame);
         }
     }
     let urls: Vec<&str> = spots.iter().map(|s| s.url.as_str()).collect();
@@ -262,6 +324,9 @@ fn score_color(score: Option<i64>) -> Color {
 
 /// Cut `s` to `width` columns with an ellipsis, on grapheme boundaries.
 fn truncate(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
     if s.width() <= width {
         return s.to_string();
     }
@@ -277,6 +342,78 @@ fn truncate(s: &str, width: usize) -> String {
     }
     out.push('…');
     out
+}
+
+fn choice_style(selected: bool) -> Style {
+    if selected {
+        Style::new().fg(TEXT).bg(SURFACE0).bold()
+    } else {
+        Style::new().fg(SUBTEXT)
+    }
+}
+
+fn selection_marker(selected: bool, focused: bool) -> &'static str {
+    match (selected, focused) {
+        (true, true) => "▌",
+        (true, false) => "│",
+        _ => " ",
+    }
+}
+
+fn fit_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let mut output = Vec::new();
+    let mut remaining = width;
+    for mut span in spans {
+        if remaining == 0 {
+            break;
+        }
+        if span.width() > remaining {
+            span.content = truncate(&span.content, remaining).into();
+        }
+        remaining = remaining.saturating_sub(span.width());
+        output.push(span);
+    }
+    output
+}
+
+fn wrap_spans(
+    spans: Vec<Span<'static>>,
+    width: usize,
+    prefix: &[Span<'static>],
+) -> Vec<Line<'static>> {
+    let room = width.saturating_sub(line_width(prefix)).max(1);
+    let mut lines = Vec::new();
+    let mut row = prefix.to_vec();
+    let mut used = 0;
+    let mut gap = 0;
+    for mut span in spans {
+        if span.content.trim().is_empty() {
+            if used > 0 {
+                gap += span.width();
+            }
+            continue;
+        }
+        if used > 0 && used + gap + span.width() > room {
+            lines.push(Line::from(std::mem::replace(&mut row, prefix.to_vec())));
+            used = 0;
+            gap = 0;
+        }
+        if used == 0 {
+            span.content = span.content.trim_start().to_string().into();
+        }
+        if gap > 0 {
+            row.push(Span::raw(" ".repeat(gap)));
+            used += gap;
+        }
+        gap = 0;
+        span.content = truncate(&span.content, room.saturating_sub(used)).into();
+        used += span.width();
+        row.push(span);
+    }
+    if used > 0 {
+        lines.push(Line::from(row));
+    }
+    lines
 }
 
 fn chip(text: impl Into<String>, fg: Color, bg: Color) -> Span<'static> {
@@ -345,6 +482,25 @@ fn empty_state(f: &mut Frame, area: Rect, icon: &str, title: &str, hint: &str) {
     );
 }
 
+fn empty_content_state(f: &mut Frame, area: Rect, title: &str, hint: &str, show_nsfw: bool) {
+    if !show_nsfw
+        && 2 + wrapped_rows(title, area.width) + wrapped_rows(hint, area.width)
+            > usize::from(area.height)
+    {
+        centered(
+            f,
+            area,
+            vec![
+                Line::styled(title.to_string(), Style::new().fg(SUBTEXT).bold()),
+                Line::styled("NSFW is off", Style::new().fg(OVERLAY)),
+                Line::styled("F2: enable Show NSFW", Style::new().fg(OVERLAY)),
+            ],
+        );
+    } else {
+        empty_state(f, area, "∅", title, hint);
+    }
+}
+
 // ----- sidebar -------------------------------------------------------------
 
 enum SideRow {
@@ -357,8 +513,8 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect, spots: &mut Vec<ImageSpot>
     let panel = Style::new().bg(MANTLE);
     f.render_widget(Block::default().style(panel), area);
     let inner = area.inner(Margin {
-        horizontal: 1,
-        vertical: 1,
+        horizontal: PANEL_PAD,
+        vertical: PANEL_PAD,
     });
     let [brand, list, status] = Layout::vertical([
         Constraint::Length(2),
@@ -483,7 +639,7 @@ fn sidebar_item(app: &App, index: usize, width: usize) -> Line<'static> {
         TabKind::Subreddit { name, .. } => ("#", name.as_str()),
     };
     let badge = match tab.kind {
-        TabKind::Bookmarks => app.state.bookmarks().len(),
+        TabKind::Bookmarks => app.visible_bookmarks().count(),
         _ => app.badge(tab),
     };
     // With focus in the sidebar, its row stands out more than the list's selection.
@@ -504,8 +660,11 @@ fn sidebar_item(app: &App, index: usize, width: usize) -> Line<'static> {
         None => format!(" {icon} "),
     };
     let mut spans = vec![
-        Span::styled(if active { "▌" } else { " " }, base.fg(ACCENT)),
-        Span::styled(number, base.fg(if active { SUBTEXT } else { SURFACE1 })),
+        Span::styled(
+            selection_marker(active, app.focus == Focus::Sidebar),
+            base.fg(ACCENT),
+        ),
+        Span::styled(number, base.fg(if active { TEXT } else { OVERLAY })),
         Span::styled(slot, base.fg(if active { ACCENT } else { OVERLAY })),
     ];
     let badge_text = match (badge, &tab.kind) {
@@ -540,19 +699,34 @@ fn sidebar_item(app: &App, index: usize, width: usize) -> Line<'static> {
 // ----- main header ---------------------------------------------------------
 
 fn view_header(f: &mut Frame, area: Rect, title: &str, chips: Vec<Span<'static>>) -> Rect {
-    let [head, rest] = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(area);
-    let mut spans = vec![Span::styled(
-        format!(" {title} "),
-        Style::new()
-            .fg(CRUST)
-            .bg(ACCENT)
-            .add_modifier(Modifier::BOLD),
-    )];
-    for c in chips {
-        spans.push(Span::raw(" "));
-        spans.push(c);
-    }
-    let lines = vec![Line::raw(""), Line::from(spans)];
+    let width = usize::from(area.width);
+    let maximum = area.height.saturating_sub(1).min(3);
+    let gap = if area.width >= 100 && maximum >= 3 {
+        PANEL_GAP
+    } else {
+        0
+    };
+    let chip_rows = maximum.saturating_sub(1 + gap) as usize;
+    let mut lines = vec![Line::from(fit_spans(
+        vec![chip(title, CRUST, ACCENT)],
+        width,
+    ))];
+    let chips = chips
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, chip)| {
+            if index == 0 {
+                vec![chip]
+            } else {
+                vec![Span::raw(" "), chip]
+            }
+        })
+        .collect();
+    lines.extend(wrap_spans(chips, width, &[]).into_iter().take(chip_rows));
+    // Request activity must not move the list under the selection.
+    let height = maximum;
+    let [head, rest] =
+        Layout::vertical([Constraint::Length(height), Constraint::Min(1)]).areas(area);
     f.render_widget(Paragraph::new(lines), head);
     rest
 }
@@ -599,7 +773,10 @@ fn post_card(app: &App, post: &Post, width: usize, opts: &CardOpts<'_>) -> [Line
     } else {
         OVERLAY
     };
-    let bar = Span::styled(if opts.selected { "▌" } else { " " }, bg.fg(bar_color));
+    let bar = Span::styled(
+        selection_marker(opts.selected, app.focus == Focus::List),
+        bg.fg(bar_color),
+    );
 
     let score = post.score.map_or("•".into(), format_count);
     let slot = Span::styled(" ".repeat(opts.reserve), bg);
@@ -667,6 +844,14 @@ fn post_meta(
     bg: Style,
     mut meta: Vec<Span<'static>>,
 ) -> Line<'static> {
+    if post.nsfw {
+        meta.push(Span::styled(" ", bg));
+        meta.push(chip("nsfw", CRUST, RED));
+    }
+    if post.spoiler {
+        meta.push(Span::styled(" ", bg));
+        meta.push(chip("spoiler", CRUST, YELLOW));
+    }
     if show_subreddit {
         meta.push(Span::styled(
             format!("r/{}  ", post.subreddit),
@@ -678,14 +863,6 @@ fn post_meta(
     if !age.is_empty() {
         meta.push(Span::styled(format!(" · {age}"), bg.fg(OVERLAY)));
     }
-    if post.nsfw {
-        meta.push(Span::styled(" ", bg));
-        meta.push(chip("nsfw", CRUST, RED));
-    }
-    if post.spoiler {
-        meta.push(Span::styled(" ", bg));
-        meta.push(chip("spoiler", CRUST, YELLOW));
-    }
     if let Some(flair) = &post.flair {
         meta.push(Span::styled(" ", bg));
         meta.push(chip(truncate(flair, 22), MAUVE, SURFACE1));
@@ -694,16 +871,7 @@ fn post_meta(
         meta.push(Span::styled(" ", bg));
         meta.push(chip(media_label(&post.media, &tag), TEAL, SURFACE1));
     }
-    let mut meta_line: Vec<Span<'static>> = Vec::new();
-    let mut used = 0;
-    for span in meta {
-        let w = span.content.width();
-        if used + w > width {
-            break;
-        }
-        used += w;
-        meta_line.push(span);
-    }
+    let mut meta_line = fit_spans(meta, width);
     pad_to(&mut meta_line, width, bg);
     Line::from(meta_line).style(bg)
 }
@@ -727,12 +895,12 @@ struct ListSpec<'a> {
     show_subreddit: bool,
     offset: usize,
     scroll: CardScroll,
-    tail: Option<&'static str>,
+    append_area: Option<Rect>,
 }
 
 fn card_marker(app: &App, selected: bool, bg: Style) -> Span<'static> {
     Span::styled(
-        if selected { "▌ " } else { "  " },
+        format!("{} ", selection_marker(selected, app.focus == Focus::List)),
         bg.fg(if app.focus == Focus::List {
             ACCENT
         } else {
@@ -741,13 +909,30 @@ fn card_marker(app: &App, selected: bool, bg: Style) -> Span<'static> {
     )
 }
 
-fn full_width_picture(pixels: (u32, u32), font: ratatui_image::FontSize, cols: u16) -> Size {
-    let rows = (f64::from(cols) * f64::from(font.width.max(1)) * f64::from(pixels.1)
-        / f64::from(pixels.0.max(1))
-        / f64::from(font.height.max(1)))
-    .ceil()
-    .clamp(1.0, f64::from(i16::MAX)) as u16;
-    Size::new(cols, rows)
+fn fit_picture(
+    pixels: (u32, u32),
+    font: ratatui_image::FontSize,
+    bounds: Size,
+    viewport_height: u16,
+) -> Size {
+    let bounds = Size::new(
+        bounds.width,
+        bounds
+            .height
+            .min((u32::from(viewport_height) * 3 / 5) as u16),
+    );
+    if bounds.width == 0 || bounds.height == 0 {
+        return Size::default();
+    }
+    picture_cells(
+        pixels.0,
+        pixels.1,
+        font,
+        bounds.width,
+        bounds.height,
+        bounds.height,
+        f64::INFINITY,
+    )
 }
 
 fn expanded_card(
@@ -761,6 +946,7 @@ fn expanded_card(
     let marker = card_marker(app, opts.selected, bg);
     let meta = post_meta(post, width, opts.show_subreddit, bg, vec![marker.clone()]);
     let mut lines = card_title(app, post, width, opts, height, bg);
+    lines.insert(0, meta);
     let image = (!post.spoiler && width >= 8 && app.inline_images_on())
         .then(|| {
             post.media
@@ -769,26 +955,39 @@ fn expanded_card(
                 .map(str::to_string)
         })
         .flatten();
-    let image_size = image.as_deref().and_then(|url| {
-        post.preview_size
-            .filter(|&(width, height)| width > 0 && height > 0)
-            .or_else(|| {
+    let image_size = post
+        .preview_size
+        .filter(|&(width, height)| width > 0 && height > 0)
+        .or_else(|| {
+            image.as_deref().and_then(|url| {
                 app.card_image_metadata
                     .get(url)
                     .map(|metadata| metadata.size)
             })
-            .filter(|&(width, height)| width > 0 && height > 0)
-    });
-    let image_rows = image.as_ref().map_or(0, |_| {
-        full_width_picture(
-            image_size.unwrap_or((1, 1)),
+        })
+        .filter(|&(width, height)| width > 0 && height > 0);
+    let preview = !post.spoiler
+        && width >= 8
+        && app.inline_images_on()
+        && (image.is_some() || post.media.video_url().is_some());
+    let fitted_size = if preview {
+        fit_picture(
+            image_size.unwrap_or(if post.media.video_url().is_some() {
+                (16, 9)
+            } else {
+                (1, 1)
+            }),
             app.image_picker.font_size(),
-            width.saturating_sub(4) as u16,
+            Size::new(
+                width.saturating_sub(4) as u16,
+                height.saturating_sub(lines.len() as u16 + 1),
+            ),
+            height,
         )
-        .height
-    });
-    lines.insert(0, meta);
-    let image = image.filter(|_| image_rows > 0);
+    } else {
+        Size::default()
+    };
+    let image = image.filter(|_| fitted_size.height > 0);
     let score = post.score.map_or("•".into(), format_count);
     let footer = Line::from(vec![
         marker.clone(),
@@ -804,9 +1003,13 @@ fn expanded_card(
         footer,
         marker,
         style: bg,
-        pixels: image_size.unwrap_or((1, 1)),
+        pixels: image_size.unwrap_or(if post.media.video_url().is_some() {
+            (16, 9)
+        } else {
+            (1, 1)
+        }),
         image,
-        image_rows,
+        image_size: fitted_size,
     }
 }
 
@@ -1021,24 +1224,45 @@ fn draw_card_list(
             Paragraph::new(card.visible(skip, usize::from(at.height))),
             at,
         );
-        if let Some(url) = &card.image {
+        if card.image_size.height > 0 {
             let image_start = card.lines.len();
             let image_y = y + image_start.saturating_sub(skip).min(area.height as usize) as u16;
             let skipped = skip.saturating_sub(image_start) as u16;
-            if skipped < card.image_rows && image_y < at.bottom() {
+            if skipped < card.image_size.height && image_y < at.bottom() {
                 pictures.cards.push(CardPicture {
-                    url: url.clone(),
+                    url: card.image.clone(),
                     area: Rect::new(
-                        area.x + 2,
+                        area.x + 2 + area.width.saturating_sub(6 + card.image_size.width) / 2,
                         image_y,
-                        area.width.saturating_sub(6),
-                        (card.image_rows - skipped).min(at.bottom() - image_y),
+                        card.image_size.width,
+                        (card.image_size.height - skipped).min(at.bottom() - image_y),
                     ),
-                    size: Size::new(area.width.saturating_sub(6), card.image_rows),
+                    size: card.image_size,
                     skipped,
                     pixels: card.pixels,
-                    video: matches!(spec.posts[i].media, Media::Video { .. })
-                        || spec.posts[i].media.video_url().is_some(),
+                    indicator: match &spec.posts[i].media {
+                        Media::Video { gif, url, .. } => Some(Indicator::Video {
+                            gif: *gif,
+                            play: url.is_some(),
+                        }),
+                        Media::Image { .. } if spec.posts[i].media.video_url().is_some() => {
+                            Some(Indicator::Video {
+                                gif: true,
+                                play: true,
+                            })
+                        }
+                        Media::Link { url, .. } => Some(Indicator::Link(
+                            crate::model::domain_of(url).unwrap_or_else(|| "link".into()),
+                        )),
+                        Media::Gallery { images, .. } if !images.is_empty() => {
+                            Some(Indicator::Gallery(images.len()))
+                        }
+                        _ => None,
+                    },
+                    selected: i == spec.selected,
+                    detail: false,
+                    post_id: Some(spec.posts[i].id.clone()),
+                    video_frame: false,
                 });
             }
         }
@@ -1046,18 +1270,14 @@ fn draw_card_list(
         if i + 1 == spec.posts.len()
             && usize::from(at.height) == rows
             && at.bottom() < area.bottom()
-            && let Some(tail) = spec.tail
         {
-            draw_list_tail(
-                f,
-                Rect::new(
-                    area.x,
-                    at.bottom(),
-                    area.width.saturating_sub(2),
-                    area.bottom() - at.bottom(),
-                ),
-                tail,
+            let tail_area = Rect::new(
+                area.x,
+                at.bottom(),
+                area.width.saturating_sub(2),
+                area.bottom() - at.bottom(),
             );
+            spec.append_area = Some(tail_area);
         }
         y = y.saturating_add(at.height.saturating_add(1));
         if y >= area.bottom() {
@@ -1080,17 +1300,105 @@ fn draw_card_list(
     (pending != 0).then_some(last_visible)
 }
 
-fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture]) {
+fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture], covered: Option<Rect>) {
     let prepare = app.card_preparation_allowed();
-    let urls: Vec<&str> = spots.iter().map(|spot| spot.url.as_str()).collect();
+    app.card_video_drawn(
+        spots
+            .iter()
+            .find(|spot| spot.selected)
+            .map(|spot| spot.size),
+    );
+    let urls: Vec<&str> = spots
+        .iter()
+        .filter_map(|spot| spot.url.as_deref())
+        .collect();
     app.card_pictures_drawn(&urls);
     app.card_renderer.begin();
     for spot in spots {
-        if app.overlay.is_some() {
+        if spot.selected
+            && let Some(player) = if spot.detail {
+                app.selected_video()
+            } else {
+                app.card_player()
+            }
+            && let Some(video::Frame {
+                pixels: video::Pixels::Raw(image),
+                ..
+            }) = player.frame()
+        {
+            let image = image.clone();
+            let mut spot = spot.clone();
+            spot.video_frame = true;
+            if !player.paused()
+                && player.error().is_none()
+                && let Some(Indicator::Video { play, .. }) = &mut spot.indicator
+            {
+                *play = false;
+            }
+            if let Err(error) = draw_card_image(
+                f,
+                &image,
+                &mut None,
+                &spot,
+                CardRender {
+                    picker: &app.image_picker,
+                    renderer: &mut app.card_renderer,
+                    prepare: Preparation::Refresh,
+                    covered,
+                    phase: app.loading_frame,
+                },
+            ) {
+                draw_visible_status(
+                    f,
+                    spot.area,
+                    covered,
+                    &format!("▶ video unavailable: {error}"),
+                );
+            }
             continue;
         }
-        let Some(slot) = app.card_images.get_mut(&spot.url) else {
-            draw_picture_wait(f, spot.area, "▣ loading image…");
+        let Some(url) = spot.url.as_deref() else {
+            let label = if !spot.selected {
+                spot.status("select to preview")
+            } else if !spot.detail && app.post_view.is_some() {
+                spot.status("open to preview")
+            } else if !app.video_controls_available() {
+                spot.status("l return to preview")
+            } else if app
+                .selected_video()
+                .is_some_and(|player| player.error().is_some())
+            {
+                spot.status("unavailable · m opens media")
+            } else if app.config.media.video_autoplay || app.selected_video().is_some() {
+                draw_visible_loading(
+                    f,
+                    spot.area,
+                    covered,
+                    &spot.status("loading video…"),
+                    app.loading_frame,
+                );
+                continue;
+            } else {
+                spot.status("P play/pause")
+            };
+            draw_visible_status(f, spot.area, covered, &label);
+            continue;
+        };
+        let preparation = if !prepare {
+            Preparation::Hold
+        } else if app.card_image_is_retained(url) {
+            Preparation::Missing
+        } else {
+            Preparation::Refresh
+        };
+        let Some(slot) = app.card_images.get_mut(url) else {
+            draw_visible_loading(
+                f,
+                spot.area,
+                covered,
+                &spot.status("loading image…"),
+                app.loading_frame,
+            );
             continue;
         };
         match slot {
@@ -1098,57 +1406,71 @@ fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture]) {
             | CardImageSlot::Cached {
                 image, protocol, ..
             } => {
-                if spot.video
-                    && app
-                        .card_image_metadata
-                        .get(&spot.url)
-                        .is_some_and(|metadata| metadata.flat)
-                {
-                    draw_picture_wait(f, spot.area, "▶ video · open post");
-                    continue;
-                }
                 if let Err(error) = draw_card_image(
                     f,
-                    &app.image_picker,
-                    &mut app.card_renderer,
                     image,
                     protocol,
                     spot,
-                    prepare,
+                    CardRender {
+                        picker: &app.image_picker,
+                        renderer: &mut app.card_renderer,
+                        prepare: preparation,
+                        covered,
+                        phase: app.loading_frame,
+                    },
                 ) {
                     *slot = CardImageSlot::Failed(error);
                 }
             }
-            CardImageSlot::Loading => draw_picture_wait(f, spot.area, "▣ loading image…"),
-            CardImageSlot::Failed(error) => f.render_widget(
-                Paragraph::new(format!(
-                    "▣ image unavailable: {}",
-                    truncate(error, spot.area.width as usize)
-                ))
-                .style(Style::new().fg(OVERLAY)),
+            CardImageSlot::Loading => draw_visible_loading(
+                f,
                 spot.area,
+                covered,
+                &spot.status("loading image…"),
+                app.loading_frame,
+            ),
+            CardImageSlot::Failed(error) => draw_visible_status(
+                f,
+                spot.area,
+                covered,
+                &spot.status(&format!("image unavailable: {error}")),
             ),
         }
     }
     app.card_renderer.finish();
 }
 
+struct CardRender<'a> {
+    picker: &'a ratatui_image::picker::Picker,
+    renderer: &'a mut crate::card_image::Renderer,
+    prepare: Preparation,
+    covered: Option<Rect>,
+    phase: usize,
+}
+
 fn draw_card_image(
     f: &mut Frame,
-    picker: &ratatui_image::picker::Picker,
-    renderer: &mut crate::card_image::Renderer,
     image: &std::sync::Arc<image::DynamicImage>,
     protocol: &mut Option<CardImageProtocol>,
     spot: &CardPicture,
-    prepare: bool,
+    render: CardRender<'_>,
 ) -> Result<(), String> {
-    if protocol
-        .as_ref()
-        .is_none_or(|protocol| protocol.size != spot.size || protocol.pixels != spot.pixels)
-    {
+    let CardRender {
+        picker,
+        renderer,
+        prepare,
+        covered,
+        phase,
+    } = render;
+    if protocol.as_ref().is_none_or(|protocol| {
+        protocol.size != spot.size
+            || protocol.pixels != spot.pixels
+            || protocol.overlay != spot.overlay()
+    }) {
         *protocol = Some(CardImageProtocol {
             size: spot.size,
             pixels: spot.pixels,
+            overlay: spot.overlay(),
             tiles: HashMap::new(),
         });
     }
@@ -1163,39 +1485,52 @@ fn draw_card_image(
             let start = spot.skipped.max(row * TILE_ROWS);
             let y = spot.area.y + start - spot.skipped;
             let rows = ((row + 1) * TILE_ROWS - start).min(spot.area.bottom() - y);
-            let key = (start, column, rows);
-            visible.push(key);
-            let request = CardImageKey::new(
-                &spot.url,
-                picker,
-                spot.size,
-                spot.pixels,
-                start,
-                rows,
-                column,
-            );
-            if let Some(result) = renderer.tile(request, image, picker, prepare) {
-                protocol.tiles.insert(key, result?);
-            }
-            if let Some(encoded) = protocol.tiles.get(&key) {
-                let area = Rect::new(
-                    spot.area.x + column * TILE_COLS,
-                    y,
-                    encoded.size().width,
-                    rows,
+            let cols = TILE_COLS.min(spot.size.width - column * TILE_COLS);
+            let tile_area = Rect::new(spot.area.x + column * TILE_COLS, y, cols, rows);
+            for area in visible_rects(tile_area, covered) {
+                let top = start + area.y - y;
+                let left = column * TILE_COLS + area.x - tile_area.x;
+                let key = (top, left, area.height, area.width);
+                visible.push(key);
+                let native = picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty;
+                let source_top = if native { row * TILE_ROWS } else { top };
+                let source_left = if native { column * TILE_COLS } else { left };
+                let mut request = CardImageKey::new(
+                    spot.url.as_deref().unwrap_or("card-video"),
+                    picker,
+                    spot.size,
+                    spot.pixels,
+                    source_top,
+                    if native {
+                        TILE_ROWS.min(spot.size.height - source_top)
+                    } else {
+                        area.height
+                    },
+                    column,
                 );
-                f.render_widget(Image::new(encoded.as_ref()), area);
-            } else {
-                draw_picture_wait(
-                    f,
-                    Rect::new(
-                        spot.area.x + column * TILE_COLS,
-                        y,
-                        TILE_COLS.min(spot.size.width - column * TILE_COLS),
-                        rows,
-                    ),
-                    "◌ preparing image…",
-                );
+                request.left = source_left;
+                request.cols = if native { cols } else { area.width };
+                request.overlay = spot.overlay();
+                request.post_id = spot.video_frame.then(|| spot.post_id.clone()).flatten();
+                request.video = spot.video_frame;
+                if let Some(result) = renderer.tile(request, image, picker, prepare) {
+                    protocol.tiles.insert(key, result?);
+                }
+                if let Some(encoded) = protocol.tiles.get(&key) {
+                    encoded.render_region(
+                        area,
+                        ratatui::layout::Position::new(left - source_left, top - source_top),
+                        f.buffer_mut(),
+                    );
+                } else {
+                    loading::draw(
+                        f,
+                        area,
+                        loading::Kind::Media,
+                        &spot.status("preparing image…"),
+                        phase,
+                    );
+                }
             }
         }
     }
@@ -1203,19 +1538,65 @@ fn draw_card_image(
     Ok(())
 }
 
-fn draw_picture_wait(f: &mut Frame, area: Rect, label: &str) {
+/// The uncovered top, bottom, left and right strips retain their source coordinates.
+fn visible_rects(area: Rect, covered: Option<Rect>) -> Vec<Rect> {
+    let Some(covered) = covered.filter(|covered| area.intersects(*covered)) else {
+        return (!area.is_empty()).then_some(area).into_iter().collect();
+    };
+    let cut = area.intersection(covered);
+    [
+        Rect::new(area.x, area.y, area.width, cut.y - area.y),
+        Rect::new(
+            area.x,
+            cut.bottom(),
+            area.width,
+            area.bottom() - cut.bottom(),
+        ),
+        Rect::new(area.x, cut.y, cut.x - area.x, cut.height),
+        Rect::new(cut.right(), cut.y, area.right() - cut.right(), cut.height),
+    ]
+    .into_iter()
+    .filter(|rect| !rect.is_empty())
+    .collect()
+}
+
+fn draw_visible_status(f: &mut Frame, area: Rect, covered: Option<Rect>, label: &str) {
+    for visible in visible_rects(area, covered) {
+        draw_picture_status(f, visible, label);
+    }
+}
+
+fn draw_visible_loading(
+    f: &mut Frame,
+    area: Rect,
+    covered: Option<Rect>,
+    label: &str,
+    phase: usize,
+) {
+    for visible in visible_rects(area, covered) {
+        loading::draw(f, visible, loading::Kind::Media, label, phase);
+    }
+}
+
+fn draw_picture_status(f: &mut Frame, area: Rect, label: &str) {
     if area.is_empty() {
         return;
     }
+    let lines: Vec<Line> = textwrap::wrap(label, usize::from(area.width))
+        .into_iter()
+        .take(usize::from(area.height))
+        .map(|line| Line::raw(line.into_owned()))
+        .collect();
+    let rows = lines.len() as u16;
     f.render_widget(
-        Paragraph::new(label)
+        Paragraph::new(lines)
             .alignment(Alignment::Center)
             .style(Style::new().fg(SUBTEXT)),
-        Rect::new(area.x, area.y + area.height / 2, area.width, 1),
+        Rect::new(area.x, area.y + (area.height - rows) / 2, area.width, rows),
     );
 }
 
-fn draw_list_tail(f: &mut Frame, mut area: Rect, label: &'static str) {
+fn draw_pagination_error(f: &mut Frame, mut area: Rect, label: &'static str) {
     if area.is_empty() {
         return;
     }
@@ -1232,18 +1613,11 @@ fn draw_list_tail(f: &mut Frame, mut area: Rect, label: &'static str) {
     }
     let inner = panel.inner(area);
     f.render_widget(panel, area);
-    let error = label.starts_with('✗');
-    let style = Style::new()
-        .fg(if error { RED } else { ACCENT })
-        .add_modifier(Modifier::BOLD);
-    let mut lines = Vec::new();
-    if !error && inner.height >= 3 && usize::from(inner.width) >= label.width() {
-        lines.push(Line::styled("⋯", style));
-        lines.push(Line::styled(label, style.fg(TEXT)));
-    } else {
-        lines.push(Line::styled(label, style));
-    }
-    centered(f, inner, lines);
+    centered(
+        f,
+        inner,
+        vec![Line::styled(label, Style::new().fg(RED).bold())],
+    );
 }
 
 /// Scrolling list of post cards separated by a blank line.
@@ -1300,14 +1674,9 @@ fn draw_post_list(
         }
     }
     f.render_widget(Paragraph::new(lines), area);
-    if let (Some(y), Some(tail)) = (tail_y, spec.tail)
-        && y < area.bottom()
-    {
-        draw_list_tail(
-            f,
-            Rect::new(area.x, y, area.width.saturating_sub(2), area.bottom() - y),
-            tail,
-        );
+    if let Some(y) = tail_y.filter(|y| *y < area.bottom()) {
+        let tail_area = Rect::new(area.x, y, area.width.saturating_sub(2), area.bottom() - y);
+        spec.append_area = Some(tail_area);
     }
     draw_scrollbar(f, area, *offset, fits, spec.posts.len());
     None
@@ -1323,7 +1692,7 @@ fn draw_scrollbar(f: &mut Frame, area: Rect, offset: usize, visible: usize, tota
     let x = area.x + area.width.saturating_sub(1);
     for y in 0..h {
         let (sym, color) = if y >= top && y < top + thumb {
-            ("┃", SURFACE1)
+            ("┃", OVERLAY)
         } else {
             ("│", SURFACE0)
         };
@@ -1349,11 +1718,26 @@ fn card_height(app: &App, group: &Group) -> u16 {
 
 const CARD_ROW_GAP: u16 = 1;
 
-fn draw_all_subs(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<ImageSpot>) {
+fn draw_all_subs(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    spots: &mut Vec<ImageSpot>,
+) -> Option<Rect> {
+    if app.all_subs.groups.is_empty() {
+        app.groups_drawn(&[]);
+    }
     let total_new: usize = app
         .all_subs
         .groups
         .iter()
+        .filter(|group| {
+            group
+                .error
+                .as_ref()
+                .and_then(crate::worker::FeedError::access)
+                .is_none()
+        })
         .map(|g| app.state.unseen(&g.subreddit, app.config.visible(&g.posts)))
         .sum();
     let loading = app.all_subs.groups.iter().filter(|g| g.loading).count();
@@ -1369,13 +1753,30 @@ fn draw_all_subs(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<Image
         chips.push(chip(format!("● {total_new} new"), CRUST, ACCENT));
     }
     if loading > 0 {
-        chips.push(chip(format!("⋯ loading {loading}"), OVERLAY, SURFACE0));
+        chips.push(chip(
+            format!("{} loading {loading}", loading::glyph(app.loading_frame)),
+            OVERLAY,
+            SURFACE0,
+        ));
     }
-    if app.all_subs.loading {
-        chips.push(chip("⋯ syncing subscriptions", OVERLAY, SURFACE0));
+    if app.all_subs.loading && !app.all_subs.groups.is_empty() {
+        chips.push(chip(
+            format!(
+                "{} syncing subscriptions",
+                loading::glyph(app.loading_frame)
+            ),
+            OVERLAY,
+            SURFACE0,
+        ));
     }
     if app.all_subs.error.is_some() {
-        chips.push(chip("✗ subscriptions failed · r retries", RED, SURFACE0));
+        chips.splice(
+            0..0,
+            [
+                chip("✗ subs failed", RED, SURFACE0),
+                chip("r retry", RED, SURFACE0),
+            ],
+        );
     }
     if let Some(freshness) = app.all_subs.freshness {
         chips.push(chip(
@@ -1398,7 +1799,7 @@ fn draw_all_subs(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<Image
             "Connect Reddit",
             "Press A to connect your account",
         );
-        return;
+        return None;
     }
     if app.all_subs.groups.is_empty() {
         let (title, hint) = if let Some(error) = &app.all_subs.error {
@@ -1407,7 +1808,13 @@ fn draw_all_subs(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<Image
                 format!("{error} — press r to retry"),
             )
         } else if app.all_subs.loading {
-            ("Loading subscriptions", String::new())
+            return loading::draw(
+                f,
+                body,
+                loading::Kind::Initial,
+                "Loading subscriptions",
+                app.loading_frame,
+            );
         } else {
             (
                 "No joined communities",
@@ -1415,7 +1822,7 @@ fn draw_all_subs(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<Image
             )
         };
         empty_state(f, body, "▦", title, &hint);
-        return;
+        return None;
     }
     let cols = (body.width / CARD_MIN_WIDTH).clamp(1, 3) as usize;
     let heights: Vec<u16> = app
@@ -1443,8 +1850,9 @@ fn draw_all_subs(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<Image
     let bottom = body.y + body.height;
     let mut y = body.y;
     let mut shown = 0;
-    for (row_index, row) in app.all_subs.groups.chunks(cols).enumerate().skip(offset) {
-        let h = heights[row_index];
+    let mut visible = Vec::new();
+    for (row_index, &h) in heights.iter().enumerate().skip(offset) {
+        let entries = (app.all_subs.groups.len() - row_index * cols).min(cols);
         let card = h - CARD_ROW_GAP;
         // Later rows only when whole; the first row always shows, clipped in a short pane.
         if y >= bottom || (row_index > offset && y + card > bottom) {
@@ -1460,28 +1868,47 @@ fn draw_all_subs(f: &mut Frame, app: &mut App, area: Rect, spots: &mut Vec<Image
         let cells = Layout::horizontal(vec![Constraint::Ratio(1, cols as u32); cols])
             .spacing(2)
             .split(row_area);
-        for (column, cell) in cells.iter().take(row.len()).enumerate() {
-            draw_group_card(f, app, row_index * cols + column, *cell, spots);
+        for (column, cell) in cells.iter().take(entries).enumerate() {
+            visible.push((row_index * cols + column, *cell));
         }
         y += h;
         shown += 1;
     }
+    app.groups_drawn(&visible.iter().map(|(index, _)| *index).collect::<Vec<_>>());
+    for (index, cell) in visible {
+        draw_group_card(f, app, index, cell, spots);
+    }
     draw_scrollbar(f, body, offset, shown.max(1), heights.len());
+    None
+}
+
+fn access_title(access: AccessDenied) -> &'static str {
+    match access {
+        AccessDenied::PrivateCommunity => "Private community",
+        AccessDenied::Forbidden => "Access restricted",
+    }
 }
 
 fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &mut Vec<ImageSpot>) {
     let group = &app.all_subs.groups[index];
     let selected_card = index == app.all_subs.group;
+    let access = group
+        .error
+        .as_ref()
+        .and_then(crate::worker::FeedError::access);
     let badge = app
         .state
         .unseen(&group.subreddit, app.config.visible(&group.posts));
-    let border = if selected_card {
+    let focused = selected_card && app.focus == Focus::List;
+    let border = if focused {
         Style::new().fg(ACCENT)
+    } else if selected_card {
+        Style::new().fg(OVERLAY)
     } else {
         Style::new().fg(SURFACE1)
     };
     let icon = app.shown_icon(&group.subreddit);
-    // The title starts after the corner: ` ` then the icon in place of `#`.
+    // Reserve the icon and its gap so the name stays put when graphics load.
     if let Some(url) = icon
         && area.width > ICON_COLS + 3
     {
@@ -1497,7 +1924,7 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
     }
     let mut title = vec![
         Span::styled(
-            if icon.is_some() { "    " } else { " # " },
+            if icon.is_some() { "    " } else { " #  " },
             Style::new().fg(if selected_card { ACCENT } else { OVERLAY }),
         ),
         Span::styled(
@@ -1505,11 +1932,11 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
             Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
         ),
     ];
-    if badge > 0 {
+    if badge > 0 && access.is_none() {
         title.push(chip(format!("{badge} new"), CRUST, ACCENT));
         title.push(Span::raw(" "));
     }
-    if let Some(freshness) = group.freshness {
+    if let Some(freshness) = group.freshness.filter(|_| access.is_none()) {
         title.push(Span::styled(
             freshness.label(
                 crate::app::now(),
@@ -1520,35 +1947,97 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
             Style::new().fg(OVERLAY),
         ));
     }
-    // A failed refresh keeps the posts; it only marks the card.
-    if group.error.is_some() && !group.posts.is_empty() {
-        title.push(chip("✗ refresh failed", RED, SURFACE0));
-        title.push(Span::raw(" "));
-    }
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(if focused {
+            BorderType::Double
+        } else {
+            BorderType::Rounded
+        })
         .border_style(border)
-        .title(Line::from(title))
+        .title(Line::from(fit_spans(
+            title,
+            usize::from(area.width.saturating_sub(2)),
+        )))
         .padding(Padding {
-            left: 0,
-            right: 1,
-            top: 1,
-            bottom: 1,
+            left: PANEL_PAD,
+            right: PANEL_PAD,
+            top: PANEL_PAD,
+            bottom: PANEL_PAD,
         });
+    if access.is_some() {
+        block = block.title_bottom(Line::styled(" o Reddit ", Style::new().fg(YELLOW)));
+    } else if group.error.is_some() {
+        block = block.title_bottom(Line::styled(" ✗ r retry ", Style::new().fg(RED)));
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
     let width = inner.width as usize;
     let posts: Vec<_> = app.group_posts(group).collect();
     // (line in the card, URL) for each post row with a thumbnail.
     let mut thumbs: Vec<(u16, &str)> = Vec::new();
-    let lines: Vec<Line> = if group.loading && group.posts.is_empty() {
-        vec![Line::styled("   ⋯ loading", Style::new().fg(OVERLAY))]
+    let lines: Vec<Line> = if let Some(access) = access {
+        let title = if width < 24 {
+            if access == AccessDenied::PrivateCommunity {
+                "Private"
+            } else {
+                "Restricted"
+            }
+        } else {
+            access_title(access)
+        };
+        vec![
+            Line::styled(format!(" 🔒 {title}"), Style::new().fg(YELLOW)),
+            Line::styled(
+                if access == AccessDenied::PrivateCommunity {
+                    " Approved members only"
+                } else {
+                    " Check access on Reddit"
+                },
+                Style::new().fg(OVERLAY),
+            ),
+        ]
+    } else if group.posts.is_empty()
+        && (group.loading || (group.freshness.is_none() && group.error.is_none()))
+    {
+        loading::draw(
+            f,
+            inner,
+            loading::Kind::Initial,
+            "Loading posts",
+            app.loading_frame,
+        );
+        return;
     } else if let Some(e) = group.error.as_ref().filter(|_| group.posts.is_empty()) {
         vec![Line::styled(
-            format!("   ✗ {}", truncate(e, width.saturating_sub(5))),
+            format!("   ✗ {}", truncate(e.as_str(), width.saturating_sub(5))),
             Style::new().fg(RED),
         )]
+    } else if group.posts.is_empty() && !app.config.show_nsfw {
+        vec![
+            Line::styled(
+                fitting_label(
+                    &[
+                        " No visible posts · NSFW off",
+                        " NSFW off · no posts",
+                        " NSFW off",
+                    ],
+                    width,
+                ),
+                Style::new().fg(OVERLAY),
+            ),
+            Line::styled(
+                fitting_label(
+                    &[
+                        "F2 Settings: enable Show NSFW",
+                        "F2: enable Show NSFW",
+                        "F2: Show NSFW",
+                    ],
+                    width,
+                ),
+                Style::new().fg(OVERLAY),
+            ),
+        ]
     } else if posts.is_empty() {
         // Non-pinned posts exist, so the config hid them.
         let text = if group.posts.iter().any(|p| !p.stickied) {
@@ -1578,7 +2067,7 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
         lines
     };
     // In a short pane the card is clipped: scroll it so the selected post shows.
-    let selected_end = if selected_card {
+    let selected_end = if selected_card && !posts.is_empty() {
         app.all_subs.post as u16 * 3 + 2
     } else {
         0
@@ -1603,9 +2092,19 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
 
 // ----- subreddit feed & bookmarks --------------------------------------------
 
-fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListPictures) {
+fn draw_feed(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    pictures: &mut ListPictures,
+) -> Option<Rect> {
+    let waiting = app
+        .reddit
+        .pause()
+        .map(|pause| format!("Waiting for Reddit · {}s", pause.seconds));
     let tab = app.active_tab();
     let feed = &tab.feed;
+    let access = tab.subreddit().and_then(|_| feed.access_denied());
     let mut chips = vec![list_view_chip(app)];
     match &feed.search {
         Some(q) => chips.push(chip(format!("🔍 {q}"), SKY, SURFACE0)),
@@ -1618,38 +2117,58 @@ fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListPictur
     }
     if let Some(name) = tab
         .subreddit()
-        .filter(|name| crate::reddit::is_community(name))
+        .filter(|name| crate::reddit::is_community(name) && access.is_none())
     {
-        let (label, color) = match app.joined(name) {
+        let membership = app.joined(name);
+        let (label, color) = match membership {
             Some(true) => ("✓ Joined", GREEN),
             Some(false) => ("Not joined", SUBTEXT),
             None => ("Membership unknown", OVERLAY),
         };
+        let label = if app.membership_progress().is_none() {
+            format!(
+                "{label} · S {}",
+                match membership {
+                    Some(true) => "leave",
+                    Some(false) => "join",
+                    None => "check",
+                }
+            )
+        } else {
+            label.into()
+        };
         chips.push(chip(label, color, SURFACE0));
     }
     let badge = app.badge(tab);
-    if badge > 0 {
+    if badge > 0 && access.is_none() {
         chips.push(chip(format!("● {badge} new"), CRUST, ACCENT));
     }
-    if feed.loading() {
-        chips.push(chip("⋯ loading", OVERLAY, SURFACE0));
-    }
-    if feed.error().is_some() && !feed.posts.is_empty() {
+    if feed.loading() && !feed.loading_more() && !feed.receiving() && !feed.posts.is_empty() {
         chips.push(chip(
-            if feed.page_failed() {
-                "✗ next page failed · L retries"
-            } else {
-                "✗ reload failed · r retries"
-            },
-            RED,
+            format!("{} loading", loading::glyph(app.loading_frame)),
+            OVERLAY,
             SURFACE0,
         ));
     }
-    if let Some(freshness) = feed.freshness {
+    if let Some(access) = access {
+        chips.insert(0, chip(access_title(access), YELLOW, SURFACE0));
+    }
+    if access.is_none() && feed.error().is_some() && !feed.posts.is_empty() {
+        let (label, retry) = if feed.page_failed() {
+            ("✗ next page failed", "L retry")
+        } else {
+            ("✗ reload failed", "r retry")
+        };
+        chips.splice(
+            0..0,
+            [chip(label, RED, SURFACE0), chip(retry, RED, SURFACE0)],
+        );
+    }
+    if let Some(freshness) = feed.freshness.filter(|_| access.is_none()) {
         chips.push(chip(
             freshness.label(
                 crate::app::now(),
-                feed.loading() || feed.refreshing(),
+                (feed.loading() || feed.refreshing()) && !feed.loading_more(),
                 feed.error().is_some(),
                 app.health == Health::Down,
             ),
@@ -1674,38 +2193,64 @@ fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListPictur
             "Connect Reddit",
             "Press A to connect your account",
         );
-        return;
+        return None;
+    }
+    if let Some(access) = access {
+        let compact = body.width < 36 || body.height < 8;
+        let guidance = if compact && access == AccessDenied::PrivateCommunity {
+            "Approved members only · o Reddit"
+        } else if compact {
+            "Check access · o Reddit"
+        } else if access == AccessDenied::PrivateCommunity {
+            "Only approved members can view this community. Press o to open Reddit and check access."
+        } else {
+            "Reddit denied access to this community. Press o to open Reddit and check access or sign in."
+        };
+        empty_state(f, body, "🔒", access_title(access), guidance);
+        return None;
     }
     if let Some(e) = error.filter(|_| posts.is_empty()) {
+        let (title, retry) = if feed.page_failed() {
+            ("Could not load more posts", "L")
+        } else {
+            ("Could not load posts", "r")
+        };
         empty_state(
             f,
             body,
             "✗",
-            "Could not load posts",
-            &format!("{e} — press r to retry"),
+            title,
+            &format!("{e} — press {retry} to retry"),
         );
-        return;
+        return None;
     }
     if posts.is_empty() {
         // Until the current sort or search answers, an earlier empty answer says nothing.
-        if !current {
-            empty_state(f, body, "⋯", "Loading", "");
+        if !current || feed.receiving() {
+            return loading::draw(
+                f,
+                body,
+                loading::Kind::Initial,
+                waiting.as_deref().unwrap_or("Loading posts"),
+                app.loading_frame,
+            );
         } else if !feed.posts.is_empty() {
             empty_state(
                 f,
                 body,
                 "∅",
                 "Every loaded post is hidden",
-                "show_nsfw and [filters] in config.toml decide what shows",
+                "F2 Settings: check Show NSFW and hidden keywords, flairs or authors",
             );
         } else if feed.search.is_some() {
-            empty_state(
-                f,
-                body,
-                "∅",
-                "No results",
-                "/ edits the search, Esc clears it",
-            );
+            let hint = if app.config.show_nsfw {
+                "/ edits the search, Esc clears it".to_string()
+            } else {
+                format!("{NSFW_EMPTY_HINT} / edits the search, Esc clears it.")
+            };
+            empty_content_state(f, body, "No results", &hint, app.config.show_nsfw);
+        } else if !app.config.show_nsfw {
+            empty_content_state(f, body, "No visible posts", NSFW_EMPTY_HINT, false);
         } else {
             empty_state(
                 f,
@@ -1715,7 +2260,7 @@ fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListPictur
                 "try another sort with s, or a different subreddit with p",
             );
         }
-        return;
+        return None;
     }
     let show_subreddit =
         matches!(tab.kind, TabKind::Home) || matches!(seen_key, Some("all" | "popular"));
@@ -1726,19 +2271,52 @@ fn draw_feed(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListPictur
         show_subreddit,
         offset,
         scroll,
-        tail: if feed.page_failed() {
+        append_area: None,
+    };
+    let scrolled_end = draw_post_list(f, app, body, &mut spec, pictures);
+    let (selected, offset, scroll, append_area) =
+        (spec.selected, spec.offset, spec.scroll, spec.append_area);
+    app.set_list_viewport(selected, offset, scroll, scrolled_end);
+    let append_area = append_area?;
+    let feed = &app.active_tab().feed;
+    if feed.loading_more() || feed.receiving() {
+        loading::draw(
+            f,
+            append_area,
+            loading::Kind::More,
+            waiting.as_deref().unwrap_or("Loading posts"),
+            app.loading_frame,
+        )
+    } else {
+        let label = if feed.page_failed() {
             Some("✗ Next page failed · L retries")
         } else {
             feed_activity(feed, !app.reddit.needs_sign_in()).map(|(label, _)| label)
-        },
-    };
-    let scrolled_end = draw_post_list(f, app, body, &mut spec, pictures);
-    let (selected, offset, scroll) = (spec.selected, spec.offset, spec.scroll);
-    app.set_list_viewport(selected, offset, scroll, scrolled_end);
+        };
+        if let Some(label) = label {
+            if feed.page_failed() {
+                draw_pagination_error(f, append_area, label);
+            } else {
+                let kind = if !feed.shows_current_query() {
+                    loading::Kind::Initial
+                } else {
+                    loading::Kind::Background
+                };
+                return loading::draw(
+                    f,
+                    append_area,
+                    kind,
+                    waiting.as_deref().unwrap_or(label),
+                    app.loading_frame,
+                );
+            }
+        }
+        None
+    }
 }
 
 fn draw_bookmarks(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListPictures) {
-    let count = app.state.bookmarks().len();
+    let count = app.visible_bookmarks().count();
     let body = view_header(
         f,
         area,
@@ -1748,14 +2326,22 @@ fn draw_bookmarks(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListP
             chip(format!("{count} saved"), SUBTEXT, SURFACE0),
         ],
     );
-    let posts: Vec<&Post> = app.state.bookmarks().iter().map(|b| &b.post).collect();
+    let posts: Vec<&Post> = app.visible_bookmarks().map(|b| &b.post).collect();
     if posts.is_empty() {
         empty_state(
             f,
             body,
             "★",
-            "No bookmarks yet",
-            "press b on any post to keep it here",
+            if count == 0 && !app.state.bookmarks().is_empty() {
+                "No visible bookmarks"
+            } else {
+                "No bookmarks yet"
+            },
+            if count == 0 && !app.state.bookmarks().is_empty() {
+                NSFW_EMPTY_HINT
+            } else {
+                "press b on any post to keep it here"
+            },
         );
         return;
     }
@@ -1767,7 +2353,7 @@ fn draw_bookmarks(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListP
         show_subreddit: true,
         offset: app.active_tab().feed.offset,
         scroll: app.active_tab().feed.cards.clone(),
-        tail: None,
+        append_area: None,
     };
     let scrolled_end = draw_post_list(f, app, body, &mut spec, pictures);
     let (selected, offset, scroll) = (spec.selected, spec.offset, spec.scroll);
@@ -1823,7 +2409,7 @@ fn wrap_into(
     prefix: &[Span<'static>],
     style: Style,
 ) {
-    let width = width.max(10);
+    let width = width.max(1);
     for para in text.split('\n') {
         if para.trim().is_empty() {
             lines.push(Line::from(prefix.to_vec()));
@@ -1854,7 +2440,8 @@ const TEXT_PICTURES_KEPT: usize = 24;
 
 /// What the post document needs to lay out pictures in its text: the loaded images (none
 /// when images are off), and the most rows one may take, so it fits the text area whole.
-struct PictureSizes<'a> {
+struct DocumentContext<'a> {
+    phase: usize,
     images: Option<&'a HashMap<String, ImageSlot>>,
     font: ratatui_image::FontSize,
     rows: u16,
@@ -1885,7 +2472,7 @@ fn text_into(
     width: usize,
     prefix: &[Span<'static>],
     style: Style,
-    sizes: &PictureSizes<'_>,
+    sizes: &DocumentContext<'_>,
 ) {
     let x = prefix.iter().map(|s| s.content.width()).sum::<usize>() as u16;
     let mut rest = text;
@@ -1949,10 +2536,14 @@ fn text_into(
                 let label = match slot {
                     None | Some(Some(ImageSlot::Ready { .. })) => "▣ image",
                     Some(Some(ImageSlot::Failed(_))) => "▣ image unavailable",
-                    _ => "◌ loading image",
+                    _ => "loading image",
                 };
                 let mut spans = first_prefix;
-                spans.push(Span::styled(label, Style::new().fg(OVERLAY)));
+                if label == "loading image" {
+                    spans.extend(loading::caption(loading::Kind::Media, label, sizes.phase).spans);
+                } else {
+                    spans.push(Span::styled(label, Style::new().fg(OVERLAY)));
+                }
                 lines.push(Line::from(spans));
             }
         }
@@ -1963,16 +2554,27 @@ fn text_into(
     }
 }
 
-fn thread_prefix(depth: usize) -> Vec<Span<'static>> {
-    (0..depth)
-        .map(|d| Span::styled("│ ", Style::new().fg(THREADS[d % THREADS.len()])))
-        .collect()
+fn thread_prefix(depth: usize, visible: usize) -> Vec<Span<'static>> {
+    let mut rails: Vec<_> = (0..visible)
+        .map(|d| {
+            Span::styled(
+                "│ ",
+                Style::new().fg(THREADS[(depth - visible + d) % THREADS.len()]),
+            )
+        })
+        .collect();
+    if depth > visible {
+        if let Some(first) = rails.first_mut() {
+            first.content = "⋮ ".into();
+        } else {
+            rails.push(Span::styled("↳", Style::new().fg(OVERLAY)));
+        }
+    }
+    rails
 }
 
-fn draw_post(f: &mut Frame, app: &mut App, area: Rect, cards: &mut Vec<CardPicture>) {
-    let Some(view) = app.post_view.as_ref() else {
-        return;
-    };
+fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures) -> Option<Rect> {
+    let view = app.post_view.as_ref()?;
     let post = view.shown_post();
     let now = Utc::now();
 
@@ -1997,16 +2599,39 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, cards: &mut Vec<CardPictu
         if app.state.is_bookmarked(&post.id) {
             s.push(Span::styled("  ★", Style::new().fg(YELLOW)));
         }
-        s
+        let mut flags = Vec::new();
+        if post.nsfw {
+            flags.push(chip("NSFW", CRUST, RED));
+            flags.push(Span::raw(" "));
+        }
+        if post.spoiler {
+            flags.push(chip("spoiler", CRUST, YELLOW));
+            flags.push(Span::raw(" "));
+        }
+        flags.extend(s);
+        fit_spans(flags, head_width)
     })];
-    header.push(Line::raw(""));
     let title_style = if app.config.highlights(post) {
         Style::new().fg(YELLOW).add_modifier(Modifier::BOLD)
     } else {
         Style::new().fg(TEXT).add_modifier(Modifier::BOLD)
     };
-    wrap_into(&mut header, &post.title, head_width, &[], title_style);
-    header.push(Line::raw(""));
+    let mut title_lines = Vec::new();
+    wrap_into(&mut title_lines, &post.title, head_width, &[], title_style);
+    let title_limit = area
+        .height
+        .saturating_div(3)
+        .max(5)
+        .saturating_sub(4)
+        .clamp(1, 3) as usize;
+    let overflow_title = (title_lines.len() > title_limit).then_some(title_style);
+    if overflow_title.is_some() {
+        title_lines.truncate(title_limit);
+        if let Some(last) = title_lines.last_mut() {
+            *last = Line::styled(truncate(&format!("{}…", last), head_width), title_style);
+        }
+    }
+    header.extend(title_lines);
     let mut stats = vec![
         Span::styled(
             format!("▲ {}", post.score.map_or("•".into(), format_count)),
@@ -2045,7 +2670,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, cards: &mut Vec<CardPictu
             }
         }
     }
-    header.push(Line::from(stats));
+    header.push(Line::from(fit_spans(stats, head_width)));
     let header_height = header.len() as u16 + 2;
     let [head_area, rest] =
         Layout::vertical([Constraint::Length(header_height), Constraint::Min(1)]).areas(area);
@@ -2053,9 +2678,13 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, cards: &mut Vec<CardPictu
         Paragraph::new(header).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::new().fg(SURFACE1))
-                .padding(Padding::horizontal(1))
+                .border_type(if app.post_focused() {
+                    BorderType::Double
+                } else {
+                    BorderType::Rounded
+                })
+                .border_style(Style::new().fg(if app.post_focused() { ACCENT } else { SURFACE1 }))
+                .padding(Padding::horizontal(PANEL_PAD))
                 .title_bottom(Line::styled(
                     view.freshness
                         .map(|freshness| {
@@ -2073,7 +2702,6 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, cards: &mut Vec<CardPictu
         head_area,
     );
 
-    // Video keeps its playback band; still images occupy scrollable document rows.
     let video = post.media.video_url().is_some();
     let image_url = post.media.shows_inline().then(|| {
         app.post_view
@@ -2086,57 +2714,51 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, cards: &mut Vec<CardPictu
         .post_view
         .as_ref()
         .is_some_and(|v| v.spoiler_hidden() || v.page.is_none());
-    // A video adds status and blank rows, and decodes for its whole box so a frame
-    // arriving does not restart it.
-    let cols = rest.width.saturating_sub(2);
-    let wide_max = rest.height.saturating_sub(TEXT_UNDER_PICTURE).max(1);
-    let tall_max = (rest.height / 2).max(1);
-    app.video_tall_rows = tall_max;
-    let decode_rows = wide_max.min(video::KITTY_MAX_ROWS);
-    let still_url = image_url.as_ref().and_then(|u| u.as_deref());
-    let picture = |max: u16| {
-        picture_size(
-            app,
-            video,
-            still_url,
-            cols,
-            max.min(wide_max),
-            max.min(tall_max),
-        )
-        .map_or(1, |size| size.height)
-    };
-    let image_rows = picture(video::KITTY_MAX_ROWS) + 2;
-    // A video needs a row of picture above its status line and the blank row, with a
-    // line of text under them.
-    let image_url = image_url
-        .as_ref()
-        .filter(|_| app.inline_images_on() && !hide_image && (!video || rest.height >= 4));
-    let [img_area, with_image] =
-        Layout::vertical([Constraint::Length(image_rows), Constraint::Min(1)]).areas(rest);
     let margin = Margin {
         horizontal: 1,
         vertical: 0,
     };
-    let (full, with_image) = (rest.inner(margin), with_image.inner(margin));
-    // The image changes only the height: the text wraps the same in both layouts.
+    let full = rest.inner(margin);
     let width = full.width.saturating_sub(2) as usize;
-    let main_pixels = still_url.and_then(|url| {
-        match app.images.get(url) {
-            Some(ImageSlot::Ready { pixels, .. }) => Some(*pixels),
-            _ => app.card_image_metadata.get(url).map(|m| m.size),
-        }
+    let still_url = image_url.as_ref().and_then(|u| u.as_deref());
+    let main_pixels = post
+        .preview_size
+        .filter(|_| video)
         .or_else(|| {
-            (!matches!(post.media, Media::Gallery { .. }) || view.gallery_index == 0)
-                .then_some(post.preview_size)
-                .flatten()
+            still_url.and_then(|url| {
+                match app.images.get(url) {
+                    Some(ImageSlot::Ready { pixels, .. }) => Some(*pixels),
+                    _ => app.card_image_metadata.get(url).map(|m| m.size),
+                }
+                .or_else(|| {
+                    (!matches!(post.media, Media::Gallery { .. }) || view.gallery_index == 0)
+                        .then_some(post.preview_size)
+                        .flatten()
+                })
+            })
         })
         .filter(|&(w, h)| w > 0 && h > 0)
+        .or_else(|| {
+            video
+                .then(|| {
+                    app.selected_video()?
+                        .frame()
+                        .map(|frame| (frame.width, frame.height))
+                })
+                .flatten()
+        })
+        .or_else(|| video.then_some((16, 9)));
+    let main_size = main_pixels.map(|pixels| {
+        fit_picture(
+            pixels,
+            app.image_picker.font_size(),
+            Size::new(width as u16, full.height.saturating_sub(2)),
+            full.height,
+        )
     });
-    let main_size = main_pixels
-        .map(|pixels| full_width_picture(pixels, app.image_picker.font_size(), width as u16));
-    // Keep its identity while images are off: zero rows let geometry reconciliation
-    // remove and restore its height without losing the text being read below it.
-    let main_image = still_url.filter(|_| !video && !hide_image).map(|url| {
+    let video_id = video.then(|| post.id.clone());
+    let main_url = still_url.map(str::to_string).or_else(|| video_id.clone());
+    let main_image = main_url.as_deref().filter(|_| !hide_image).map(|url| {
         let size = if app.inline_images_on() {
             main_size
         } else {
@@ -2144,20 +2766,43 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, cards: &mut Vec<CardPictu
         };
         (url, size)
     });
-    let sizes = PictureSizes {
+    if video && app.inline_images_on() && !hide_image {
+        app.video_area = main_size
+            .filter(|size| size.width > 0 && size.height > 0)
+            .map(|size| Rect::new(0, 0, size.width, size.height));
+    }
+    let video_status = video.then(|| video_status(app));
+    let sizes = DocumentContext {
+        phase: app.loading_frame,
         images: app.inline_images_on().then_some(&app.images),
         font: app.image_picker.font_size(),
         rows: TEXT_PICTURE_ROWS.min(full.height).max(1),
     };
-    let Some(view) = app.post_view.as_mut() else {
-        return;
-    };
+    let view = app.post_view.as_mut()?;
+    if view.title_in_document != overflow_title.is_some() {
+        view.title_in_document = overflow_title.is_some();
+        view.content_changed = true;
+    }
     let mut more_lines = std::mem::take(&mut view.rendered_more);
     let PostDocument {
-        lines,
+        mut lines,
         spans,
         pictures,
-    } = post_document(view, width, now, Some(&mut more_lines), &sizes, main_image);
+    } = post_document(
+        view,
+        width,
+        now,
+        Some(&mut more_lines),
+        &sizes,
+        main_image,
+        overflow_title,
+    );
+    if let Some(status) = video_status
+        && let Some(picture) = pictures.iter().find(|p| p.main)
+        && picture.rows() > 0
+    {
+        lines[picture.line + picture.rows()] = status;
+    }
     view.row_starts = spans.iter().map(|(s, _)| *s).collect();
     let requested_scroll = view.scroll;
     // Replies loaded above the text being read: put it back where it was.
@@ -2247,7 +2892,8 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, cards: &mut Vec<CardPictu
     {
         let shown = view.reveal_spoilers;
         view.reveal_spoilers = was;
-        let old_lines = post_document(view, width, now, None, &sizes, main_image).lines;
+        let old_lines =
+            post_document(view, width, now, None, &sizes, main_image, overflow_title).lines;
         view.reveal_spoilers = shown;
         if let Some(at) = same_line(&old_lines, pinned, &lines) {
             let moved = view.scroll as isize - pinned as isize;
@@ -2259,33 +2905,15 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, cards: &mut Vec<CardPictu
     if view.free_scroll || view.hold_view.is_none_or(|h| h.row != view.cursor) {
         view.hold_view = None;
     }
-    // Scrolled away, video stays away until a key returns to the top, even when a short
-    // post clamps the scroll back to 0: otherwise frames alternate with and without it.
-    if video && image_url.is_some() && view.scroll != 0 {
-        view.image_away = true;
-    }
-    let settle = |height: usize| settle_scroll(view, &spans, lines.len(), height);
-    let mut image = image_url.filter(|_| video && view.scroll == 0 && !view.image_away);
-    let (mut doc_area, mut settled) = match image {
-        Some(_) => (with_image, settle(with_image.height as usize)),
-        None => (full, settle(full.height as usize)),
-    };
-    let mut image_away = false;
-    if image.is_some() && settled.0 != 0 {
-        image = None;
-        image_away = true;
-        doc_area = full;
-        settled = settle(full.height as usize);
-    }
-    view.image_away |= image_away;
-    let (scroll, held) = settled;
+    let (scroll, held) = settle_scroll(view, &spans, lines.len(), full.height as usize);
+    let doc_area = full;
     let main_visible = pictures.iter().any(|p| {
         p.main
             && p.rows() > 0
             && p.line < scroll + full.height as usize
             && p.line + p.rows() > scroll
     });
-    view.image_shown = image.is_some() || main_visible;
+    view.image_shown = main_visible;
     view.scroll = scroll;
     if !held {
         view.hold_view = None;
@@ -2307,6 +2935,35 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, cards: &mut Vec<CardPictu
         f.buffer_mut()
             .set_line(doc_area.x, doc_area.y + row as u16, line, doc_area.width);
     }
+    let primary_loader = if view.page.is_none() && view.error.is_none() {
+        let occupied = total.saturating_sub(1).saturating_sub(scroll).min(height) as u16;
+        loading::draw(
+            f,
+            Rect::new(
+                doc_area.x,
+                doc_area.y + occupied,
+                doc_area.width,
+                doc_area.height - occupied,
+            ),
+            loading::Kind::Initial,
+            "Loading post",
+            sizes.phase,
+        )
+    } else {
+        more_lines
+            .iter()
+            .find(|(id, line)| {
+                view.loading_more.contains(id) && *line >= scroll && *line < scroll + height
+            })
+            .map(|(_, line)| {
+                Rect::new(
+                    doc_area.x,
+                    doc_area.y + (*line - scroll) as u16,
+                    doc_area.width,
+                    1,
+                )
+            })
+    };
     view.rendered_document = lines;
     view.rendered_more = more_lines;
     view.rendered_pictures = pictures
@@ -2325,10 +2982,10 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, cards: &mut Vec<CardPictu
             let end = (picture.line + picture.rows()).min(scroll + height);
             if start < end {
                 let size = picture.size.unwrap_or(Size::new(width as u16, 1));
-                cards.push(CardPicture {
-                    url: picture.url.clone(),
+                media.cards.push(CardPicture {
+                    url: still_url.map(str::to_string),
                     area: Rect::new(
-                        doc_area.x,
+                        doc_area.x + picture.x,
                         doc_area.y + (start - scroll) as u16,
                         size.width,
                         (end - start) as u16,
@@ -2336,7 +2993,11 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, cards: &mut Vec<CardPictu
                     size,
                     skipped: (start - picture.line) as u16,
                     pixels: main_pixels.unwrap_or((1, 1)),
-                    video: false,
+                    indicator: None,
+                    selected: video,
+                    detail: true,
+                    post_id: video_id.clone(),
+                    video_frame: false,
                 });
             }
             continue;
@@ -2360,9 +3021,9 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, cards: &mut Vec<CardPictu
             _ => {}
         }
     }
-    for (url, at) in shown {
-        draw_inline_image(f, app, &url, at);
-    }
+    media
+        .inline
+        .extend(shown.into_iter().map(|(url, area)| ImageSpot { url, area }));
     for url in wanted {
         app.request_text_picture(&url);
     }
@@ -2399,14 +3060,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, cards: &mut Vec<CardPictu
     for url in &far {
         app.drop_text_picture(url);
     }
-    if let Some(still) = image {
-        let area = img_area.inner(margin);
-        let decode_box = Rect {
-            height: decode_rows,
-            ..area
-        };
-        draw_video(f, app, still.as_deref(), area, decode_box);
-    }
+    primary_loader
 }
 
 impl DocPicture {
@@ -2416,39 +3070,6 @@ impl DocPicture {
     }
 }
 
-/// The post's picture in cells, by `picture_cells`: a video's frame, else the loaded
-/// image or poster; none while it loads or after it failed. A frame encoded off the UI
-/// thread (sixel, iTerm2, half-blocks) has fixed cells, so the band takes exactly those.
-fn picture_size(
-    app: &App,
-    video: bool,
-    still: Option<&str>,
-    cols: u16,
-    wide_max: u16,
-    tall_max: u16,
-) -> Option<Size> {
-    let font = app.image_picker.font_size();
-    let frame = video
-        .then(|| app.video.as_ref().and_then(|p| p.frame()))
-        .flatten();
-    // A frame's pixels are the decoder's, not the source's: only its shape counts.
-    let (width, height, enlarge) = match frame {
-        Some(frame) => match &frame.pixels {
-            video::Pixels::Image(protocol) => return Some(protocol.size()),
-            video::Pixels::Zlib(_) => (frame.width, frame.height, f64::INFINITY),
-        },
-        None => match still.map(|u| app.images.get(u)) {
-            Some(Some(ImageSlot::Ready { pixels, .. })) => (pixels.0, pixels.1, MAX_ENLARGE),
-            _ => return None,
-        },
-    };
-    Some(picture_cells(
-        width, height, font, cols, wide_max, tall_max, enlarge,
-    ))
-}
-
-/// Lines of the post kept in view under a wide picture (with the blank row after it).
-const TEXT_UNDER_PICTURE: u16 = 5;
 /// A small picture grows at most this much, so a thumbnail-sized one stays sharp.
 const MAX_ENLARGE: f64 = 2.0;
 
@@ -2598,11 +3219,16 @@ fn post_document(
     width: usize,
     now: DateTime<Utc>,
     mut more_lines: Option<&mut Vec<(String, usize)>>,
-    sizes: &PictureSizes<'_>,
+    sizes: &DocumentContext<'_>,
     main_image: Option<(&str, Option<Size>)>,
+    overflow_title: Option<Style>,
 ) -> PostDocument {
     let mut pictures = Vec::new();
     let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some(style) = overflow_title {
+        wrap_into(&mut lines, &view.shown_post().title, width, &[], style);
+        lines.push(Line::default());
+    }
     // Early-return documents contain no More rows.
     if (view.page.is_none() || view.spoiler_hidden())
         && let Some(rows) = &mut more_lines
@@ -2623,7 +3249,7 @@ fn post_document(
     }
     let Some(page) = &view.page else {
         lines.push(Line::raw(""));
-        lines.push(Line::styled("⋯ loading post", Style::new().fg(OVERLAY)));
+
         return PostDocument {
             lines,
             ..PostDocument::default()
@@ -2651,7 +3277,7 @@ fn post_document(
         let picture = DocPicture {
             url: url.to_string(),
             line: lines.len(),
-            x: 0,
+            x: size.map_or(0, |size| (width as u16).saturating_sub(size.width) / 2),
             size,
             main: true,
         };
@@ -2688,13 +3314,14 @@ fn post_document(
         };
         let bar = Span::styled(if selected { "▌" } else { " " }, bg.fg(ACCENT));
         let mut prefix = vec![bar.clone()];
-        prefix.extend(thread_prefix(row.depth));
-        let body_width = width.saturating_sub(row.depth * 2 + 2);
+        let visible_depth = row.depth.min(width.saturating_sub(18) / 2);
+        prefix.extend(thread_prefix(row.depth, visible_depth));
+        let body_width = width.saturating_sub(visible_depth * 2 + 2).max(1);
         match &row.kind {
             RowKind::Comment { comment, hidden } => {
                 let mut head = prefix.clone();
                 let author_color = if comment.is_op {
-                    ACCENT
+                    PEACH
                 } else if comment.is_mod {
                     GREEN
                 } else {
@@ -2722,10 +3349,10 @@ fn post_document(
                     format!("  ▲ {}", comment.score.map_or("•".into(), format_count)),
                     bg.fg(score_color(comment.score)),
                 ));
-                head.push(Span::styled(
-                    format!(" · {}", comment.age_at(now)),
-                    bg.fg(OVERLAY),
-                ));
+                let age = comment.age_at(now);
+                if !age.is_empty() {
+                    head.push(Span::styled(format!(" · {age}"), bg.fg(OVERLAY)));
+                }
                 if *hidden > 0 {
                     head.push(Span::styled("  ", bg));
                     head.push(chip(format!("+{hidden} folded"), YELLOW, SURFACE1));
@@ -2733,14 +3360,21 @@ fn post_document(
                 if selected {
                     pad_to(&mut head, width, bg);
                 }
-                lines.push(Line::from(head));
+                let content = head.split_off(prefix.len());
+                let mut header = wrap_spans(content, width, &prefix);
+                if selected {
+                    for line in &mut header {
+                        pad_to(&mut line.spans, width, bg);
+                    }
+                }
+                lines.extend(header);
                 // The bar spans the whole selected comment, so it shows with the header off screen.
                 let mut body_prefix = vec![if selected {
                     Span::styled("▌", Style::new().fg(ACCENT))
                 } else {
                     Span::raw(" ")
                 }];
-                body_prefix.extend(thread_prefix(row.depth));
+                body_prefix.extend(thread_prefix(row.depth, visible_depth));
                 if *hidden > 0 {
                     let body = spoiler_text(&comment.body, reveal);
                     let first = body
@@ -2788,7 +3422,24 @@ fn post_document(
                 }
                 let mut line = prefix.clone();
                 let text = if view.loading_more.contains(*parent) {
-                    "⋯ loading replies".to_string()
+                    let mut progress = loading::compact(
+                        loading::Kind::More,
+                        "Loading replies",
+                        body_width,
+                        sizes.phase,
+                    );
+                    for span in &mut progress.spans {
+                        span.style = span.style.patch(bg);
+                    }
+                    line.extend(progress.spans);
+                    if selected {
+                        pad_to(&mut line, width, bg);
+                    }
+                    lines.push(Line::from(fit_spans(line, width)));
+                    let end = lines.len();
+                    lines.push(Line::raw(""));
+                    spans.push((start, end));
+                    continue;
                 } else {
                     match more.count {
                         Some(n) => format!(
@@ -2802,7 +3453,7 @@ fn post_document(
                 if selected {
                     pad_to(&mut line, width, bg);
                 }
-                lines.push(Line::from(line));
+                lines.push(Line::from(fit_spans(line, width)));
             }
         }
         let end = lines.len();
@@ -2819,89 +3470,30 @@ fn post_document(
     }
 }
 
-/// The post's video: the current frame (the poster until the first), centred, then a
-/// status line. Frames are decoded for `decode_box`, which stays put while the drawn
-/// area follows the frame's shape.
-fn draw_video(f: &mut Frame, app: &mut App, poster: Option<&str>, area: Rect, decode_box: Rect) {
-    // The last row stays blank, as under an image.
-    let [picture, status, _] = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(area);
-    let picture = Rect {
-        height: picture.height.min(video::KITTY_MAX_ROWS),
-        ..picture
-    };
-    app.video_area = Some(decode_box);
-    // As for images: nothing drawn under an overlay.
-    let covered = app.overlay.is_some();
-    let kitty = app.image_picker.protocol_type() == ProtocolType::Kitty;
-    let mut shown = false;
-    if !covered
-        && let Some(player) = &app.video
-        && let Some(frame) = player.frame()
-    {
-        shown = true;
-        match &frame.pixels {
-            video::Pixels::Zlib(_) if kitty => {
-                let fitted = picture_cells(
-                    frame.width,
-                    frame.height,
-                    app.image_picker.font_size(),
-                    picture.width,
-                    picture.height,
-                    picture.height,
-                    f64::INFINITY,
-                );
-                let cells = centred(Rect::new(0, 0, fitted.width, fitted.height), picture);
-                // A frame goes out once; a draw that only repeats it sends the cells.
-                let sent = Some((player.frame_number, cells));
-                let transmit = (app.video_sent != sent).then(|| {
-                    video::kitty_transmit(
-                        video::kitty_id(),
-                        frame,
-                        cells.width,
-                        cells.height,
-                        app.image_picker.tmux_detected(),
-                    )
-                });
-                app.video_sent = sent;
-                video::kitty_cells(f.buffer_mut(), cells, video::kitty_id(), transmit);
-            }
-            video::Pixels::Image(protocol) => {
-                let size = protocol.size();
-                let at = centred(
-                    Rect::new(picture.x, picture.y, size.width, size.height),
-                    picture,
-                );
-                f.render_widget(Image::new(protocol), at.intersection(picture));
-            }
-            video::Pixels::Zlib(_) => {}
-        }
-    }
-    if !shown {
-        match poster {
-            Some(url) => draw_inline_image(f, app, url, picture),
-            None if !covered => f.render_widget(
-                Paragraph::new("  ▶ video").style(Style::new().fg(OVERLAY)),
-                picture,
-            ),
-            None => {}
-        }
-    }
+fn video_status(app: &App) -> Line<'static> {
     let dim = Style::new().fg(OVERLAY);
     let mut spans = vec![Span::raw(" ")];
-    match (
-        &app.video,
-        app.video.as_ref().and_then(|player| player.error()),
-    ) {
+    let controls = app.video_controls_available();
+    if !controls {
+        spans.push(key_chip("l"));
+        spans.push(Span::styled(" return · ", dim));
+    }
+    let player = app.selected_video();
+    match (player, player.and_then(|player| player.error())) {
         (_, Some(e)) => spans.push(Span::styled(
             format!("✗ video unavailable: {e}"),
             Style::new().fg(RED),
         )),
-        (None, _) => spans.push(Span::styled("◌ loading video…", dim)),
+        (None, _) if !app.config.media.video_autoplay && controls => {
+            spans.push(key_chip("P"));
+            spans.push(Span::styled(" play · autoplay off", dim));
+        }
+        (None, _) if !app.config.media.video_autoplay => {
+            spans.push(Span::styled("autoplay off", dim))
+        }
+        (None, _) => spans.extend(
+            loading::caption(loading::Kind::Media, "loading video…", app.loading_frame).spans,
+        ),
         (Some(player), None) => {
             let at = video::clock_text(player.position(Instant::now()));
             let icon = if player.paused() { "⏸" } else { "▶" };
@@ -2912,10 +3504,15 @@ fn draw_video(f: &mut Frame, app: &mut App, poster: Option<&str>, area: Rect, de
             } else {
                 at
             };
-            spans.push(Span::styled(
-                format!("{icon} {time}"),
-                Style::new().fg(TEXT),
-            ));
+            if player.frame().is_none() {
+                spans
+                    .extend(loading::caption(loading::Kind::Media, &time, app.loading_frame).spans);
+            } else {
+                spans.push(Span::styled(
+                    format!("{icon} {time}"),
+                    Style::new().fg(TEXT),
+                ));
+            }
             // `a` turns the preference over; a video without sound says so.
             let wanted = app.video_sound_wanted();
             spans.push(Span::styled(
@@ -2928,25 +3525,27 @@ fn draw_video(f: &mut Frame, app: &mut App, poster: Option<&str>, area: Rect, de
             ));
             let pause = if player.paused() { "play" } else { "pause" };
             let sound = if wanted { "mute" } else { "sound" };
-            for (key, label) in [("P", pause), ("a", sound), (",/.", "seek")] {
+            for (key, label) in [("P", pause), ("a", sound), (",/.", "seek")]
+                .into_iter()
+                .filter(|_| controls)
+            {
                 spans.push(Span::raw("   "));
                 spans.push(key_chip(key));
                 spans.push(Span::styled(format!(" {label}"), dim));
             }
         }
     }
-    if !covered {
-        f.render_widget(Line::from(spans), status);
-    }
+    Line::from(spans)
 }
 
-fn draw_inline_image(f: &mut Frame, app: &mut App, url: &str, area: Rect) {
+fn draw_inline_image(f: &mut Frame, app: &mut App, url: &str, area: Rect, covered: Option<Rect>) {
     draw_image_slot(
         f,
         app.images.get_mut(url),
         app.image_picker.font_size(),
-        app.overlay.is_some(),
+        covered.is_some_and(|popup| popup.intersects(area)),
         area,
+        app.loading_frame,
     );
 }
 
@@ -2956,10 +3555,13 @@ fn draw_image_slot(
     font: ratatui_image::FontSize,
     covered: bool,
     area: Rect,
+    phase: usize,
 ) {
-    // As in `draw_spots`: nothing drawn under an overlay.
+    // Stateful protocols cannot crop arbitrary holes; only intersecting slots wait.
+    if covered {
+        return;
+    }
     match slot {
-        Some(ImageSlot::Ready { .. }) if covered => {}
         Some(ImageSlot::Ready {
             protocol, pixels, ..
         }) => {
@@ -2979,20 +3581,10 @@ fn draw_image_slot(
             f.render_stateful_widget(scaled, at, protocol.as_mut());
         }
         Some(ImageSlot::Failed(e)) => {
-            f.render_widget(
-                Paragraph::new(format!(
-                    "  ▣ image unavailable: {}",
-                    truncate(e, area.width as usize)
-                ))
-                .style(Style::new().fg(OVERLAY)),
-                area,
-            );
+            draw_picture_status(f, area, &format!("▣ image unavailable: {e}"))
         }
         Some(ImageSlot::Loading) | None => {
-            f.render_widget(
-                Paragraph::new("  ▣ loading image…").style(Style::new().fg(OVERLAY)),
-                area,
-            );
+            loading::draw(f, area, loading::Kind::Media, "loading image…", phase);
         }
     }
 }
@@ -3009,8 +3601,8 @@ fn centred(inner: Rect, outer: Rect) -> Rect {
 // ----- footer --------------------------------------------------------------
 
 fn feed_activity(feed: &crate::app::Feed, can_load: bool) -> Option<(&'static str, &'static str)> {
-    if feed.loading_more() {
-        Some(("Loading more posts…", "more posts"))
+    if feed.loading_more() || feed.receiving() {
+        Some(("Loading more posts…", "Loading more posts…"))
     } else if feed.loading() || (can_load && !feed.loaded && feed.error().is_none()) {
         Some(if feed.posts.is_empty() || !feed.shows_current_query() {
             ("Loading posts…", "posts")
@@ -3024,91 +3616,129 @@ fn feed_activity(feed: &crate::app::Feed, can_load: bool) -> Option<(&'static st
     }
 }
 
-fn loading_activity(app: &App) -> Option<&'static str> {
+#[derive(Default)]
+struct VisibleLoaders {
+    list: bool,
+    post: bool,
+}
+
+fn loading_activity(app: &App, loaders: &VisibleLoaders) -> Option<&'static str> {
     if app.media_loading() {
         return Some("media");
     }
-    if app.post_focused() {
-        if let Some(view) = &app.post_view {
+    let post = app
+        .post_view
+        .as_ref()
+        .filter(|_| !loaders.post)
+        .and_then(|view| {
             if view.loading || (view.page.is_none() && view.error.is_none()) {
-                return Some(if view.page.is_some() {
+                Some(if view.page.is_some() {
                     "refresh"
                 } else {
                     "post"
-                });
+                })
+            } else {
+                (!view.loading_more.is_empty()).then_some("replies")
             }
-            if !view.loading_more.is_empty() {
-                return Some("replies");
-            }
-        }
-    } else {
+        });
+    let list = if !loaders.list && (app.post_view.is_none() || app.detail_fits()) {
         match app.active_tab().kind {
             TabKind::Home | TabKind::Subreddit { .. } => {
-                if let Some((_, activity)) =
-                    feed_activity(&app.active_tab().feed, !app.reddit.needs_sign_in())
-                {
-                    return Some(activity);
-                }
+                feed_activity(&app.active_tab().feed, !app.reddit.needs_sign_in())
+                    .map(|(_, activity)| activity)
             }
-            TabKind::AllSubs if app.all_subs.loading => return Some("subs"),
+            TabKind::AllSubs if app.all_subs.loading => Some("subs"),
             TabKind::AllSubs if app.all_subs.groups.iter().any(|group| group.loading) => {
-                return Some("communities");
+                Some("communities")
             }
-            _ => {}
+            _ => None,
         }
-    }
-    (app.inline_images_on()
-        && (app.card_renderer.pending()
-            || app.card_images.values().any(|slot| {
-                matches!(
-                    slot,
-                    CardImageSlot::Loading
-                        | CardImageSlot::Cached {
-                            refreshing: true,
-                            ..
-                        }
-                )
-            })
-            || app
-                .images
-                .values()
-                .chain(app.thumbs.values().filter(|_| app.thumbnails_on()))
-                .any(|slot| {
-                    matches!(
-                        slot,
-                        ImageSlot::Loading
-                            | ImageSlot::Ready {
-                                refresh: ImageRefresh::Loading,
-                                ..
-                            }
-                    )
-                })))
-    .then_some("images")
+    } else {
+        None
+    };
+    let active = if app.post_focused() {
+        post.or(list)
+    } else {
+        list.or(post)
+    };
+    active.or_else(|| app.images_loading().then_some("images"))
 }
 
-fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let activity = loading_activity(app)
-        .map(|activity| Span::styled(format!(" ⋯ {activity}  "), Style::new().fg(YELLOW)));
-    let content_width =
-        usize::from(area.width).saturating_sub(activity.as_ref().map_or(0, Span::width));
+fn draw_footer(f: &mut Frame, app: &App, area: Rect, loaders: &VisibleLoaders) {
+    let progress = app.membership_progress();
+    let cooldown = app
+        .reddit
+        .pause()
+        .map(|pause| format!("Reddit paused {}s · {}", pause.seconds, pause.cause));
+    let playback_error = app
+        .selected_video()
+        .filter(|_| app.video_controls_available())
+        .and_then(|player| player.error());
+    let feedback = app.status.is_some()
+        || progress.is_some()
+        || playback_error.is_some()
+        || matches!(
+            app.health,
+            Health::SignedOut | Health::Down | Health::Paused
+        );
+    let help_width = if area.width >= 180
+        || (area.width >= 64
+            && app.settings.store.persistence == crate::config::store::Persistence::Unsaved)
+    {
+        26
+    } else if area.width >= 20 {
+        10
+    } else {
+        2.min(area.width)
+    };
+    let available = usize::from(area.width.saturating_sub(help_width));
+    // Reserve progress space even while idle, so hints never reflow as work changes.
+    // Errors and connection/membership feedback take the full content width.
+    let activity_width = if !feedback || app.status.as_ref().is_some_and(|status| !status.error) {
+        (available / 3).min(24)
+    } else {
+        0
+    };
+    let content_width = available.saturating_sub(activity_width);
     let mut line = if let Some(status) = &app.status {
         let (icon, color) = if status.error {
             ("✗", RED)
         } else {
-            ("✓", TEAL)
+            if app.media_loading() {
+                (loading::glyph(app.loading_frame), YELLOW)
+            } else {
+                ("✓", TEAL)
+            }
         };
         Line::from(vec![
             Span::styled(
                 format!(" {icon} "),
                 Style::new().fg(color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(status.text.as_str(), Style::new().fg(color)),
+            Span::styled(
+                if status.error
+                    && (status.text.contains("Reddit rate limit reached")
+                        || status.text.contains("Reddit requests paused"))
+                {
+                    cooldown.clone().unwrap_or_else(|| status.text.clone())
+                } else {
+                    status.text.clone()
+                },
+                Style::new().fg(color),
+            ),
         ])
-    } else if let Some(progress) = app.membership_progress() {
+    } else if let Some(progress) = progress {
         Line::from(vec![Span::styled(
-            format!(" ⋯ {progress}"),
-            Style::new().fg(YELLOW),
+            format!(" {} {progress}", loading::glyph(app.loading_frame)),
+            loading::style(loading::Kind::Action),
         )])
+    } else if let Some(error) = playback_error {
+        let label = if content_width < 28 {
+            "✗ P retry".into()
+        } else {
+            format!("✗ P retry · m media · {error}")
+        };
+        Line::from(Span::styled(label, Style::new().fg(RED)))
     } else if app.health == Health::SignedOut {
         Line::from(Span::styled(
             " Reddit sign-in required · A connect",
@@ -3123,7 +3753,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled(" ◐ ", Style::new().fg(YELLOW)),
             Span::styled(
-                "Reddit requests paused · wait before retrying",
+                cooldown.unwrap_or_else(|| "Reddit requests paused".into()),
                 Style::new().fg(YELLOW),
             ),
         ])
@@ -3135,6 +3765,22 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         );
         let dynamic;
         let hints: &[(&str, &str)] = if app.post_focused() {
+            let playback = (app.video_controls_available()
+                && app.post_view.as_ref().is_some_and(|view| view.image_shown))
+            .then(|| {
+                [
+                    (
+                        "P",
+                        if app.selected_video().is_some_and(|p| !p.paused()) {
+                            "pause"
+                        } else {
+                            "play"
+                        },
+                    ),
+                    ("a", "sound"),
+                    (",/.", "seek"),
+                ]
+            });
             let spoilers = app.post_view.as_ref().is_some_and(PostView::has_spoilers);
             // `c` selects the comment being read, or acts on the selected row.
             let c = app.post_view.as_ref().and_then(|v| {
@@ -3161,12 +3807,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 .is_some_and(|p| !matches!(p.media, Media::None))
                 .then_some(("m", "media"));
             let save = if shown_post.is_some_and(|p| app.state.is_bookmarked(&p.id)) {
-                ("b", "unsave")
+                ("b", "unbookmark")
             } else {
-                ("b", "save")
+                ("b", "bookmark")
             };
-            dynamic = [("j/k", "comments")]
+            dynamic = playback
                 .into_iter()
+                .flatten()
+                .chain([("j/k", "comments")])
                 .chain(spoilers.then_some(("v", "spoilers")))
                 .chain(c)
                 .chain([("space", "page")])
@@ -3191,11 +3839,49 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             .chain(closable.then_some(("x", "close")))
             .collect();
             &dynamic
+        } else if app.restricted_community().is_some() {
+            dynamic = vec![
+                (
+                    "o",
+                    if content_width < 20 {
+                        "Reddit"
+                    } else {
+                        "open Reddit"
+                    },
+                ),
+                ("r", "check access"),
+                ("p", "jump"),
+                ("B", "community"),
+            ];
+            &dynamic
+        } else if app.video_controls_available() {
+            dynamic = vec![
+                ("j/k", "move"),
+                ("⏎", "open"),
+                (
+                    "P",
+                    if app
+                        .video
+                        .as_ref()
+                        .is_some_and(|player| !player.paused() && player.error().is_none())
+                    {
+                        "pause"
+                    } else {
+                        "play"
+                    },
+                ),
+                ("a", "sound"),
+                (",/.", "seek"),
+                ("PgUp/Dn", "page"),
+                ("m", "media"),
+                ("V", "view"),
+            ];
+            &dynamic
         } else {
             match app.active_tab().kind {
                 TabKind::AllSubs => &[
                     ("j/k", "posts"),
-                    ("J/K", "cards"),
+                    ("J/K", "communities"),
                     ("⏎", "open"),
                     ("space", "subreddit"),
                     ("S", "join/leave"),
@@ -3223,7 +3909,6 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                         ("V", "view"),
                         ("PgUp/Dn", "page"),
                         ("space", "sub"),
-                        ("S", "join/leave"),
                         ("s", "sort"),
                     ]
                     .into_iter()
@@ -3239,7 +3924,15 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         // Keep whole key + label pairs; do not build pairs past the available width.
         let mut fitted = vec![Span::raw(" ")];
         let mut used = 1;
-        for (key, label) in hints.iter().chain(&[("?", "help")]) {
+        for (key, label) in hints {
+            if matches!(*key, "S" | "space")
+                && app
+                    .community()
+                    .filter(|name| crate::reddit::is_community(name))
+                    .is_none()
+            {
+                continue;
+            }
             if *key == "PgUp/Dn" && app.state.list_view() != ListView::Card {
                 continue;
             }
@@ -3249,41 +3942,151 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ];
             let width = line_width(&pair);
             if used + width > content_width {
-                break;
+                continue;
             }
             used += width;
             fitted.extend(pair);
         }
         Line::from(fitted)
     };
-    if let Some(activity) = activity {
-        line.spans.insert(0, activity);
+    line.spans = fit_spans(line.spans, content_width);
+    f.render_widget(
+        line,
+        Rect::new(area.x, area.y, content_width as u16, area.height),
+    );
+    if let Some(activity) = loading_activity(app, loaders).filter(|_| activity_width > 0) {
+        let kind = match activity {
+            "Loading more posts…" | "replies" => loading::Kind::More,
+            "images" => loading::Kind::Media,
+            "media" => loading::Kind::Action,
+            "refresh" | "communities" => loading::Kind::Background,
+            _ => loading::Kind::Initial,
+        };
+        let label = match activity {
+            _ if activity_width < 7 => "",
+            "Loading more posts…" if activity_width < 13 => "more",
+            "Loading more posts…" if activity_width < 22 => "more posts",
+            _ => activity,
+        };
+        let activity = Span::styled(
+            if activity_width < 3 {
+                loading::glyph(app.loading_frame).to_string()
+            } else {
+                format!(" {} {label}", loading::glyph(app.loading_frame))
+            },
+            loading::style(kind),
+        );
+        f.render_widget(
+            Line::from(fit_spans(vec![activity], activity_width)),
+            Rect::new(
+                area.x + content_width as u16,
+                area.y,
+                activity_width as u16,
+                area.height,
+            ),
+        );
     }
-    f.render_widget(line, area);
+    let help = if help_width >= 26 {
+        Line::from(vec![
+            key_chip("F2"),
+            Span::styled(
+                if app.settings.store.persistence == crate::config::store::Persistence::Unsaved {
+                    " unsaved  "
+                } else {
+                    " settings "
+                },
+                Style::new().fg(SUBTEXT),
+            ),
+            key_chip("F1"),
+            Span::styled(" help", Style::new().fg(SUBTEXT)),
+        ])
+    } else if help_width >= 10 {
+        Line::from(vec![
+            key_chip("F1"),
+            Span::styled(" help", Style::new().fg(SUBTEXT)),
+        ])
+    } else {
+        Line::from("F1")
+    };
+    f.render_widget(
+        help,
+        Rect::new(
+            area.right().saturating_sub(help_width),
+            area.y,
+            help_width,
+            area.height,
+        ),
+    );
 }
 
 // ----- overlays --------------------------------------------------------------
 
 fn popup(area: Rect, width: u16, height: u16) -> Rect {
-    let w = width.min(area.width.saturating_sub(4));
-    let h = height.min(area.height.saturating_sub(2));
+    let w = width.min(area.width.saturating_sub(if area.width >= 8 {
+        POPUP_OUTER_X * 2
+    } else {
+        0
+    }));
+    let h = height.min(area.height.saturating_sub(if area.height >= 6 {
+        POPUP_OUTER_Y * 2
+    } else {
+        0
+    }));
     Rect {
         x: area.x + (area.width - w) / 2,
-        y: area.y + (area.height - h) / 3,
+        y: area.y + (area.height - h) / 2,
         width: w,
         height: h,
     }
 }
 
-fn popup_block(title: &str) -> Block<'static> {
+fn wrapped_rows(text: &str, width: u16) -> usize {
+    text.lines()
+        .map(|line| textwrap::wrap(line, usize::from(width).max(1)).len().max(1))
+        .sum()
+}
+
+fn fitting_label(labels: &[&'static str], width: usize) -> &'static str {
+    labels
+        .iter()
+        .copied()
+        .find(|label| label.width() <= width)
+        .unwrap_or("")
+}
+
+fn enter_escape(width: usize) -> &'static str {
+    fitting_label(&["Enter · Esc", "⏎ · Esc", "⏎⎋", "⎋"], width)
+}
+
+fn dialog_controls(action: &str, width: usize) -> String {
+    let full = format!("Enter {action} · Esc cancel");
+    if full.width() <= width {
+        full
+    } else {
+        enter_escape(width).into()
+    }
+}
+
+fn identity_lines(text: &str, width: usize, color: Color) -> Vec<Line<'static>> {
+    let options = textwrap::Options::new(width.max(1))
+        .word_separator(textwrap::WordSeparator::AsciiSpace)
+        .word_splitter(textwrap::WordSplitter::NoHyphenation);
+    textwrap::wrap(text, options)
+        .into_iter()
+        .map(|row| Line::styled(row.into_owned(), Style::new().fg(color)))
+        .collect()
+}
+
+fn popup_block(title: &str, width: u16) -> Block<'static> {
+    let title = truncate(title, usize::from(width.saturating_sub(4)));
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(ACCENT))
-        .style(Style::new().bg(MANTLE))
-        .padding(Padding::horizontal(1))
+        .style(Style::new().bg(MANTLE).fg(TEXT))
+        .padding(Padding::horizontal(PANEL_PAD))
         .title(Line::from(vec![
-            Span::styled(" ◆ ", Style::new().fg(ACCENT)),
+            Span::raw(" "),
             Span::styled(
                 format!("{title} "),
                 Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -3291,191 +4094,150 @@ fn popup_block(title: &str) -> Block<'static> {
         ]))
 }
 
-const HELP: &[(&str, &str)] = &[
-    (":", "Reddit: saved, profiles, inbox, search"),
-    (";", "post/comment: vote, save, reply, edit"),
-    ("B", "community info, rules, wiki and actions"),
-    ("f (post)", "comment sort and find in loaded comments"),
-    ("{ } (post)", "previous / next gallery image"),
-    ("C-s (composer)", "submit to Reddit; Tab field, Esc back"),
-    ("C-o (Reddit)", "open the corresponding Reddit page"),
-    ("A", "saved accounts: switch, add or reconnect"),
-    ("Space (list)", "open the selected community"),
-    ("S", "join or leave a community on Reddit"),
-    ("Tabs", ""),
-    ("Tab ] / S-Tab [", "next / previous tab"),
-    ("1-9 / 0", "jump to a tab / the last tab"),
-    ("p", "jump to a tab or open any subreddit"),
-    ("x", "close a tab opened with p"),
-    ("\\", "hide or show the sidebar"),
-    ("h · l Enter Esc", "focus the sidebar · back to the list"),
-    ("j k · g G", "sidebar: next / previous tab · first / last"),
-    ("Lists", ""),
-    ("V", "Card / Compact view (saved)"),
-    ("PgDn/PgUp · C-d/u", "cards: scroll a page / half page"),
-    ("C-e C-y", "cards: scroll down / up one line"),
-    ("j k · C-d C-u", "move · page; a post open beside follows"),
-    ("g G", "first / last"),
-    ("Enter l", "open the post, or resume the one shown"),
-    ("J K", "All subs: next / previous card"),
-    ("Space", "All subs: open the card's subreddit"),
-    ("s · t", "Home/subreddit: sort · time range"),
-    ("/ · Esc", "subreddit: search · clear search"),
-    ("L", "feed: next page (automatic near end)"),
-    ("Post", ""),
-    ("j k", "next / previous comment"),
-    ("Space PgDn · PgUp", "page down · up"),
-    ("C-d C-u · C-e C-y", "half page · one line"),
-    ("l c Enter", "select the comment read (or left with h)"),
-    ("l c Enter again", "fold a thread · load more replies"),
-    ("n N", "next / previous top-level comment"),
-    ("v", "show / hide spoilers"),
-    ("P · a", "video: pause / play · sound on / off"),
-    (", .", "video: back / forward 5 seconds"),
-    ("g G", "top of post / last comment"),
-    ("h", "split: list; narrow: back one level"),
-    ("Esc q", "back to the list"),
-    ("Anywhere", ""),
-    ("o · y", "open on reddit.com · copy link"),
-    ("m", "media: image viewer, mpv, or browser"),
-    ("b", "bookmark"),
-    ("i", "images and videos on / off"),
-    ("r", "reload"),
-    ("q · C-c", "quit"),
-];
-
-/// The key list, scrolled with `j`/`k` when the terminal is too short for all of it.
-fn draw_help(f: &mut Frame, scroll: &mut usize) {
-    let area = popup(f.area(), 68, HELP.len() as u16 + 2);
-    let visible = area.height.saturating_sub(2) as usize;
-    // j/k keep the popup open even when everything fits, so the title always says so.
-    *scroll = (*scroll).min(HELP.len().saturating_sub(visible));
-    let lines: Vec<Line> = HELP
-        .iter()
-        .skip(*scroll)
-        .map(|(k, v)| {
-            if v.is_empty() {
-                Line::styled(
-                    k.to_string(),
-                    Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Line::from(vec![
-                    Span::styled(format!("  {k:<19}"), Style::new().fg(LAVENDER)),
-                    Span::styled(v.to_string(), Style::new().fg(SUBTEXT)),
-                ])
-            }
-        })
-        .collect();
-    let title = "Keys · j/k scroll · any other key closes";
-    f.render_widget(Clear, area);
-    f.render_widget(Paragraph::new(lines).block(popup_block(title)), area);
-}
-
-fn draw_picker(f: &mut Frame, app: &App, input: &str, selected: usize) {
+fn draw_picker(f: &mut Frame, app: &App, input: &str, selected: usize) -> Rect {
     let entries = app.picker_entries(input);
-    let area = popup(f.area(), 56, 22);
+    let mut area = popup(f.area(), 56, entries.len().clamp(1, 12) as u16 + 6);
+    let compact = area.height.saturating_sub(2) < 5;
+    if compact {
+        area = popup(f.area(), 56, entries.len().clamp(1, 12) as u16 + 3);
+    }
     f.render_widget(Clear, area);
-    let block = popup_block("Jump");
+    let mut block = popup_block("Jump", area.width);
+    if compact {
+        let keys = if entries.is_empty() {
+            "Esc close"
+        } else {
+            enter_escape(usize::from(area.width.saturating_sub(4)))
+        };
+        block = block.title_bottom(Line::styled(format!(" {keys} "), Style::new().fg(SUBTEXT)));
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
     let [input_area, list_area, hint_area] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(1),
-        Constraint::Length(1),
+        Constraint::Length(if compact { 1 } else { 3 }),
+        Constraint::Min(0),
+        Constraint::Length(if compact { 0 } else { 1 }),
     ])
     .areas(inner);
-    // Inside the box's borders: " › " (3) and the caret (1) besides the input.
-    let room = (input_area.width as usize).saturating_sub(2 + 3 + 1);
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" › ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
-            Span::styled(input_tail(input, room), Style::new().fg(TEXT)),
-            Span::styled("▏", Style::new().fg(ACCENT)),
-        ]))
-        .block(
+    let room = usize::from(input_area.width).saturating_sub(if compact { 4 } else { 6 });
+    let mut input = Paragraph::new(Line::from(vec![
+        Span::styled(" › ", Style::new().fg(ACCENT).bold()),
+        Span::styled(input_tail(input, room), Style::new().fg(TEXT)),
+        Span::styled("▏", Style::new().fg(ACCENT)),
+    ]))
+    .style(Style::new().bg(SURFACE0));
+    if !compact {
+        input = input.block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::new().fg(SURFACE1)),
-        ),
-        input_area,
-    );
+        );
+    }
+    f.render_widget(input, input_area);
     let height = list_area.height as usize;
     let start = selected.saturating_sub(height.saturating_sub(1));
     let width = list_area.width as usize;
-    let lines: Vec<Line> = entries
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(height)
-        .map(|(i, entry)| {
-            let bg = if i == selected {
-                Style::new().bg(SURFACE0)
-            } else {
-                Style::new()
-            };
-            let mut spans = vec![Span::styled(
-                if i == selected { "▌" } else { " " },
-                bg.fg(ACCENT),
-            )];
-            match entry {
-                PickerEntry::Tab { index, title } => {
-                    let icon = match app.tabs[*index].kind {
-                        TabKind::Home => "⌂",
-                        TabKind::AllSubs => "▦",
-                        TabKind::Bookmarks => "★",
-                        TabKind::Subreddit { .. } => "#",
-                    };
-                    spans.push(Span::styled(format!(" {icon} "), bg.fg(OVERLAY)));
-                    spans.push(Span::styled(title.clone(), bg.fg(TEXT)));
-                    let badge = app.badge(&app.tabs[*index]);
-                    if badge > 0 {
-                        pad_to(
-                            &mut spans,
-                            width.saturating_sub(format!(" {badge} ").width()),
-                            bg,
-                        );
-                        spans.push(chip(badge.to_string(), CRUST, ACCENT));
+    let lines: Vec<Line> = if entries.is_empty() {
+        vec![Line::styled(
+            truncate("No matching tab or valid subreddit", width),
+            Style::new().fg(OVERLAY),
+        )]
+    } else {
+        entries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(height)
+            .map(|(i, entry)| {
+                let bg = choice_style(i == selected);
+                let mut spans = vec![Span::styled(
+                    if i == selected { "▌" } else { " " },
+                    bg.fg(ACCENT),
+                )];
+                match entry {
+                    PickerEntry::Tab { index, title } => {
+                        let icon = match app.tabs[*index].kind {
+                            TabKind::Home => "⌂",
+                            TabKind::AllSubs => "▦",
+                            TabKind::Bookmarks => "★",
+                            TabKind::Subreddit { .. } => "#",
+                        };
+                        spans.push(Span::styled(format!(" {icon} "), bg.fg(OVERLAY)));
+                        let badge = app.badge(&app.tabs[*index]);
+                        let badge_width = if badge > 0 {
+                            format!(" {badge} ").width()
+                        } else {
+                            0
+                        };
+                        spans.push(Span::styled(
+                            truncate(
+                                title,
+                                width.saturating_sub(line_width(&spans) + badge_width),
+                            ),
+                            bg.fg(TEXT),
+                        ));
+                        if badge > 0 {
+                            pad_to(
+                                &mut spans,
+                                width.saturating_sub(format!(" {badge} ").width()),
+                                bg,
+                            );
+                            spans.push(chip(badge.to_string(), CRUST, ACCENT));
+                        }
+                    }
+                    PickerEntry::Open(name) => {
+                        spans.push(Span::styled(" + ", bg.fg(GREEN)));
+                        spans.push(Span::styled(format!("open r/{name}"), bg.fg(GREEN)));
                     }
                 }
-                PickerEntry::Open(name) => {
-                    spans.push(Span::styled(" + ", bg.fg(GREEN)));
-                    spans.push(Span::styled(format!("open r/{name}"), bg.fg(GREEN)));
-                }
-            }
-            pad_to(&mut spans, width, bg);
-            Line::from(spans)
-        })
-        .collect();
+                let mut spans = fit_spans(spans, width);
+                pad_to(&mut spans, width, bg);
+                Line::from(spans)
+            })
+            .collect()
+    };
     f.render_widget(Paragraph::new(lines), list_area);
-    f.render_widget(
-        Line::from(vec![
-            key_chip("⏎"),
-            Span::styled(" go  ", Style::new().fg(OVERLAY)),
-            key_chip("↑↓"),
-            Span::styled(" move  ", Style::new().fg(OVERLAY)),
-            key_chip("esc"),
-            Span::styled(" close", Style::new().fg(OVERLAY)),
-        ]),
-        hint_area,
-    );
+    let mut controls = Vec::new();
+    for (key, label) in [("⏎", "open"), ("Esc", "close"), ("↑↓", "move")] {
+        if entries.is_empty() && key != "Esc" {
+            continue;
+        }
+        let pair = [
+            key_chip(key),
+            Span::styled(format!(" {label}  "), Style::new().fg(OVERLAY)),
+        ];
+        if line_width(&controls) + line_width(&pair) <= hint_area.width as usize {
+            controls.extend(pair);
+        }
+    }
+    let controls = if hint_area.width < 20 {
+        Line::from(if entries.is_empty() {
+            "Esc close"
+        } else {
+            enter_escape(usize::from(hint_area.width))
+        })
+    } else {
+        Line::from(controls)
+    };
+    f.render_widget(controls, hint_area);
+    area
 }
 
-fn draw_sort(f: &mut Frame, app: &App, selected: usize) {
+fn draw_sort(f: &mut Frame, app: &App, selected: usize) -> Rect {
     let sorts = app.active_tab().sorts();
     let home = matches!(app.active_tab().kind, TabKind::Home);
-    let area = popup(f.area(), 34, sorts.len() as u16 + 4);
+    let area = popup(f.area(), 34, sorts.len() as u16 + 2);
+    let visible = area.height.saturating_sub(2) as usize;
+    let offset = selected.saturating_sub(visible.saturating_sub(1));
     f.render_widget(Clear, area);
     let lines: Vec<Line> = sorts
         .iter()
         .enumerate()
+        .skip(offset)
+        .take(visible)
         .map(|(i, s)| {
-            let bg = if i == selected {
-                Style::new().bg(SURFACE0)
-            } else {
-                Style::new()
-            };
+            let bg = choice_style(i == selected);
             let name = s.as_str();
             let mut spans = vec![
                 Span::styled(if i == selected { "▌" } else { " " }, bg.fg(ACCENT)),
@@ -3489,73 +4251,154 @@ fn draw_sort(f: &mut Frame, app: &App, selected: usize) {
             if home && *s == Sort::Best {
                 spans.push(Span::styled(" recommendations", bg.fg(TEXT)));
             }
-            pad_to(&mut spans, 28, bg);
+            let mut spans = fit_spans(spans, area.width.saturating_sub(4) as usize);
+            pad_to(&mut spans, area.width.saturating_sub(4) as usize, bg);
             Line::from(spans)
         })
         .collect();
-    f.render_widget(Paragraph::new(lines).block(popup_block("Sort")), area);
-}
-
-fn draw_membership(f: &mut Frame, subreddit: &str, join: bool) {
-    let action = if join { "Join" } else { "Leave" };
-    let lines = vec![
-        Line::styled(
-            format!("r/{subreddit}"),
-            Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+    let block = popup_block("Sort", area.width).title_bottom(Line::styled(
+        format!(
+            " {} ",
+            dialog_controls("apply", usize::from(area.width.saturating_sub(4)))
         ),
-        Line::raw(format!(
-            "Enter {} · Esc cancel",
-            action.to_ascii_lowercase()
-        )),
-        Line::raw("Space open subreddit"),
-    ];
-    let cols = f.area().width.saturating_sub(8).clamp(1, 50) as usize;
-    let rows: usize = lines
-        .iter()
-        .map(|line| {
-            let text: String = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect();
-            textwrap::wrap(&text, cols).len().max(1)
-        })
-        .sum();
-    let area = popup(f.area(), 54, rows as u16 + 2);
-    f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(popup_block(&format!("{action} on Reddit"))),
-        area,
-    );
+        Style::new().fg(SUBTEXT),
+    ));
+    f.render_widget(Paragraph::new(lines).block(block), area);
+    area
 }
 
-fn draw_auth(f: &mut Frame, app: &App) {
+fn draw_membership(f: &mut Frame, subreddit: &str, join: bool) -> Rect {
+    let action = if join { "Join" } else { "Leave" };
+    let available = popup(f.area(), 54, u16::MAX);
+    let width = usize::from(available.width.saturating_sub(4)).max(1);
+    let mut lines = identity_lines(&format!("r/{subreddit}"), width, TEXT);
+    for line in &mut lines {
+        line.style = line.style.bold();
+    }
+    let hint = fitting_label(&["Space open subreddit", "Space open"], width);
+    let mut area = popup(
+        f.area(),
+        54,
+        (lines.len() + usize::from(!hint.is_empty()) + 2).min(u16::MAX as usize) as u16,
+    );
+    let minimum = lines.len().saturating_add(2).min(u16::MAX as usize) as u16;
+    if area.height < minimum {
+        area.height = f.area().height.min(minimum);
+        area.y = f.area().y + (f.area().height - area.height) / 2;
+    }
+    let block = popup_block(&format!("{action} on Reddit"), area.width).title_bottom(Line::styled(
+        format!(" {} ", dialog_controls(&action.to_ascii_lowercase(), width)),
+        Style::new().fg(SUBTEXT),
+    ));
+    let inner = block.inner(area);
+    if lines.len() > usize::from(inner.height) {
+        lines.truncate(usize::from(inner.height));
+        if let Some(last) = lines.last_mut() {
+            *last = Line::styled(truncate(&format!("{last}…"), width), last.style);
+        }
+    }
+    if lines.len() < usize::from(inner.height) && !hint.is_empty() {
+        lines.push(Line::styled(hint, Style::new().fg(SUBTEXT)));
+    }
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(lines).block(block), area);
+    area
+}
+
+fn draw_auth(f: &mut Frame, app: &App) -> Rect {
     use crate::auth::Phase;
     let auth = &app.auth;
-    let area = popup(f.area(), 76, 22);
-    f.render_widget(Clear, area);
+    let available = popup(f.area(), 76, 22);
     let block = popup_block(
         if matches!(auth.phase, Phase::DisconnectConfirm | Phase::Disconnecting) {
-            " Remove from redtab "
+            "Remove from redtab"
         } else if matches!(
             auth.phase,
             Phase::Accounts | Phase::LoadingAccounts | Phase::Switching
         ) {
-            " Accounts "
+            "Accounts"
         } else {
-            " Connect Reddit "
+            "Connect Reddit"
         },
+        available.width,
+    );
+    let available_inner = block.inner(available);
+    let measured = auth_lines(
+        app,
+        usize::from(available_inner.width).max(1),
+        usize::from(available_inner.height),
+    );
+    let area = popup(
+        f.area(),
+        76,
+        measured.len().min(u16::MAX as usize - 2) as u16 + 2,
     );
     let inner = block.inner(area);
+    f.render_widget(Clear, area);
     f.render_widget(block, area);
-    let width = usize::from(inner.width).max(1);
+    let lines = auth_lines(
+        app,
+        usize::from(inner.width).max(1),
+        usize::from(inner.height),
+    );
+    f.render_widget(Paragraph::new(lines).style(Style::new().fg(TEXT)), inner);
+    area
+}
+
+fn auth_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
+    use crate::auth::Phase;
+    let auth = &app.auth;
     let wrapped = |text: &str, color| -> Vec<Line<'static>> {
         textwrap::wrap(text, width)
             .into_iter()
             .map(|row| Line::styled(row.into_owned(), Style::new().fg(color)))
             .collect()
+    };
+    let primary_controls = enter_escape(width);
+    // Keep primary action/cancel on one row before adding optional guidance.
+    let fit_controls = |full: Vec<Line<'static>>, compact: &[&str], reserve: usize| {
+        let budget = height.saturating_sub(reserve);
+        if full.len() <= budget {
+            return full;
+        }
+        let mut rows = Vec::new();
+        for text in compact {
+            let next = wrapped(text, TEXT);
+            if rows.len() + next.len() <= budget {
+                rows.extend(next);
+            }
+        }
+        rows
+    };
+    let target = |label: &str, name: &str, color| {
+        let wrap = |text: &str| identity_lines(text, width, color);
+        let rows = height.saturating_sub(1);
+        let mut identity = wrap(label);
+        if identity.len() > rows {
+            identity = wrap(name);
+        }
+        if identity.len() > rows {
+            identity.truncate(rows);
+            if let Some(last) = identity.last_mut() {
+                *last = Line::styled(truncate(&format!("{last}…"), width), last.style);
+            }
+        }
+        identity
+    };
+    let account_status = |index: usize| {
+        auth.accounts.get(index).map_or(("", TEXT), |account| {
+            let active = auth.active_id.as_ref() == Some(&account.id);
+            let status = match (active, account.expired) {
+                (true, true) => "[active, expired]",
+                (true, false) => "[active]",
+                (false, true) => "[expired]",
+                (false, false) => "",
+            };
+            (status, if account.expired { YELLOW } else { TEAL })
+        })
+    };
+    let status_fits = |label: &str, status: &str| {
+        status.is_empty() || 3 + label.width() + status.width() <= width
     };
     let mut lines = auth
         .message
@@ -3563,48 +4406,140 @@ fn draw_auth(f: &mut Frame, app: &App) {
         .map(|message| wrapped(message, YELLOW))
         .unwrap_or_default();
     let mut controls = Vec::new();
+    let mut target_rows = 1;
     match auth.phase {
         Phase::Accounts => {
-            let mut footer = wrapped("Enter switches · j/k choose · a Add account", TEXT);
-            footer.extend(wrapped("r Reconnect selected · Esc close", TEXT));
-            footer.extend(wrapped("d Remove from redtab", TEXT));
-            let height = usize::from(inner.height);
-            lines.truncate(height.saturating_sub(footer.len() + 1));
-            if lines.is_empty() && height > footer.len() + 1 {
-                lines.extend(wrapped("Choose a saved account or add another.", TEXT));
+            let saved = auth.selected < auth.accounts.len();
+            let status_rows = auth
+                .accounts
+                .iter()
+                .enumerate()
+                .map(|(index, account)| {
+                    let (status, color) = account_status(index);
+                    let rows = wrapped(status.trim_matches(['[', ']']), color).len();
+                    if !status_fits(&account.name, status) && rows + 2 <= height {
+                        rows
+                    } else {
+                        0
+                    }
+                })
+                .max()
+                .unwrap_or(0);
+            let footers = [true, false].map(|saved| {
+                let mut footer = wrapped(
+                    if saved {
+                        "Enter selects · j/k choose · a Add account"
+                    } else {
+                        "Enter adds · j/k choose · a Add account"
+                    },
+                    TEXT,
+                );
+                footer.extend(wrapped(
+                    if saved {
+                        "r Reconnect selected · Esc close"
+                    } else {
+                        "r Rescan browsers · Esc close"
+                    },
+                    TEXT,
+                ));
+                if !auth.accounts.is_empty() {
+                    let removal = wrapped("d Remove from redtab", TEXT);
+                    footer.extend(if saved {
+                        removal
+                    } else {
+                        vec![Line::default(); removal.len()]
+                    });
+                }
+                footer
+            });
+            let full_rows = footers.iter().map(Vec::len).max().unwrap();
+            let footers = footers
+                .into_iter()
+                .zip([true, false])
+                .map(|(mut footer, saved)| {
+                    footer.resize(full_rows, Line::default());
+                    let mut compact = vec![
+                        primary_controls,
+                        "F1 help",
+                        "j/k choose",
+                        if saved { "r reconnect" } else { "r rescan" },
+                        "a add",
+                    ];
+                    if saved && !auth.accounts.is_empty() {
+                        compact.push("d remove");
+                    }
+                    fit_controls(footer, &compact, 1 + status_rows)
+                })
+                .collect::<Vec<_>>();
+            let footer_rows = footers.iter().map(Vec::len).max().unwrap();
+            let mut footer = footers[usize::from(!saved)].clone();
+            footer.resize(footer_rows, Line::default());
+            let reserved = footer.len() + 1 + status_rows;
+            lines.truncate(height.saturating_sub(reserved));
+            let guidance = wrapped("Choose a saved account or add another.", TEXT);
+            if lines.is_empty() && guidance.len() <= height.saturating_sub(reserved) {
+                lines.extend(guidance);
             }
-            let visible = height.saturating_sub(lines.len() + footer.len()).max(1);
+            let visible = height.saturating_sub(lines.len() + footer.len() + status_rows);
             let start = auth.selected.saturating_sub(visible.saturating_sub(1));
             for index in (start..auth.choices()).take(visible) {
                 let selected = index == auth.selected;
-                let label = if let Some(account) = auth.accounts.get(index) {
-                    let active = auth.active_id.as_ref() == Some(&account.id);
-                    let status = match (active, account.expired) {
-                        (true, true) => "active, expired · ",
-                        (true, false) => "active · ",
-                        (false, true) => "expired · ",
-                        (false, false) => "",
-                    };
-                    format!("{status}{}", account.name)
+                let style = choice_style(selected);
+                let label = auth
+                    .accounts
+                    .get(index)
+                    .map_or("+ Add account", |account| account.name.as_str());
+                let (status, color) = account_status(index);
+                let status = if status_fits(label, status) {
+                    status
                 } else {
-                    "+ Add account".into()
+                    ""
                 };
-                lines.push(Line::styled(
-                    truncate(
-                        &format!("{} {label}", if selected { "›" } else { " " }),
-                        width,
-                    ),
-                    Style::new().fg(if selected { ACCENT } else { TEXT }),
-                ));
+                let mut spans = vec![Span::styled(
+                    format!("{} ", if selected { "▌" } else { " " }),
+                    style,
+                )];
+                let room =
+                    width.saturating_sub(2 + status.width() + usize::from(!status.is_empty()));
+                spans.push(Span::styled(truncate(label, room), style));
+                pad_to(&mut spans, width.saturating_sub(status.width()), style);
+                if !status.is_empty() {
+                    spans.push(Span::styled(status, style.fg(color)));
+                }
+                lines.push(Line::from(spans));
             }
+            let (status, color) = account_status(auth.selected);
+            let status = if auth
+                .accounts
+                .get(auth.selected)
+                .is_some_and(|account| !status_fits(&account.name, status))
+            {
+                status.trim_matches(['[', ']'])
+            } else {
+                ""
+            };
+            let mut status_lines = wrapped(status, color);
+            status_lines.truncate(status_rows);
+            status_lines.resize(status_rows, Line::default());
+            lines.extend(status_lines);
             lines.extend(footer);
         }
         Phase::LoadingAccounts => {
-            lines.extend(wrapped("⋯ Loading saved accounts…", TEXT));
+            lines.extend(loading::wrapped(
+                loading::Kind::Initial,
+                "Loading saved accounts…",
+                width,
+                app.loading_frame,
+            ));
             controls = wrapped("Esc cancels", TEXT);
         }
         Phase::Switching => {
-            lines.extend(wrapped("⋯ Verifying account…", TEXT));
+            lines.extend(loading::wrapped(
+                loading::Kind::Action,
+                "Verifying account…",
+                width,
+                app.loading_frame,
+            ));
             lines.extend(wrapped(
                 "A failed switch leaves your connection unchanged.",
                 SUBTEXT,
@@ -3612,36 +4547,61 @@ fn draw_auth(f: &mut Frame, app: &App) {
             controls = wrapped("Esc cancels", TEXT);
         }
         Phase::Idle | Phase::Choose => {
-            let mut footer = wrapped("Enter connects · j/k choose · r rescan · Esc cancel", TEXT);
+            let mut footer = wrapped(
+                if auth.sources.is_empty() {
+                    "r rescan · Esc cancel"
+                } else {
+                    "Enter connects · j/k choose · r rescan · Esc cancel"
+                },
+                TEXT,
+            );
             if auth.active_id.is_some() {
                 footer.extend(wrapped("d Remove from redtab", TEXT));
             }
             let disclosure = wrapped("Only Reddit cookies; OS access may prompt.", SUBTEXT);
-            let height = usize::from(inner.height);
             if lines.len() + footer.len() + disclosure.len() + 2 <= height {
                 footer.extend(disclosure);
             }
+            let compact = if auth.sources.is_empty() {
+                vec!["r · Esc", "F1 help"]
+            } else {
+                vec![primary_controls, "F1 help", "j/k choose", "r rescan"]
+            };
+            footer = fit_controls(footer, &compact, usize::from(!auth.sources.is_empty()));
             // Errors and controls stay visible; labels occupy one row each.
-            lines.truncate(height.saturating_sub(footer.len() + 1));
+            lines.truncate(
+                height.saturating_sub(footer.len() + usize::from(!auth.sources.is_empty())),
+            );
             if lines.is_empty() && height > footer.len() + 1 {
-                lines.extend(wrapped("Choose a profile or a new login window.", TEXT));
+                let guidance = wrapped("Choose a profile or a new login window.", TEXT);
+                if guidance.len() < height.saturating_sub(footer.len()) {
+                    lines.extend(guidance);
+                }
             }
             let visible = height.saturating_sub(lines.len() + footer.len()).max(1);
             let start = auth.selected.saturating_sub(visible.saturating_sub(1));
             for (index, source) in auth.sources.iter().enumerate().skip(start).take(visible) {
                 let selected = index == auth.selected;
-                lines.push(Line::from(Span::styled(
+                let style = choice_style(selected);
+                let mut spans = vec![Span::styled(
                     truncate(
-                        &format!("{} {}", if selected { "›" } else { " " }, source.label()),
+                        &format!("{} {}", if selected { "▌" } else { " " }, source.label()),
                         width,
                     ),
-                    Style::new().fg(if selected { ACCENT } else { TEXT }),
-                )));
+                    style,
+                )];
+                pad_to(&mut spans, width, style);
+                lines.push(Line::from(spans));
             }
             lines.extend(footer);
         }
         Phase::Discovering => {
-            lines.extend(wrapped("⋯ Finding browser profiles…", TEXT));
+            lines.extend(loading::wrapped(
+                loading::Kind::Action,
+                "Finding browser profiles…",
+                width,
+                app.loading_frame,
+            ));
             controls = wrapped(
                 if auth.can_remove() {
                     "d Remove from redtab · Esc cancels"
@@ -3656,36 +4616,50 @@ fn draw_auth(f: &mut Frame, app: &App) {
                 auth.sources.get(auth.selected),
                 Some(crate::auth::Source::Window { .. })
             );
-            lines.extend(wrapped(
+            lines.extend(loading::wrapped(
+                loading::Kind::Action,
                 if window {
-                    "⋯ Sign in to Reddit in the separate browser window…"
+                    "Sign in to Reddit in the separate browser window…"
                 } else {
-                    "⋯ Reading Reddit session and verifying account…"
+                    "Reading Reddit session and verifying account…"
                 },
-                TEXT,
+                width,
+                app.loading_frame,
             ));
-            lines.extend(wrapped("Allow OS access if prompted. Esc cancels.", TEXT));
+            lines.extend(wrapped("Allow OS access if prompted.", TEXT));
+            controls = wrapped("Esc cancels", TEXT);
             if auth.can_remove() {
-                controls = wrapped("d Remove from redtab", TEXT);
+                controls.extend(wrapped("d Remove from redtab", TEXT));
             }
         }
         Phase::Confirm => {
-            lines.extend(wrapped(
-                &format!("Verified u/{}", auth.account_name().unwrap_or_default()),
-                GREEN,
-            ));
+            let name = format!("u/{}", auth.account_name().unwrap_or_default());
+            let identity = target(&format!("Verified {name}"), &name, GREEN);
+            let message = std::mem::take(&mut lines);
+            target_rows = identity.len();
+            lines = identity;
+            lines.extend(message);
             controls = wrapped(
                 "Enter saves this connection · Esc keeps the current account",
                 TEXT,
             );
         }
-        Phase::Saving => lines.extend(wrapped("⋯ Saving account…", TEXT)),
+        Phase::Saving => lines.extend(loading::wrapped(
+            loading::Kind::Action,
+            "Saving account…",
+            width,
+            app.loading_frame,
+        )),
         Phase::DisconnectConfirm => {
             let who = auth
                 .removal_name
                 .as_deref()
                 .unwrap_or("the current account");
-            lines.extend(wrapped(&format!("Remove {who} from redtab?"), YELLOW));
+            let identity = target(&format!("Remove {who} from redtab?"), who, YELLOW);
+            let message = std::mem::take(&mut lines);
+            lines = identity;
+            target_rows = lines.len();
+            lines.extend(message);
             lines.extend(wrapped(
                 if auth.removing_current {
                     "Remove its saved session and disconnect redtab."
@@ -3701,14 +4675,32 @@ fn draw_auth(f: &mut Frame, app: &App) {
             lines.extend(wrapped("Your browser session is unchanged.", SUBTEXT));
             controls = wrapped("Enter removes · Esc cancels", TEXT);
         }
-        Phase::Disconnecting => lines.extend(wrapped("⋯ Removing saved session…", TEXT)),
+        Phase::Disconnecting => lines.extend(loading::wrapped(
+            loading::Kind::Action,
+            "Removing saved session…",
+            width,
+            app.loading_frame,
+        )),
     }
-    lines.truncate(usize::from(inner.height).saturating_sub(controls.len()));
+    let mut compact = if matches!(auth.phase, Phase::Confirm | Phase::DisconnectConfirm) {
+        vec![primary_controls, "F1 help"]
+    } else {
+        vec!["Esc", "F1 help"]
+    };
+    if auth.can_remove() && matches!(auth.phase, Phase::Discovering | Phase::Importing) {
+        compact.push("d remove");
+    }
+    controls = fit_controls(
+        controls,
+        &compact,
+        target_rows.min(height.saturating_sub(1)).min(lines.len()),
+    );
+    lines.truncate(height.saturating_sub(controls.len()));
     lines.extend(controls);
-    f.render_widget(Paragraph::new(lines).style(Style::new().fg(TEXT)), inner);
+    lines
 }
 
-fn draw_search(f: &mut Frame, app: &App, input: &str) {
+fn draw_search(f: &mut Frame, app: &App, input: &str) -> Rect {
     let area = popup(f.area(), 60, 3);
     f.render_widget(Clear, area);
     let title = format!("Search {}", app.active_tab().title());
@@ -3721,13 +4713,23 @@ fn draw_search(f: &mut Frame, app: &App, input: &str) {
             Span::styled(shown, Style::new().fg(TEXT)),
             Span::styled("▏", Style::new().fg(ACCENT)),
         ]))
-        .block(popup_block(&title)),
+        .block(popup_block(&title, area.width).title_bottom(Line::styled(
+            format!(
+                " {} ",
+                dialog_controls("search", usize::from(area.width.saturating_sub(4)))
+            ),
+            Style::new().fg(SUBTEXT),
+        ))),
         area,
     );
+    area
 }
 
 /// Input fitted to `room` columns; a longer input shows its end after "…".
 fn input_tail(input: &str, room: usize) -> String {
+    if room == 0 {
+        return String::new();
+    }
     if input.width() <= room {
         return input.to_string();
     }
@@ -3751,12 +4753,17 @@ pub(crate) mod tests {
     use crate::model::{Comment, PostPage, ReplyPage};
     use crate::reddit::Reddit;
     use crate::worker::{Msg, Pool};
+    use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui_image::picker::Picker;
 
     fn app(subscriptions: &[&str]) -> App {
         let reddit = Reddit::test_at("http://127.0.0.1:9", false);
+        app_with_client(subscriptions, reddit)
+    }
+
+    fn app_with_client(subscriptions: &[&str], reddit: Reddit) -> App {
         let (pool, _rx) = Pool::start(reddit.clone(), 3, None);
         let state = std::env::temp_dir().join(format!(
             "redtab-ui-test-{}-{:?}.json",
@@ -3765,7 +4772,10 @@ pub(crate) mod tests {
         ));
         let mut app = App::new(
             Config {
-                image_preview: false,
+                media: crate::config::MediaSettings {
+                    image_preview: false,
+                    ..Default::default()
+                },
                 ..Config::default()
             },
             pool,
@@ -3852,7 +4862,7 @@ pub(crate) mod tests {
             "{actual}"
         );
         assert!(!actual.contains("Loading"), "{actual}");
-        assert!(loading_activity(&app).is_none());
+        assert!(loading_activity(&app, &VisibleLoaders::default()).is_none());
     }
 
     #[test]
@@ -3917,10 +4927,20 @@ pub(crate) mod tests {
         let actual = screen(&mut app, 90, 24);
 
         assert!(actual.contains("Accounts"), "{actual}");
-        assert!(actual.contains("active · u/first"), "{actual}");
-        assert!(actual.contains("expired · u/second"), "{actual}");
+        assert!(
+            actual
+                .lines()
+                .any(|line| line.contains("u/first") && line.contains("[active]")),
+            "{actual}"
+        );
+        assert!(
+            actual
+                .lines()
+                .any(|line| line.contains("u/second") && line.contains("[expired]")),
+            "{actual}"
+        );
         assert!(actual.contains("+ Add account"), "{actual}");
-        assert!(actual.contains("Enter switches"), "{actual}");
+        assert!(actual.contains("Enter selects"), "{actual}");
         assert!(actual.contains("d Remove from redtab"), "{actual}");
     }
 
@@ -3939,7 +4959,7 @@ pub(crate) mod tests {
             "Add account must be reachable without browser sources"
         );
         let actual = screen(&mut app, 90, 24);
-        assert!(actual.contains("› + Add account"), "{actual}");
+        assert!(actual.contains("▌ + Add account"), "{actual}");
     }
 
     #[test]
@@ -3981,8 +5001,8 @@ pub(crate) mod tests {
         app.overlay = Some(Overlay::Auth);
         let actual = screen(&mut app, 60, 12);
         assert!(actual.contains("Could not switch accounts"), "{actual}");
-        assert!(actual.contains("› u/reader9"), "{actual}");
-        assert!(actual.contains("Enter switches"), "{actual}");
+        assert!(actual.contains("▌ u/reader9"), "{actual}");
+        assert!(actual.contains("Enter selects"), "{actual}");
         assert!(actual.contains("r Reconnect selected"), "{actual}");
         assert!(actual.contains("d Remove from redtab"), "{actual}");
     }
@@ -4032,7 +5052,7 @@ pub(crate) mod tests {
         let actual = screen(&mut app, 60, 12);
         assert!(actual.contains("Could not read Reddit cookies"), "{actual}");
         assert!(actual.contains("login window"), "{actual}");
-        assert!(actual.contains("› Firefox 9"), "{actual}");
+        assert!(actual.contains("▌ Firefox 9"), "{actual}");
         assert!(actual.contains("Enter connects"), "{actual}");
         assert!(actual.contains("Esc cancel"), "{actual}");
     }
@@ -4092,6 +5112,181 @@ pub(crate) mod tests {
         buffer_text(terminal.backend().buffer())
     }
 
+    fn popup_snapshot(app: &mut App, width: u16, height: u16) -> (Rect, String) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut area = None;
+        terminal.draw(|f| area = draw_overlay(f, app)).unwrap();
+        (area.unwrap(), buffer_text(terminal.backend().buffer()))
+    }
+
+    #[test]
+    fn popup_navigation_should_keep_collection_bounds_and_preview_divider_stable() {
+        use crate::app::experience::Screen;
+        use crate::reddit::experience::{Entry, Page, Query, UserFeed};
+        let mut app = app(&[]);
+        app.overlay = Some(Overlay::Experience);
+        for query in [
+            Query::User {
+                name: "reader".into(),
+                feed: UserFeed::Overview,
+            },
+            Query::Thread("post".into()),
+        ] {
+            app.experience.screens = vec![Screen::Browse {
+                query,
+                page: Page {
+                    title: "u/reader · Overview".into(),
+                    text: String::new(),
+                    entries: (0..20)
+                        .map(|index| Entry {
+                            title: format!("Entry {index}"),
+                            body: match index {
+                                0 => "Short preview".into(),
+                                1 => "Long preview with enough text to wrap.\n".repeat(12),
+                                _ => String::new(),
+                            },
+                            target: None,
+                            query: None,
+                            post: None,
+                        })
+                        .collect(),
+                    after: None,
+                    url: "/user/reader".into(),
+                },
+                selected: 0,
+                scroll: 0,
+            }];
+            for (width, height) in [(120, 60), (40, 20), (24, 10)] {
+                let mut layouts = Vec::new();
+                for selected in [0, 1, 2, 19, 0] {
+                    let Screen::Browse {
+                        selected: current, ..
+                    } = app.experience.screens.last_mut().unwrap()
+                    else {
+                        unreachable!()
+                    };
+                    *current = selected;
+                    let (area, shown) = popup_snapshot(&mut app, width, height);
+                    let divider = shown
+                        .lines()
+                        .enumerate()
+                        .filter(|(y, line)| {
+                            *y > usize::from(area.y)
+                                && *y + 1 < usize::from(area.bottom())
+                                && line.contains("──")
+                        })
+                        .map(|(y, _)| y)
+                        .collect::<Vec<_>>();
+                    layouts.push((area, divider));
+                    assert!(shown.contains(&format!("Entry {selected}")), "{shown}");
+                    assert!(shown.contains("Esc"), "{shown}");
+                }
+                assert!(
+                    layouts.windows(2).all(|pair| pair[0] == pair[1]),
+                    "{width}x{height}: {layouts:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn popup_navigation_should_keep_settings_list_and_description_regions_stable() {
+        use crate::config::schema::SETTINGS;
+        let mut app = app(&[]);
+        app.show_settings();
+        for (width, height) in [(100, 40), (40, 40), (40, 16)] {
+            let mut layouts = Vec::new();
+            for (selected, field) in SETTINGS.iter().enumerate() {
+                app.settings.selected = selected;
+                let (area, shown) = popup_snapshot(&mut app, width, height);
+                let description = shown
+                    .lines()
+                    .position(|line| line.contains(field.key))
+                    .unwrap();
+                let list_rows = shown
+                    .lines()
+                    .filter(|line| SETTINGS.iter().any(|setting| line.contains(setting.label)))
+                    .count();
+                layouts.push((area, description, list_rows));
+                assert!(shown.contains(field.label), "{shown}");
+                assert!(shown.contains("Esc"), "{shown}");
+            }
+            assert!(
+                layouts.windows(2).all(|pair| pair[0] == pair[1]),
+                "{width}x{height}: {layouts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn popup_navigation_should_keep_account_list_and_controls_stable_including_add() {
+        let mut app = app(&[]);
+        app.overlay = Some(Overlay::Auth);
+        app.auth.phase = crate::auth::Phase::Accounts;
+        app.auth.accounts = vec![
+            saved_account("reader", false),
+            saved_account("abcdefghijklmnopqrst", true),
+        ];
+        app.auth.active_id = Some("abcdefghijklmnopqrst".into());
+        for (width, height) in [(90, 30), (46, 24), (24, 12), (20, 8)] {
+            let mut layouts = Vec::new();
+            for selected in [0, 1, 2, 0] {
+                app.auth.selected = selected;
+                let (area, shown) = popup_snapshot(&mut app, width, height);
+                let controls = shown
+                    .lines()
+                    .position(|line| line.contains("Enter") || line.contains('⏎'))
+                    .unwrap();
+                layouts.push((area, controls));
+                assert!(shown.contains("▌"), "{shown}");
+                assert!(shown.contains("Esc"), "{shown}");
+            }
+            assert!(
+                layouts.windows(2).all(|pair| pair[0] == pair[1]),
+                "{width}x{height}: {layouts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn popup_navigation_should_keep_form_fields_stable_at_caret_wrap_boundaries() {
+        use crate::app::experience::Screen;
+        for (width, height, value_width) in [(120, 50, 66), (40, 30, 30)] {
+            let mut app = form_app("Create text post");
+            let Screen::Input(form) = app.experience.screens.last_mut().unwrap() else {
+                unreachable!()
+            };
+            for field in form.fields.iter_mut().take(2) {
+                field.value = "é".repeat(value_width);
+                field.cursor = field.value.len();
+            }
+            let mut layouts = Vec::new();
+            for active in [0, 1, 2, 0] {
+                let Screen::Input(form) = app.experience.screens.last_mut().unwrap() else {
+                    unreachable!()
+                };
+                form.active = active;
+                let (area, shown) = popup_snapshot(&mut app, width, height);
+                let labels = shown
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| {
+                        line.contains("Subreddit")
+                            || line.contains("Title")
+                            || line.contains("Body (Markdown)")
+                    })
+                    .map(|(y, _)| y)
+                    .collect::<Vec<_>>();
+                layouts.push((area, labels));
+                assert_eq!(shown.matches('▏').count(), 1, "{shown}");
+            }
+            assert!(
+                layouts.windows(2).all(|pair| pair[0] == pair[1]),
+                "{width}x{height}: {layouts:?}"
+            );
+        }
+    }
+
     fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
         (0..buf.area.height)
             .map(|y| {
@@ -4101,6 +5296,226 @@ pub(crate) mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn description_popup(
+        query: crate::reddit::experience::Query,
+        summary: &str,
+        bodies: &[&str],
+    ) -> App {
+        use crate::app::experience::Screen;
+        use crate::reddit::experience::{Entry, Page};
+        let mut app = app(&[]);
+        app.overlay = Some(Overlay::Experience);
+        app.experience.screens = vec![Screen::Browse {
+            query,
+            page: Page {
+                title: "Collection".into(),
+                text: summary.into(),
+                entries: bodies
+                    .iter()
+                    .enumerate()
+                    .map(|(index, body)| Entry {
+                        title: format!("Entry {index}"),
+                        body: (*body).into(),
+                        target: None,
+                        query: None,
+                        post: None,
+                    })
+                    .collect(),
+                after: None,
+                url: "/user/reader".into(),
+            },
+            selected: 0,
+            scroll: 0,
+        }];
+        app
+    }
+
+    #[test]
+    fn popup_description_footer_should_prioritize_vim_scroll_keys_at_each_width() {
+        use crate::reddit::experience::Query;
+        for (query, summary, bodies, scrolls) in [
+            (
+                Query::Profile("reader".into()),
+                "",
+                vec!["Description\n"; 2],
+                true,
+            ),
+            (
+                Query::Profile("reader".into()),
+                "Summary\n",
+                vec![""; 2],
+                true,
+            ),
+            (Query::Rules("rust".into()), "Rules\n", vec![], true),
+            (
+                Query::Thread("post".into()),
+                "Ignored thread summary",
+                vec![""; 2],
+                false,
+            ),
+            (Query::Profile("reader".into()), "", vec![""; 2], false),
+        ] {
+            let mut app = description_popup(query, summary, &bodies);
+            for (width, height) in [(120, 40), (40, 16), (24, 12)] {
+                let (_, shown) = popup_snapshot(&mut app, width, height);
+                assert_eq!(
+                    shown.contains("Ctrl+d/u")
+                        || shown.contains("C-d/u")
+                        || shown.contains("C-e/y"),
+                    scrolls,
+                    "{width}: {shown}"
+                );
+                assert!(shown.contains("Esc"), "{shown}");
+                assert_eq!(
+                    shown.contains("Enter") || shown.contains('⏎'),
+                    !bodies.is_empty(),
+                    "{shown}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn popup_description_vim_keys_should_scroll_without_selecting_or_opening_feed_actions() {
+        use crate::app::experience::Screen;
+        use crate::reddit::experience::Query;
+        let body = (0..40)
+            .map(|row| format!("Line {row:02}\n"))
+            .collect::<String>();
+        let mut app = description_popup(
+            Query::Multi {
+                owner: "reader".into(),
+                name: "feed".into(),
+            },
+            "",
+            &[&body, &body],
+        );
+        let (area, before) = popup_snapshot(&mut app, 100, 40);
+        assert!(before.contains("Line 00"));
+
+        key(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            app.experience.screens.last(),
+            Some(Screen::Browse {
+                selected: 0,
+                scroll: 5,
+                ..
+            })
+        ));
+        let (after_area, after) = popup_snapshot(&mut app, 100, 40);
+        assert_eq!(after_area, area);
+        assert!(after.contains("Line 05"), "{after}");
+        assert!(!after.contains("Line 00"), "{after}");
+        assert!(app.experience.pending.is_none());
+
+        key(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        key(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            app.experience.screens.last(),
+            Some(Screen::Browse {
+                selected: 0,
+                scroll: 0,
+                ..
+            })
+        ));
+        key(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        assert!(matches!(
+            app.experience.screens.last(),
+            Some(Screen::Browse { scroll: 10, .. })
+        ));
+        key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert!(matches!(
+            app.experience.screens.last(),
+            Some(Screen::Browse {
+                selected: 1,
+                scroll: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn popup_description_help_should_name_vim_scrolling_and_pending_reads_should_block_it() {
+        use crate::app::experience::Screen;
+        use crate::reddit::experience::{Query, Request};
+        let query = Query::Profile("reader".into());
+        let mut app = description_popup(query.clone(), "", &["Description"]);
+        key(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+        let sections = help::entries(&app);
+        assert!(sections.iter().any(
+            |(keys, action)| keys.contains("C-d/u") && action == "scroll the selected content"
+        ));
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        app.experience.pending = Some((
+            1,
+            Request::Read {
+                query,
+                after: Some("next".into()),
+            },
+        ));
+
+        key(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            app.experience.screens.last(),
+            Some(Screen::Browse { scroll: 0, .. })
+        ));
+        let (_, shown) = popup_snapshot(&mut app, 40, 16);
+        assert!(
+            !shown.contains("C-d/u") && !shown.contains("C-e/y"),
+            "{shown}"
+        );
+        assert!(shown.contains("Esc"), "{shown}");
+    }
+
+    #[test]
+    fn popup_description_line_keys_should_reach_text_skipped_by_large_steps_in_short_panes() {
+        use crate::reddit::experience::Query;
+        let body = (0..40)
+            .map(|row| format!("Line {row:02}\n"))
+            .collect::<String>();
+        let mut app = description_popup(Query::Profile("reader".into()), "", &[&body, &body]);
+        let (area, before) = popup_snapshot(&mut app, 24, 12);
+        assert!(before.contains("Line 00"));
+        assert!(!before.contains("Line 04"));
+
+        key(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        let (after_area, shown) = popup_snapshot(&mut app, 24, 12);
+        assert_eq!(area, after_area);
+        assert!(shown.contains("Line 04"), "{shown}");
+        assert!(!shown.contains("Line 00"), "{shown}");
+        assert!(shown.contains("C-e/y"), "{shown}");
+        key(&mut app, KeyCode::Char('y'), KeyModifiers::CONTROL);
+        let (_, restored) = popup_snapshot(&mut app, 24, 12);
+        assert!(restored.contains("Line 00"), "{restored}");
+    }
+
+    #[test]
+    fn popup_description_should_keep_scrollable_text_visible_beside_crowded_short_lists() {
+        use crate::reddit::experience::Query;
+        let body = (0..20)
+            .map(|row| format!("Line {row:02}\n"))
+            .collect::<String>();
+        for (width, height, summary, bodies) in [
+            (20, 8, body.as_str(), vec![""; 3]),
+            (24, 10, "", vec![body.as_str(); 8]),
+            (20, 7, "", vec![body.as_str(); 3]),
+        ] {
+            let mut app = description_popup(Query::Profile("reader".into()), summary, &bodies);
+            let (area, before) = popup_snapshot(&mut app, width, height);
+            assert!(before.contains("Entry 0"), "{before}");
+            assert!(before.contains("Line 00"), "{width}x{height}: {before}");
+            key(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+            let (after_area, after) = popup_snapshot(&mut app, width, height);
+            assert_eq!(area, after_area);
+            assert!(after.contains("Line 01"), "{after}");
+            key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            let (selected_area, selected) = popup_snapshot(&mut app, width, height);
+            assert_eq!(area, selected_area);
+            assert!(selected.contains("Entry 1"), "{selected}");
+            assert!(selected.contains("Line 00"), "{selected}");
+        }
     }
 
     #[test]
@@ -4114,6 +5529,53 @@ pub(crate) mod tests {
         assert!(shown.contains("rising"), "{shown}");
         assert!(shown.contains("controversial"), "{shown}");
         assert!(shown.contains("▌ c"), "{shown}");
+    }
+
+    #[test]
+    fn short_picker_and_account_dialogs_should_fit_their_content() {
+        let app = app(&[]);
+        for accounts in [false, true] {
+            let mut terminal = Terminal::new(TestBackend::new(120, 60)).unwrap();
+            terminal
+                .draw(|f| {
+                    if accounts {
+                        draw_auth(f, &app);
+                    } else {
+                        draw_picker(f, &app, "", 0);
+                    }
+                })
+                .unwrap();
+            let rows: Vec<_> = terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(120)
+                .enumerate()
+                .filter(|(_, row)| row.iter().any(|cell| cell.symbol() != " "))
+                .map(|(index, _)| index)
+                .collect();
+            assert!(rows.last().unwrap() - rows.first().unwrap() < 14);
+        }
+    }
+
+    #[test]
+    fn review_regression_wrapped_selected_menu_labels_should_stay_wholly_visible() {
+        let mut app = app(&[]);
+        app.reddit_menu();
+        let Some(crate::app::experience::Screen::Menu {
+            choices, selected, ..
+        }) = app.experience.screens.last_mut()
+        else {
+            panic!("menu missing")
+        };
+        *selected = choices
+            .iter()
+            .position(|choice| choice.label.starts_with("Privacy, blocked users"))
+            .unwrap();
+        let actual = screen(&mut app, 40, 12);
+        assert!(actual.contains("profile settings"), "{actual}");
+        assert!(actual.contains("Privacy, blocked"), "{actual}");
+        assert!(actual.contains("Esc back"), "{actual}");
     }
 
     #[test]
@@ -4159,7 +5621,7 @@ pub(crate) mod tests {
         app.open_subreddit("rust");
         let shown = screen(&mut app, 120, 24);
         assert!(
-            shown.contains("Joined") && shown.contains("join/leave"),
+            shown.contains("Joined") && shown.contains("S leave"),
             "{shown}"
         );
         app.open_subreddit("armenia");
@@ -4322,6 +5784,10 @@ pub(crate) mod tests {
         app.all_subs.groups = vec![crate::app::Group {
             subreddit: "s".into(),
             posts: vec![post.clone()],
+            freshness: Some(crate::cache::Freshness {
+                fetched_at: crate::app::now(),
+                source: Default::default(),
+            }),
             ..Default::default()
         }];
         app.open_current_post();
@@ -4376,7 +5842,7 @@ pub(crate) mod tests {
         page.comments[0].body = format!("before\n{PICTURE}{url}\nafter");
 
         let loading = screen(&mut app, 100, 40);
-        assert!(loading.contains("◌ loading image"), "{loading}");
+        assert!(loading.contains("⠋ loading image"), "{loading}");
         assert!(matches!(app.images.get(url), Some(ImageSlot::Loading)));
 
         let slot = ready(&app, 400, 200);
@@ -4511,7 +5977,7 @@ pub(crate) mod tests {
         let again = screen(&mut app, 100, 40);
 
         assert!(failed.contains("▣ image unavailable"), "{failed}");
-        assert!(again.contains("◌ loading image"), "{again}");
+        assert!(again.contains("⠋ loading image"), "{again}");
         assert!(matches!(app.images.get(url), Some(ImageSlot::Loading)));
     }
 
@@ -4767,6 +6233,198 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn private_community_worker_result_should_show_access_guidance_in_the_feed() {
+        use crate::reddit::tests::{Fixture, Reply};
+        let fixture = Fixture::new(|request| {
+            assert!(request.url.starts_with("/r/doit/"));
+            Reply {
+                status: 403,
+                body: serde_json::json!({"error":403,"reason":"private","message":"Forbidden"})
+                    .to_string(),
+                headers: vec![],
+            }
+        });
+        let reddit = fixture.reddit();
+        let (pool, messages) = Pool::start(reddit.clone(), 3, None);
+        let state = std::env::temp_dir().join(format!(
+            "redtab-private-ui-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut app = App::new(
+            Config {
+                media: crate::config::MediaSettings {
+                    image_preview: false,
+                    ..Default::default()
+                },
+                ..Config::default()
+            },
+            pool,
+            reddit,
+            state,
+            Picker::halfblocks(),
+        );
+        app.open_subreddit("doit");
+        app.on_msg(
+            messages
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+        );
+
+        let actual = screen(&mut app, 100, 24);
+
+        assert!(actual.contains("Private community"), "{actual}");
+        assert!(actual.contains("approved members"), "{actual}");
+        assert!(!actual.contains("Could not load posts"), "{actual}");
+        assert!(!actual.contains("press r to retry"), "{actual}");
+    }
+
+    #[test]
+    fn private_community_cached_feed_should_hide_unavailable_posts_and_keep_recovery_visible() {
+        for (width, height) in [(24, 10), (40, 12), (100, 24)] {
+            let mut app = denied_community(crate::reddit::AccessDenied::PrivateCommunity);
+            app.show_sidebar = false;
+            let actual = screen(&mut app, width, height);
+            let words = actual.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(words.contains("Private community"), "{actual}");
+            assert!(
+                words.contains("o Reddit") || words.contains("o open Reddit"),
+                "{actual}"
+            );
+            assert!(
+                !actual.contains("failed") && !actual.contains("retry"),
+                "{actual}"
+            );
+            assert!(!app.active_tab().feed.posts.is_empty(), "cache is retained");
+            assert!(
+                app.current_post().is_none(),
+                "hidden cached posts cannot be acted on"
+            );
+        }
+    }
+
+    fn denied_community(access: AccessDenied) -> App {
+        let mut app = card_feed_app(Picker::halfblocks());
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Err(crate::worker::FeedError::Access(access)),
+        });
+        app
+    }
+
+    #[test]
+    fn private_community_home_denial_should_keep_the_generic_home_failure() {
+        let mut app = app(&[]);
+        app.switch_tab(0);
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Err(crate::worker::FeedError::Access(AccessDenied::Forbidden)),
+        });
+
+        assert!(app.status.as_ref().is_some_and(|status| status.error));
+        let actual = screen(&mut app, 100, 24);
+        assert!(actual.contains("Could not load posts"), "{actual}");
+        assert!(!actual.contains("Private community"), "{actual}");
+    }
+
+    #[test]
+    fn private_community_unclassified_denial_should_not_claim_private() {
+        let mut app = denied_community(AccessDenied::Forbidden);
+        let actual = screen(&mut app, 100, 24);
+        assert!(actual.contains("Access restricted"), "{actual}");
+        assert!(
+            !actual.contains("Private community") && !actual.contains("Could not load posts"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn private_community_island_should_show_approval_guidance_with_cached_posts() {
+        for (access, title, guidance) in [
+            (
+                AccessDenied::PrivateCommunity,
+                "Private community",
+                "Approved members only",
+            ),
+            (
+                AccessDenied::Forbidden,
+                "Access restricted",
+                "Check access on Reddit",
+            ),
+        ] {
+            for selected in 0..3 {
+                let mut app = app(&["doit"]);
+                app.all_subs.groups[0].posts = (0..3)
+                    .map(|i| post_with(&format!("cached{i}"), Media::None))
+                    .collect();
+                app.all_subs.post = selected;
+                app.on_msg(Msg::Group {
+                    subreddit: "doit".into(),
+                    generation: app.all_subs.groups[0].generation,
+                    result: Err(crate::worker::FeedError::Access(access)),
+                });
+                let actual = screen(&mut app, 100, 24);
+                assert!(
+                    actual.contains(title) && actual.contains(guidance),
+                    "selection={selected}: {actual}"
+                );
+                assert!(
+                    !actual.contains("r retry") && !actual.contains("cached"),
+                    "{actual}"
+                );
+                assert!(app.current_post().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn private_community_help_should_prioritize_access_actions() {
+        let mut app = denied_community(AccessDenied::PrivateCommunity);
+        press(&mut app, '?');
+        let actual = screen(&mut app, 100, 14);
+        assert!(actual.contains("Private community"), "{actual}");
+        assert!(actual.contains("open this community on Reddit"), "{actual}");
+        assert!(actual.contains("check access again"), "{actual}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_community_browser_key_should_open_the_community_without_a_selected_post() {
+        let mut app = denied_community(AccessDenied::PrivateCommunity);
+        let file = std::env::temp_dir().join(format!(
+            "redtab-private-browser-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        app.config.commands.browser = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '%s' \"$1\" > \"$0\"".into(),
+            file.to_string_lossy().into_owned(),
+        ];
+        press(&mut app, 'o');
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let actual = loop {
+            if let Ok(text) = std::fs::read_to_string(&file)
+                && !text.is_empty()
+            {
+                break text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native browser probe did not receive a URL"
+            );
+            std::thread::yield_now();
+        };
+        std::fs::remove_file(file).unwrap();
+        assert_eq!(actual, "https://www.reddit.com/r/s/");
+    }
+
+    #[test]
     fn a_long_post_opens_at_its_top() {
         let (app, s) = open_long_post(|_| {});
 
@@ -4824,6 +6482,7 @@ pub(crate) mod tests {
         app.show_images = true;
         let image = Media::Image {
             url: "https://i.redd.it/big.jpeg".into(),
+            preview: None,
         };
         let view = app.post_view.as_mut().unwrap();
         view.post.media = image.clone();
@@ -4834,7 +6493,259 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_tall_detail_image_should_take_its_full_width_height_in_the_document() {
+    fn main_media_should_fit_the_usable_height_in_cards_and_detail() {
+        for (width, height) in [(80, 20), (100, 40), (200, 20)] {
+            for (pixels, video) in [
+                ((320, 1280), false),
+                ((1080, 1920), true),
+                ((1600, 900), false),
+            ] {
+                let mut app = card_feed_app(kitty());
+                app.tabs[3].feed.posts.truncate(1);
+                let post = &mut app.tabs[3].feed.posts[0];
+                post.preview_size = Some(pixels);
+                if video {
+                    post.media = Media::Video {
+                        gif: false,
+                        url: Some(VIDEO.into()),
+                        poster: None,
+                    };
+                }
+                let mut pictures = ListPictures::default();
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|f| {
+                        draw_feed(f, &mut app, f.area(), &mut pictures);
+                    })
+                    .unwrap();
+                let picture = &pictures.cards[0];
+                assert_eq!(
+                    picture.area.as_size(),
+                    picture.size,
+                    "card {pixels:?} in {width}x{height}"
+                );
+                assert_eq!(picture.skipped, 0);
+                assert!(
+                    usize::from(picture.size.height) * 5
+                        <= app.active_tab().feed.cards.viewport * 3,
+                    "card media must stay within 60% of its viewport"
+                );
+                assert!(app.active_tab().feed.cards.height <= app.active_tab().feed.cards.viewport);
+
+                let mut app = if video {
+                    open_video_post()
+                } else {
+                    image_post("caption")
+                };
+                app.post_view
+                    .as_mut()
+                    .unwrap()
+                    .page
+                    .as_mut()
+                    .unwrap()
+                    .post
+                    .preview_size = Some(pixels);
+                let pictures = detail_pictures(&mut app, width, height);
+                let picture = &pictures[0];
+                assert_eq!(
+                    picture.area.as_size(),
+                    picture.size,
+                    "detail {pixels:?} in {width}x{height}"
+                );
+                assert_eq!(picture.skipped, 0);
+                assert!(
+                    usize::from(picture.size.height) * 5
+                        <= app.post_view.as_ref().unwrap().page_height * 3,
+                    "detail media must stay within 60% of its viewport"
+                );
+                assert!(
+                    picture.area.bottom() < height,
+                    "leave space for status/spacing"
+                );
+                assert!(picture.area.right() <= width);
+                if video {
+                    assert_eq!(app.video_area.unwrap().as_size(), picture.size);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fitted_media_status_should_wrap_in_a_narrow_portrait_box() {
+        let mut terminal = Terminal::new(TestBackend::new(16, 8)).unwrap();
+        terminal
+            .draw(|f| draw_picture_status(f, Rect::new(1, 1, 12, 6), "image unavailable: offline"))
+            .unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("offline"), "{text}");
+        assert!(text.contains("unavailable"), "{text}");
+    }
+
+    #[test]
+    fn video_width_regression_portrait_detail_should_fit_height_and_scroll_with_content() {
+        let mut app = open_video_post();
+        app.post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .post
+            .preview_size = Some((1080, 1920));
+
+        let first = detail_pictures(&mut app, 80, 30);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].size, Size::new(17, 15));
+        assert_eq!(first[0].area.width, 17);
+
+        app.scroll_post(10);
+        let scrolled = detail_pictures(&mut app, 80, 30);
+        assert_eq!(scrolled[0].skipped, 9);
+        assert_eq!(scrolled[0].size, first[0].size);
+        assert!(app.post_view.as_ref().unwrap().image_shown);
+    }
+
+    #[test]
+    fn video_width_regression_unknown_portrait_should_use_the_first_frame_shape() {
+        let mut app = open_video_post();
+        let url = app.reddit.media_url(VIDEO).unwrap();
+        app.video = Some(video::Player::showing(
+            &url,
+            video::Frame {
+                width: 180,
+                height: 320,
+                pixels: video::Pixels::Raw(std::sync::Arc::new(image::DynamicImage::new_rgb8(
+                    180, 320,
+                ))),
+                same_as_first: false,
+            },
+        ));
+
+        let actual = detail_pictures(&mut app, 80, 30);
+
+        assert_eq!(actual[0].size, Size::new(17, 15));
+        assert_eq!(actual[0].pixels, (180, 320));
+    }
+
+    #[test]
+    fn video_width_regression_tall_detail_should_keep_controls_in_the_footer() {
+        let mut app = open_video_post();
+        app.post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .post
+            .preview_size = Some((1080, 1920));
+
+        let actual = screen(&mut app, 100, 20);
+
+        let footer = actual
+            .lines()
+            .last()
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(footer.contains("P play"), "{actual}");
+        assert!(footer.contains("a sound"), "{actual}");
+    }
+
+    #[test]
+    fn video_width_regression_tall_detail_failure_should_keep_retry_in_the_footer() {
+        let mut app = open_video_post();
+        app.post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .post
+            .preview_size = Some((1080, 1920));
+        let url = app.reddit.media_url(VIDEO).unwrap();
+        app.video = Some(video::Player::unavailable(&url, Size::new(70, 63)));
+
+        let actual = screen(&mut app, 100, 20);
+
+        assert!(
+            actual.lines().last().unwrap().contains("P retry"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn video_width_regression_split_detail_should_leave_the_list_poster_static() {
+        let mut picker = kitty();
+        picker.set_protocol_type(ProtocolType::Iterm2);
+        let mut app = card_feed_app(picker);
+        let poster = "https://i.redd.it/p1.jpeg";
+        app.tabs[3].feed.posts.truncate(1);
+        app.tabs[3].feed.posts[0].media = Media::Video {
+            gif: false,
+            url: Some(VIDEO.into()),
+            poster: Some(poster.into()),
+        };
+        app.tabs[3].feed.posts[0].preview_size = Some((160, 90));
+        app.card_images.insert(
+            poster.into(),
+            CardImageSlot::Ready {
+                image: std::sync::Arc::new(image::DynamicImage::ImageRgb8(
+                    image::RgbImage::from_pixel(160, 90, image::Rgb([0, 0, 255])),
+                )),
+                protocol: None,
+            },
+        );
+        screen(&mut app, 200, 40);
+        app.open_current_post();
+        let post = app.post_view.as_ref().unwrap().post.clone();
+        app.post_view.as_mut().unwrap().page = Some(PostPage {
+            post,
+            body: String::new(),
+            comments: vec![],
+        });
+        let url = app.reddit.media_url(VIDEO).unwrap();
+        app.video = Some(video::Player::showing(
+            &url,
+            video::Frame {
+                width: 160,
+                height: 90,
+                pixels: video::Pixels::Raw(std::sync::Arc::new(image::DynamicImage::ImageRgb8(
+                    image::RgbImage::from_pixel(160, 90, image::Rgb([255, 0, 0])),
+                ))),
+                same_as_first: false,
+            },
+        ));
+
+        let actual = screen(&mut app, 200, 40);
+
+        use base64::Engine;
+        let images: Vec<_> = actual
+            .split("doNotMoveCursor=1:")
+            .skip(1)
+            .map(|chunk| {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(chunk.split('\u{7}').next().unwrap())
+                    .unwrap();
+                image::load_from_memory(&bytes).unwrap().to_rgb8()
+            })
+            .collect();
+        assert!(
+            images
+                .iter()
+                .any(|i| i.pixels().any(|p| p.0 == [0, 0, 255])),
+            "list poster must stay blue"
+        );
+        assert!(
+            images
+                .iter()
+                .any(|i| i.pixels().any(|p| p.0 == [255, 0, 0])),
+            "detail video must be red"
+        );
+    }
+
+    #[test]
+    fn a_tall_detail_image_should_fit_below_the_fixed_header() {
         let mut app = image_post("body below the full image");
         let slot = ready(&app, 320, 1280);
         app.images.insert("https://i.redd.it/big.jpeg".into(), slot);
@@ -4842,18 +6753,20 @@ pub(crate) mod tests {
         let shown = screen(&mut app, 100, 40);
         let view = app.post_view.as_ref().unwrap();
 
-        assert!(!shown.contains("body below the full image"));
-        assert_eq!(view.rendered_pictures.first().map(|p| p.2), Some(140));
+        assert!(shown.contains("body below the full image"));
+        assert_eq!(view.rendered_pictures.first().map(|p| p.2), Some(20));
         assert_eq!(view.scroll, 0);
     }
 
     fn detail_pictures(app: &mut App, width: u16, height: u16) -> Vec<CardPicture> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        let mut pictures = Vec::new();
+        let mut pictures = ListPictures::default();
         terminal
-            .draw(|f| draw_post(f, app, f.area(), &mut pictures))
+            .draw(|f| {
+                draw_post(f, app, f.area(), &mut pictures);
+            })
             .unwrap();
-        pictures
+        pictures.cards
     }
 
     #[test]
@@ -4862,27 +6775,27 @@ pub(crate) mod tests {
         let slot = ready(&app, 320, 1280);
         app.images.insert("https://i.redd.it/big.jpeg".into(), slot);
         let first = detail_pictures(&mut app, 80, 30);
-        assert_eq!(first[0].size, Size::new(76, 152));
+        assert_eq!(first[0].size, Size::new(8, 15));
         assert_eq!(first[0].skipped, 0);
-        assert_eq!(first[0].area.width, 76);
+        assert_eq!(first[0].area.width, 8);
 
-        app.scroll_post(10);
+        app.scroll_post(6);
         let middle = detail_pictures(&mut app, 80, 30);
-        assert_eq!(middle[0].skipped, 9);
+        assert_eq!(middle[0].skipped, 5);
         assert_eq!(
-            middle[0].area.height as usize,
-            app.post_view.as_ref().unwrap().page_height
+            middle[0].area.height,
+            first[0].size.height - middle[0].skipped
         );
-        assert_eq!(app.post_view.as_ref().unwrap().scroll, 10);
+        assert_eq!(app.post_view.as_ref().unwrap().scroll, 6);
 
-        app.scroll_post(130);
+        app.scroll_post(6);
         let end = detail_pictures(&mut app, 80, 30);
-        assert_eq!(end[0].skipped, 139);
-        assert_eq!(end[0].area.height, 13);
-        assert_eq!(app.post_view.as_ref().unwrap().scroll, 140);
-        app.scroll_post(-130);
+        assert_eq!(end[0].skipped, 11);
+        assert_eq!(end[0].area.height, 4);
+        assert_eq!(app.post_view.as_ref().unwrap().scroll, 12);
+        app.scroll_post(-6);
         let back = detail_pictures(&mut app, 80, 30);
-        assert_eq!(back[0].skipped, 9);
+        assert_eq!(back[0].skipped, 5);
     }
 
     #[test]
@@ -4891,15 +6804,15 @@ pub(crate) mod tests {
         let slot = ready(&app, 320, 1280);
         app.images.insert("https://i.redd.it/big.jpeg".into(), slot);
         detail_pictures(&mut app, 80, 30);
-        app.scroll_post(155);
+        app.scroll_post(26);
         detail_pictures(&mut app, 80, 30);
         let old = app.post_view.as_ref().unwrap().scroll;
 
-        detail_pictures(&mut app, 100, 30);
+        detail_pictures(&mut app, 100, 40);
 
         let view = app.post_view.as_ref().unwrap();
-        assert_eq!(view.rendered_pictures[0].2, 192);
-        assert_eq!(view.scroll, old + 40);
+        assert_eq!(view.rendered_pictures[0].2, 21);
+        assert_eq!(view.scroll, old + 6);
     }
 
     #[test]
@@ -4914,7 +6827,7 @@ pub(crate) mod tests {
             .post
             .preview_size = Some((320, 1280));
         let first = detail_pictures(&mut app, 80, 30);
-        assert_eq!(first[0].size, Size::new(76, 152));
+        assert_eq!(first[0].size, Size::new(8, 15));
         app.images.insert(
             "https://i.redd.it/big.jpeg".into(),
             ImageSlot::Failed("offline".into()),
@@ -4935,7 +6848,7 @@ pub(crate) mod tests {
 
         let pictures = &app.post_view.as_ref().unwrap().rendered_pictures;
         assert_eq!(pictures.len(), 2);
-        assert_eq!(pictures[0].2, 152);
+        assert_eq!(pictures[0].2, 15);
         assert_eq!(pictures[1].2, TEXT_PICTURE_ROWS as usize);
     }
 
@@ -4944,6 +6857,7 @@ pub(crate) mod tests {
         let mut app = image_post("gallery caption");
         let media = Media::Gallery {
             thumb: None,
+            previews: Vec::new(),
             images: vec![
                 "https://i.redd.it/big.jpeg".into(),
                 "https://i.redd.it/wide.jpeg".into(),
@@ -4962,11 +6876,11 @@ pub(crate) mod tests {
             app.images
                 .insert(format!("https://i.redd.it/{url}.jpeg"), slot);
         }
-        assert_eq!(detail_pictures(&mut app, 80, 30)[0].size.height, 152);
+        assert_eq!(detail_pictures(&mut app, 80, 30)[0].size.height, 15);
         app.scroll_post(20);
         app.gallery_step(true);
         let next = detail_pictures(&mut app, 80, 30);
-        assert_eq!(next[0].url, "https://i.redd.it/wide.jpeg");
+        assert_eq!(next[0].url.as_deref(), Some("https://i.redd.it/wide.jpeg"));
         assert_eq!(next[0].size, Size::new(76, 10));
         assert_eq!(app.post_view.as_ref().unwrap().scroll, 0);
         app.post_view
@@ -4992,7 +6906,11 @@ pub(crate) mod tests {
         detail_pictures(&mut app, 80, 30);
         let view = app.post_view.as_ref().unwrap();
         assert!(!view.free_scroll);
-        assert!(view.scroll > 130);
+        assert_eq!(
+            view.scroll, 0,
+            "the first comment already fits below the image"
+        );
+        assert!(view.row_starts[view.cursor] > view.rendered_pictures[0].2);
         assert!(view.row_starts[view.cursor] < view.scroll + view.page_height);
         press(&mut app, 'g');
         let top = detail_pictures(&mut app, 80, 30);
@@ -5000,7 +6918,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_detail_image_should_render_pixels_below_its_first_viewport() {
+    fn the_whole_detail_image_should_render_in_its_first_viewport() {
         let mut app = image_post("body below image");
         screen(&mut app, 100, 40);
         app.on_msg(Msg::Image {
@@ -5008,12 +6926,11 @@ pub(crate) mod tests {
             result: Ok(image::DynamicImage::new_rgb8(320, 1280).into()),
         });
         screen(&mut app, 100, 40);
-        app.scroll_post(50);
 
         let cells = placeholder_cells(&mut app, 100, 40);
 
-        assert!(cells.len() > 70 * 20);
-        assert_eq!(app.post_view.as_ref().unwrap().scroll, 50);
+        assert_eq!(cells.len(), 10 * 20);
+        assert_eq!(app.post_view.as_ref().unwrap().scroll, 0);
     }
 
     #[test]
@@ -5042,7 +6959,7 @@ pub(crate) mod tests {
             assert!(detail_pictures(&mut app, 80, 30).is_empty());
             let view = app.post_view.as_ref().unwrap();
             assert_eq!(view.rendered_document[view.scroll].to_string(), before);
-            assert_eq!(view.scroll, scroll - 152);
+            assert_eq!(view.scroll, scroll - 15);
 
             app.toggle_images();
             detail_pictures(&mut app, 80, 30);
@@ -5076,7 +6993,10 @@ pub(crate) mod tests {
         let s = screen(&mut app, 100, 50);
 
         let row = |text: &str| s.lines().position(|l| l.contains(text)).unwrap();
-        let gap = row("first line of the body") - row("╰");
+        let gap = row("first line of the body")
+            - s.lines()
+                .position(|line| line.contains('╰') || line.contains('╚'))
+                .unwrap();
         // 19 picture rows plus three rows of spacing.
         assert_eq!(gap, 22, "rows between header and text");
     }
@@ -5136,61 +7056,41 @@ pub(crate) mod tests {
 
     #[test]
     fn when_a_video_frame_is_decoded_smaller_it_should_still_be_drawn_at_full_size() {
-        // The terminal scales a kitty frame: only its shape decides its cells.
         let placement = |w, h| {
             let mut app = open_video_post();
             let frame = video::Frame {
                 width: w,
                 height: h,
-                pixels: video::Pixels::Zlib(vec![1, 2, 3]),
+                pixels: video::Pixels::Raw(std::sync::Arc::new(image::DynamicImage::new_rgb8(
+                    w, h,
+                ))),
                 same_as_first: false,
             };
             let url = app.reddit.media_url(VIDEO).unwrap();
             app.video = Some(video::Player::showing(&url, frame));
-            let s = screen(&mut app, 100, 40);
-            let header = s.split("_Ga=T").nth(1).unwrap().to_string();
-            let keys: Vec<&str> = header
-                .split([',', ';'])
-                .filter(|k| k.starts_with("c=") || k.starts_with("r="))
-                .take(2)
-                .collect();
-            keys.join(",")
+            detail_pictures(&mut app, 100, 40)[0].size
         };
 
-        assert_eq!(placement(160, 90), placement(1280, 720));
+        assert_eq!(placement(160, 90), Size::new(75, 21));
+        assert_eq!(placement(1280, 720), Size::new(75, 21));
     }
 
     #[test]
-    fn a_wide_video_taller_than_32_rows_should_still_fill_the_width() {
-        let placement = |w, h| {
-            let mut app = open_video_post();
-            let frame = video::Frame {
-                width: w,
-                height: h,
-                pixels: video::Pixels::Zlib(vec![1, 2, 3]),
-                same_as_first: false,
-            };
-            let url = app.reddit.media_url(VIDEO).unwrap();
-            app.video = Some(video::Player::showing(&url, frame));
-            let s = screen(&mut app, 200, 80);
-            let header = s.split("_Ga=T").nth(1).unwrap().to_string();
-            let cell = |key: &str| -> u16 {
-                header
-                    .split([',', ';'])
-                    .find_map(|k| k.strip_prefix(key))
-                    .unwrap()
-                    .parse()
-                    .unwrap()
-            };
-            (cell("c="), cell("r="))
-        };
-
-        let (wide_cols, _) = placement(1600, 900);
-        // 4:3 across the post's width (over 90 columns of 8 px) needs more than 32 rows.
-        let (cols, rows) = placement(800, 600);
-        assert!(rows > 32, "{cols}×{rows}");
-        // A taller picture may drop the text's scrollbar column.
-        assert!(cols.abs_diff(wide_cols) <= 1, "{cols} vs {wide_cols}");
+    fn a_wide_video_should_fit_the_height_when_width_would_overflow() {
+        let mut app = open_video_post();
+        app.post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .post
+            .preview_size = Some((800, 600));
+        let actual = detail_pictures(&mut app, 200, 40);
+        assert_eq!(actual[0].size, Size::new(56, 21));
+        assert_eq!(actual[0].area.width, 56);
+        assert_eq!(actual[0].area.height, actual[0].size.height);
+        assert_eq!(actual[0].area.x, 71);
     }
 
     #[test]
@@ -5201,6 +7101,7 @@ pub(crate) mod tests {
             app.show_images = true;
             app.post_view.as_mut().unwrap().post.media = Media::Image {
                 url: "https://i.redd.it/big.jpeg".into(),
+                preview: None,
             };
             *shown.borrow_mut() = screen(app, 100, 40);
         });
@@ -5357,7 +7258,7 @@ pub(crate) mod tests {
     fn footer_hints_follow_the_post_and_the_tab() {
         let footer = |app: &mut App| {
             app.status = None;
-            let s = screen(app, 160, 30);
+            let s = screen(app, 200, 30);
             s.lines().last().unwrap_or_default().to_string()
         };
         // No media: no `m`; bookmarked: `b` unsaves.
@@ -5377,8 +7278,8 @@ pub(crate) mod tests {
         let searching = footer(&mut feed);
 
         assert!(!plain.contains("media"), "{plain}");
-        assert!(plain.contains(" save"), "{plain}");
-        assert!(saved.contains("unsave"), "{saved}");
+        assert!(plain.contains(" bookmark"), "{plain}");
+        assert!(saved.contains("unbookmark"), "{saved}");
         assert!(
             opened.contains("time") && opened.contains("close"),
             "{opened}"
@@ -5621,6 +7522,7 @@ pub(crate) mod tests {
         app.show_images = true;
         let image = Media::Image {
             url: "https://i.redd.it/big.jpeg".into(),
+            preview: None,
         };
         let view = app.post_view.as_mut().unwrap();
         view.post.media = image.clone();
@@ -6434,6 +8336,7 @@ pub(crate) mod tests {
                 } else {
                     Media::Image {
                         url: format!("https://i.redd.it/p{i}.jpeg"),
+                        preview: None,
                     }
                 };
                 post_with(&format!("p{i}"), media)
@@ -6486,6 +8389,132 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn rapid_navigation_should_reuse_loaded_native_media_without_new_preparation_or_uploads() {
+        for kind in ["image", "video", "gallery", "link"] {
+            let mut app = card_with_image(640, 320);
+            let url = "https://i.redd.it/p1.jpeg";
+            app.tabs[3].feed.posts[0].media = match kind {
+                "video" => Media::Video {
+                    gif: false,
+                    url: Some(VIDEO.into()),
+                    poster: Some(url.into()),
+                },
+                "gallery" => Media::Gallery {
+                    thumb: None,
+                    previews: Vec::new(),
+                    images: vec![url.into(), "other".into()],
+                },
+                "link" => Media::Link {
+                    url: "https://example.com/story".into(),
+                    thumb: Some(url.into()),
+                },
+                _ => Media::Image {
+                    url: url.into(),
+                    preview: None,
+                },
+            };
+            app.tabs[3]
+                .feed
+                .posts
+                .extend((0..10).map(|i| post_with(&format!("tail{i}"), Media::None)));
+            screen(&mut app, 100, 40);
+            for delta in [3, 1, -1, -3, 8, -8] {
+                app.scroll_card(delta);
+                let shown = first_screen(&mut app, 100, 40);
+                assert!(
+                    !shown.contains("preparing image"),
+                    "warm {kind} must draw immediately"
+                );
+                assert!(shown.contains('\u{10EEEE}'), "{kind}");
+                assert!(
+                    !shown.contains("_G"),
+                    "warm {kind} must not upload pixels again"
+                );
+                assert!(
+                    !app.card_renderer.pending(),
+                    "warm {kind} must not queue encoding"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn warm_navigation_replay_should_display_loaded_cards_without_media_work() {
+        let mut app = card_feed_app(kitty());
+        app.tabs[3].feed.posts = (0..12)
+            .map(|i| {
+                let mut post = post_with(
+                    &format!("warm{i}"),
+                    Media::Image {
+                        url: format!("https://i.redd.it/warm{i}.png"),
+                        preview: None,
+                    },
+                );
+                post.preview_size = Some((320, 640));
+                post
+            })
+            .collect();
+        for i in 0..12 {
+            app.tabs[3].feed.selected = i;
+            app.tabs[3].feed.cards = CardScroll::default();
+            let url = format!("https://i.redd.it/warm{i}.png");
+            app.card_pictures_drawn(&[&url]);
+            app.on_msg(Msg::Image {
+                url,
+                result: Ok(image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+                    320,
+                    640,
+                    |x, y| image::Rgb([x as u8, y as u8, i as u8]),
+                ))
+                .into()),
+            });
+            screen(&mut app, 140, 50);
+        }
+        let started = Instant::now();
+        let (mut delayed, mut preparation, mut uploads) = (0, 0, 0);
+        for delta in std::iter::repeat_n(-1, 11)
+            .chain(std::iter::repeat_n(1, 11))
+            .cycle()
+            .take(66)
+        {
+            app.move_selection(delta);
+            let shown = first_screen(&mut app, 140, 50);
+            delayed +=
+                usize::from(shown.contains("preparing image") || shown.contains("loading image"));
+            preparation += usize::from(app.card_renderer.pending());
+            uploads += usize::from(shown.contains("_G"));
+        }
+        eprintln!(
+            "navigation replay: 66 moves in {:?}; delayed frames={delayed}; preparation batches={preparation}; upload frames={uploads}",
+            started.elapsed()
+        );
+        assert_eq!((delayed, preparation, uploads), (0, 0, 0));
+    }
+
+    #[test]
+    fn the_same_loaded_image_on_another_post_should_reuse_its_native_encoding() {
+        let mut app = card_with_image(640, 320);
+        screen(&mut app, 100, 40);
+        app.tabs[3].feed.posts[0].id = "crosspost".into();
+        let shown = first_screen(&mut app, 100, 40);
+        assert!(!shown.contains("preparing image"));
+        assert!(!shown.contains("_G"));
+        assert!(!app.card_renderer.pending());
+    }
+
+    #[test]
+    fn rapid_list_navigation_should_defer_cold_graphics_preparation() {
+        let mut app = card_with_decoded_image();
+        app.move_selection(0);
+        app.move_selection(0);
+        first_screen(&mut app, 100, 24);
+        assert!(
+            !app.card_renderer.pending(),
+            "list input must not queue cold graphics during a quick run"
+        );
+    }
+
+    #[test]
     fn when_sidebar_navigation_shows_decoded_card_pixels_it_should_defer_missing_preparation() {
         let mut app = card_with_decoded_image();
         app.focus_sidebar();
@@ -6533,7 +8562,273 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn when_a_card_feed_waits_for_more_posts_it_should_label_the_loaded_content_boundary() {
+    fn when_a_collection_loads_more_it_should_use_the_shared_append_loader() {
+        use crate::app::experience::Screen;
+        use crate::reddit::experience::{Entry, Page, Query, Request};
+        let mut app = app(&[]);
+        app.overlay = Some(Overlay::Experience);
+        app.experience.screens.push(Screen::Browse {
+            query: Query::Multis,
+            page: Page {
+                title: "Custom feeds".into(),
+                text: String::new(),
+                entries: vec![Entry {
+                    title: "Existing feed".into(),
+                    body: String::new(),
+                    target: None,
+                    query: None,
+                    post: None,
+                }],
+                after: Some("next".into()),
+                url: "/api/multi/mine".into(),
+            },
+            selected: 0,
+            scroll: 0,
+        });
+        app.experience.pending = Some((
+            91,
+            Request::Read {
+                query: Query::Multis,
+                after: Some("next".into()),
+            },
+        ));
+
+        let actual = screen(&mut app, 100, 30);
+
+        assert!(actual.contains("Existing feed"), "{actual}");
+        assert!(
+            actual.contains("━") && actual.contains("Loading results"),
+            "{actual}"
+        );
+        assert!(matches!(
+            app.experience.screens.last(),
+            Some(Screen::Browse {
+                selected: 0,
+                scroll: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn when_a_pending_collection_is_extremely_narrow_its_cancel_hint_should_survive() {
+        use crate::app::experience::Screen;
+        use crate::reddit::experience::{Page, Query, Request};
+        for width in [5, 6] {
+            let mut app = app(&[]);
+            app.overlay = Some(Overlay::Experience);
+            app.experience.screens.push(Screen::Browse {
+                query: Query::Multis,
+                page: Page {
+                    title: "Custom feeds".into(),
+                    text: String::new(),
+                    entries: vec![],
+                    after: Some("next".into()),
+                    url: String::new(),
+                },
+                selected: 0,
+                scroll: 0,
+            });
+            app.experience.pending = Some((
+                1,
+                Request::Read {
+                    query: Query::Multis,
+                    after: Some("next".into()),
+                },
+            ));
+            let actual = screen(&mut app, width, 10);
+            assert!(actual.contains('⎋'), "{actual}");
+        }
+    }
+
+    #[test]
+    fn when_replies_load_more_the_compact_loader_should_keep_the_comment_rows_stable() {
+        let (mut app, _) = open_long_post(|_| {});
+        let view = app.post_view.as_mut().unwrap();
+        let page = view.page.as_mut().unwrap();
+        page.body.clear();
+        page.comments[0].more = Some(crate::model::MoreReplies {
+            count: Some(2),
+            cursor: "next".into(),
+        });
+        screen(&mut app, 100, 30);
+        let rows = app.post_view.as_ref().unwrap().rendered_document.len();
+        app.post_view
+            .as_mut()
+            .unwrap()
+            .loading_more
+            .insert("c".into());
+
+        let actual = screen(&mut app, 100, 30);
+
+        assert!(
+            actual.contains("Loading replies") && actual.contains("━"),
+            "{actual}"
+        );
+        assert_eq!(
+            app.post_view.as_ref().unwrap().rendered_document.len(),
+            rows
+        );
+    }
+
+    #[test]
+    fn when_subscriptions_first_load_the_initial_loader_should_use_the_shared_spinner() {
+        let mut app = app(&[]);
+        app.all_subs.loading = true;
+
+        let actual = screen(&mut app, 100, 30);
+
+        assert!(
+            actual.contains("Loading subscriptions") && actual.contains('⠋'),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_images_are_pending_cards_and_embedded_pictures_should_share_the_media_spinner() {
+        let mut card = card_feed_app(kitty());
+        let mut post = picture_comment("https://preview.redd.it/pending.png");
+
+        let card_view = first_screen(&mut card, 100, 30);
+        let post_view = screen(&mut post, 100, 30);
+
+        assert!(
+            card_view.contains('⠋') && card_view.contains("loading image"),
+            "{card_view}"
+        );
+        assert!(
+            post_view.contains('⠋') && post_view.contains("loading image"),
+            "{post_view}"
+        );
+    }
+
+    #[test]
+    fn when_initial_or_append_loading_waits_for_cooldown_the_loader_should_explain_the_wait() {
+        use crate::reddit::tests::{Fixture, Reply};
+        use std::time::{Duration, Instant};
+        for append in [false, true] {
+            let fixture = Fixture::new(|_| Reply {
+                status: 429,
+                body: r#"{"kind":"Listing","data":{"children":[],"after":null}}"#.into(),
+                headers: vec![("Retry-After".into(), "30".into())],
+            });
+            let reddit = fixture.reddit();
+            assert!(reddit.search("s", "first", None).is_err());
+            let mut app = app_with_client(&["s"], reddit.clone());
+            app.switch_tab(3);
+            if append {
+                app.on_msg(Msg::Feed {
+                    tab: app.active_tab().id,
+                    generation: app.active_tab().feed.generation,
+                    append: false,
+                    result: Ok(crate::model::Listing {
+                        posts: vec![post_with("existing", Media::None)],
+                        after: Some("next".into()),
+                    }),
+                });
+                app.load_feed(3, true);
+            }
+            app.status = None;
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while reddit.pause().is_none() {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            app.tick();
+
+            let actual = screen(&mut app, 100, 24);
+            reddit.retire();
+
+            assert!(actual.contains("Waiting for Reddit"), "{actual}");
+            assert!(actual.contains("HTTP 429"), "{actual}");
+        }
+    }
+
+    #[test]
+    fn when_an_empty_feed_has_a_failed_next_page_it_should_offer_the_cursor_retry_key() {
+        let mut app = app(&["s"]);
+        app.switch_tab(3);
+        let tab = app.active_tab().id;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Ok(crate::model::Listing {
+                posts: vec![],
+                after: Some("next".into()),
+            }),
+        });
+        app.load_feed(3, true);
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.active_tab().feed.generation,
+            append: true,
+            result: Err("failed continuation".into()),
+        });
+
+        let actual = screen(&mut app, 100, 24);
+
+        assert!(
+            actual.contains("Could not load more posts") && actual.contains("press L to retry"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_an_initial_page_streams_card_and_compact_views_should_keep_the_append_loader() {
+        for view in [ListView::Card, ListView::Compact] {
+            let mut app = app(&["s"]);
+            app.switch_tab(3);
+            if app.state.list_view() != view {
+                app.state.toggle_list_view();
+            }
+            let mut post = post_with("arrived", Media::None);
+            post.title = "Arrived post".into();
+            app.on_msg(Msg::FeedProgress {
+                tab: app.active_tab().id,
+                generation: app.active_tab().feed.generation,
+                post: Box::new(post),
+                source: crate::cache::Source::default(),
+            });
+
+            let actual = screen(&mut app, 100, 24);
+
+            assert!(
+                actual.contains("Arrived post")
+                    && actual.contains("Loading posts")
+                    && actual.contains('━'),
+                "{actual}"
+            );
+            assert!(app.active_tab().feed.loading());
+            assert!(actual.find("Arrived post").unwrap() < actual.find("Loading posts").unwrap());
+        }
+    }
+
+    #[test]
+    fn when_compact_pagination_starts_it_should_render_a_skeleton_after_the_entries() {
+        let mut app = feed_with_next_page(ListView::Compact);
+        app.load_feed(3, true);
+
+        let actual = screen(&mut app, 80, 20);
+
+        assert!(actual.contains("━"), "{actual}");
+        assert!(actual.contains("Loading posts"), "{actual}");
+        assert_eq!(
+            actual.lines().filter(|line| line.contains("━")).count(),
+            2,
+            "{actual}"
+        );
+        assert!(
+            !actual.lines().last().unwrap().contains("more posts"),
+            "{actual}"
+        );
+        assert!(actual.find("Existing post").unwrap() < actual.find("Loading posts").unwrap());
+        assert_eq!(app.active_tab().feed.selected, 0);
+        assert_eq!(app.active_tab().feed.offset, 0);
+    }
+
+    #[test]
+    fn when_card_pagination_starts_it_should_render_a_skeleton_after_the_entries() {
         let mut app = feed_with_next_page(ListView::Card);
         screen(&mut app, 80, 20);
         let geometry = app.active_tab().feed.cards.clone();
@@ -6541,12 +8836,15 @@ pub(crate) mod tests {
 
         let actual = screen(&mut app, 80, 20);
 
-        assert!(
-            actual.contains("Existing post") && actual.contains("Loading more posts…"),
+        assert!(actual.contains("━"), "{actual}");
+        assert!(actual.contains("Loading posts"), "{actual}");
+        assert_eq!(
+            actual.lines().filter(|line| line.contains("━")).count(),
+            2,
             "{actual}"
         );
         assert!(
-            actual.lines().last().unwrap().contains("⋯ more posts"),
+            !actual.lines().last().unwrap().contains("more posts"),
             "{actual}"
         );
         let cards = &app.active_tab().feed.cards;
@@ -6557,20 +8855,183 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn when_a_compact_feed_waits_for_more_posts_it_should_label_the_loaded_content_boundary() {
-        let mut app = feed_with_next_page(ListView::Compact);
-        app.load_feed(3, true);
+    fn when_scrolling_starts_pagination_the_same_draw_should_show_the_append_loader() {
+        let mut app = feed_with_next_page(ListView::Card);
+        screen(&mut app, 80, 20);
+        assert!(!app.active_tab().feed.loading_more());
+        app.scroll_card(1);
 
         let actual = screen(&mut app, 80, 20);
 
+        assert!(app.active_tab().feed.loading_more());
         assert!(
-            actual.contains("Existing post") && actual.contains("Loading more posts…"),
+            actual.contains("Loading posts") && actual.contains("━"),
+            "{actual}"
+        );
+        assert!(
+            !actual.lines().last().unwrap().contains("more posts"),
             "{actual}"
         );
     }
 
     #[test]
-    fn when_a_notification_is_visible_pagination_activity_should_remain_visible() {
+    fn when_a_long_notification_is_visible_the_append_loader_should_remain_visible() {
+        let mut app = feed_with_next_page(ListView::Compact);
+        app.load_feed(3, true);
+        app.info("Checking membership and keeping the current reading position while posts load");
+
+        let actual = screen(&mut app, 80, 20);
+
+        let footer = actual.lines().last().unwrap();
+        assert!(footer.contains("Checking"), "{actual}");
+        assert!(
+            actual.contains("Loading posts") && actual.contains("━"),
+            "{actual}"
+        );
+        assert!(!footer.contains("more posts"), "{actual}");
+        assert!(footer.contains("F1"), "{actual}");
+    }
+
+    #[test]
+    fn when_a_loaded_split_post_has_focus_pagination_should_stay_visible() {
+        let mut app = feed_with_next_page(ListView::Compact);
+        app.open_current_post();
+        let view = app.post_view.as_ref().unwrap();
+        app.on_msg(Msg::Post {
+            generation: view.generation,
+            result: Ok(Box::new(PostPage {
+                post: view.post.clone(),
+                body: "Loaded detail".into(),
+                comments: vec![],
+            })),
+        });
+        app.load_feed(3, true);
+
+        let actual = screen(&mut app, 158, 20);
+
+        assert!(actual.contains("Loaded detail"), "{actual}");
+        assert!(app.post_focused());
+        assert_eq!(actual.matches("Loading posts").count(), 1, "{actual}");
+        assert!(
+            !actual.lines().last().unwrap().contains("more posts"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_split_views_load_independently_each_should_keep_its_own_progress() {
+        for replies in [false, true] {
+            let mut app = feed_with_next_page(ListView::Compact);
+            app.open_current_post();
+            let view = app.post_view.as_ref().unwrap();
+            app.on_msg(Msg::Post {
+                generation: view.generation,
+                result: Ok(Box::new(PostPage {
+                    post: view.post.clone(),
+                    body: paragraphs("paragraph", 1..=60),
+                    comments: vec![reply("c".into())],
+                })),
+            });
+            app.load_feed(3, true);
+            if replies {
+                let view = app.post_view.as_mut().unwrap();
+                view.page.as_mut().unwrap().comments[0].more = Some(crate::model::MoreReplies {
+                    count: Some(2),
+                    cursor: "next".into(),
+                });
+                view.loading_more.insert("c".into());
+            } else {
+                app.reload();
+            }
+            let actual = screen(&mut app, 158, 20);
+            assert!(actual.contains("Loading posts"), "{actual}");
+            let activity = if replies {
+                "⠋ replies"
+            } else {
+                "⠋ refresh"
+            };
+            assert!(
+                actual.lines().last().unwrap().contains(activity),
+                "{actual}"
+            );
+        }
+
+        let mut app = feed_with_next_page(ListView::Card);
+        app.tabs[3]
+            .feed
+            .posts
+            .extend((0..8).map(|i| post_with(&format!("post{i}"), Media::None)));
+        app.open_current_post();
+        app.load_feed(3, true);
+        let actual = screen(&mut app, 158, 20);
+        assert!(actual.contains("Loading post"), "{actual}");
+        assert!(
+            actual
+                .lines()
+                .last()
+                .unwrap()
+                .contains("⠋ Loading more posts"),
+            "{actual}"
+        );
+        let view = app.post_view.as_ref().unwrap();
+        app.on_msg(Msg::Post {
+            generation: view.generation,
+            result: Ok(Box::new(PostPage {
+                post: view.post.clone(),
+                body: "Retained detail".into(),
+                comments: vec![],
+            })),
+        });
+        app.reload();
+        for (focus, activity) in [
+            (Focus::List, "⠋ Loading more posts"),
+            (Focus::Post, "⠋ refresh"),
+        ] {
+            app.focus = focus;
+            let actual = screen(&mut app, 158, 20);
+            assert!(
+                actual.lines().last().unwrap().contains(activity),
+                "{actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn when_a_post_with_an_overflow_title_is_pending_its_loader_should_not_overwrite_the_title() {
+        for (width, focus) in [(50, Focus::Post), (158, Focus::List)] {
+            let (mut app, _) = open_long_post(|_| {});
+            app.show_sidebar = false;
+            app.focus = focus;
+            let view = app.post_view.as_mut().unwrap();
+            view.post.title = (0..200).map(|i| format!("Segment{i:02} ")).collect();
+            view.page = None;
+            view.loading = true;
+            let actual = screen(&mut app, width, 20);
+            let view = app.post_view.as_ref().unwrap();
+            for line in view
+                .rendered_document
+                .iter()
+                .skip(view.scroll)
+                .take(view.page_height)
+            {
+                let text = line.to_string();
+                if !text.trim().is_empty() {
+                    let text: String = text.chars().take(40).collect();
+                    assert!(
+                        actual.contains(text.trim_end()),
+                        "Missing {text:?}:\n{actual}"
+                    );
+                }
+            }
+            assert!(
+                actual.lines().last().unwrap().contains("⠋ post"),
+                "{actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn when_a_notification_is_visible_the_card_append_loader_should_remain_visible() {
         let mut app = feed_with_next_page(ListView::Card);
         app.load_feed(3, true);
         app.info("Still browsing");
@@ -6579,20 +9040,84 @@ pub(crate) mod tests {
 
         let footer = actual.lines().last().unwrap();
         assert!(
-            footer.contains("⋯ more posts") && footer.contains("Still browsing"),
+            actual.contains("Loading posts")
+                && !footer.contains("more posts")
+                && footer.contains("Still browsing"),
             "{actual}"
         );
     }
 
     #[test]
-    fn when_a_new_query_waits_in_a_narrow_pane_its_activity_should_remain_visible() {
+    fn when_the_append_position_is_offscreen_pagination_should_use_the_footer() {
+        let mut app = feed_with_next_page(ListView::Card);
+        app.tabs[3]
+            .feed
+            .posts
+            .extend((0..8).map(|i| post_with(&format!("post{i}"), Media::None)));
+        app.load_feed(3, true);
+
+        let actual = screen(&mut app, 80, 20);
+
+        assert!(
+            !actual.contains("Loading posts") && !actual.contains("━"),
+            "{actual}"
+        );
+        assert!(
+            actual.lines().last().unwrap().contains("⠋ more posts"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_jump_covers_the_append_loader_pagination_should_use_the_footer() {
+        let mut app = feed_with_next_page(ListView::Compact);
+        app.load_feed(3, true);
+        app.overlay = Some(Overlay::Picker(crate::app::PickerState::default()));
+
+        let actual = screen(&mut app, 80, 20);
+
+        assert!(!actual.contains("Loading posts"), "{actual}");
+        assert!(
+            actual.lines().last().unwrap().contains("⠋ more posts"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn when_the_append_loader_animates_cached_graphics_should_not_be_prepared_or_uploaded_again() {
+        let mut app = card_with_image(640, 320);
+        screen(&mut app, 100, 40);
+        app.tabs[3].feed.after = Some("next".into());
+        app.load_feed(3, true);
+        screen(&mut app, 100, 40);
+        app.loading_frame = 1;
+
+        let actual = first_screen(&mut app, 100, 40);
+
+        assert!(
+            actual.contains("Loading posts") && actual.contains("━"),
+            "{actual}"
+        );
+        assert!(actual.contains('\u{10EEEE}'));
+        assert!(
+            !actual.contains("_G"),
+            "warm graphics should not upload again"
+        );
+        assert!(
+            !app.card_renderer.pending(),
+            "warm graphics should not queue encoding"
+        );
+    }
+
+    #[test]
+    fn when_a_new_query_waits_in_a_narrow_pane_its_initial_loader_should_remain_visible() {
         let mut app = feed_with_next_page(ListView::Card);
         app.search("a query long enough to fill the header".into());
 
         let actual = screen(&mut app, 50, 12);
 
         assert!(
-            actual.lines().last().unwrap().contains("⋯ posts"),
+            actual.contains("⠋ Loading posts") && !actual.lines().last().unwrap().contains("posts"),
             "{actual}"
         );
     }
@@ -6614,8 +9139,9 @@ pub(crate) mod tests {
         let actual = screen(&mut app, 80, 20);
 
         assert!(actual.contains("next"), "{actual}");
+        assert!(!actual.contains("more posts"), "{actual}");
         assert!(
-            !actual.contains("Loading more posts") && !actual.contains("⋯ more posts"),
+            !actual.contains("Loading posts") && !actual.contains("━"),
             "{actual}"
         );
     }
@@ -6634,14 +9160,15 @@ pub(crate) mod tests {
         let actual = screen(&mut app, 80, 20);
 
         assert!(actual.contains("Next page failed · L retries"), "{actual}");
+        assert!(!actual.contains("more posts"), "{actual}");
         assert!(
-            !actual.contains("Loading more posts") && !actual.contains("⋯ more posts"),
+            !actual.contains("Loading posts") && !actual.contains("━"),
             "{actual}"
         );
     }
 
     #[test]
-    fn when_cached_posts_are_refreshing_the_footer_should_keep_the_activity_visible() {
+    fn when_cached_posts_are_refreshing_a_single_background_loader_should_keep_activity_visible() {
         let mut app = feed_with_next_page(ListView::Card);
         app.load_feed(3, false);
         app.on_msg(Msg::Snapshot {
@@ -6670,7 +9197,8 @@ pub(crate) mod tests {
             "{actual}"
         );
         assert!(
-            actual.lines().last().unwrap().contains("⋯ refresh"),
+            actual.contains("⠋ Refreshing posts")
+                && !actual.lines().last().unwrap().contains("refresh"),
             "{actual}"
         );
     }
@@ -6697,6 +9225,17 @@ pub(crate) mod tests {
         let actual = first_screen(&mut app, 100, 24);
 
         assert!(actual.contains("preparing image"), "{actual}");
+        assert!(
+            app.images_loading(),
+            "still graphics preparation remains visible"
+        );
+        app.card_renderer.wait_for_completion();
+        assert!(
+            app.images_loading(),
+            "unpublished still graphics remain visible"
+        );
+        assert!(app.card_renderer.poll());
+        assert!(!app.images_loading());
     }
 
     #[test]
@@ -6731,7 +9270,7 @@ pub(crate) mod tests {
         assert!(actual.contains('\u{10EEEE}'), "{actual}");
         assert!(!actual.contains("preparing image"), "{actual}");
         assert!(
-            actual.lines().last().unwrap().contains("⋯ images"),
+            actual.lines().last().unwrap().contains("⠋ images"),
             "{actual}"
         );
     }
@@ -6742,7 +9281,7 @@ pub(crate) mod tests {
 
         let actual = first_screen(&mut app, 100, 20);
 
-        assert!(actual.contains('◌'), "{actual}");
+        assert!(actual.contains('⠋'), "{actual}");
     }
 
     fn refreshing_thumbnail_app() -> App {
@@ -6772,9 +9311,82 @@ pub(crate) mod tests {
 
         assert!(actual.contains('\u{10EEEE}'), "{actual}");
         assert!(
-            actual.lines().last().unwrap().contains("⋯ images"),
+            actual.lines().last().unwrap().contains("⠋ images"),
             "{actual}"
         );
+    }
+
+    #[test]
+    fn footer_activity_should_keep_the_same_keys_in_the_same_cells() {
+        for width in [5, 6, 7, 8, 9, 10, 20, 32, 40, 64, 80, 100, 180] {
+            for context in ["list", "sidebar", "detail", "unsaved"] {
+                let mut app = if context == "detail" {
+                    open_video_post()
+                } else {
+                    feed_with_next_page(ListView::Card)
+                };
+                app.image_picker = kitty();
+                app.show_images = true;
+                app.health = Health::Up;
+                app.status = None;
+                if context == "sidebar" {
+                    app.focus_sidebar();
+                }
+                if context == "unsaved" {
+                    app.settings.store.persistence = crate::config::store::Persistence::Unsaved;
+                }
+                let footer = |app: &App| {
+                    let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+                    terminal
+                        .draw(|f| draw_footer(f, app, f.area(), &VisibleLoaders::default()))
+                        .unwrap();
+                    terminal.backend().buffer().clone()
+                };
+                let keys = |buffer: &ratatui::buffer::Buffer| {
+                    (0..width)
+                        .filter_map(|x| {
+                            let cell = &buffer[(x, 0)];
+                            (cell.bg == SURFACE1).then(|| (x, cell.symbol().to_string()))
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let idle = footer(&app);
+                let expected = keys(&idle);
+                assert!(buffer_text(&idle).contains("F1"));
+                if width >= 20 {
+                    assert!(!expected.is_empty());
+                }
+                app.card_images
+                    .insert("pending".into(), CardImageSlot::Loading);
+                for frame in [0, 4] {
+                    app.loading_frame = frame;
+                    let busy = footer(&app);
+                    assert!(
+                        buffer_text(&busy).contains(loading::glyph(frame)),
+                        "{width}: {}",
+                        buffer_text(&busy)
+                    );
+                    assert_eq!(keys(&busy), expected, "{context} at width {width}");
+                    if width >= 40 {
+                        assert!(buffer_text(&busy).contains("images"));
+                    }
+                }
+                app.card_images.clear();
+                assert_eq!(
+                    footer(&app),
+                    idle,
+                    "completion must restore the idle footer"
+                );
+                if context == "detail" {
+                    app.post_view.as_mut().unwrap().loading = true;
+                } else {
+                    app.load_feed(app.active, true);
+                }
+                let busy = footer(&app);
+                assert!(buffer_text(&busy).contains(loading::glyph(app.loading_frame)));
+                assert_eq!(keys(&busy), expected, "content loading at width {width}");
+            }
+        }
     }
 
     #[test]
@@ -6788,7 +9400,7 @@ pub(crate) mod tests {
 
         assert!(actual.contains('\u{10EEEE}'), "{actual}");
         assert!(
-            actual.lines().last().unwrap().contains("⋯ images"),
+            actual.lines().last().unwrap().contains("⠋ images"),
             "{actual}"
         );
     }
@@ -6805,7 +9417,7 @@ pub(crate) mod tests {
 
         assert!(!actual.contains('\u{10EEEE}'), "{actual}");
         assert!(
-            !actual.lines().last().unwrap().contains("⋯ images"),
+            !actual.lines().last().unwrap().contains("⠋ images"),
             "{actual}"
         );
     }
@@ -6822,7 +9434,7 @@ pub(crate) mod tests {
 
         assert!(actual.contains('\u{10EEEE}'), "{actual}");
         assert!(
-            !actual.lines().last().unwrap().contains("⋯ images"),
+            !actual.lines().last().unwrap().contains("⠋ images"),
             "{actual}"
         );
     }
@@ -6839,7 +9451,7 @@ pub(crate) mod tests {
 
         assert!(actual.contains('\u{10EEEE}'), "{actual}");
         assert!(
-            !actual.lines().last().unwrap().contains("⋯ images"),
+            !actual.lines().last().unwrap().contains("⠋ images"),
             "{actual}"
         );
     }
@@ -6853,7 +9465,7 @@ pub(crate) mod tests {
 
         assert!(!actual.contains('\u{10EEEE}'), "{actual}");
         assert!(
-            !actual.lines().last().unwrap().contains("⋯ images"),
+            !actual.lines().last().unwrap().contains("⠋ images"),
             "{actual}"
         );
     }
@@ -6867,7 +9479,7 @@ pub(crate) mod tests {
 
         assert!(!actual.contains('\u{10EEEE}'), "{actual}");
         assert!(
-            !actual.lines().last().unwrap().contains("⋯ images"),
+            !actual.lines().last().unwrap().contains("⠋ images"),
             "{actual}"
         );
     }
@@ -6876,6 +9488,7 @@ pub(crate) mod tests {
     fn when_media_opening_outlasts_its_notification_the_footer_should_keep_showing_activity() {
         let mut app = feed_with_next_page(ListView::Card);
         app.tabs[3].feed.posts[0].media = Media::Video {
+            gif: false,
             url: None,
             poster: None,
         };
@@ -6887,7 +9500,7 @@ pub(crate) mod tests {
         let actual = screen(&mut app, 80, 20);
 
         assert!(
-            actual.lines().last().unwrap().contains("⋯ media"),
+            actual.lines().last().unwrap().contains("⠋ media"),
             "{actual}"
         );
     }
@@ -6896,6 +9509,7 @@ pub(crate) mod tests {
     fn when_media_loading_fails_the_footer_should_show_the_error_and_stop_activity() {
         let mut app = feed_with_next_page(ListView::Card);
         app.tabs[3].feed.posts[0].media = Media::Video {
+            gif: false,
             url: None,
             poster: None,
         };
@@ -6909,7 +9523,7 @@ pub(crate) mod tests {
 
         let footer = actual.lines().last().unwrap();
         assert!(
-            footer.contains("media: offline") && !footer.contains("⋯ media"),
+            footer.contains("media: offline") && !footer.contains("⠋ media"),
             "{actual}"
         );
     }
@@ -6998,6 +9612,7 @@ pub(crate) mod tests {
         let mut app = card_feed_app(kitty());
         app.tabs[3].feed.posts.truncate(1);
         app.tabs[3].feed.posts[0].media = Media::Video {
+            gif: false,
             url: Some("https://v.redd.it/example/HLSPlaylist.m3u8".into()),
             poster: Some("https://i.redd.it/p1.jpeg".into()),
         };
@@ -7011,7 +9626,120 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn when_a_video_poster_is_solid_dark_its_card_should_show_how_to_open_it() {
+    fn card_media_detail_sidebar_should_offer_return_instead_of_play_keys() {
+        let mut app = open_video_post();
+        app.config.media.video_autoplay = false;
+        app.focus_sidebar();
+
+        let actual = screen(&mut app, 180, 40);
+        let words = actual.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(words.contains("l return"), "{actual}");
+        assert!(!words.contains("P play"), "{actual}");
+    }
+
+    #[test]
+    fn card_media_review_manual_detail_should_show_play_instead_of_loading() {
+        let mut app = open_video_post();
+        app.config.media.video_autoplay = false;
+
+        let actual = screen(&mut app, 100, 30);
+        let words = actual.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(words.contains("P play"), "{actual}");
+        assert!(!actual.contains("loading video"), "{actual}");
+    }
+
+    #[test]
+    fn card_media_known_portrait_size_without_a_poster_should_keep_its_geometry() {
+        let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 640));
+        if let Media::Video { poster, .. } = &mut app.tabs[3].feed.posts[0].media {
+            *poster = None;
+        }
+        let mut pictures = ListPictures::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+
+        terminal
+            .draw(|f| {
+                draw_feed(f, &mut app, f.area(), &mut pictures);
+            })
+            .unwrap();
+
+        assert_eq!(pictures.cards[0].pixels, (320, 640));
+        assert_eq!(pictures.cards[0].size.height, pictures.cards[0].size.width);
+    }
+
+    #[test]
+    fn card_media_unavailable_stream_should_not_offer_a_play_button() {
+        let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 180));
+        if let Media::Video { url, .. } = &mut app.tabs[3].feed.posts[0].media {
+            *url = None;
+        }
+        let mut pictures = ListPictures::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+
+        terminal
+            .draw(|f| {
+                draw_feed(f, &mut app, f.area(), &mut pictures);
+            })
+            .unwrap();
+
+        assert!(matches!(
+            pictures.cards[0].indicator,
+            Some(Indicator::Video { play: false, .. })
+        ));
+        assert!(!app.video_controls_available());
+    }
+
+    #[test]
+    fn card_media_converted_gif_should_reach_the_gif_overlay() {
+        let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 180));
+        if let Media::Video { gif, .. } = &mut app.tabs[3].feed.posts[0].media {
+            *gif = true;
+        }
+        let mut pictures = ListPictures::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+
+        terminal
+            .draw(|f| {
+                draw_feed(f, &mut app, f.area(), &mut pictures);
+            })
+            .unwrap();
+
+        assert!(matches!(
+            pictures.cards[0].indicator,
+            Some(Indicator::Video { gif: true, .. })
+        ));
+    }
+
+    #[test]
+    fn card_media_pause_key_should_control_the_selected_card() {
+        let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 180));
+        app.video = Some(video::Player::silent(VIDEO, Size::new(68, 17)));
+
+        press(&mut app, 'P');
+
+        assert!(app.video.as_ref().unwrap().paused());
+    }
+
+    #[test]
+    fn card_media_waiting_video_should_show_play_controls() {
+        let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 180));
+
+        let actual = screen(&mut app, 100, 20);
+
+        let footer = actual
+            .lines()
+            .last()
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(footer.contains("P play"), "{actual}");
+    }
+
+    #[test]
+    fn when_a_video_poster_is_solid_dark_its_card_should_keep_its_play_indicator() {
         let mut app = video_card_with_poster(image::DynamicImage::ImageRgba8(
             image::RgbaImage::from_pixel(404, 719, image::Rgba([2, 0, 3, 255])),
         ));
@@ -7019,14 +9747,21 @@ pub(crate) mod tests {
 
         let actual = screen(&mut app, 100, 20);
 
-        assert!(actual.contains("▶ video · open post"), "{actual}");
-        assert!(!actual.contains('\u{10EEEE}'), "{actual}");
+        assert!(
+            actual.contains("video") || actual.contains("gif"),
+            "{actual}"
+        );
+        assert!(
+            actual.contains('\u{10EEEE}')
+                || app.image_picker.protocol_type() == ProtocolType::Halfblocks,
+            "{actual}"
+        );
         assert_eq!(app.active_tab().feed.cards.height, reserved_height);
         assert!(!app.card_renderer.pending());
     }
 
     #[test]
-    fn when_a_video_poster_is_transparent_its_card_should_show_how_to_open_it() {
+    fn when_a_video_poster_is_transparent_its_card_should_keep_its_play_indicator() {
         let mut app = video_card_with_poster(image::DynamicImage::ImageRgba8(
             image::RgbaImage::from_fn(2, 2, |x, y| image::Rgba([x as u8, y as u8, 255, 0])),
         ));
@@ -7034,7 +9769,15 @@ pub(crate) mod tests {
 
         let actual = screen(&mut app, 100, 20);
 
-        assert!(actual.contains("▶ video · open post"), "{actual}");
+        assert!(
+            actual.contains("video") || actual.contains("gif"),
+            "{actual}"
+        );
+        assert!(
+            actual.contains('\u{10EEEE}')
+                || app.image_picker.protocol_type() == ProtocolType::Halfblocks,
+            "{actual}"
+        );
         assert!(!app.card_renderer.pending());
     }
 
@@ -7055,6 +9798,7 @@ pub(crate) mod tests {
         let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 180));
         app.tabs[3].feed.posts[0].media = Media::Image {
             url: "https://i.redd.it/p1.jpeg".into(),
+            preview: None,
         };
 
         let actual = screen(&mut app, 100, 20);
@@ -7064,11 +9808,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn when_a_gif_card_has_a_flat_first_frame_it_should_show_how_to_open_it() {
+    fn when_a_gif_card_has_a_flat_first_frame_it_should_keep_its_play_indicator() {
         let mut app = card_feed_app(kitty());
         app.tabs[3].feed.posts.truncate(1);
         app.tabs[3].feed.posts[0].media = Media::Image {
             url: "https://i.redd.it/animation.gif".into(),
+            preview: None,
         };
         first_screen(&mut app, 100, 20);
         app.on_msg(Msg::Image {
@@ -7078,18 +9823,34 @@ pub(crate) mod tests {
 
         let actual = screen(&mut app, 100, 20);
 
-        assert!(actual.contains("▶ video · open post"), "{actual}");
+        assert!(
+            actual.contains("video") || actual.contains("gif"),
+            "{actual}"
+        );
+        assert!(
+            actual.contains('\u{10EEEE}')
+                || app.image_picker.protocol_type() == ProtocolType::Halfblocks,
+            "{actual}"
+        );
     }
 
     #[test]
-    fn when_a_flat_video_preview_returns_after_eviction_its_placeholder_should_stay_visible() {
+    fn when_a_flat_video_preview_returns_after_eviction_its_indicator_should_stay_visible() {
         let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 180));
         screen(&mut app, 100, 20);
         app.card_images.clear();
 
-        let actual = first_screen(&mut app, 100, 20);
+        let actual = screen(&mut app, 100, 20);
 
-        assert!(actual.contains("▶ video · open post"), "{actual}");
+        assert!(
+            actual.contains("video") || actual.contains("gif"),
+            "{actual}"
+        );
+        assert!(
+            actual.contains('\u{10EEEE}')
+                || app.image_picker.protocol_type() == ProtocolType::Halfblocks,
+            "{actual}"
+        );
         assert!(!actual.contains("loading image"));
     }
 
@@ -7116,7 +9877,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn when_a_retained_video_preview_is_upgraded_to_a_flat_frame_it_should_show_the_placeholder() {
+    fn when_a_retained_video_preview_is_upgraded_to_a_flat_frame_it_should_keep_the_play_indicator()
+    {
         let mut app = video_card_with_poster(image::DynamicImage::ImageRgb8(
             image::RgbImage::from_fn(320, 180, |x, _| image::Rgb([x as u8, 128, 255])),
         ));
@@ -7130,8 +9892,15 @@ pub(crate) mod tests {
 
         let actual = screen(&mut app, 100, 20);
 
-        assert!(actual.contains("▶ video · open post"), "{actual}");
-        assert!(!actual.contains('\u{10EEEE}'));
+        assert!(
+            actual.contains("video") || actual.contains("gif"),
+            "{actual}"
+        );
+        assert!(
+            actual.contains('\u{10EEEE}')
+                || app.image_picker.protocol_type() == ProtocolType::Halfblocks,
+            "{actual}"
+        );
     }
 
     #[test]
@@ -7216,7 +9985,7 @@ pub(crate) mod tests {
         let actual = screen_buffer(&mut app, 100, 40);
 
         assert!(
-            (3..23).all(|y| actual[(25, y)].symbol() == "▌" && actual[(25, y)].fg == OVERLAY),
+            (3..23).all(|y| actual[(25, y)].symbol() == "│" && actual[(25, y)].fg == OVERLAY),
             "{}",
             buffer_text(&actual)
         );
@@ -7225,70 +9994,29 @@ pub(crate) mod tests {
     #[test]
     fn when_card_style_scrolls_into_an_image_the_bar_should_remain_visible_with_native_pixels() {
         let mut app = card_with_image(320, 640);
-        app.scroll_card(16);
+        app.tabs[3].feed.posts.push(post_with("tail", Media::None));
+        app.tabs[3].feed.posts.push(post_with("tail2", Media::None));
+        app.scroll_card(3);
 
         let actual = screen_buffer(&mut app, 100, 20);
 
         assert!(
-            (3..19).all(|y| actual[(25, y)].symbol() == "▌" && actual[(25, y)].fg == ACCENT),
+            (3..12).all(|y| actual[(25, y)].symbol() == "▌" && actual[(25, y)].fg == ACCENT),
             "{}",
             buffer_text(&actual)
         );
-        assert!(actual[(27, 3)].symbol().contains('\u{10EEEE}'));
-        assert_eq!(app.active_tab().feed.cards.line, 16);
-    }
-
-    fn assert_centered_page_loading(actual: &ratatui::buffer::Buffer) {
-        let text = buffer_text(actual);
-        let y = text
-            .lines()
-            .position(|line| line.contains("Loading more posts…"))
-            .unwrap() as u16;
-        let x = (25..78).find(|&x| actual[(x, y)].symbol() == "L").unwrap();
-        assert!((12..=22).contains(&y), "{text}");
-        assert!((2 * x + 19).abs_diff(102) <= 1, "{text}");
-        assert_eq!(actual[(x, y)].bg, MANTLE);
-        assert!(actual[(x, y)].modifier.contains(Modifier::BOLD));
-        assert_eq!(actual[(25, 8)].bg, MANTLE);
-        assert_eq!(actual[(25, 28)].bg, MANTLE);
+        assert!(actual[(56, 3)].symbol().contains('\u{10EEEE}'));
+        assert_eq!(app.active_tab().feed.cards.line, 3);
     }
 
     #[test]
-    fn when_card_style_waits_for_more_posts_the_loading_panel_should_fill_and_center_in_empty_space()
-     {
-        let mut app = feed_with_next_page(ListView::Card);
-        app.load_feed(3, true);
-
-        let actual = screen_buffer(&mut app, 80, 30);
-
-        assert_centered_page_loading(&actual);
-        assert_eq!(app.active_tab().feed.cards.height, 3);
-        assert_eq!(app.active_tab().feed.cards.line, 0);
-    }
-
-    #[test]
-    fn when_compact_style_waits_for_more_posts_the_loading_panel_should_fill_and_center_in_empty_space()
-     {
-        let mut app = feed_with_next_page(ListView::Compact);
-        app.load_feed(3, true);
-
-        let actual = screen_buffer(&mut app, 80, 30);
-
-        assert_centered_page_loading(&actual);
-        assert_eq!(app.active_tab().feed.offset, 0);
-    }
-
-    #[test]
-    fn when_card_style_has_no_room_for_a_panel_pagination_should_stay_visible_in_the_footer() {
+    fn when_a_short_card_view_loads_pagination_it_should_keep_the_footer_status_visible() {
         let mut app = feed_with_next_page(ListView::Card);
         app.load_feed(3, true);
 
         let actual = screen(&mut app, 50, 5);
 
-        assert!(
-            actual.lines().last().unwrap().contains("⋯ more posts"),
-            "{actual}"
-        );
+        assert!(actual.lines().last().unwrap().contains('⠋'), "{actual}");
         assert!(actual.contains("Existing po"), "{actual}");
     }
 
@@ -7314,7 +10042,7 @@ pub(crate) mod tests {
             "image preparation blocked input for {:?}",
             started.elapsed()
         );
-        assert_eq!(app.active_tab().feed.cards.line, 1);
+        assert_eq!(app.active_tab().feed.cards.line, 0);
     }
 
     #[test]
@@ -7329,8 +10057,8 @@ pub(crate) mod tests {
 
         let actual = screen(&mut app, 100, 20);
 
-        assert_eq!(app.active_tab().feed.cards.height, 71, "{actual}");
-        assert!(!actual.contains("p2"), "{actual}");
+        assert_eq!(app.active_tab().feed.cards.height, 12, "{actual}");
+        assert!(actual.contains("p2"), "{actual}");
     }
 
     #[test]
@@ -7342,16 +10070,18 @@ pub(crate) mod tests {
             app.tabs[3].feed.posts[0].title = "Full width image".into();
             if video {
                 app.tabs[3].feed.posts[0].media = Media::Video {
+                    gif: false,
                     url: Some("https://v.redd.it/example/HLSPlaylist.m3u8".into()),
                     poster: Some("https://i.redd.it/p1.jpeg".into()),
                 };
             } else {
                 app.tabs[3].feed.posts[0].media = Media::Image {
                     url: "https://i.redd.it/p1.jpeg".into(),
+                    preview: None,
                 };
             }
             screen(&mut app, 100, 20);
-            for number in 0..9 {
+            for number in 0..65 {
                 let url = format!("https://i.redd.it/pressure-{number}.png");
                 app.card_pictures_drawn(&[&url]);
                 app.on_msg(Msg::Image {
@@ -7371,7 +10101,7 @@ pub(crate) mod tests {
                 "retained image/poster must render immediately: {actual}"
             );
             assert!(!actual.contains("loading image"), "{actual}");
-            assert_eq!(app.active_tab().feed.cards.height, 71);
+            assert_eq!(app.active_tab().feed.cards.height, 12);
             std::thread::sleep(crate::app::NAV_SETTLE);
             app.tick();
             screen(&mut app, 100, 20);
@@ -7397,7 +10127,7 @@ pub(crate) mod tests {
                 app.card_images.get("https://i.redd.it/p1.jpeg"),
                 Some(CardImageSlot::Ready { .. })
             ));
-            assert_eq!(app.active_tab().feed.cards.height, 71);
+            assert_eq!(app.active_tab().feed.cards.height, 12);
         }
     }
 
@@ -7408,7 +10138,7 @@ pub(crate) mod tests {
         app.tabs[3].feed.posts[0].title = "Reserved portrait".into();
         app.tabs[3].feed.posts[0].preview_size = Some((320, 640));
         screen(&mut app, 100, 20);
-        assert_eq!(app.active_tab().feed.cards.height, 71);
+        assert_eq!(app.active_tab().feed.cards.height, 12);
         app.scroll_card(16);
 
         app.on_msg(Msg::Image {
@@ -7417,9 +10147,9 @@ pub(crate) mod tests {
         });
         let actual = screen(&mut app, 100, 20);
 
-        assert_eq!(app.active_tab().feed.cards.height, 71, "{actual}");
-        assert_eq!(app.active_tab().feed.cards.line, 16);
-        assert!(actual.contains("image unavailable"), "{actual}");
+        assert_eq!(app.active_tab().feed.cards.height, 12, "{actual}");
+        assert_eq!(app.active_tab().feed.cards.line, 0);
+        assert!(actual.contains("offline"), "{actual}");
     }
 
     #[test]
@@ -7481,11 +10211,13 @@ pub(crate) mod tests {
     fn when_a_scrolled_loading_card_receives_pixels_it_should_keep_the_visible_row() {
         let mut app = card_feed_app(kitty());
         app.tabs[3].feed.posts.truncate(1);
+        app.tabs[3].feed.posts.push(post_with("tail", Media::None));
+        app.tabs[3].feed.posts.push(post_with("tail2", Media::None));
         app.tabs[3].feed.posts[0].title = "Loading image".into();
         screen(&mut app, 100, 20);
-        app.scroll_card(1000);
+        app.scroll_card(3);
         screen(&mut app, 100, 20);
-        assert_eq!(app.active_tab().feed.cards.line, 21);
+        assert_eq!(app.active_tab().feed.cards.line, 3);
         app.scroll_card(-1);
         screen(&mut app, 100, 20);
 
@@ -7495,12 +10227,12 @@ pub(crate) mod tests {
         });
         screen(&mut app, 100, 20);
 
-        assert_eq!(app.active_tab().feed.cards.line, 20);
+        assert_eq!(app.active_tab().feed.cards.line, 2);
         assert_eq!(app.active_tab().feed.cards.pending, 0);
     }
 
     #[test]
-    fn when_paging_a_bookmark_before_its_image_loads_it_should_scroll_reserved_space() {
+    fn when_paging_a_bookmark_before_its_image_loads_it_should_keep_all_reserved_media_visible() {
         let mut app = card_feed_app(kitty());
         app.tabs[3].feed.posts[0].title = "Reserved bookmark".into();
         app.tabs[3].feed.posts[0].preview_size = Some((320, 640));
@@ -7511,45 +10243,46 @@ pub(crate) mod tests {
         app.page_list(1, 1);
         screen(&mut app, 100, 20);
 
-        assert_eq!(app.active_tab().feed.cards.line, 16);
-        assert_eq!(app.active_tab().feed.cards.height, 71);
+        assert_eq!(app.active_tab().feed.cards.line, 0);
+        assert_eq!(app.active_tab().feed.cards.height, 12);
         assert_eq!(app.current_post().unwrap().id, "p1");
     }
 
     #[test]
-    fn when_a_landscape_card_image_loads_it_should_fill_the_available_width() {
+    fn when_a_landscape_card_image_loads_it_should_fit_the_available_height() {
         let mut app = card_with_image(640, 320);
 
         let cells = placeholder_cells(&mut app, 100, 20);
 
-        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(27));
-        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(94));
+        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(43));
+        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(78));
         assert!(matches!(app.card_images.get("https://i.redd.it/p1.jpeg"),
             Some(CardImageSlot::Ready { protocol: Some(protocol), .. })
-                if protocol.size == Size::new(68, 17)));
+                if protocol.size == Size::new(36, 9)));
     }
 
     #[test]
-    fn when_a_portrait_card_image_loads_it_should_fill_width_and_extend_beyond_the_viewport() {
+    fn when_a_portrait_card_image_loads_it_should_fit_height_and_center_in_the_viewport() {
         let mut app = card_with_image(320, 640);
 
         let cells = placeholder_cells(&mut app, 100, 20);
 
-        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(27));
-        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(94));
+        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(56));
+        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(64));
         assert!(matches!(app.card_images.get("https://i.redd.it/p1.jpeg"),
             Some(CardImageSlot::Ready { protocol: Some(protocol), .. })
-                if protocol.size == Size::new(68, 68)));
+                if protocol.size == Size::new(9, 9)));
     }
 
     #[test]
-    fn when_a_small_card_image_loads_it_should_fill_width_without_the_detail_upscaling_limit() {
+    fn when_a_small_card_image_loads_it_should_fill_its_fitted_box_without_the_text_upscaling_limit()
+     {
         let mut app = card_with_image(16, 8);
 
         let cells = placeholder_cells(&mut app, 100, 20);
 
-        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(27));
-        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(94));
+        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(43));
+        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(78));
     }
 
     fn card_png(protocol: &ratatui_image::protocol::Protocol) -> image::RgbImage {
@@ -7576,7 +10309,7 @@ pub(crate) mod tests {
                 &picker,
                 &image,
                 None,
-                (Size::new(68, 34), (2, 2)),
+                (Size::new(68, 34), (2, 2), None),
                 start,
                 16,
                 0,
@@ -7610,7 +10343,7 @@ pub(crate) mod tests {
             &picker,
             &image,
             None,
-            (Size::new(68, 32767), (2, 1600)),
+            (Size::new(68, 27200), (2, 1600), None),
             16384,
             1,
             0,
@@ -7648,13 +10381,17 @@ pub(crate) mod tests {
         else {
             panic!("card protocol");
         };
-        let pixels = card_png(&protocol.tiles[&(0, 0, 1)]);
+        let crate::card_image::Tile::Image(encoded) = protocol.tiles[&(0, 0, 1, 68)].as_ref()
+        else {
+            panic!("still-image tile");
+        };
+        let pixels = card_png(encoded);
         assert_eq!(pixels.dimensions(), (544, 16));
         assert!((120..=136).contains(&pixels.get_pixel(272, 8)[0]));
     }
 
     #[test]
-    fn when_paging_inside_a_tall_card_it_should_keep_the_selected_post() {
+    fn when_paging_a_single_fitted_card_it_should_keep_the_selected_post() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = card_with_image(320, 640);
         screen(&mut app, 100, 20);
@@ -7666,8 +10403,8 @@ pub(crate) mod tests {
         let cells = placeholder_cells(&mut app, 100, 20);
 
         assert_eq!(app.current_post().unwrap().id, "p1");
-        assert_eq!(app.active_tab().feed.cards.line, 16);
-        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(94));
+        assert_eq!(app.active_tab().feed.cards.line, 0);
+        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(64));
     }
 
     fn two_tall_media_cards() -> App {
@@ -7678,6 +10415,7 @@ pub(crate) mod tests {
         let mut next = post_with(
             "p2",
             Media::Video {
+                gif: false,
                 url: Some("https://v.redd.it/example/HLSPlaylist.m3u8".into()),
                 poster: Some("https://i.redd.it/p2.jpeg".into()),
             },
@@ -7707,7 +10445,7 @@ pub(crate) mod tests {
     fn when_half_paging_past_a_tall_card_the_next_card_should_enter_without_snapping() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = two_tall_media_cards();
-        app.scroll_card(55);
+        app.scroll_card(0);
         screen(&mut app, 100, 20);
 
         crate::keys::handle(
@@ -7720,9 +10458,9 @@ pub(crate) mod tests {
             actual
                 .lines()
                 .position(|line| line.contains("Following video")),
-            Some(13)
+            Some(9)
         );
-        assert_eq!(app.active_tab().feed.cards.line, 63);
+        assert_eq!(app.active_tab().feed.cards.line, 8);
         assert_eq!(app.current_post().unwrap().id, "p1");
     }
 
@@ -7740,12 +10478,12 @@ pub(crate) mod tests {
         let actual = screen(&mut app, 100, 20);
 
         assert_eq!(app.active_tab().feed.offset, 0);
-        assert_eq!(app.active_tab().feed.cards.line, 64);
+        assert_eq!(app.active_tab().feed.cards.line, 1);
         assert_eq!(
             actual
                 .lines()
                 .position(|line| line.contains("Following video")),
-            Some(12)
+            Some(16)
         );
     }
 
@@ -7753,7 +10491,8 @@ pub(crate) mod tests {
     fn when_half_page_keys_are_batched_their_row_distances_should_accumulate() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = two_tall_media_cards();
-        app.scroll_card(55);
+        app.tabs[3].feed.posts.push(post_with("tail", Media::None));
+        app.scroll_card(0);
         screen(&mut app, 100, 20);
 
         crate::keys::handle(
@@ -7766,13 +10505,13 @@ pub(crate) mod tests {
         );
         let actual = screen(&mut app, 100, 20);
 
-        assert_eq!(app.active_tab().feed.offset, 0);
-        assert_eq!(app.active_tab().feed.cards.line, 71);
+        assert_eq!(app.active_tab().feed.offset, 1);
+        assert_eq!(app.active_tab().feed.cards.line, 2);
         assert_eq!(
             actual
                 .lines()
                 .position(|line| line.contains("Following video")),
-            Some(5)
+            None
         );
         assert_eq!(app.active_tab().feed.cards.pending, 0);
     }
@@ -7780,7 +10519,8 @@ pub(crate) mod tests {
     #[test]
     fn when_line_scrolling_crosses_a_separator_it_should_move_exactly_one_row_each_way() {
         let mut app = two_tall_media_cards();
-        app.scroll_card(71);
+        app.tabs[3].feed.posts.push(post_with("tail", Media::None));
+        app.scroll_card(12);
         screen(&mut app, 100, 20);
 
         app.scroll_card(1);
@@ -7797,7 +10537,7 @@ pub(crate) mod tests {
             up.lines().position(|line| line.contains("Following video")),
             Some(5)
         );
-        assert_eq!(app.active_tab().feed.cards.line, 71);
+        assert_eq!(app.active_tab().feed.cards.line, 12);
     }
 
     #[test]
@@ -7821,6 +10561,9 @@ pub(crate) mod tests {
     fn when_scrolling_from_a_short_card_into_tall_media_it_should_keep_the_overshoot() {
         let mut app = two_tall_media_cards();
         app.tabs[3].feed.posts[0].media = Media::None;
+        let mut following = app.tabs[3].feed.posts[1].clone();
+        following.id = "tail".into();
+        app.tabs[3].feed.posts.push(following);
         screen(&mut app, 100, 20);
 
         app.page_list(1, 2);
@@ -7834,20 +10577,20 @@ pub(crate) mod tests {
     #[test]
     fn when_item_selection_follows_continuous_scrolling_it_should_reveal_the_selected_post() {
         let mut app = two_tall_media_cards();
-        app.scroll_card(63);
+        app.scroll_card(8);
         screen(&mut app, 100, 20);
 
         press(&mut app, 'j');
         let actual = screen(&mut app, 100, 20);
 
         assert_eq!(app.current_post().unwrap().id, "p2");
-        assert_eq!(app.active_tab().feed.offset, 1);
-        assert_eq!(app.active_tab().feed.cards.line, 0);
+        assert_eq!(app.active_tab().feed.offset, 0);
+        assert_eq!(app.active_tab().feed.cards.line, 9);
         assert_eq!(
             actual
                 .lines()
                 .position(|line| line.contains("Following video")),
-            Some(4)
+            Some(8)
         );
     }
 
@@ -7860,18 +10603,18 @@ pub(crate) mod tests {
             .toggle_bookmark(&app.tabs[3].feed.posts[0].clone(), 2);
         app.switch_tab(1);
         screen(&mut app, 100, 20);
-        app.scroll_card(55);
+        app.scroll_card(0);
         screen(&mut app, 100, 20);
 
         app.page_list(1, 2);
         let actual = screen(&mut app, 100, 20);
 
-        assert_eq!(app.active_tab().feed.cards.line, 63);
+        assert_eq!(app.active_tab().feed.cards.line, 8);
         assert_eq!(
             actual
                 .lines()
                 .position(|line| line.contains("Following video")),
-            Some(13)
+            Some(9)
         );
     }
 
@@ -7884,16 +10627,16 @@ pub(crate) mod tests {
             .toggle_bookmark(&app.tabs[3].feed.posts[0].clone(), 2);
         app.switch_tab(1);
         screen(&mut app, 100, 20);
-        app.scroll_card(82);
+        app.scroll_card(8);
         screen(&mut app, 100, 20);
 
         app.state
             .toggle_bookmark(&post_with("inserted", Media::None), 3);
         screen(&mut app, 100, 20);
 
-        assert_eq!(app.active_tab().feed.cards.post.as_deref(), Some("p2"));
-        assert_eq!(app.active_tab().feed.offset, 2);
-        assert_eq!(app.active_tab().feed.cards.line, 10);
+        assert_eq!(app.active_tab().feed.cards.post.as_deref(), Some("p1"));
+        assert_eq!(app.active_tab().feed.offset, 1);
+        assert_eq!(app.active_tab().feed.cards.line, 8);
     }
 
     #[test]
@@ -7933,7 +10676,7 @@ pub(crate) mod tests {
     #[test]
     fn when_a_refresh_inserts_posts_above_the_viewport_its_post_and_row_should_stay_anchored() {
         let mut app = two_tall_media_cards();
-        app.scroll_card(82);
+        app.scroll_card(8);
         screen(&mut app, 100, 20);
         let mut posts = app.tabs[3].feed.posts.clone();
         posts.insert(0, post_with("inserted", Media::None));
@@ -7947,9 +10690,9 @@ pub(crate) mod tests {
         });
         screen(&mut app, 100, 20);
 
-        assert_eq!(app.active_tab().feed.cards.post.as_deref(), Some("p2"));
-        assert_eq!(app.active_tab().feed.offset, 2);
-        assert_eq!(app.active_tab().feed.cards.line, 10);
+        assert_eq!(app.active_tab().feed.cards.post.as_deref(), Some("p1"));
+        assert_eq!(app.active_tab().feed.offset, 1);
+        assert_eq!(app.active_tab().feed.cards.line, 8);
     }
 
     #[test]
@@ -7976,13 +10719,13 @@ pub(crate) mod tests {
     #[test]
     fn when_resize_shortens_the_anchor_card_it_should_clamp_to_that_cards_content() {
         let mut app = two_tall_media_cards();
-        app.scroll_card(55);
+        app.scroll_card(14);
         screen(&mut app, 100, 20);
 
-        screen(&mut app, 80, 20);
+        screen(&mut app, 80, 12);
 
         assert_eq!(app.active_tab().feed.cards.post.as_deref(), Some("p1"));
-        assert_eq!(app.active_tab().feed.cards.line, 50);
+        assert_eq!(app.active_tab().feed.cards.line, 6);
         assert_eq!(app.current_post().unwrap().id, "p1");
     }
 
@@ -8022,7 +10765,7 @@ pub(crate) mod tests {
         let actual = screen(&mut app, 100, 20);
 
         assert!(actual.contains("comments"), "{actual}");
-        assert_eq!(app.active_tab().feed.cards.line, 55);
+        assert_eq!(app.active_tab().feed.cards.line, 0);
         assert_eq!(app.current_post().unwrap().id, "p1");
     }
 
@@ -8030,6 +10773,8 @@ pub(crate) mod tests {
     fn when_scrolling_up_a_card_by_control_y_it_should_move_one_line_without_copying() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = card_with_image(320, 640);
+        app.tabs[3].feed.posts.push(post_with("tail", Media::None));
+        app.tabs[3].feed.posts.push(post_with("tail2", Media::None));
         screen(&mut app, 100, 20);
         app.scroll_card(5);
 
@@ -8063,11 +10808,11 @@ pub(crate) mod tests {
 
         let cells = placeholder_cells(&mut app, 80, 20);
 
-        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(27));
-        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(74));
+        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(33));
+        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(68));
         assert!(matches!(app.card_images.get("https://i.redd.it/p1.jpeg"),
             Some(CardImageSlot::Ready { protocol: Some(protocol), .. })
-                if protocol.size == Size::new(48, 12)));
+                if protocol.size == Size::new(36, 9)));
     }
 
     #[test]
@@ -8100,14 +10845,16 @@ pub(crate) mod tests {
     #[test]
     fn when_returning_from_fullscreen_detail_a_reloading_card_should_keep_its_scroll() {
         let mut app = card_with_image(320, 640);
+        app.tabs[3].feed.posts.push(post_with("tail", Media::None));
+        app.tabs[3].feed.posts.push(post_with("tail2", Media::None));
         screen(&mut app, 100, 20);
-        app.scroll_card(16);
+        app.scroll_card(3);
         screen(&mut app, 100, 20);
         app.open_current_post();
         screen(&mut app, 100, 20);
         app.close_post();
         screen(&mut app, 100, 20);
-        assert_eq!(app.active_tab().feed.cards.line, 16);
+        assert_eq!(app.active_tab().feed.cards.line, 3);
 
         app.on_msg(Msg::Image {
             url: "https://i.redd.it/p1.jpeg".into(),
@@ -8115,18 +10862,22 @@ pub(crate) mod tests {
         });
         placeholder_cells(&mut app, 100, 20);
 
-        assert_eq!(app.active_tab().feed.cards.line, 16);
+        assert_eq!(app.active_tab().feed.cards.line, 3);
         assert_eq!(app.current_post().unwrap().id, "p1");
     }
 
     #[test]
     fn when_scrolling_below_kittys_row_limit_image_tiles_should_use_local_coordinates() {
         let mut app = card_with_image(100, 1000);
-        screen(&mut app, 100, 20);
+        app.tabs[3]
+            .feed
+            .posts
+            .extend((0..200).map(|i| post_with(&format!("tail{i}"), Media::None)));
+        screen(&mut app, 100, 600);
         app.scroll_card(300);
-        screen(&mut app, 100, 20);
+        screen(&mut app, 100, 600);
 
-        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 600)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let CardImageSlot::Ready {
@@ -8137,10 +10888,10 @@ pub(crate) mod tests {
             panic!("card protocol");
         };
         assert_eq!(protocol.size, Size::new(68, 340));
-        assert!(protocol.tiles.contains_key(&(298, 0, 6)));
-        assert_eq!(protocol.tiles.len(), 2);
-        assert_eq!(protocol.tiles[&(298, 0, 6)].size(), Size::new(68, 6));
-        assert_eq!(protocol.tiles[&(304, 0, 10)].size(), Size::new(68, 10));
+        assert!(protocol.tiles.contains_key(&(298, 0, 6, 68)));
+        assert_eq!(protocol.tiles.len(), 4);
+        assert_eq!(protocol.tiles[&(298, 0, 6, 68)].size(), Size::new(68, 16));
+        assert_eq!(protocol.tiles[&(336, 0, 4, 68)].size(), Size::new(68, 4));
         let row = terminal.backend().buffer()[(27, 3)]
             .symbol()
             .split_once('\u{10EEEE}')
@@ -8148,14 +10899,14 @@ pub(crate) mod tests {
             .1
             .chars()
             .next();
-        assert_eq!(row, Some('\u{305}'));
+        assert_eq!(row, Some('\u{34B}'));
     }
 
     #[test]
     fn when_a_card_is_wider_than_kittys_column_limit_it_should_render_its_right_edge() {
         let mut app = card_with_image(640, 320);
 
-        let cells = placeholder_cells(&mut app, 340, 20);
+        let cells = placeholder_cells(&mut app, 340, 150);
 
         assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(33));
         assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(334));
@@ -8164,9 +10915,11 @@ pub(crate) mod tests {
     #[test]
     fn when_scrolling_an_iterm2_card_it_should_encode_only_the_visible_image_rows() {
         let mut app = card_with_image(320, 640);
+        app.tabs[3].feed.posts.push(post_with("tail", Media::None));
+        app.tabs[3].feed.posts.push(post_with("tail2", Media::None));
         app.image_picker.set_protocol_type(ProtocolType::Iterm2);
         screen(&mut app, 100, 20);
-        app.scroll_card(16);
+        app.scroll_card(3);
 
         screen(&mut app, 100, 20);
 
@@ -8177,21 +10930,22 @@ pub(crate) mod tests {
         else {
             panic!("card protocol");
         };
-        assert_eq!(protocol.tiles.len(), 2);
-        assert_eq!(protocol.tiles[&(14, 0, 2)].size(), Size::new(68, 2));
-        assert_eq!(protocol.tiles[&(16, 0, 14)].size(), Size::new(68, 14));
+        assert_eq!(protocol.tiles.len(), 1);
+        assert_eq!(protocol.tiles[&(1, 0, 8, 9)].size(), Size::new(9, 8));
         assert!(matches!(
-            *protocol.tiles[&(14, 0, 2)],
-            ratatui_image::protocol::Protocol::ITerm2(_)
+            *protocol.tiles[&(1, 0, 8, 9)],
+            crate::card_image::Tile::Image(ratatui_image::protocol::Protocol::ITerm2(_))
         ));
     }
 
     #[test]
     fn when_scrolling_a_sixel_card_it_should_encode_only_the_visible_image_rows() {
         let mut app = card_with_image(320, 640);
+        app.tabs[3].feed.posts.push(post_with("tail", Media::None));
+        app.tabs[3].feed.posts.push(post_with("tail2", Media::None));
         app.image_picker.set_protocol_type(ProtocolType::Sixel);
         screen(&mut app, 100, 20);
-        app.scroll_card(16);
+        app.scroll_card(3);
 
         screen(&mut app, 100, 20);
 
@@ -8202,12 +10956,11 @@ pub(crate) mod tests {
         else {
             panic!("card protocol");
         };
-        assert_eq!(protocol.tiles.len(), 2);
-        assert_eq!(protocol.tiles[&(14, 0, 2)].size(), Size::new(68, 2));
-        assert_eq!(protocol.tiles[&(16, 0, 14)].size(), Size::new(68, 14));
+        assert_eq!(protocol.tiles.len(), 1);
+        assert_eq!(protocol.tiles[&(1, 0, 8, 9)].size(), Size::new(9, 8));
         assert!(matches!(
-            *protocol.tiles[&(14, 0, 2)],
-            ratatui_image::protocol::Protocol::Sixel(_)
+            *protocol.tiles[&(1, 0, 8, 9)],
+            crate::card_image::Tile::Image(ratatui_image::protocol::Protocol::Sixel(_))
         ));
     }
 
@@ -8226,7 +10979,7 @@ pub(crate) mod tests {
         screen(&mut app, 100, 20);
 
         assert_eq!(app.current_post().unwrap().id, "p1");
-        assert_eq!(app.active_tab().feed.cards.line, 16);
+        assert_eq!(app.active_tab().feed.cards.line, 0);
     }
 
     #[test]
@@ -8234,12 +10987,12 @@ pub(crate) mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = card_with_image(320, 640);
         app.tabs[3].feed.posts.push(post_with("p2", Media::None));
-        screen(&mut app, 100, 20);
+        screen(&mut app, 100, 12);
         app.move_selection(1);
-        screen(&mut app, 100, 20);
+        screen(&mut app, 100, 12);
         crate::keys::handle(&mut app, KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
-        screen(&mut app, 100, 20);
-        assert_eq!(app.active_tab().feed.cards.line, 45);
+        screen(&mut app, 100, 12);
+        assert_eq!(app.active_tab().feed.cards.line, 0);
         assert_eq!(app.current_post().unwrap().id, "p1");
     }
 
@@ -8282,6 +11035,7 @@ pub(crate) mod tests {
         let mut app = card_feed_app(kitty());
         app.tabs[3].feed.posts[0].media = Media::Gallery {
             images: vec!["https://i.redd.it/full.jpeg".into()],
+            previews: Vec::new(),
             thumb: Some("https://i.redd.it/small.jpeg".into()),
         };
 
@@ -8333,6 +11087,193 @@ pub(crate) mod tests {
             }
         }
         cells
+    }
+
+    #[test]
+    fn empty_nsfw_disabled_feed_should_explain_how_to_show_nsfw() {
+        for (width, height) in [(40, 12), (24, 8)] {
+            let mut app = feed_app(Picker::halfblocks());
+            app.config.show_nsfw = false;
+            app.show_sidebar = false;
+            app.on_msg(Msg::Feed {
+                tab: app.active_tab().id,
+                generation: app.active_tab().feed.generation,
+                append: false,
+                result: Ok(crate::model::Listing {
+                    posts: vec![],
+                    after: None,
+                }),
+            });
+
+            let actual = screen(&mut app, width, height);
+
+            assert!(actual.contains("No visible posts"), "{actual}");
+            let words = actual.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(words.contains("NSFW is off"), "{actual}");
+            let compact: String = actual.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                compact.contains("F2") && compact.contains("ShowNSFW"),
+                "{actual}"
+            );
+            assert!(!words.contains("restart"), "{actual}");
+            assert!(!actual.contains("No posts here"), "{actual}");
+        }
+    }
+
+    #[test]
+    fn empty_nsfw_disabled_search_should_explain_the_setting() {
+        let mut app = feed_app(Picker::halfblocks());
+        app.config.show_nsfw = false;
+        app.search("something".into());
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Ok(crate::model::Listing {
+                posts: vec![],
+                after: None,
+            }),
+        });
+
+        let actual = screen(&mut app, 100, 20);
+
+        assert!(actual.contains("No results"), "{actual}");
+        assert!(
+            actual.contains("F2") && actual.contains("Show NSFW"),
+            "{actual}"
+        );
+        assert!(!actual.contains("restart"), "{actual}");
+    }
+
+    #[test]
+    fn empty_nsfw_enabled_feed_should_keep_the_normal_empty_message() {
+        let mut app = feed_app(Picker::halfblocks());
+        app.config.show_nsfw = true;
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Ok(crate::model::Listing {
+                posts: vec![],
+                after: None,
+            }),
+        });
+
+        let actual = screen(&mut app, 100, 20);
+
+        assert!(actual.contains("No posts here"), "{actual}");
+        assert!(!actual.contains("show_nsfw"), "{actual}");
+    }
+
+    #[test]
+    fn empty_nsfw_disabled_island_should_suggest_the_existing_setting() {
+        for width in [40, 100] {
+            let mut app = app(&["empty"]);
+            app.config.show_nsfw = false;
+            app.show_sidebar = false;
+            app.on_msg(Msg::Group {
+                subreddit: "empty".into(),
+                generation: app.all_subs.groups[0].generation,
+                result: Ok(crate::model::Listing {
+                    posts: vec![],
+                    after: None,
+                }),
+            });
+
+            let actual = screen(&mut app, width, 20);
+
+            assert!(actual.contains("NSFW off"), "{actual}");
+            assert!(
+                actual.contains("F2") && actual.contains("Show NSFW"),
+                "{actual}"
+            );
+            assert!(!actual.contains("restart"), "{actual}");
+        }
+    }
+
+    #[test]
+    fn empty_nsfw_disabled_content_tools_should_fit_the_setting_guidance() {
+        use crate::app::experience::Screen;
+        use crate::reddit::experience::{Page, Query, SearchKind, SearchSort, UserFeed};
+        for query in [
+            Query::Search {
+                text: "something".into(),
+                kind: SearchKind::Posts,
+                sort: SearchSort::Relevance,
+                time: crate::model::TimeRange::Day,
+            },
+            Query::User {
+                name: "someone".into(),
+                feed: UserFeed::Posts,
+            },
+            Query::Communities,
+            Query::Multi {
+                owner: "someone".into(),
+                name: "example".into(),
+            },
+        ] {
+            let mut app = app(&[]);
+            app.config.show_nsfw = false;
+            app.overlay = Some(Overlay::Experience);
+            app.experience.screens = vec![Screen::Browse {
+                query,
+                page: Page {
+                    title: "Empty collection".into(),
+                    text: String::new(),
+                    entries: vec![],
+                    after: None,
+                    url: String::new(),
+                },
+                selected: 0,
+                scroll: 0,
+            }];
+
+            let actual = screen(&mut app, 60, 16);
+
+            assert!(actual.contains("NSFW is off"), "{actual}");
+            assert!(
+                actual.contains("F2") && actual.contains("Show NSFW"),
+                "{actual}"
+            );
+            assert!(!actual.contains("restart"), "{actual}");
+        }
+    }
+
+    #[test]
+    fn empty_nsfw_guidance_should_preserve_notifications_and_supplied_text() {
+        use crate::app::experience::Screen;
+        use crate::reddit::experience::{Inbox, Page, Query};
+        for (show_nsfw, query, text, expected) in [
+            (false, Query::Inbox(Inbox::Unread), "", "No items."),
+            (true, Query::Communities, "", "No items."),
+            (
+                false,
+                Query::Communities,
+                "A supplied explanation",
+                "A supplied explanation",
+            ),
+        ] {
+            let mut app = app(&[]);
+            app.config.show_nsfw = show_nsfw;
+            app.overlay = Some(Overlay::Experience);
+            app.experience.screens = vec![Screen::Browse {
+                query,
+                page: Page {
+                    title: "Empty collection".into(),
+                    text: text.into(),
+                    entries: vec![],
+                    after: None,
+                    url: String::new(),
+                },
+                selected: 0,
+                scroll: 0,
+            }];
+
+            let actual = screen(&mut app, 60, 16);
+
+            assert!(actual.contains(expected), "{actual}");
+            assert!(!actual.contains("show_nsfw"), "{actual}");
+        }
     }
 
     #[test]
@@ -8482,13 +11423,16 @@ pub(crate) mod tests {
                     .ends_with(" s")
             })
             .unwrap() as u16;
-        let card_row = s.lines().position(|l| l.contains("╭")).unwrap() as u16;
+        let card_row = s
+            .lines()
+            .position(|l| l.contains('╭') || l.contains('╔'))
+            .unwrap() as u16;
         let card_x = s
             .lines()
             .nth(card_row as usize)
             .unwrap()
             .chars()
-            .position(|c| c == '╭')
+            .position(|c| c == '╭' || c == '╔')
             .unwrap() as u16;
         // Sidebar: x 1 + bar + number = 3; card title: corner + space = 2.
         let mut expected = vec![
@@ -8513,15 +11457,200 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn popup_media_jump_should_preserve_card_pixels_around_its_bounds() {
+        let mut app = card_with_image(640, 320);
+        let before = placeholder_cells(&mut app, 100, 40);
+        press(&mut app, 'p');
+
+        let actual = placeholder_cells(&mut app, 100, 40);
+
+        assert!(!actual.is_empty());
+        assert!(
+            actual
+                .iter()
+                .all(|&(x, y)| !Rect::new(22, 15, 56, 10).contains((x, y).into()))
+        );
+        assert!(
+            actual
+                .iter()
+                .any(|&(x, y)| x >= 78 && (15..25).contains(&y)),
+            "right-side image strip remains visible"
+        );
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert_eq!(placeholder_cells(&mut app, 100, 40), before);
+    }
+
+    #[test]
+    fn popup_media_jump_should_preserve_iterm2_card_fragments() {
+        let mut app = card_with_image(640, 320);
+        app.image_picker.set_protocol_type(ProtocolType::Iterm2);
+        let CardImageSlot::Ready { image, .. } = app
+            .card_images
+            .get_mut("https://i.redd.it/p1.jpeg")
+            .unwrap()
+        else {
+            panic!("loaded card")
+        };
+        *image = std::sync::Arc::new(image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+            640,
+            320,
+            |x, _| image::Rgb([if x < 320 { 0 } else { 255 }, 0, 0]),
+        )));
+        screen(&mut app, 100, 40);
+        press(&mut app, 'p');
+
+        let actual = screen(&mut app, 100, 40);
+
+        assert!(actual.contains("doNotMoveCursor=1:"));
+        assert!(actual.contains("Jump"));
+        let CardImageSlot::Ready {
+            protocol: Some(protocol),
+            ..
+        } = app.card_images.get("https://i.redd.it/p1.jpeg").unwrap()
+        else {
+            panic!("encoded fragments")
+        };
+        let right: Vec<_> = protocol
+            .tiles
+            .iter()
+            .filter(|(key, _)| key.1 == 51)
+            .collect();
+        assert!(!right.is_empty());
+        assert!(
+            right.iter().all(|(_, tile)| match tile.as_ref() {
+                crate::card_image::Tile::Image(protocol) =>
+                    card_png(protocol).pixels().all(|p| p.0 == [255, 0, 0]),
+                _ => false,
+            }),
+            "right strips must sample the original image's right half"
+        );
+    }
+
+    #[test]
+    fn popup_media_jump_should_preserve_sixel_card_fragments() {
+        let mut app = card_with_image(320, 640);
+        app.image_picker.set_protocol_type(ProtocolType::Sixel);
+        press(&mut app, 'p');
+
+        let actual = screen(&mut app, 100, 40);
+
+        assert!(actual.contains("\u{1b}P"));
+        assert!(actual.contains("Jump"));
+    }
+
+    #[test]
+    fn popup_media_jump_should_preserve_halfblock_pixels_outside_the_popup() {
+        let mut app = card_with_image(320, 640);
+        app.image_picker.set_protocol_type(ProtocolType::Halfblocks);
+        press(&mut app, 'p');
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        while app.card_renderer.pending() {
+            app.card_renderer.wait_for_completion();
+            app.card_renderer.poll();
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+        }
+
+        let actual = terminal.backend().buffer();
+
+        assert!(
+            actual
+                .content
+                .iter()
+                .any(|cell| cell.fg == Color::Rgb(0, 0, 0) || cell.bg == Color::Rgb(0, 0, 0))
+        );
+        assert!((15..25).all(
+            |y| (22..78).all(|x| actual[(x, y)].fg != Color::Rgb(0, 0, 0)
+                && actual[(x, y)].bg != Color::Rgb(0, 0, 0))
+        ));
+    }
+
+    #[test]
+    fn popup_media_jump_should_keep_the_paused_detail_video_frame() {
+        let mut app = open_video_post();
+        let url = app.reddit.media_url(VIDEO).unwrap();
+        let frame = video::Frame {
+            width: 160,
+            height: 90,
+            pixels: video::Pixels::Raw(std::sync::Arc::new(image::DynamicImage::new_rgb8(160, 90))),
+            same_as_first: false,
+        };
+        let mut player = video::Player::showing(&url, frame);
+        player.area = app.video_area.unwrap().as_size();
+        app.video = Some(player);
+        press(&mut app, 'P');
+        press(&mut app, 'p');
+        app.tick();
+
+        let actual = placeholder_cells(&mut app, 100, 40);
+
+        assert!(!actual.is_empty());
+        assert!(app.video.as_ref().unwrap().hidden());
+        assert!(app.video.as_ref().unwrap().paused());
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        app.tick();
+        assert!(app.video.as_ref().unwrap().paused());
+        assert!(!app.video.as_ref().unwrap().hidden());
+    }
+
+    #[test]
+    fn popup_media_inline_errors_should_not_paint_over_the_dialog() {
+        let mut app = image_post("");
+        let url = "https://i.redd.it/failed.png";
+        app.images
+            .insert(url.into(), ImageSlot::Failed("unavailable".into()));
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let mut expected = None;
+
+        terminal
+            .draw(|f| {
+                f.render_widget(
+                    Paragraph::new("Opaque popup\nOpaque popup\nOpaque popup"),
+                    f.area(),
+                );
+                expected = Some(f.buffer_mut().clone());
+                draw_inline_image(
+                    f,
+                    &mut app,
+                    url,
+                    Rect::new(0, 0, 40, 3),
+                    Some(Rect::new(0, 0, 40, 3)),
+                );
+            })
+            .unwrap();
+
+        assert_eq!(terminal.backend().buffer(), &expected.unwrap());
+    }
+
+    #[test]
+    fn popup_media_help_should_preserve_thumbnails_outside_its_bounds() {
+        let mut app = feed_app(kitty());
+        screen(&mut app, 200, 40);
+        let slot = ready(&app, 32, 32);
+        app.thumbs.insert("https://i.redd.it/p1.jpeg".into(), slot);
+        app.help_scroll = Some(0);
+
+        let actual = placeholder_cells(&mut app, 200, 40);
+
+        assert_eq!(actual.len(), 8, "uncovered 4x2 thumbnail");
+    }
+
+    #[test]
     fn thumbnails_wait_for_an_overlay_to_close() {
         let mut app = feed_app(kitty());
         screen(&mut app, 100, 20);
         let slot = ready(&app, 32, 32);
         app.thumbs.insert("https://i.redd.it/p1.jpeg".into(), slot);
 
-        app.overlay = Some(crate::app::Overlay::Help { scroll: 0 });
+        app.help_scroll = Some(0);
         let under_help = placeholder_cells(&mut app, 100, 20);
-        app.overlay = None;
+        app.help_scroll = None;
         let after = placeholder_cells(&mut app, 100, 20);
 
         // kitty sends an image once, in its first cell: drawing it under the
@@ -8592,6 +11721,7 @@ pub(crate) mod tests {
                     &format!("p{i}"),
                     Media::Image {
                         url: format!("https://i.redd.it/p{i}.jpeg"),
+                        preview: None,
                     },
                 )
             })
@@ -8950,10 +12080,7 @@ pub(crate) mod tests {
         key(&mut app, KeyCode::Char('?'), KeyModifiers::ALT);
 
         assert!(app.post_view.is_none(), "Esc closed the post");
-        assert!(
-            matches!(app.overlay, Some(Overlay::Help { .. })),
-            "then ? opened help"
-        );
+        assert!(app.help_scroll.is_some(), "then ? opened help");
         // Esc then Tab arrives as Alt+Tab: the sort popup closes, then Tab moves on.
         let mut feed = feed_app(Picker::halfblocks());
         let active = feed.active;
@@ -9087,10 +12214,537 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn post_help_should_put_comment_navigation_before_reddit_tools() {
+        let (mut app, _) = open_long_post(|_| {});
+        press(&mut app, '?');
+
+        let shown = screen(&mut app, 100, 24);
+
+        assert!(shown.contains("next / previous comment"));
+    }
+
+    #[test]
+    fn help_should_follow_the_focused_pane_when_a_post_remains_beside_the_list() {
+        let (mut app, _) = open_long_post(|_| {});
+        app.resize(160);
+        app.focus_main();
+        press(&mut app, '?');
+
+        let shown = screen(&mut app, 160, 20);
+
+        assert!(shown.contains("All subs · community islands"));
+        assert!(!shown.contains("Post · reading"));
+    }
+
+    #[test]
+    fn help_should_prioritize_each_list_view() {
+        for (tab, compact, title, expected_key) in [
+            (
+                0,
+                false,
+                "Home · Card view",
+                "cards: scroll a page / half page",
+            ),
+            (
+                1,
+                true,
+                "Bookmarks · Compact view",
+                "remove the selected bookmark",
+            ),
+            (
+                2,
+                false,
+                "All subs · community islands",
+                "next / previous community island",
+            ),
+            (
+                3,
+                false,
+                "Subreddit feed / search · Card view",
+                "subreddit: search",
+            ),
+        ] {
+            let mut app = card_feed_app(Picker::halfblocks());
+            app.active = tab;
+            if compact {
+                app.state.toggle_list_view();
+            }
+            key(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+
+            let shown = screen(&mut app, 120, 20);
+
+            assert!(shown.contains(title), "missing {title}");
+            assert!(shown.contains(expected_key), "missing {expected_key}");
+        }
+    }
+
+    #[test]
+    fn sidebar_help_should_prioritize_switching_tabs() {
+        let mut app = app(&[]);
+        app.focus = Focus::Sidebar;
+        press(&mut app, '?');
+
+        let shown = screen(&mut app, 100, 12);
+
+        assert!(shown.contains("Sidebar and tabs"));
+        assert!(shown.contains("sidebar: next / previous tab"));
+        assert!(!shown.contains("Reddit: saved"));
+    }
+
+    #[test]
+    fn compact_help_should_put_applicable_controls_before_card_line_scrolling() {
+        let mut app = feed_app(Picker::halfblocks());
+        app.active = 0;
+        key(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+
+        let shown = screen(&mut app, 100, 12);
+
+        assert!(shown.contains("Home · Compact view"));
+        assert!(shown.contains("Card / Compact view"));
+        assert!(!shown.contains("cards: scroll down / up one line"));
+    }
+
+    #[test]
+    fn selected_comment_help_should_prioritize_comment_actions() {
+        let (mut app, _) = open_long_post(|_| {});
+        app.activate_comment();
+        press(&mut app, '?');
+
+        let shown = screen(&mut app, 100, 12);
+
+        assert!(shown.contains("Post · comment selected"));
+        assert!(shown.contains("fold a thread · load more replies"));
+        assert!(shown.contains("actions for the selected post or comment"));
+    }
+
+    #[test]
+    fn video_help_should_prioritize_playback_controls() {
+        let mut app = open_video_post();
+        press(&mut app, '?');
+
+        let shown = screen(&mut app, 100, 12);
+
+        assert!(shown.contains("Video / GIF"));
+        assert!(shown.contains("video: pause / play"));
+        assert!(!shown.contains("Reddit: saved"));
+    }
+
+    #[test]
+    fn help_should_prioritize_reading_when_the_video_is_scrolled_away() {
+        let mut app = open_video_post();
+        app.scroll_post(1000);
+        screen(&mut app, 100, 30);
+        assert!(!app.post_view.as_ref().unwrap().image_shown);
+        press(&mut app, '?');
+
+        let shown = screen(&mut app, 100, 12);
+
+        assert!(shown.contains("Post · reading"));
+        assert!(shown.contains("next / previous comment"));
+        assert!(!shown.contains("video: pause"));
+    }
+
+    #[test]
+    fn gallery_help_should_prioritize_browsing_images() {
+        let mut app = image_post("caption");
+        app.post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .post
+            .media = Media::Gallery {
+            images: vec!["https://i.redd.it/first.png".into()],
+            previews: Vec::new(),
+            thumb: None,
+        };
+        press(&mut app, '?');
+
+        let shown = screen(&mut app, 100, 12);
+
+        assert!(shown.contains("Gallery"));
+        assert!(shown.contains("previous / next gallery image"));
+        assert!(!shown.contains("Reddit: saved"));
+    }
+
+    #[test]
+    fn hidden_media_help_should_prioritize_revealing_spoilers() {
+        let mut app = open_video_post();
+        app.post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .post
+            .spoiler = true;
+        press(&mut app, '?');
+
+        let shown = screen(&mut app, 100, 10);
+
+        assert!(shown.contains("Post · spoiler hidden"));
+        assert!(shown.contains("show / hide spoilers"));
+        assert!(!shown.contains("video: pause"));
+    }
+
+    #[test]
+    fn help_should_preserve_text_dialogs_and_literal_question_marks() {
+        for overlay in [
+            Overlay::Picker(crate::app::PickerState {
+                input: "draft".into(),
+                selected: 2,
+            }),
+            Overlay::Search {
+                input: "draft".into(),
+            },
+        ] {
+            let mut app = app(&[]);
+            app.overlay = Some(overlay);
+            press(&mut app, '?');
+            key(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+            crate::keys::paste(&mut app, "ignored paste");
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+            assert!(app.help_scroll.is_none());
+            match app.overlay.as_ref().unwrap() {
+                Overlay::Picker(p) => assert_eq!(p.input, "draft?"),
+                Overlay::Search { input } => assert_eq!(input, "draft?"),
+                _ => panic!("help replaced the text dialog"),
+            }
+        }
+    }
+
+    #[test]
+    fn dialog_help_should_show_the_active_action_before_view_shortcuts() {
+        for (overlay, title, description) in [
+            (
+                Overlay::Picker(crate::app::PickerState::default()),
+                "Jump / open subreddit",
+                "open the selected result",
+            ),
+            (
+                Overlay::Search {
+                    input: "query".into(),
+                },
+                "Subreddit search",
+                "search this subreddit",
+            ),
+            (
+                Overlay::Sort { selected: 0 },
+                "Choose feed sort",
+                "apply the selected sort",
+            ),
+            (
+                Overlay::Membership {
+                    subreddit: "rust".into(),
+                    join: true,
+                },
+                "Confirm Join / Leave",
+                "confirm the membership change",
+            ),
+            (
+                Overlay::Auth,
+                "Saved accounts / sign-in",
+                "select saved account / Add account",
+            ),
+        ] {
+            let mut app = app(&[]);
+            app.auth.phase = crate::auth::Phase::Accounts;
+            app.overlay = Some(overlay);
+            key(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+
+            let shown = screen(&mut app, 100, 12);
+
+            assert!(shown.contains(title), "missing {title}");
+            assert!(shown.contains(description), "missing {description}");
+            assert!(!shown.contains("Reddit: saved"));
+        }
+    }
+
+    #[test]
+    fn ui_audit_read_forms_should_name_the_read_action_in_narrow_footers() {
+        let mut app = form_app("Search posts across Reddit");
+        let actual = screen(&mut app, 32, 12);
+        assert!(!actual.contains("send"), "{actual}");
+        assert!(actual.contains("Enter search"), "{actual}");
+    }
+
+    #[test]
+    fn ui_audit_optional_description_should_be_identified_before_submission() {
+        let mut app = form_app("Create a custom feed");
+        let actual = screen(&mut app, 80, 24);
+        assert!(actual.contains("Description (optional)"), "{actual}");
+    }
+
+    #[test]
+    fn ui_audit_caret_should_remain_visible_at_a_short_form_wrap_boundary() {
+        let mut app = form_app("Create text post");
+        let Some(crate::app::experience::Screen::Input(form)) = app.experience.screens.last_mut()
+        else {
+            panic!("form missing")
+        };
+        form.fields.truncate(1);
+        form.fields[0].value = "12345678901234567890123456789012".into();
+        form.fields[0].cursor = 32;
+        let actual = screen(&mut app, 40, 6);
+        assert!(actual.contains('▏'), "{actual}");
+    }
+
+    #[test]
+    fn ui_audit_scrolled_multiline_input_should_keep_its_field_label_visible() {
+        let mut app = form_app("Create text post");
+        let Some(crate::app::experience::Screen::Input(form)) = app.experience.screens.last_mut()
+        else {
+            panic!("form missing")
+        };
+        form.active = 2;
+        form.fields[2].value = "A paragraph of draft text.\n".repeat(30);
+        form.fields[2].cursor = form.fields[2].value.len();
+
+        let actual = screen(&mut app, 64, 12);
+
+        assert!(actual.contains("Body (Markdown)"), "{actual}");
+        assert!(actual.contains('▏'), "{actual}");
+    }
+
+    #[test]
+    fn ui_audit_auth_confirmation_help_should_not_advertise_account_navigation() {
+        let mut app = app(&[]);
+        app.overlay = Some(Overlay::Auth);
+        app.auth.phase = crate::auth::Phase::Confirm;
+        let actual = help::entries(&app);
+        let context: Vec<_> = actual
+            .iter()
+            .take_while(|(key, _)| key != "All subs · community islands")
+            .collect();
+        assert!(
+            !context
+                .iter()
+                .any(|(_, text)| text.contains("select an account"))
+        );
+        assert!(
+            !context
+                .iter()
+                .any(|(_, text)| text.contains("reconnect the selected"))
+        );
+    }
+
+    #[test]
+    fn ui_audit_single_field_help_should_not_advertise_field_navigation() {
+        let app = form_app("Search people");
+        let actual = help::entries(&app);
+        assert!(
+            !actual
+                .iter()
+                .any(|(_, text)| text == "next / previous field")
+        );
+    }
+
+    #[test]
+    fn ui_audit_empty_jump_results_should_explain_the_empty_list() {
+        let mut app = app(&[]);
+        app.overlay = Some(Overlay::Picker(crate::app::PickerState {
+            input: "not a reddit name!".into(),
+            selected: 0,
+        }));
+        let actual = screen(&mut app, 80, 20);
+        assert!(actual.contains("No matching"), "{actual}");
+    }
+
+    #[test]
+    fn ui_audit_help_should_remain_discoverable_in_a_narrow_main_footer() {
+        let mut app = feed_app(Picker::halfblocks());
+        app.show_sidebar = false;
+        app.health = Health::Up;
+        let actual = screen(&mut app, 40, 16);
+        assert!(actual.lines().last().unwrap().contains("F1"), "{actual}");
+    }
+
+    #[test]
+    fn ui_audit_long_post_title_should_leave_room_to_read_the_document() {
+        let (mut app, _) = open_long_post(|_| {});
+        app.show_sidebar = false;
+        let view = app.post_view.as_mut().unwrap();
+        view.page.as_mut().unwrap().post.title =
+            format!("{}TITLEEND", "A long title with many words ".repeat(24));
+        screen(&mut app, 50, 14);
+        let view = app.post_view.as_ref().unwrap();
+        assert!(view.page_height >= 6);
+        assert!(
+            view.rendered_document
+                .iter()
+                .any(|line| line.to_string().contains("TITLEEND"))
+        );
+    }
+
+    #[test]
+    fn ui_audit_deep_comment_body_should_fit_the_available_columns() {
+        let (mut app, _) = open_long_post(|_| {});
+        app.show_sidebar = false;
+        let view = app.post_view.as_mut().unwrap();
+        let mut leaf = reply("leaf".into());
+        leaf.body = "Every word in this deeply nested reply must remain readable".into();
+        for depth in 0..24 {
+            let mut parent = reply(format!("p{depth}"));
+            parent.replies = vec![leaf];
+            leaf = parent;
+        }
+        view.page.as_mut().unwrap().comments = vec![leaf];
+        screen(&mut app, 40, 24);
+        let lines = &app.post_view.as_ref().unwrap().rendered_document;
+        let actual = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(lines.iter().all(|line| line.width() <= 34), "{actual}");
+        assert!(actual.contains("readable"));
+    }
+
+    fn form_app(label: &str) -> App {
+        use crate::app::experience::Screen;
+        let mut app = app(&[]);
+        app.reddit_menu();
+        let Screen::Menu {
+            choices, selected, ..
+        } = app.experience.screens.last_mut().unwrap()
+        else {
+            panic!("expected menu")
+        };
+        *selected = choices.iter().position(|c| c.label == label).unwrap();
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        app
+    }
+
+    #[test]
+    fn composer_help_should_preserve_the_draft_and_consume_submit_keys() {
+        use crate::app::experience::Screen;
+        let mut app = form_app("Create text post");
+        crate::keys::paste(&mut app, "Հայերեն");
+        press(&mut app, '?');
+        key(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+        let shown = screen(&mut app, 100, 20);
+        key(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        assert!(shown.contains("Text entry"));
+        assert!(shown.contains("post"));
+        assert!(app.help_scroll.is_none());
+        assert!(app.experience.pending.is_none());
+        let Some(Screen::Input(form)) = app.experience.screens.last() else {
+            panic!("help lost the composer")
+        };
+        assert_eq!(form.fields[0].value, "Հայերեն?");
+        assert_eq!(form.fields[0].cursor, "Հայերեն?".len());
+    }
+
+    #[test]
+    fn menu_help_should_return_to_the_same_selected_action() {
+        use crate::app::experience::Screen;
+        let mut app = app(&[]);
+        app.reddit_menu();
+        press(&mut app, 'j');
+        press(&mut app, '?');
+        let shown = screen(&mut app, 100, 14);
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(shown.contains("Reddit menu / actions"));
+        assert!(matches!(
+            app.experience.screens.last(),
+            Some(Screen::Menu { selected: 1, .. })
+        ));
+        assert!(app.experience.pending.is_none());
+        assert!(matches!(app.overlay, Some(Overlay::Experience)));
+    }
+
+    #[test]
+    fn help_should_follow_a_read_result_without_dismissing_the_new_screen() {
+        use crate::app::experience::Screen;
+        use crate::reddit::experience::{Page, Query, Request, Response};
+        let mut app = app(&[]);
+        app.overlay = Some(Overlay::Experience);
+        app.experience.screens.push(Screen::Loading(Query::Multis));
+        app.experience.pending = Some((
+            91,
+            Request::Read {
+                query: Query::Multis,
+                after: None,
+            },
+        ));
+        key(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+        app.on_experience(
+            91,
+            Ok(Response::Page(Page {
+                title: "Loaded feeds".into(),
+                text: "No feeds".into(),
+                entries: vec![],
+                after: None,
+                url: "/api/multi/mine".into(),
+            })),
+        );
+        let shown = screen(&mut app, 100, 14);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(shown.contains("Reddit collection"));
+        assert!(app.experience.pending.is_none());
+        assert!(
+            matches!(app.experience.screens.last(), Some(Screen::Browse { page, .. }) if page.title == "Loaded feeds")
+        );
+        assert!(matches!(app.overlay, Some(Overlay::Experience)));
+    }
+
+    #[test]
+    fn help_should_not_cancel_or_resubmit_a_pending_write() {
+        use crate::app::experience::Screen;
+        use crate::reddit::experience::{Action, Request, Response};
+        let mut app = app(&[]);
+        app.overlay = Some(Overlay::Experience);
+        app.experience.screens.push(Screen::Confirm {
+            label: "Save post".into(),
+            action: Action::Save {
+                id: "t3_p".into(),
+                save: true,
+            },
+            native: "/".into(),
+        });
+        app.experience.pending = Some((
+            91,
+            Request::Write(Action::Save {
+                id: "t3_p".into(),
+                save: true,
+            }),
+        ));
+        key(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+        let shown = screen(&mut app, 100, 14);
+        app.on_experience(91, Ok(Response::Written { url: None }));
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(shown.contains("Sending to Reddit"));
+        assert!(app.help_scroll.is_none());
+        assert!(app.experience.pending.is_none());
+        assert!(app.overlay.is_none());
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn narrow_help_should_wrap_descriptions_and_clamp_at_the_last_key() {
+        let mut app = app(&[]);
+        press(&mut app, '?');
+        app.help_scroll = Some(usize::MAX);
+        press(&mut app, 'j');
+
+        let shown = screen(&mut app, 32, 12);
+
+        assert!(shown.contains("quit"));
+        assert!(shown.contains("q closes an open"));
+        assert!(app.help_scroll.is_some_and(|s| s < usize::MAX));
+    }
+
+    #[test]
     fn help_scrolls_to_its_last_keys_in_a_short_terminal() {
         let mut app = app(&[]);
         press(&mut app, '?');
-        for _ in 0..HELP.len() {
+        for _ in 0..200 {
             press(&mut app, 'j');
             screen(&mut app, 80, 24);
         }
@@ -9098,7 +12752,10 @@ pub(crate) mod tests {
         let s = screen(&mut app, 80, 24);
 
         assert!(s.contains("quit"), "{s}");
-        assert!(app.overlay.is_some(), "j scrolls, it does not close help");
+        assert!(
+            app.help_scroll.is_some(),
+            "j scrolls, it does not close help"
+        );
     }
 
     #[test]
@@ -9106,9 +12763,18 @@ pub(crate) mod tests {
         let mut app = app(&[]);
         press(&mut app, '?');
 
-        let s = screen(&mut app, 120, 60);
+        let mut s = String::new();
+        let mut offset = 0;
+        loop {
+            app.help_scroll = Some(offset);
+            s.push_str(&screen(&mut app, 160, 160));
+            if app.help_scroll.unwrap() < offset {
+                break;
+            }
+            offset += 20;
+        }
 
-        for (key, desc) in HELP.iter().filter(|(_, d)| !d.is_empty()) {
+        for (key, desc) in help::entries(&app).iter().filter(|(_, d)| !d.is_empty()) {
             // The key, its padding and the whole description, on one line.
             assert!(
                 s.lines()
@@ -9136,6 +12802,7 @@ pub(crate) mod tests {
         app.show_images = true;
         let view = app.post_view.as_mut().unwrap();
         view.page.as_mut().unwrap().post.media = Media::Video {
+            gif: false,
             url: Some(VIDEO.into()),
             poster: None,
         };
@@ -9144,32 +12811,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn when_a_frame_is_encoded_for_fixed_cells_the_video_band_should_be_that_tall() {
+    fn when_detail_uses_sixel_it_should_keep_viewport_fitted_document_geometry() {
         let mut app = open_video_post();
-        let mut picker = kitty();
-        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Sixel);
-        app.image_picker = picker.clone();
-        // A 160×90 frame encoded unscaled is 20×6 cells; the rule would grow it twice.
-        let image = image::DynamicImage::new_rgb8(160, 90);
-        let protocol = picker
-            .new_protocol(image, Size::new(98, 30), Resize::Fit(None))
-            .unwrap();
-        let cells = protocol.size();
-        let frame = video::Frame {
-            width: 160,
-            height: 90,
-            pixels: video::Pixels::Image(protocol),
-            same_as_first: false,
-        };
-        let url = app.reddit.media_url(VIDEO).unwrap();
-        app.video = Some(video::Player::showing(&url, frame));
-
-        let s = screen(&mut app, 100, 40);
-
-        let row = |text: &str| s.lines().position(|l| l.contains(text)).unwrap();
-        assert_eq!(cells.height, 6);
-        // Six picture rows right under the header, then the status line.
-        assert_eq!(row("pause") - row("╰"), 6 + 1, "no empty band:\n{s}");
+        app.image_picker.set_protocol_type(ProtocolType::Sixel);
+        app.post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .post
+            .preview_size = Some((1080, 1920));
+        let actual = detail_pictures(&mut app, 80, 30);
+        assert_eq!(actual[0].size, Size::new(17, 15));
     }
 
     #[test]
@@ -9184,7 +12838,7 @@ pub(crate) mod tests {
         assert_eq!(step(&mut app), Some(false), "starts with the post");
         press(&mut app, '?');
         assert_eq!(step(&mut app), Some(true), "waits under the help");
-        app.overlay = None;
+        app.help_scroll = None;
         assert_eq!(step(&mut app), Some(false));
         press(&mut app, ' ');
         assert_eq!(step(&mut app), Some(true), "waits while scrolled away");
@@ -9208,6 +12862,7 @@ pub(crate) mod tests {
         let mut page = view.page.take().unwrap();
         page.post.media = Media::Image {
             url: "https://i.redd.it/f5ndv6yotovh1.gif".into(),
+            preview: None,
         };
 
         app.on_msg(Msg::Post {
@@ -9263,8 +12918,8 @@ pub(crate) mod tests {
     #[test]
     fn a_resized_video_starts_again_as_it_was_once_the_size_holds() {
         let mut app = open_video_post();
-        let step = |app: &mut App, h: u16| {
-            screen(app, 100, h);
+        let step = |app: &mut App, height: u16| {
+            screen(app, 100, height);
             app.tick();
         };
         step(&mut app, 30);
@@ -9272,15 +12927,15 @@ pub(crate) mod tests {
         press(&mut app, 'P');
 
         // Two draws at once at the new size: it has not held still yet.
-        step(&mut app, 22);
-        step(&mut app, 22);
+        step(&mut app, 40);
+        step(&mut app, 40);
         assert_eq!(
             app.video.as_ref().unwrap().area,
             first,
             "a size passing by changes nothing"
         );
         std::thread::sleep(std::time::Duration::from_millis(300));
-        step(&mut app, 22);
+        step(&mut app, 40);
         let player = app.video.as_ref().unwrap();
         assert_ne!(player.area, first, "sized for the new area");
         assert!(player.paused(), "still paused");
@@ -9296,6 +12951,14 @@ pub(crate) mod tests {
     #[test]
     fn when_a_frame_shrinks_the_drawn_video_the_decoder_should_not_restart() {
         let mut app = open_video_post();
+        app.post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .post
+            .preview_size = Some((1600, 900));
         let step = |app: &mut App| {
             screen(app, 100, 30);
             app.tick();
@@ -9309,7 +12972,7 @@ pub(crate) mod tests {
         let frame = video::Frame {
             width: 160,
             height: 9,
-            pixels: video::Pixels::Zlib(vec![1, 2, 3]),
+            pixels: video::Pixels::Raw(std::sync::Arc::new(image::DynamicImage::new_rgb8(160, 9))),
             same_as_first: true,
         };
         let mut player = video::Player::showing(&url, frame);
@@ -9334,17 +12997,58 @@ pub(crate) mod tests {
         let frame = || video::Frame {
             width: 16,
             height: 9,
-            pixels: video::Pixels::Zlib(vec![1, 2, 3]),
+            pixels: video::Pixels::Raw(std::sync::Arc::new(image::DynamicImage::new_rgb8(16, 9))),
             same_as_first: false,
         };
         let url = app.reddit.media_url(VIDEO).unwrap();
         app.video = Some(video::Player::showing(&url, frame()));
-        let sends = |app: &mut App| screen(app, 100, 30).matches("_Ga=T").count();
+        let sends = |app: &mut App| screen(app, 100, 40).matches("_Ga=T").count();
 
-        assert_eq!(sends(&mut app), 1);
+        assert_eq!(sends(&mut app), 2);
         assert_eq!(sends(&mut app), 0, "a redraw repeats the cells only");
         app.video.as_mut().unwrap().show(frame());
-        assert_eq!(sends(&mut app), 1, "the next frame goes out");
+        assert_eq!(
+            sends(&mut app),
+            2,
+            "the next frame sends both visible tiles"
+        );
+    }
+
+    #[test]
+    fn video_frame_preparation_should_not_show_image_loading_activity() {
+        let mut app = open_video_post();
+        let url = app.reddit.media_url(VIDEO).unwrap();
+        let frame = || video::Frame {
+            width: 16,
+            height: 9,
+            pixels: video::Pixels::Raw(std::sync::Arc::new(image::DynamicImage::new_rgb8(16, 9))),
+            same_as_first: false,
+        };
+        app.video = Some(video::Player::showing(&url, frame()));
+        for _ in 0..2 {
+            let actual = first_screen(&mut app, 100, 40);
+            assert!(app.card_renderer.pending(), "keep graphics backpressure");
+            assert!(
+                !app.images_loading(),
+                "normal video preparation is playback"
+            );
+            assert!(
+                !actual.lines().last().unwrap().contains("images"),
+                "{actual}"
+            );
+            app.card_renderer.wait_for_completion();
+            assert!(
+                app.card_renderer.pending(),
+                "unpublished tiles still need polling"
+            );
+            assert!(
+                !app.images_loading(),
+                "completed video tiles are playback too"
+            );
+            assert!(app.card_renderer.poll());
+            assert!(!app.card_renderer.pending());
+            app.video.as_mut().unwrap().show(frame());
+        }
     }
 
     #[test]
@@ -9932,6 +13636,632 @@ pub(crate) mod tests {
         assert_eq!(
             view.scroll, view.row_starts[reply],
             "follow the reply, not its sibling"
+        );
+    }
+    #[test]
+    fn ui_audit_safety_labels_should_precede_a_long_author_in_compact_rows() {
+        let mut app = feed_app(Picker::halfblocks());
+        app.show_sidebar = false;
+        app.config.show_nsfw = true;
+        for post in &mut app.tabs[3].feed.posts {
+            post.author = "an_author_name_that_is_long_enough_to_fill_the_metadata_row".into();
+            post.nsfw = true;
+            post.spoiler = true;
+        }
+
+        let actual = screen(&mut app, 40, 20);
+
+        assert!(actual.contains("spoiler"), "{actual}");
+    }
+
+    #[test]
+    fn ui_audit_narrow_loading_and_text_only_views_should_show_applicable_controls() {
+        use crate::app::experience::Screen;
+        use crate::reddit::experience::{Page, Query, Request};
+        for width in [20, 24, 40, 72] {
+            let mut app = app(&[]);
+            app.overlay = Some(Overlay::Experience);
+            let query = Query::Rules("rust".into());
+            app.experience.screens = vec![Screen::Loading(query.clone())];
+            app.experience.pending = Some((
+                1,
+                Request::Read {
+                    query: query.clone(),
+                    after: None,
+                },
+            ));
+            let actual = screen(&mut app, width, 8);
+            assert!(!actual.contains("r retry"), "{actual}");
+            assert!(actual.contains("Esc"), "{actual}");
+            app.experience.pending = None;
+            app.experience.screens = vec![Screen::Browse {
+                query,
+                page: Page {
+                    title: "Rules".into(),
+                    text: "Community rules".into(),
+                    entries: vec![],
+                    after: None,
+                    url: "/r/rust/about/rules".into(),
+                },
+                selected: 0,
+                scroll: 0,
+            }];
+            let actual = screen(&mut app, width, 8);
+            assert!(!actual.contains("Enter"), "{actual}");
+            assert!(actual.contains("Esc"), "{actual}");
+        }
+    }
+
+    pub(crate) fn auth_content(app: &mut App, width: u16, height: u16) -> String {
+        let buf = screen_buffer(app, width, height);
+        (0..height)
+            .filter(|&y| buf[(2, y)].symbol() == "│" && buf[(width - 3, y)].symbol() == "│")
+            .map(|y| {
+                (4..width - 4)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn ui_audit_short_accounts_should_preserve_identity_and_back_controls() {
+        use crate::auth::Phase;
+        for name in ["reader", "abcdefghijklmnopqrst"] {
+            for (width, height) in [(14, 6), (18, 6), (20, 6), (20, 8), (24, 8), (40, 12)] {
+                for phase in [Phase::Accounts, Phase::DisconnectConfirm] {
+                    let mut app = app(&[]);
+                    app.overlay = Some(Overlay::Auth);
+                    app.auth.phase = phase;
+                    app.auth.accounts = vec![saved_account(name, true)];
+                    app.auth.active_id = Some(name.into());
+                    app.auth.removal_name = Some(format!("u/{name}"));
+                    let actual = auth_content(&mut app, width, height);
+                    if phase == Phase::Accounts && height >= 8 {
+                        assert!(actual.contains("expired"), "{actual}");
+                    }
+                    if phase == Phase::Accounts && width == 40 {
+                        assert!(actual.contains(&format!("u/{name}")), "{actual}");
+                    }
+                    assert!(
+                        actual.contains(&format!("u/{name}"))
+                            || (actual.contains(&format!("u/{}", &name[..1]))
+                                && actual.contains('…')),
+                        "{phase:?}: {actual}"
+                    );
+                    assert!(
+                        actual.contains("Esc") || actual.contains('⎋'),
+                        "{phase:?}: {actual}"
+                    );
+                    assert!(
+                        actual.contains("Enter") || actual.contains('⏎'),
+                        "{phase:?}: {actual}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ui_audit_direct_inputs_should_backspace_complete_graphemes() {
+        for (input, expected) in [("cafe\u{301}", "caf"), ("x👩‍💻", "x"), ("x🇮🇪", "x"), ("", "")]
+        {
+            for picker in [false, true] {
+                let mut app = app(&[]);
+                app.overlay = Some(if picker {
+                    Overlay::Picker(crate::app::PickerState::default())
+                } else {
+                    Overlay::Search {
+                        input: String::new(),
+                    }
+                });
+                crate::keys::paste(&mut app, input);
+                key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+                let actual = match app.overlay.as_ref().unwrap() {
+                    Overlay::Picker(picker) => &picker.input,
+                    Overlay::Search { input } => input,
+                    _ => unreachable!(),
+                };
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn ui_audit_failed_forms_should_keep_correction_visible() {
+        use crate::app::experience::Screen;
+        for label in [
+            "Search posts across Reddit",
+            "Search communities",
+            "Search people",
+            "Open a user profile",
+            "Create text post",
+            "Create link post",
+            "Create a custom feed",
+        ] {
+            for (width, height) in [(20, 6), (24, 8), (40, 12), (64, 18)] {
+                let mut app = form_app(label);
+                let Screen::Input(form) = app.experience.screens.last_mut().unwrap() else {
+                    panic!("form missing")
+                };
+                let missing = form
+                    .fields
+                    .iter()
+                    .rposition(|field| field.required)
+                    .unwrap();
+                for (i, field) in form.fields.iter_mut().enumerate() {
+                    field.value = if i == missing {
+                        String::new()
+                    } else {
+                        "fixture".into()
+                    };
+                    field.cursor = field.value.len();
+                }
+                key(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+                assert!(app.experience.error.is_some());
+                assert!(app.experience.pending.is_none());
+                let buf = screen_buffer(&mut app, width, height);
+                assert!(
+                    buf.content()
+                        .iter()
+                        .any(|cell| cell.fg == RED
+                            && cell.symbol().chars().any(char::is_alphanumeric)),
+                    "error feedback missing at {width}x{height}"
+                );
+                let before = buffer_text(&buf);
+                assert!(before.contains('▏'), "{label}: {before}");
+                crate::keys::paste(&mut app, "fixedbody");
+                let actual = screen(&mut app, width, height);
+                assert!(
+                    actual.contains("fixedbody") && actual.contains('▏'),
+                    "{label}: {actual}"
+                );
+                assert!(actual.contains("Esc"), "{actual}");
+            }
+        }
+    }
+
+    #[test]
+    fn ui_audit_narrow_headers_should_prioritize_failure_and_retry() {
+        let mut subs = app(&["s"]);
+        subs.show_sidebar = false;
+        subs.all_subs.groups[0].posts = vec![post_with("p", Media::None)];
+        subs.all_subs.groups[0].loading = false;
+        subs.on_msg(Msg::Subscriptions {
+            generation: 0,
+            result: Err("fixture failure".into()),
+        });
+        subs.status = None;
+        let actual = screen(&mut subs, 24, 8);
+        let header = actual.lines().take(3).collect::<Vec<_>>().join("\n");
+        assert!(
+            header.contains("subs failed") && header.contains("r retry"),
+            "{actual}"
+        );
+        for retained in [false, true] {
+            let mut group = app(&["a_very_long_community"]);
+            group.show_sidebar = false;
+            group.all_subs.groups[0].loading = false;
+            group.all_subs.groups[0].error = Some("Fixture refresh failure".into());
+            if retained {
+                let mut post = post_with("cached", Media::None);
+                post.subreddit = "a_very_long_community".into();
+                group.all_subs.groups[0].posts = vec![post];
+            }
+            group.status = None;
+            let actual = screen(&mut group, 24, 10);
+            assert!(
+                actual
+                    .lines()
+                    .any(|line| line.contains('✗') && line.contains("r retry")),
+                "{actual}"
+            );
+        }
+        for append in [false, true] {
+            let mut feed = feed_with_next_page(ListView::Compact);
+            feed.show_sidebar = false;
+            feed.load_feed(3, append);
+            feed.on_msg(Msg::Feed {
+                tab: feed.active_tab().id,
+                generation: feed.active_tab().feed.generation,
+                append,
+                result: Err("fixture failure".into()),
+            });
+            feed.status = None;
+            let actual = screen(&mut feed, 24, 8);
+            let header = actual.lines().take(3).collect::<Vec<_>>().join("\n");
+            assert!(
+                header.contains("failed")
+                    && header.contains(if append { "L retry" } else { "r retry" }),
+                "{actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn ui_audit_compact_dialogs_should_keep_input_and_cancel_visible() {
+        for (width, height) in [(14, 6), (20, 6), (20, 8), (24, 8), (40, 12)] {
+            for kind in ["jump", "search", "sort", "help", "form", "composer"] {
+                let mut app = app(&["rust"]);
+                match kind {
+                    "jump" => {
+                        press(&mut app, 'p');
+                        crate::keys::paste(&mut app, "rust");
+                    }
+                    "search" => {
+                        app.overlay = Some(Overlay::Search {
+                            input: "rust".into(),
+                        })
+                    }
+                    "sort" => app.overlay = Some(Overlay::Sort { selected: 0 }),
+                    "help" => app.help_scroll = Some(0),
+                    "form" => app = form_app("Search people"),
+                    "composer" => app = form_app("Create text post"),
+                    _ => unreachable!(),
+                }
+                let actual = screen(&mut app, width, height);
+                if matches!(kind, "jump" | "search") {
+                    assert!(
+                        actual.contains('▏') && (width < 20 || actual.contains("rust")),
+                        "{kind}: {actual}"
+                    );
+                }
+                if matches!(kind, "form" | "composer") {
+                    assert!(actual.contains('▏'), "{actual}");
+                }
+                assert!(
+                    actual.contains("Esc") || actual.contains('⎋'),
+                    "{kind}: {actual}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ui_audit_short_membership_dialogs_should_keep_target_and_cancel_visible() {
+        for name in ["rust", "a_very_long_community"] {
+            for join in [true, false] {
+                for (width, height) in [(20, 6), (20, 8), (24, 8), (40, 12)] {
+                    let mut app = app(&[]);
+                    app.overlay = Some(Overlay::Membership {
+                        subreddit: name.into(),
+                        join,
+                    });
+                    let body = auth_content(&mut app, width, height);
+                    let actual = screen(&mut app, width, height);
+                    assert!(body.contains(&format!("r/{name}")), "{actual}");
+                    assert!(actual.contains("Esc") || actual.contains('⎋'), "{actual}");
+                    assert!(actual.contains("Enter") || actual.contains('⏎'), "{actual}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ui_audit_feedback_should_precede_background_activity() {
+        let mut app = feed_app(Picker::halfblocks());
+        app.show_sidebar = false;
+        app.images.insert(
+            "https://preview.redd.it/pending.png".into(),
+            ImageSlot::Loading,
+        );
+        app.error("Clipboard failure");
+        let actual = screen(&mut app, 20, 8);
+        let footer = actual.lines().last().unwrap();
+        assert!(footer.contains('✗') && footer.contains("Clip"), "{actual}");
+    }
+    #[test]
+    fn settings_f2_should_cover_every_field_and_restore_the_underlying_dialog() {
+        let mut app = app(&[]);
+        app.overlay = Some(Overlay::Search {
+            input: "draft?".into(),
+        });
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE),
+        );
+        assert!(matches!(app.overlay, Some(Overlay::Settings)));
+        let actual = screen(&mut app, 100, 30);
+        for field in crate::config::schema::SETTINGS {
+            assert!(actual.contains(field.label), "{}: {actual}", field.key);
+        }
+        assert!(actual.contains("Temporary"));
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(matches!(app.overlay, Some(Overlay::Search { ref input }) if input == "draft?"));
+    }
+
+    #[test]
+    fn settings_editor_should_keep_unicode_drafts_across_help_and_reject_bad_arrays() {
+        let mut app = app(&[]);
+        app.show_settings();
+        app.settings.selected = 4;
+        let key = |app: &mut App, code, modifiers| {
+            crate::keys::handle(app, crossterm::event::KeyEvent::new(code, modifiers))
+        };
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        key(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        crate::keys::paste(&mut app, "[\"café 👩‍💻\"]");
+        key(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        assert!(app.help_scroll.is_none(), "? is literal in settings inputs");
+        key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        key(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        key(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(app.settings.editing.as_ref().unwrap().value, "[\"café \"]");
+        key(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+        assert!(screen(&mut app, 70, 20).contains("Edit setting"));
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.settings.editing.is_some());
+        let actual = screen(&mut app, 70, 16);
+        assert!(actual.contains("café"), "{actual}");
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.config.filters.keywords, ["café "]);
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        key(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        crate::keys::paste(&mut app, "[42]");
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.settings.message.is_some());
+        assert!(app.settings.editing.is_some());
+        assert_eq!(app.config.filters.keywords, ["café "]);
+    }
+
+    #[test]
+    fn settings_small_dialogs_should_keep_selection_value_and_escape_visible() {
+        let mut app = app(&[]);
+        app.show_settings();
+        app.settings.selected = 10;
+        for (width, height) in [(40, 12), (24, 8), (10, 6), (1, 1)] {
+            let actual = screen(&mut app, width, height);
+            if width >= 24 {
+                assert!(actual.contains("Image command"), "{actual}");
+                assert!(actual.contains("Esc"), "{actual}");
+            }
+        }
+    }
+
+    #[test]
+    fn settings_popup_should_show_temporary_and_retry_revert_actual_file_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[media]\nimage_preview = false\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let mut app = app(&[]);
+        app.settings = crate::app::settings::Settings::new(
+            crate::config::store::Store::open(Some(&path)).unwrap(),
+        );
+        let fixture = crate::config::managed::tests::Fixture::new();
+        app.settings.chezmoi = fixture.tool.clone();
+        app.show_settings();
+        app.settings.selected = 1;
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(app.config.media.image_preview && app.show_images);
+        app.settings.wait_managed();
+        app.tick();
+        let actual = screen(&mut app, 100, 30);
+        assert!(
+            actual.contains("Temporary") && actual.contains("read-only"),
+            "{actual}"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        press(&mut app, 'r');
+        assert!(Config::load(Some(&path)).unwrap().media.image_preview);
+        std::fs::write(&path, "[media]\nimage_preview = false\n").unwrap();
+        press(&mut app, 'u');
+        assert!(!app.show_images);
+        assert!(screen(&mut app, 100, 30).contains("Saved"));
+    }
+
+    fn managed_settings_app() -> (App, crate::config::managed::tests::Fixture) {
+        let fixture = crate::config::managed::tests::Fixture::new();
+        let mut app = app(&[]);
+        app.settings = crate::app::settings::Settings::new(fixture.store());
+        app.settings.chezmoi = fixture.tool.clone();
+        app.overlay = Some(Overlay::Search {
+            input: "retained draft".into(),
+        });
+        app.show_settings();
+        app.settings.selected = crate::config::schema::SETTINGS
+            .iter()
+            .position(|field| field.key == "media.video_autoplay")
+            .unwrap();
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        (app, fixture)
+    }
+
+    #[test]
+    fn managed_settings_should_confirm_before_source_writes_and_keep_session_changes_on_cancel() {
+        let (mut app, fixture) = managed_settings_app();
+        assert!(!app.config.media.video_autoplay);
+        app.settings.wait_managed();
+        app.tick();
+        let actual = screen(&mut app, 100, 30);
+        assert!(actual.contains("Save through chezmoi?"), "{actual}");
+        assert!(
+            actual.contains("media.video_autoplay: true → false"),
+            "{actual}"
+        );
+        assert!(
+            Config::load(Some(&fixture.source))
+                .unwrap()
+                .media
+                .video_autoplay
+        );
+        assert!(
+            Config::load(Some(&fixture.target))
+                .unwrap()
+                .media
+                .video_autoplay
+        );
+
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+
+        assert!(app.settings.managed.is_none());
+        assert!(!app.config.media.video_autoplay);
+        assert_eq!(
+            app.settings.store.persistence,
+            crate::config::store::Persistence::Temporary
+        );
+        assert!(!fixture.directory.path().join("applied-args").exists());
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(
+            matches!(app.overlay, Some(Overlay::Search { ref input }) if input == "retained draft")
+        );
+    }
+
+    #[test]
+    fn managed_settings_should_apply_after_confirmation_and_preserve_help_and_the_covered_dialog() {
+        let (mut app, fixture) = managed_settings_app();
+        app.settings.wait_managed();
+        app.tick();
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(app.settings.busy() && app.loading_active());
+        press(&mut app, 'u');
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(app.settings.busy());
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+        );
+        assert!(!app.loading_active());
+        app.settings.wait_managed();
+
+        app.tick();
+
+        assert_eq!(
+            app.settings.store.persistence,
+            crate::config::store::Persistence::Saved
+        );
+        assert!(
+            !Config::load(Some(&fixture.target))
+                .unwrap()
+                .media
+                .video_autoplay
+        );
+        assert!(app.help_scroll.is_some());
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(matches!(app.overlay, Some(Overlay::Settings)));
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(
+            matches!(app.overlay, Some(Overlay::Search { ref input }) if input == "retained draft")
+        );
+    }
+
+    #[test]
+    fn managed_settings_confirmation_should_scroll_and_keep_controls_in_narrow_windows() {
+        let (mut app, _fixture) = managed_settings_app();
+        app.settings.wait_managed();
+        app.tick();
+        for (width, height) in [(80, 24), (40, 12), (24, 8), (10, 6), (1, 1)] {
+            let before = screen(&mut app, width, height);
+            crate::keys::handle(
+                &mut app,
+                crossterm::event::KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+            );
+            let after = screen(&mut app, width, height);
+            if width >= 24 {
+                assert!(
+                    after.contains("Esc") && (after.contains('⏎') || after.contains("Enter")),
+                    "{after}"
+                );
+            }
+            if width == 40 {
+                assert_ne!(before, after);
+            }
+            crate::keys::handle(
+                &mut app,
+                crossterm::event::KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+            );
+        }
+    }
+
+    #[test]
+    fn managed_settings_should_finish_an_approved_save_when_the_app_quits() {
+        let (mut app, fixture) = managed_settings_app();
+        app.settings.wait_managed();
+        app.tick();
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(app.quit);
+
+        drop(app);
+
+        assert!(
+            !Config::load(Some(&fixture.target))
+                .unwrap()
+                .media
+                .video_autoplay
+        );
+    }
+
+    #[test]
+    fn managed_settings_retry_should_confirm_even_when_values_are_already_applied() {
+        let (mut app, fixture) = managed_settings_app();
+        app.settings.wait_managed();
+        app.tick();
+        std::fs::write(fixture.directory.path().join("writable"), "").unwrap();
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        app.settings.wait_managed();
+        app.tick();
+        assert_eq!(
+            app.settings.store.persistence,
+            crate::config::store::Persistence::Unsaved
+        );
+        app.settings.store.reload();
+        assert!(!app.settings.store.dirty());
+
+        press(&mut app, 'r');
+        app.settings.wait_managed();
+        app.tick();
+
+        let actual = screen(&mut app, 100, 30);
+        assert!(actual.contains("Save through chezmoi?"), "{actual}");
+        assert!(
+            actual.contains("previously approved file permissions"),
+            "{actual}"
+        );
+        assert_ne!(
+            app.settings.store.persistence,
+            crate::config::store::Persistence::Saved
         );
     }
 }
