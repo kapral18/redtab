@@ -25,13 +25,28 @@ and generated comments use the [settings schema](../src/config/schema.rs).
 
 Selected threads, active feeds and main images have separate worker capacity from
 account work, community listings and other media. Cache readers run independently of HTTP.
+
+Account discovery preserves community and followed-user identities. Only communities
+seed All subs; user tabs fetch submitted posts with distinct feed cache keys.
+Community icon URLs and known absence travel with membership snapshots. Ordered
+metadata seeds sidebar icons; only visible pixels load from the CDN. Unknown
+communities alone need a separate metadata lookup. The subscription cache key is
+versioned separately from other cached content.
+Community and user membership share the protected write/acknowledgment and fresh
+subscription reconciliation path. User writes resolve a validated profile fullname
+from `user/<name>/about.json` and use `sr` in `api/subscribe`; community writes keep
+`sr_name`. Neither writes nor ambiguous failures retry automatically. Ordered cache
+tombstones prevent earlier reads from restoring pre-write membership.
 At authenticated admission, selected threads precede visible listings, ordinary
 foreground reads and background reads. Each class yields after two starts when a lower
 class waits, so sustained browsing cannot starve feeds or account actions. All
-classes obey the same base spacing and server cooldowns. Visible reads and actions
-can use up to three quota credits, refilled at the reported quota rate and capped
-by the remaining request count. Background work waits for its paced slot and cannot
-spend those credits early. Startup subscription snapshots use background admission;
+classes share a 500 ms minimum between starts and obey server cooldowns. Native
+HTML/GraphQL and classic JSON track separate quota budgets. Each budget has up to 32
+credits, which refill no faster than once per second and stay capped by remaining quota.
+Background normally spends only idle overflow, retaining up to three credits for
+interaction; after two ready higher-priority starts it can borrow one for fairness.
+That turn uses available credit without waiting for the normal background interval.
+Visible island feeds use listing priority. Startup subscription snapshots use background admission;
 forced membership refreshes retain foreground priority.
 
 Queued and admission-waiting obsolete reads cancel immediately. Active reads get
@@ -63,6 +78,22 @@ Failed continuations keep existing content. Cold loads retain the starter with `
 retry; reloads retain the shown page with `r` retry. Failed combined loads are not cached.
 
 ## Media rendering
+
+YouTube recognition is derived from stored link URLs, so cached posts and bookmarks
+use the same video/poster behavior without a storage migration. Their canonical page
+URL identifies playback; signed stream URLs stay in a 32-entry memory cache for at
+most five minutes, shortened to expire before the signed URL. Failed playback clears
+its cached source.
+
+One background extraction runs at a time. Player disposal cancels it; the worker
+kills and reaps its process group on cancellation, a 20-second deadline or oversized
+output. `yt-dlp` runs without user config, plugins, cookie import or filesystem cache.
+Only public, non-live metadata and HTTPS Google video streams are accepted. Only
+User-Agent, YouTube Referer and Origin headers reach ffmpeg/ffplay. This path never
+uses the authenticated Reddit transport.
+
+Extraction skips HLS manifests, which this playback path cannot use. DASH remains
+available because its metadata can also expose direct HTTPS files.
 
 Main media keeps its aspect ratio and fits the usable pane. Recent cards reuse
 decoded pixels and prepared graphics; rapid navigation delays uncached preparation.

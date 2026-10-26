@@ -10,8 +10,16 @@ pub enum Kind {
     Command,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    Reddit,
+    Reader,
+    Device,
+}
+
 pub struct Setting {
     pub key: &'static str,
+    pub scope: Scope,
     pub label: &'static str,
     pub description: &'static str,
     pub kind: Kind,
@@ -20,66 +28,77 @@ pub struct Setting {
 pub const SETTINGS: &[Setting] = &[
     Setting {
         key: "show_nsfw",
+        scope: Scope::Reddit,
         label: "Show NSFW",
-        description: "Include adult posts. Changing this reloads content immediately.",
-        kind: Kind::Boolean,
-    },
-    Setting {
-        key: "media.image_preview",
-        label: "Image previews",
-        description: "Show inline images, card previews, thumbnails and community icons.",
+        description: "Reddit mature-content setting for feeds and search. Saves to Reddit and reloads content.",
         kind: Kind::Boolean,
     },
     Setting {
         key: "media.video_autoplay",
+        scope: Scope::Reddit,
         label: "Autoplay videos",
-        description: "Play selected videos and GIFs muted after navigation settles. P still plays manually.",
+        description: "Use Reddit account autoplay for selected videos and GIFs. Saves to Reddit; P still plays manually.",
         kind: Kind::Boolean,
     },
     Setting {
-        key: "all_subs_posts_per_group",
-        label: "Posts per community",
-        description: "Number of posts in each All subs island (1–10).",
-        kind: Kind::Count,
-    },
-    Setting {
         key: "filters.keywords",
+        scope: Scope::Reader,
         label: "Hide title keywords",
         description: "Hide titles containing these phrases, ignoring case. Use a TOML string array, e.g. [\"spoiler\"].",
         kind: Kind::Strings,
     },
     Setting {
         key: "filters.flairs",
+        scope: Scope::Reader,
         label: "Hide flairs",
         description: "Hide exact flair names, ignoring case. Use a TOML string array.",
         kind: Kind::Strings,
     },
     Setting {
         key: "filters.authors",
+        scope: Scope::Reader,
         label: "Hide authors",
         description: "Hide exact usernames without u/, ignoring case. Use a TOML string array.",
         kind: Kind::Strings,
     },
     Setting {
         key: "highlight.keywords",
+        scope: Scope::Reader,
         label: "Highlight keywords",
         description: "Emphasize titles containing these phrases, ignoring case. Use a TOML string array.",
         kind: Kind::Strings,
     },
     Setting {
+        key: "media.image_preview",
+        scope: Scope::Device,
+        label: "Image previews",
+        description: "Show inline images, card previews, thumbnails and community icons.",
+        kind: Kind::Boolean,
+    },
+    Setting {
+        key: "all_subs_posts_per_group",
+        scope: Scope::Device,
+        label: "Posts per community",
+        description: "Number of posts in each All subs island (1–10).",
+        kind: Kind::Count,
+    },
+    Setting {
         key: "commands.browser",
+        scope: Scope::Device,
         label: "Browser command",
         description: "Argument array for opening URLs; URL appended. No shell expansion. Example: [\"open\"].",
         kind: Kind::Command,
     },
     Setting {
         key: "commands.video",
+        scope: Scope::Device,
         label: "Video command",
         description: "Argument array for the external video player; stream URL appended. Example: [\"mpv\", \"--force-window=immediate\"].",
         kind: Kind::Command,
     },
     Setting {
         key: "commands.image",
+        scope: Scope::Device,
         label: "Image command",
         description: "Argument array for opening local images; file paths appended. No shell expansion.",
         kind: Kind::Command,
@@ -87,12 +106,33 @@ pub const SETTINGS: &[Setting] = &[
 ];
 
 impl Setting {
+    pub fn file_key(&self, config: &Config) -> String {
+        if self.scope != Scope::Reader {
+            return self.key.into();
+        }
+        match &config.active_account {
+            Some(name) if name.is_empty() => "Reconnect with A to identify this account".into(),
+            Some(name) => format!("accounts.{name}.{}", self.key),
+            None => format!("signed_out.{}", self.key),
+        }
+    }
     pub fn value(&self, config: &Config) -> toml::Value {
-        let value = toml::Value::try_from(config).expect("config serializes");
-        self.key
-            .split('.')
-            .fold(&value, |value, key| &value[key])
-            .clone()
+        let strings =
+            |v: &[String]| toml::Value::Array(v.iter().cloned().map(toml::Value::String).collect());
+        match self.key {
+            "show_nsfw" => config.show_nsfw.into(),
+            "media.video_autoplay" => config.media.video_autoplay.into(),
+            "media.image_preview" => config.media.image_preview.into(),
+            "all_subs_posts_per_group" => (config.all_subs_posts_per_group as i64).into(),
+            "filters.keywords" => strings(&config.filters.keywords),
+            "filters.flairs" => strings(&config.filters.flairs),
+            "filters.authors" => strings(&config.filters.authors),
+            "highlight.keywords" => strings(&config.highlight.keywords),
+            "commands.browser" => strings(&config.commands.browser),
+            "commands.video" => strings(&config.commands.video),
+            "commands.image" => strings(&config.commands.image),
+            _ => unreachable!("known setting"),
+        }
     }
 
     pub(super) fn validate_value(&self, value: &toml::Value) -> Result<()> {
@@ -116,16 +156,38 @@ impl Setting {
     }
 
     pub fn set(&self, config: &Config, value: toml::Value) -> Result<Config> {
-        self.validate_value(&value)?;
-        let mut root = toml::Value::try_from(config)?;
-        let mut target = &mut root;
-        for key in self.key.split('.') {
-            target = &mut target[key];
+        if self.scope == Scope::Reader && config.active_account.as_deref() == Some("") {
+            bail!("Reconnect with A to identify this account before editing reader settings");
         }
-        *target = value;
-        let mut next: Config = root.try_into()?;
-        next.path = config.path.clone();
-        next.validate()?;
+        self.validate_value(&value)?;
+        let mut next = config.clone();
+        let strings = || {
+            value
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect()
+        };
+        match self.key {
+            "show_nsfw" => next.show_nsfw = value.as_bool().unwrap(),
+            "media.video_autoplay" => next.media.video_autoplay = value.as_bool().unwrap(),
+            "media.image_preview" => next.media.image_preview = value.as_bool().unwrap(),
+            "all_subs_posts_per_group" => {
+                next.all_subs_posts_per_group = value.as_integer().unwrap() as usize
+            }
+            "filters.keywords" => next.filters.keywords = strings(),
+            "filters.flairs" => next.filters.flairs = strings(),
+            "filters.authors" => next.filters.authors = strings(),
+            "highlight.keywords" => next.highlight.keywords = strings(),
+            "commands.browser" => next.commands.browser = strings(),
+            "commands.video" => next.commands.video = strings(),
+            "commands.image" => next.commands.image = strings(),
+            _ => unreachable!("known setting"),
+        }
+        if self.scope == Scope::Reader {
+            next.store_reader();
+        }
         Ok(next)
     }
 
@@ -142,16 +204,24 @@ impl Setting {
 pub fn annotated() -> String {
     let defaults = Config::default();
     let mut text = String::from(
-        "# redtab settings — edit here or press F2 in the app.\n# Valid file changes apply live. UI changes save here when writable.\n# F2 offers confirmed source saves for plain chezmoi-managed configs.\n\n",
+        "# redtab settings — edit here or press F2 in the app.\n# Valid file changes apply live. UI changes save here when writable.\n# F2 offers confirmed source saves for plain chezmoi-managed configs.\n# Reddit account preferences are read from and saved to Reddit.\n# Account reader rules use [accounts.<username>.filters] and .highlight.\n\n",
     );
-    for section in ["", "media", "filters", "highlight", "commands"] {
+    for section in [
+        "",
+        "media",
+        "commands",
+        "signed_out.filters",
+        "signed_out.highlight",
+    ] {
         if !section.is_empty() {
             text.push_str(&format!("[{section}]\n"));
         }
-        for field in SETTINGS
-            .iter()
-            .filter(|f| f.key.rsplit_once('.').map_or("", |(s, _)| s) == section)
-        {
+        let reader_section = section.strip_prefix("signed_out.");
+        for field in SETTINGS.iter().filter(|f| {
+            f.scope != Scope::Reddit
+                && f.key.rsplit_once('.').map_or("", |(s, _)| s)
+                    == reader_section.unwrap_or(section)
+        }) {
             let key = field.key.rsplit('.').next().unwrap();
             text.push_str(&format!(
                 "# {}\n{key} = {}\n\n",
@@ -191,13 +261,23 @@ mod tests {
             String::new(),
             &mut keys,
         );
-        let mut schema: Vec<_> = SETTINGS.iter().map(|f| f.key.to_string()).collect();
+        let mut schema: Vec<_> = SETTINGS
+            .iter()
+            .filter(|f| f.scope != Scope::Reddit)
+            .map(|f| {
+                if f.scope == Scope::Reader {
+                    format!("signed_out.{}", f.key)
+                } else {
+                    f.key.into()
+                }
+            })
+            .collect();
         keys.sort();
         schema.sort();
         assert_eq!(keys, schema);
         let config: Config = toml::from_str(&annotated()).unwrap();
         assert_eq!(config, Config::default());
-        for field in SETTINGS {
+        for field in SETTINGS.iter().filter(|f| f.scope != Scope::Reddit) {
             assert!(annotated().contains(field.description));
         }
     }

@@ -1,5 +1,6 @@
 //! Account subscription writes; cookies and CSRF tokens stay in memory.
 
+use crate::model::MembershipTarget;
 use anyhow::{Context, Result, bail};
 use wreq::header::HeaderValue;
 
@@ -11,9 +12,9 @@ pub(crate) fn is_community(name: &str) -> bool {
 }
 
 impl Reddit {
-    pub fn set_subscription(&self, subreddit: &str, join: bool) -> Result<()> {
-        if !is_community(subreddit) {
-            bail!("Choose an individual subreddit to join or leave");
+    pub fn set_membership(&self, target: &MembershipTarget, join: bool) -> Result<()> {
+        if !target.is_valid() {
+            bail!("Choose a valid community or user to follow");
         }
         let me = self.get(self.0.api.join("api/me.json")?)?;
         let account = me["data"]["name"]
@@ -35,8 +36,15 @@ impl Reddit {
         token.set_sensitive(true);
         let mut form = url::form_urlencoded::Serializer::new(String::new());
         form.append_pair("action", if join { "sub" } else { "unsub" })
-            .append_pair("sr_name", subreddit)
             .append_pair("api_type", "json");
+        match target {
+            MembershipTarget::Community(name) => {
+                form.append_pair("sr_name", name);
+            }
+            MembershipTarget::User(name) => {
+                form.append_pair("sr", &self.profile_membership_id(name)?);
+            }
+        }
         if join {
             form.append_pair("skip_initial_defaults", "true");
         }
@@ -64,5 +72,44 @@ impl Reddit {
         bail!(
             "Reddit did not acknowledge the membership change; refresh subscriptions before retrying"
         )
+    }
+
+    fn profile_membership_id(&self, name: &str) -> Result<String> {
+        let profile = self.get(self.0.api.join(&format!("user/{name}/about.json"))?)?;
+        let data = &profile["data"];
+        let subreddit = &data["subreddit"];
+        let valid = data["name"]
+            .as_str()
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(name))
+            && subreddit["subreddit_type"] == "user"
+            && subreddit["url"]
+                .as_str()
+                .and_then(crate::model::profile_user)
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(name));
+        if !valid {
+            bail!(
+                "Reddit did not confirm this user's profile; open the profile in your browser to check access"
+            );
+        }
+        let id = subreddit["name"]
+            .as_str()
+            .filter(|id| {
+                id.strip_prefix("t5_").is_some_and(|suffix| {
+                    !suffix.is_empty()
+                        && suffix.len() <= 32
+                        && suffix.bytes().all(|c| c.is_ascii_alphanumeric())
+                })
+            })
+            .context("Reddit did not identify this user's profile subscription")?;
+        Ok(id.into())
+    }
+}
+
+impl MembershipTarget {
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Self::Community(name) => is_community(name),
+            Self::User(name) => crate::model::is_username(name),
+        }
     }
 }

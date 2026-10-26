@@ -2,7 +2,7 @@
 use super::{App, CardScroll, Feed, Group, Overlay, TabKind, experience::Field};
 use crate::config::{
     managed::{Chezmoi, Plan, Verification},
-    schema::{Kind, SETTINGS},
+    schema::{Kind, SETTINGS, Scope},
     store::Store,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 pub struct Task<T> {
     receiver: Receiver<Result<T, String>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    join_on_drop: bool,
 }
 
 impl<T: Send + 'static> Task<T> {
@@ -23,6 +24,7 @@ impl<T: Send + 'static> Task<T> {
         Self {
             receiver,
             thread: Some(thread),
+            join_on_drop: true,
         }
     }
 
@@ -40,7 +42,7 @@ impl<T: Send + 'static> Task<T> {
 impl<T> Drop for Task<T> {
     fn drop(&mut self) {
         // Commands are bounded; shutdown must finish an approved source/apply transaction.
-        if let Some(thread) = self.thread.take() {
+        if let Some(thread) = self.thread.take().filter(|_| self.join_on_drop) {
             let _ = thread.join();
         }
     }
@@ -52,6 +54,16 @@ pub enum ManagedSave {
     Applying(Task<()>, Verification),
 }
 
+#[derive(Default)]
+pub struct AccountSettings {
+    pub values: Option<crate::reddit::Preferences>,
+    task: Option<Task<crate::reddit::Preferences>>,
+    owner: Option<String>,
+    pub writing: bool,
+    pub error: Option<String>,
+    pub loaded: bool,
+}
+
 pub struct Settings {
     pub store: Store,
     pub selected: usize,
@@ -61,9 +73,16 @@ pub struct Settings {
     pub message: Option<String>,
     pub managed: Option<ManagedSave>,
     pub managed_scroll: usize,
+    pub account: AccountSettings,
     pub(crate) chezmoi: Chezmoi,
     last_poll: Instant,
 }
+impl AccountSettings {
+    pub fn pending(&self) -> bool {
+        self.task.is_some()
+    }
+}
+
 impl Settings {
     pub fn new(store: Store) -> Self {
         Self {
@@ -75,16 +94,43 @@ impl Settings {
             message: None,
             managed: None,
             managed_scroll: 0,
+            account: AccountSettings::default(),
             chezmoi: Chezmoi::default(),
             last_poll: Instant::now(),
         }
     }
 
     pub fn busy(&self) -> bool {
+        self.managed_busy() || self.account.task.is_some()
+    }
+
+    pub fn managed_busy(&self) -> bool {
         matches!(
             self.managed,
             Some(ManagedSave::Checking(_) | ManagedSave::Applying(..))
         )
+    }
+
+    pub fn writing(&self) -> bool {
+        self.account.writing
+    }
+
+    pub fn scope_label(&self, scope: Scope, account: Option<&crate::reddit::Account>) -> String {
+        let name = account.map_or_else(
+            || {
+                if self.store.current.active_account.as_deref() == Some("") {
+                    "Unidentified account".into()
+                } else {
+                    "Signed out".into()
+                }
+            },
+            |a| format!("u/{}", a.name),
+        );
+        match scope {
+            Scope::Reddit => format!("Reddit settings · {name}"),
+            Scope::Reader => format!("Reader settings · {name}"),
+            Scope::Device => "This device · all accounts".into(),
+        }
     }
 
     #[cfg(test)]
@@ -101,6 +147,118 @@ impl Settings {
 }
 
 impl App {
+    pub fn install_settings_store(&mut self, mut store: Store) {
+        let account = self.reddit.account();
+        let username = account
+            .as_ref()
+            .map(|a| a.name.as_str())
+            .or_else(|| (!self.reddit.needs_sign_in()).then_some(""));
+        store.select_account(username);
+        self.settings.store = store;
+        self.apply_settings();
+    }
+
+    pub(super) fn load_account_preferences(&mut self, refresh: bool) {
+        let Some(account) = self
+            .reddit
+            .account()
+            .filter(|_| !self.reddit.needs_sign_in())
+        else {
+            return;
+        };
+        if self.settings.account.task.is_some() || (!refresh && self.settings.account.loaded) {
+            return;
+        }
+        let reddit = self.reddit.clone();
+        let mut task = Task::start(move || reddit.preferences());
+        task.join_on_drop = false;
+        self.settings.account.owner = Some(account.id);
+        self.settings.account.task = Some(task);
+        self.settings.account.writing = false;
+        self.settings.account.error = None;
+    }
+
+    fn change_account_preference(&mut self, key: &str, value: toml::Value) {
+        if self.settings.account.task.is_some() {
+            return;
+        }
+        if matches!(
+            self.auth.phase,
+            crate::auth::Phase::Saving
+                | crate::auth::Phase::Switching
+                | crate::auth::Phase::Disconnecting
+        ) {
+            self.settings.message =
+                Some("Wait for the account change before saving Reddit preferences".into());
+            return;
+        }
+        let Some(current) = self
+            .settings
+            .account
+            .values
+            .as_ref()
+            .filter(|_| self.settings.account.error.is_none())
+        else {
+            self.settings.message =
+                Some("Reddit preferences are unavailable; r retries loading them".into());
+            return;
+        };
+        let Some(value) = value.as_bool() else {
+            self.settings.message = Some("Expected true or false".into());
+            return;
+        };
+        if key == "show_nsfw" && !current.mature_content_editable {
+            self.settings.message = Some("Reddit requires you to complete this setting in the browser. Open reddit.com/settings/preferences.".into());
+            return;
+        }
+        let key = if key == "show_nsfw" {
+            crate::reddit::Preference::MatureContent
+        } else {
+            crate::reddit::Preference::Autoplay
+        };
+        if key.value(current) == value {
+            return;
+        }
+        let Some(account) = self.reddit.account() else {
+            return;
+        };
+        let reddit = self.reddit.clone();
+        self.settings.account.owner = Some(account.id);
+        self.settings.account.writing = true;
+        self.settings.account.error = None;
+        self.settings.message = None;
+        self.settings.account.task = Some(Task::start(move || reddit.set_preference(key, value)));
+    }
+
+    fn poll_account_preferences(&mut self) -> bool {
+        if self.membership.is_some() || self.experience.writing() {
+            return false;
+        }
+        let Some(result) = self.settings.account.task.as_ref().and_then(Task::poll) else {
+            return false;
+        };
+        self.settings.account.task = None;
+        let was_writing = std::mem::take(&mut self.settings.account.writing);
+        if self.reddit.account().map(|a| a.id) != self.settings.account.owner {
+            return false;
+        }
+        self.settings.account.loaded = true;
+        match result {
+            Ok(values) => {
+                self.settings.account.values = Some(values);
+                self.settings.account.error = None;
+                self.apply_settings();
+            }
+            Err(error) => {
+                if was_writing {
+                    self.settings.account.values = None;
+                }
+                self.settings.account.error = Some(error);
+            }
+        }
+        true
+    }
+
     /// Async completions update the covered dialog without taking Settings' keys.
     pub(super) fn behind_settings<T>(&mut self, update: impl FnOnce(&mut Self) -> T) -> T {
         let covered = matches!(self.overlay, Some(Overlay::Settings));
@@ -120,7 +278,7 @@ impl App {
             self.info("Finish reviewing or saving the managed config first");
             return false;
         }
-        if self.membership.is_some() || self.experience.writing() {
+        if self.membership.is_some() || self.experience.writing() || self.settings.writing() {
             self.info("Wait for the pending Reddit action before changing settings");
             false
         } else {
@@ -136,6 +294,7 @@ impl App {
         self.apply_settings();
         self.settings.return_overlay = self.overlay.take();
         self.overlay = Some(Overlay::Settings);
+        self.load_account_preferences(true);
         self.begin_managed_save();
     }
 
@@ -147,6 +306,10 @@ impl App {
             .iter()
             .find(|field| field.key == key)
             .expect("known setting");
+        if field.scope == Scope::Reddit {
+            self.change_account_preference(field.key, value);
+            return;
+        }
         match self.settings.store.change(field, value) {
             Ok(()) => {
                 self.settings.message = None;
@@ -161,14 +324,16 @@ impl App {
     }
 
     pub(super) fn poll_settings(&mut self, now: Instant) -> bool {
+        let account_changed = self.poll_account_preferences();
         if self.settings.managed.is_some() {
-            return self.poll_managed_save();
+            return self.poll_managed_save() || account_changed;
         }
         if now.saturating_duration_since(self.settings.last_poll) < Duration::from_millis(500)
             || self.membership.is_some()
             || self.experience.writing()
+            || self.settings.writing()
         {
-            return false;
+            return account_changed;
         }
         self.settings.last_poll = now;
         let before = (
@@ -178,6 +343,7 @@ impl App {
         self.settings.store.reload();
         let changed = self.apply_settings();
         changed
+            || account_changed
             || before
                 != (
                     self.settings.store.persistence,
@@ -235,8 +401,15 @@ impl App {
         }
     }
 
-    fn apply_settings(&mut self) -> bool {
-        let next = self.settings.store.current.clone();
+    pub(super) fn apply_settings(&mut self) -> bool {
+        let mut next = self.settings.store.current.clone();
+        if let Some(values) = &self.settings.account.values {
+            next.show_nsfw = values.show_nsfw;
+            next.media.video_autoplay = values.video_autoplay;
+        } else {
+            next.show_nsfw = self.config.show_nsfw;
+            next.media.video_autoplay = self.config.media.video_autoplay;
+        }
         if self.config == next {
             return false;
         }
@@ -446,12 +619,20 @@ impl App {
                 }
             }
             KeyCode::Char('r') if self.settings_allowed() => {
+                if SETTINGS[self.settings.selected].scope == Scope::Reddit {
+                    self.load_account_preferences(true);
+                    return;
+                }
                 self.settings.store.save();
                 self.apply_settings();
                 self.settings.message = None;
                 self.begin_managed_save();
             }
             KeyCode::Char('u') if self.settings_allowed() => {
+                if SETTINGS[self.settings.selected].scope == Scope::Reddit {
+                    self.settings.message = Some("Reddit saves immediately. Toggle the preference to change it; r reloads account values.".into());
+                    return;
+                }
                 self.settings.store.revert();
                 self.apply_settings();
             }
@@ -460,7 +641,7 @@ impl App {
     }
 
     fn managed_save_key(&mut self, key: KeyEvent) {
-        if self.settings.busy() || !key.modifiers.is_empty() {
+        if self.settings.managed_busy() || !key.modifiers.is_empty() {
             return;
         }
         match key.code {
@@ -565,5 +746,349 @@ impl App {
         if let Some(input) = &mut self.settings.editing {
             input.insert(&text.chars().filter(|c| !c.is_control()).collect::<String>());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reddit::{
+        Preferences,
+        tests::{Fixture, Reply, saved_export},
+    };
+    use crate::{config::Config, worker::Pool};
+    use ratatui_image::picker::Picker;
+    use serde_json::json;
+
+    fn fixture() -> Fixture {
+        Fixture::new(|request| {
+            match request.url.as_str() {
+            "/settings/preferences" => Reply { status:200, body:"<settings-preferences initialstate='{\"identity\":{\"preferences\":{\"isNsfwContentShown\":false,\"isVideoAutoplayDisabled\":true}}}'></settings-preferences>".into(), headers:vec![] },
+            _ => Reply::json(json!({"kind":"Listing","data":{"children":[]}})),
+        }
+        })
+    }
+
+    fn app(fixture: &Fixture, config: Config, directory: &std::path::Path) -> App {
+        let reddit = fixture.saved_reddit(&saved_export("first", "reader"));
+        let (pool, _) = Pool::start(reddit.clone(), 1, None);
+        App::new(
+            config,
+            pool,
+            reddit,
+            directory.join("accounts/first/state.json"),
+            Picker::halfblocks(),
+        )
+    }
+
+    fn finish(app: &mut App) {
+        if let Some(thread) = app
+            .settings
+            .account
+            .task
+            .as_mut()
+            .and_then(|t| t.thread.take())
+        {
+            thread.join().unwrap();
+        }
+        app.poll_account_preferences();
+    }
+
+    fn completed_preference_read(app: &mut App) {
+        let mut task = Task::start(|| {
+            Ok(Preferences {
+                show_nsfw: true,
+                video_autoplay: true,
+                mature_content_editable: true,
+            })
+        });
+        task.thread.take().unwrap().join().unwrap();
+        app.settings.account.task = Some(task);
+        app.settings.account.owner = Some("first".into());
+    }
+
+    #[test]
+    fn scoped_settings_completed_preference_read_should_wait_for_membership_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = fixture();
+        let mut app = app(&fixture, Config::default(), directory.path());
+        completed_preference_read(&mut app);
+        app.membership = Some(crate::app::MembershipChange {
+            generation: 9,
+            target: crate::model::MembershipTarget::Community("rust".into()),
+            join: true,
+            checking: false,
+            error: None,
+        });
+        assert!(!app.poll_account_preferences());
+        assert!(app.settings.account.pending());
+        assert!(app.settings.account.values.is_none());
+        assert!(app.membership.is_some());
+        assert!(app.take_replacement_messages().is_none());
+        app.membership = None;
+        assert!(app.poll_account_preferences());
+        assert!(app.config.show_nsfw);
+        assert!(!app.settings.account.pending());
+    }
+
+    #[test]
+    fn scoped_settings_completed_preference_read_should_preserve_a_pending_experience_write() {
+        use crate::reddit::experience::{Action, Request};
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = fixture();
+        let mut app = app(&fixture, Config::default(), directory.path());
+        completed_preference_read(&mut app);
+        app.experience.pending = Some((
+            91,
+            Request::Write(Action::Save {
+                id: "t3_post".into(),
+                save: true,
+            }),
+        ));
+        assert!(!app.poll_account_preferences());
+        assert!(app.settings.account.pending());
+        assert!(app.experience.writing());
+        assert!(!app.config.show_nsfw);
+        assert!(app.take_replacement_messages().is_none());
+    }
+
+    fn managed_with_pending_account_read() -> (
+        App,
+        crate::config::managed::tests::Fixture,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let reddit_fixture = fixture();
+        let mut app = app(&reddit_fixture, Config::default(), directory.path());
+        let managed = crate::config::managed::tests::Fixture::new();
+        app.install_settings_store(managed.store());
+        app.settings.chezmoi = managed.tool.clone();
+        app.overlay = Some(Overlay::Settings);
+        let (release, gate) = mpsc::channel();
+        let mut task = Task::start(move || {
+            let _ = gate.recv_timeout(Duration::from_secs(5));
+            Ok(Preferences {
+                show_nsfw: false,
+                video_autoplay: false,
+                mature_content_editable: true,
+            })
+        });
+        task.join_on_drop = false;
+        app.settings.account.task = Some(task);
+        app.settings.account.owner = Some("first".into());
+        app.change_setting("media.image_preview", false.into());
+        app.settings.wait_managed();
+        app.poll_managed_save();
+        assert!(matches!(
+            app.settings.managed,
+            Some(ManagedSave::Confirm(_))
+        ));
+        (app, managed, release)
+    }
+
+    #[test]
+    fn scoped_settings_pending_reddit_read_should_not_block_managed_save_confirmation() {
+        let (mut app, fixture, release) = managed_with_pending_account_read();
+        app.settings_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            app.settings.managed,
+            Some(ManagedSave::Applying(..))
+        ));
+        app.settings.wait_managed();
+        app.poll_managed_save();
+        assert!(app.settings.managed.is_none());
+        assert!(
+            !Config::load(Some(&fixture.target))
+                .unwrap()
+                .media
+                .image_preview
+        );
+        let _ = release.send(());
+    }
+
+    #[test]
+    fn scoped_settings_pending_reddit_read_should_not_block_managed_save_cancellation() {
+        let (mut app, _fixture, release) = managed_with_pending_account_read();
+        app.settings_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.settings.managed.is_none());
+        assert!(app.settings.account.pending());
+        let _ = release.send(());
+    }
+
+    #[test]
+    fn scoped_settings_pending_write_should_guard_an_already_open_account_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = fixture();
+        let mut app = app(&fixture, Config::default(), directory.path());
+        app.auth.phase = crate::auth::Phase::Accounts;
+        app.auth.active_id = Some("first".into());
+        app.auth.accounts = vec![crate::reddit::SavedAccount {
+            id: "first".into(),
+            name: "reader".into(),
+            expired: false,
+            source: None,
+        }];
+        app.settings.account.writing = true;
+        assert!(!app.select_auth());
+        assert_eq!(app.auth.phase, crate::auth::Phase::Accounts);
+        assert!(
+            app.auth
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("preference save")
+        );
+        app.settings.account.writing = false;
+    }
+
+    #[test]
+    fn scoped_settings_pending_write_should_guard_an_already_open_account_confirmation() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = fixture();
+        let mut app = app(&fixture, Config::default(), directory.path());
+        app.auth.phase = crate::auth::Phase::Confirm;
+        app.settings.account.writing = true;
+        app.confirm_auth();
+        assert_eq!(app.auth.phase, crate::auth::Phase::Confirm);
+        assert!(
+            app.auth
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("preference save")
+        );
+        app.settings.account.writing = false;
+    }
+
+    #[test]
+    fn scoped_settings_unidentified_session_should_not_use_or_edit_signed_out_rules() {
+        let directory = tempfile::tempdir().unwrap();
+        let reddit = crate::reddit::Reddit::test_at("http://127.0.0.1:9", false);
+        let (pool, _) = Pool::start(reddit.clone(), 1, None);
+        let config: Config =
+            toml::from_str("[signed_out.filters]\nkeywords=[\"signed out\"]\n").unwrap();
+        let mut app = App::new(
+            config.clone(),
+            pool,
+            reddit,
+            directory.path().join("state.json"),
+            Picker::halfblocks(),
+        );
+        app.install_settings_store(Store::memory(config));
+        assert!(app.config.filters.keywords.is_empty());
+        app.change_setting("filters.keywords", toml::Value::Array(vec!["wrong".into()]));
+        assert!(app.settings.message.as_ref().unwrap().contains("identify"));
+        assert!(!app.settings.store.dirty());
+        assert_eq!(
+            app.settings.store.current.signed_out.filters.keywords,
+            ["signed out"]
+        );
+    }
+
+    #[test]
+    fn scoped_settings_switch_should_replace_reader_rules_and_keep_device_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = fixture();
+        let config:Config=toml::from_str("[accounts.ReAdEr.filters]\nkeywords=[\"first\"]\n[accounts.Other.highlight]\nkeywords=[\"second\"]\n[media]\nimage_preview=false\n").unwrap();
+        let mut app = app(&fixture, config, directory.path());
+        assert_eq!(app.config.filters.keywords, ["first"]);
+        app.install_connection(fixture.saved_reddit(&saved_export("second", "other")));
+        assert!(app.config.filters.keywords.is_empty());
+        assert_eq!(app.config.highlight.keywords, ["second"]);
+        assert!(!app.show_images);
+        app.install_connection(fixture.saved_reddit(&saved_export("first", "READER")));
+        assert_eq!(app.config.filters.keywords, ["first"]);
+        assert!(app.config.highlight.keywords.is_empty());
+        assert!(!app.show_images);
+    }
+
+    #[test]
+    fn scoped_settings_switch_should_not_wait_for_an_obsolete_preference_read() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = fixture();
+        let mut app = app(&fixture, Config::default(), directory.path());
+        let (release, gate) = mpsc::channel();
+        let completed = Arc::new(AtomicBool::new(false));
+        let done = completed.clone();
+        let mut task = Task::start(move || {
+            let _ = gate.recv_timeout(Duration::from_secs(2));
+            done.store(true, Ordering::SeqCst);
+            Ok(Preferences {
+                show_nsfw: true,
+                video_autoplay: true,
+                mature_content_editable: true,
+            })
+        });
+        task.join_on_drop = false;
+        app.settings.account.task = Some(task);
+        app.settings.account.owner = Some("first".into());
+        app.install_connection(fixture.saved_reddit(&saved_export("second", "other")));
+        assert!(!completed.load(Ordering::SeqCst));
+        assert!(!app.config.show_nsfw && !app.config.media.video_autoplay);
+        let _ = release.send(());
+    }
+
+    #[test]
+    fn scoped_settings_stale_account_completion_should_not_change_the_active_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = fixture();
+        let mut app = app(&fixture, Config::default(), directory.path());
+        app.settings.account.owner = Some("other".into());
+        app.settings.account.task = Some(Task::start(|| {
+            Ok(Preferences {
+                show_nsfw: true,
+                video_autoplay: true,
+                mature_content_editable: true,
+            })
+        }));
+        finish(&mut app);
+        assert!(app.settings.account.values.is_none());
+        assert!(!app.config.show_nsfw);
+    }
+
+    #[test]
+    fn scoped_settings_failed_write_should_require_readback_before_another_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = fixture();
+        let mut app = app(&fixture, Config::default(), directory.path());
+        app.settings.account.values = Some(Preferences {
+            show_nsfw: false,
+            video_autoplay: true,
+            mature_content_editable: true,
+        });
+        app.settings.account.owner = Some("first".into());
+        app.settings.account.writing = true;
+        app.settings.account.task = Some(Task::start(|| anyhow::bail!("Save may have succeeded")));
+        finish(&mut app);
+        assert!(app.settings.account.values.is_none());
+        assert!(
+            app.settings
+                .account
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("may have succeeded")
+        );
+        app.change_setting("media.video_autoplay", false.into());
+        assert!(app.settings.account.task.is_none());
+        assert!(!app.settings.writing());
+        assert!(!app.settings.store.dirty());
+    }
+
+    #[test]
+    fn scoped_settings_loading_reddit_should_leave_file_edits_usable() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = fixture();
+        let mut app = app(&fixture, Config::default(), directory.path());
+        app.load_account_preferences(false);
+        app.change_setting("filters.keywords", toml::Value::Array(vec!["local".into()]));
+        assert_eq!(app.config.filters.keywords, ["local"]);
+        finish(&mut app);
+        assert_eq!(app.config.filters.keywords, ["local"]);
+        assert!(!app.config.media.video_autoplay);
     }
 }

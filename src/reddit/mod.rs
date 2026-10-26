@@ -6,6 +6,7 @@ pub mod experience;
 mod home;
 mod membership;
 pub mod parse;
+mod preferences;
 mod rate;
 mod relay;
 mod session;
@@ -18,6 +19,7 @@ pub use accounts::SavedAccount;
 pub(crate) use accounts::saved_revision;
 pub(crate) use membership::is_community;
 pub(crate) use parse::merge_reply_continuations;
+pub use preferences::{Preference, Preferences};
 pub use rate::Pause;
 
 use std::collections::HashSet;
@@ -587,7 +589,7 @@ impl Reddit {
     }
 
     /// Follow every page before replacing the account's last complete subscription list.
-    pub fn subscriptions(&self) -> Result<Vec<String>> {
+    pub fn subscriptions(&self) -> Result<Vec<crate::model::Subscription>> {
         let mut names = Vec::new();
         let mut seen_names = HashSet::new();
         let mut cursors = HashSet::new();
@@ -601,18 +603,40 @@ impl Reddit {
                 url.query_pairs_mut().append_pair("after", cursor);
             }
             let (page, next) = parse::parse_subscriptions(self.get(url)?)?;
-            names.extend(
-                page.into_iter()
-                    .filter(|name| seen_names.insert(name.to_ascii_lowercase())),
-            );
+            names.extend(page.into_iter().filter(|entry| {
+                seen_names.insert((
+                    entry.community().is_none(),
+                    entry.name().to_ascii_lowercase(),
+                ))
+            }));
             let Some(next) = next else { break };
             if !cursors.insert(next.clone()) {
                 bail!("Reddit repeated a subscription cursor");
             }
             after = Some(next);
         }
-        names.sort_by_key(|name| name.to_ascii_lowercase());
+        names.sort_by_key(|entry| entry.name().to_ascii_lowercase());
         Ok(names)
+    }
+
+    pub(crate) fn user_posts_progress(
+        &self,
+        user: &str,
+        sort: Sort,
+        time: TimeRange,
+        after: Option<&str>,
+        progress: &mut dyn FnMut(ListingEvent<'_>),
+    ) -> Result<Listing> {
+        let user = experience::name(user)?;
+        if !matches!(
+            sort,
+            Sort::Hot | Sort::New | Sort::Top | Sort::Controversial
+        ) {
+            bail!("Unsupported user-post sort");
+        }
+        let mut url = self.0.api.join(&format!("user/{user}/submitted.json"))?;
+        url.query_pairs_mut().append_pair("sort", sort.as_str());
+        self.fetch_listing(url, sort, time, after, progress)
     }
 
     #[cfg(test)]

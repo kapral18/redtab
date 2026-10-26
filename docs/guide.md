@@ -21,6 +21,7 @@ Optional programs:
 | Program | Used for |
 | --- | --- |
 | `ffmpeg` | Inline video and GIF playback |
+| `yt-dlp` and Deno or Node.js | Inline public YouTube videos and Shorts |
 | `ffplay` | Sound during inline playback |
 | `mpv` | Opening videos with `m` |
 | `secret-tool` | Saved sessions on Linux; included in Debian/Ubuntu's `libsecret-tools` |

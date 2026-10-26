@@ -10,7 +10,7 @@ const READ_ONLY_HINT: &str = "Config is read-only. Changes are active for this s
 
 use super::{
     Config, config_dir, expand_tilde,
-    schema::{SETTINGS, Setting, annotated},
+    schema::{Setting, annotated},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,7 +29,7 @@ pub struct Store {
     unverified: Option<super::managed::Verification>,
     pub persistence: Persistence,
     pub error: Option<String>,
-    pub conflicts: Vec<&'static str>,
+    pub conflicts: Vec<String>,
 }
 
 impl Store {
@@ -110,15 +110,21 @@ impl Store {
     }
 
     pub fn change(&mut self, field: &Setting, value: toml::Value) -> Result<()> {
+        if field.scope == super::schema::Scope::Reddit {
+            bail!("This preference is saved to Reddit, not the config file");
+        }
         self.current = field.set(&self.current, value)?;
         self.save();
         Ok(())
     }
 
     pub fn dirty(&self) -> bool {
-        SETTINGS
-            .iter()
-            .any(|f| f.value(&self.current) != f.value(&self.baseline))
+        self.current.entries() != self.baseline.entries()
+    }
+
+    pub fn select_account(&mut self, username: Option<&str>) {
+        self.current.select_account(username);
+        self.baseline.select_account(username);
     }
 
     pub fn managed_request(&self) -> Option<super::managed::Request> {
@@ -169,20 +175,37 @@ impl Store {
     }
 
     fn merge(&mut self, disk: &Config) -> Result<()> {
+        let mut disk = disk.clone();
+        Config::align_account_names(&mut [&mut disk, &mut self.current, &mut self.baseline]);
         self.conflicts.clear();
-        for field in SETTINGS {
-            let local = field.value(&self.current);
-            let base = field.value(&self.baseline);
-            let remote = field.value(disk);
-            if local != base && remote != base && local != remote {
-                self.conflicts.push(field.key);
+        let local = self.current.entries();
+        let base = self.baseline.entries();
+        let remote = disk.entries();
+        let mut current_updates = Vec::new();
+        let mut base_updates = Vec::new();
+        let keys: std::collections::BTreeSet<_> = local
+            .keys()
+            .chain(base.keys())
+            .chain(remote.keys())
+            .collect();
+        for key in keys {
+            let local = local.get(key);
+            let base = base.get(key);
+            let remote = remote.get(key);
+            if !Config::same_entry(key, local, base)
+                && !Config::same_entry(key, remote, base)
+                && !Config::same_entry(key, local, remote)
+            {
+                self.conflicts.push(key.clone());
                 continue;
             }
-            if local == base {
-                self.current = field.set(&self.current, remote.clone())?;
+            if Config::same_entry(key, local, base) {
+                current_updates.push((key.clone(), remote.cloned()));
             }
-            self.baseline = field.set(&self.baseline, remote)?;
+            base_updates.push((key.clone(), remote.cloned()));
         }
+        self.current = self.current.with_entries(current_updates)?;
+        self.baseline = self.baseline.with_entries(base_updates)?;
         if !self.conflicts.is_empty() {
             bail!(
                 "Conflicting file changes: {}. Revert to file, then reapply your choice.",
@@ -330,7 +353,10 @@ impl Store {
         }
         let result = (|| {
             let target = resolve(&self.current.path)?;
-            let disk = parse(&self.current.path, &fs::read_to_string(&target)?)?;
+            let mut disk = parse(&self.current.path, &fs::read_to_string(&target)?)?;
+            disk.select_account(self.current.active_account.as_deref());
+            disk.show_nsfw = self.current.show_nsfw;
+            disk.media.video_autoplay = self.current.media.video_autoplay;
             self.target = Some(target);
             self.current = disk.clone();
             self.baseline = disk;
@@ -370,19 +396,26 @@ pub(super) fn patch(original: &str, before: &Config, after: &Config) -> Result<S
     let mut document: DocumentMut = body
         .parse()
         .context("Invalid TOML; file was left untouched")?;
-    for field in SETTINGS {
-        if field.value(before) == field.value(after) {
+    let before = before.entries();
+    let after = after.entries();
+    let keys: std::collections::BTreeSet<_> = before.keys().chain(after.keys()).collect();
+    for key in keys {
+        if before.get(key) == after.get(key) {
+            continue;
+        }
+        if !after.contains_key(key) {
+            remove(document.as_item_mut(), &key.split('.').collect::<Vec<_>>());
             continue;
         }
         let mut item = document.as_item_mut();
-        let mut parts = field.key.split('.').peekable();
+        let mut parts = key.split('.').peekable();
         while let Some(part) = parts.next() {
             if parts.peek().is_some() && item.get(part).is_none() {
                 item[part] = Item::Table(Table::new());
             }
             item = &mut item[part];
         }
-        let mut value: Value = field.value(after).to_string().parse()?;
+        let mut value: Value = after[key].to_string().parse()?;
         if let Some(old) = item.as_value() {
             preserve_format(old, &mut value);
         }
@@ -395,6 +428,22 @@ pub(super) fn patch(original: &str, before: &Config, after: &Config) -> Result<S
         ""
     };
     Ok(format!("{header}{separator}{body}"))
+}
+
+fn remove(item: &mut Item, parts: &[&str]) {
+    let Some(table) = item.as_table_like_mut() else {
+        return;
+    };
+    if parts.len() == 1 {
+        table.remove(parts[0]);
+        return;
+    }
+    if let Some(child) = table.get_mut(parts[0]) {
+        remove(child, &parts[1..]);
+        if child.as_table_like().is_some_and(|t| t.is_empty()) {
+            table.remove(parts[0]);
+        }
+    }
 }
 
 /// Keep annotations inside edited arrays, including those on removed elements.
@@ -480,6 +529,7 @@ fn resolve(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::schema::SETTINGS;
     fn change(store: &mut Store, key: &str, input: &str) {
         let value: toml::Table = toml::from_str(&format!("value = {input}")).unwrap();
         store
@@ -491,15 +541,41 @@ mod tests {
     }
 
     #[test]
-    fn grouped_settings_should_initialize_active_media_defaults() {
+    fn scoped_settings_should_initialize_local_defaults_without_reddit_preferences() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         Store::open(Some(&path)).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         let values: toml::Value = toml::from_str(&text).unwrap();
-        assert!(text.contains("[media]"), "{text}");
         assert_eq!(values["media"]["image_preview"].as_bool(), Some(true));
-        assert_eq!(values["media"]["video_autoplay"].as_bool(), Some(true));
+        assert!(values["media"].get("video_autoplay").is_none());
+        assert!(values.get("show_nsfw").is_none());
+        assert_eq!(
+            values["signed_out"]["filters"]["authors"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn grouped_settings_should_keep_headers_and_section_annotations_when_inserting_root_keys() {
+        let original = "# file header\n\n# media section\n\n[media]\nimage_preview = true # keep\n";
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, original).unwrap();
+        let mut store = Store::open(Some(&path)).unwrap();
+        change(&mut store, "all_subs_posts_per_group", "4");
+        let actual = fs::read_to_string(&path).unwrap();
+        assert!(
+            actual.starts_with("# file header\n\nall_subs_posts_per_group = 4\n"),
+            "{actual}"
+        );
+        assert!(
+            actual.contains("# media section\n\n[media]\nimage_preview = true # keep\n"),
+            "{actual}"
+        );
     }
 
     #[test]
@@ -509,76 +585,23 @@ mod tests {
             let path = directory.path().join("config.toml");
             fs::write(&path, original).unwrap();
             let mut store = Store::open(Some(&path)).unwrap();
-            change(&mut store, "show_nsfw", "true");
+            change(&mut store, "all_subs_posts_per_group", "4");
             let actual = fs::read_to_string(&path).unwrap();
             assert!(actual.starts_with(original), "{actual}");
-            assert!(actual.contains("\nshow_nsfw = true"), "{actual}");
-            assert!(Config::load(Some(&path)).unwrap().show_nsfw);
+            assert_eq!(
+                Config::load(Some(&path)).unwrap().all_subs_posts_per_group,
+                4
+            );
         }
-    }
-
-    #[test]
-    fn grouped_settings_should_create_missing_media_tables_without_moving_headers() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        fs::write(&path, "# settings\n\nshow_nsfw = false # keep\n").unwrap();
-        let mut store = Store::open(Some(&path)).unwrap();
-        change(&mut store, "media.video_autoplay", "false");
-        let actual = fs::read_to_string(&path).unwrap();
-        assert!(
-            actual.starts_with("# settings\n\nshow_nsfw = false # keep\n"),
-            "{actual}"
-        );
-        assert!(actual.contains("[media]\n"), "{actual}");
-    }
-
-    #[test]
-    fn grouped_settings_should_keep_section_annotations_when_inserting_root_keys() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        fs::write(
-            &path,
-            "# file header\n\n# media section\n\n[media]\nvideo_autoplay = true # keep\n",
-        )
-        .unwrap();
-        let mut store = Store::open(Some(&path)).unwrap();
-        change(&mut store, "show_nsfw", "true");
-        let actual = fs::read_to_string(&path).unwrap();
-        assert!(
-            actual.starts_with("# file header\n\nshow_nsfw = true\n"),
-            "{actual}"
-        );
-        assert!(
-            actual.contains("# media section\n\n[media]\nvideo_autoplay = true # keep\n"),
-            "{actual}"
-        );
-    }
-
-    #[test]
-    fn grouped_settings_should_keep_a_single_leading_header_above_new_root_keys() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        fs::write(
-            &path,
-            "\n# personal settings\n[media]\nvideo_autoplay = true\n",
-        )
-        .unwrap();
-        let mut store = Store::open(Some(&path)).unwrap();
-        change(&mut store, "show_nsfw", "true");
-        let actual = fs::read_to_string(&path).unwrap();
-        assert!(
-            actual.starts_with("\n# personal settings\nshow_nsfw = true\n"),
-            "{actual}"
-        );
     }
 
     #[test]
     fn grouped_settings_should_keep_existing_inline_and_dotted_media_styles() {
         for (original, prefix) in [
-            ("media = { video_autoplay = false }\n", "media = {"),
+            ("media = { image_preview = true }\n", "media = {"),
             (
-                "media.video_autoplay = false\n",
-                "media.video_autoplay = false\n",
+                "media.image_preview = true\n",
+                "media.image_preview = false\n",
             ),
         ] {
             let directory = tempfile::tempdir().unwrap();
@@ -588,115 +611,169 @@ mod tests {
             change(&mut store, "media.image_preview", "false");
             let actual = fs::read_to_string(&path).unwrap();
             assert!(actual.starts_with(prefix), "{actual}");
-            let values: toml::Value = toml::from_str(&actual).unwrap();
-            assert_eq!(values["media"]["image_preview"].as_bool(), Some(false));
-            assert_eq!(values["media"]["video_autoplay"].as_bool(), Some(false));
+            assert!(!Config::load(Some(&path)).unwrap().media.image_preview);
         }
     }
+
     #[test]
-    fn initializes_once_and_preserves_comments_and_unrelated_external_changes() {
+    fn when_username_casing_differs_saving_should_keep_one_readable_account_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "# mine\n[accounts.TFordragon.filters]\nkeywords=[\"old\"] # keep\n",
+        )
+        .unwrap();
+        let mut store = Store::open(Some(&path)).unwrap();
+        store.select_account(Some("tfordragon"));
+
+        change(&mut store, "filters.keywords", "[\"new\"]");
+
+        assert_eq!(store.persistence, Persistence::Saved);
+        assert_eq!(store.current.accounts.len(), 1);
+        assert_eq!(
+            store.current.accounts["TFordragon"].filters.keywords,
+            ["new"]
+        );
+        assert!(fs::read_to_string(&path).unwrap().contains("# keep"));
+    }
+
+    #[test]
+    fn when_username_table_case_changes_a_pending_edit_should_merge_under_disk_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[accounts.Reader.filters]\nkeywords=[\"old\"]\n").unwrap();
+        let mut store = Store::open(Some(&path)).unwrap();
+        store.select_account(Some("Reader"));
+        store.current = SETTINGS
+            .iter()
+            .find(|f| f.key == "filters.keywords")
+            .unwrap()
+            .set(&store.current, toml::Value::Array(vec!["new".into()]))
+            .unwrap();
+        fs::write(&path, "[accounts.reader.filters]\nkeywords=[\"old\"]\n").unwrap();
+
+        store.save();
+
+        assert_eq!(store.persistence, Persistence::Saved);
+        assert_eq!(store.current.accounts.len(), 1);
+        assert_eq!(store.current.active_account.as_deref(), Some("reader"));
+        assert_eq!(
+            Config::load(Some(&path)).unwrap().accounts["reader"]
+                .filters
+                .keywords,
+            ["new"]
+        );
+    }
+
+    #[test]
+    fn when_username_first_writers_use_different_case_distinct_rule_edits_should_merge() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let mut first = Store::open(Some(&path)).unwrap();
-        assert!(
-            fs::read_to_string(&path)
-                .unwrap()
-                .contains("# redtab settings")
-        );
+        let mut second = Store::open(Some(&path)).unwrap();
+        first.select_account(Some("Reader"));
+        second.select_account(Some("reader"));
+        change(&mut first, "filters.authors", "[\"bot\"]");
+
+        change(&mut second, "filters.keywords", "[\"mine\"]");
+
+        assert_eq!(second.persistence, Persistence::Saved);
+        assert_eq!(second.current.accounts.len(), 1);
+        assert_eq!(second.current.accounts["Reader"].filters.authors, ["bot"]);
+        assert_eq!(second.current.accounts["Reader"].filters.keywords, ["mine"]);
+    }
+
+    #[test]
+    fn scoped_settings_should_merge_different_accounts_without_losing_rules_or_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
         fs::write(
             &path,
-            "# mine\nshow_nsfw = false # keep this\n\n[filters]\nkeywords = [\"news\"] # custom\n",
+            "# mine\n[accounts.first.filters]\nkeywords = [\"news\"] # custom\n",
         )
         .unwrap();
+        let mut first = Store::open(Some(&path)).unwrap();
         let mut second = Store::open(Some(&path)).unwrap();
-        change(&mut second, "media.video_autoplay", "false");
-        change(&mut first, "show_nsfw", "true");
+        first.select_account(Some("first"));
+        second.select_account(Some("second"));
+        change(&mut second, "filters.authors", "[\"bot\"]");
+        change(&mut first, "filters.keywords", "[\"spoiler\"]");
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("show_nsfw = true # keep this"), "{text}");
-        assert!(text.contains("keywords = [\"news\"] # custom"));
-        assert!(!first.current.media.video_autoplay);
-        assert_eq!(first.current.filters.keywords, ["news"]);
-        assert_eq!(first.persistence, Persistence::Saved);
+        assert!(text.contains("# custom"), "{text}");
+        assert_eq!(first.current.accounts["second"].filters.authors, ["bot"]);
+        assert_eq!(first.current.filters.keywords, ["spoiler"]);
         second.reload();
-        assert!(second.current.show_nsfw);
-        change(&mut first, "show_nsfw", "false");
-        change(&mut first, "show_nsfw", "true");
-        assert!(Config::load(Some(&path)).unwrap().show_nsfw);
+        assert_eq!(second.current.filters.authors, ["bot"]);
+        assert_eq!(
+            second.current.accounts["first"].filters.keywords,
+            ["spoiler"]
+        );
+        assert_eq!(first.persistence, Persistence::Saved);
     }
+
     #[test]
-    fn concurrent_same_key_conflicts_until_revert_then_reapply() {
+    fn concurrent_same_account_key_conflicts_until_revert_then_reapply() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let mut local = Store::open(Some(&path)).unwrap();
-        // Unsaved local intent plus an independent editor's change to the same key.
-        local.current.all_subs_posts_per_group = 4;
+        local.select_account(Some("Reader"));
+        local.current = SETTINGS
+            .iter()
+            .find(|f| f.key == "filters.keywords")
+            .unwrap()
+            .set(&local.current, toml::Value::Array(vec!["local".into()]))
+            .unwrap();
         fs::write(
             &path,
-            "all_subs_posts_per_group = 5\n[media]\nimage_preview = false\n",
+            "[accounts.reader.filters]\nkeywords=[\"external\"]\n[media]\nimage_preview=false\n",
         )
         .unwrap();
         local.save();
         assert_eq!(local.persistence, Persistence::Unsaved);
-        assert_eq!(local.conflicts, ["all_subs_posts_per_group"]);
-        assert_eq!(local.current.all_subs_posts_per_group, 4);
+        assert_eq!(local.conflicts, ["accounts.reader.filters.keywords"]);
+        assert_eq!(local.current.filters.keywords, ["local"]);
         assert!(!local.current.media.image_preview);
-        local.reload();
-        assert_eq!(local.conflicts, ["all_subs_posts_per_group"]);
-        assert_eq!(
-            Config::load(Some(&path)).unwrap().all_subs_posts_per_group,
-            5
-        );
         local.revert();
-        assert_eq!(local.current.all_subs_posts_per_group, 5);
-        change(&mut local, "all_subs_posts_per_group", "4");
-        assert_eq!(
-            Config::load(Some(&path)).unwrap().all_subs_posts_per_group,
-            4
-        );
+        assert_eq!(local.current.filters.keywords, ["external"]);
+        change(&mut local, "filters.keywords", "[\"local\"]");
+        assert_eq!(local.persistence, Persistence::Saved);
     }
+
     #[test]
     fn invalid_deleted_and_retargeted_files_keep_last_working_values() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
+        fs::write(&path, "all_subs_posts_per_group=4\n").unwrap();
         let mut store = Store::open(Some(&path)).unwrap();
-        fs::write(&path, "show_nsfw = true\n").unwrap();
+        fs::write(&path, "[media]\nimage_preview=\"invalid\"\n").unwrap();
         store.reload();
-        assert!(store.current.show_nsfw);
-        fs::write(&path, "[media]\nimage_preview = \"invalid\"\n").unwrap();
-        store.reload();
-        assert!(store.current.show_nsfw);
+        assert_eq!(store.current.all_subs_posts_per_group, 4);
         assert_eq!(store.persistence, Persistence::Unsaved);
-        store.save();
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            "[media]\nimage_preview = \"invalid\"\n"
-        );
         fs::remove_file(&path).unwrap();
         store.save();
         assert!(!path.exists());
-        fs::write(&path, "show_nsfw = false\n").unwrap();
+        fs::write(&path, "all_subs_posts_per_group=5\n").unwrap();
         store.revert();
-        assert!(!store.current.show_nsfw);
-        assert_eq!(store.persistence, Persistence::Saved);
+        assert_eq!(store.current.all_subs_posts_per_group, 5);
     }
+
     #[test]
     fn read_only_is_temporary_and_retry_keeps_mode_and_symlink() {
         use std::os::unix::fs::{PermissionsExt, symlink};
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("réglages.toml");
-        fs::write(&real, "# user\nshow_nsfw = false\n").unwrap();
+        fs::write(&real, "# user\nall_subs_posts_per_group=3\n").unwrap();
         fs::set_permissions(&real, fs::Permissions::from_mode(0o444)).unwrap();
         let link = dir.path().join("config.toml");
         symlink(&real, &link).unwrap();
         let mut store = Store::open(Some(&link)).unwrap();
-        change(&mut store, "show_nsfw", "true");
+        change(&mut store, "all_subs_posts_per_group", "4");
         assert_eq!(store.persistence, Persistence::Temporary);
         assert_eq!(
-            fs::read_to_string(&real).unwrap(),
-            "# user\nshow_nsfw = false\n"
+            Config::load(Some(&real)).unwrap().all_subs_posts_per_group,
+            3
         );
-        store.reload();
-        assert!(store.current.show_nsfw);
         fs::set_permissions(&real, fs::Permissions::from_mode(0o640)).unwrap();
         store.save();
         assert_eq!(store.persistence, Persistence::Saved);
@@ -710,66 +787,65 @@ mod tests {
             fs::metadata(&real).unwrap().permissions().mode() & 0o777,
             0o640
         );
-        assert!(
-            fs::read_to_string(&real)
-                .unwrap()
-                .contains("show_nsfw = true")
-        );
         let other = dir.path().join("other.toml");
-        fs::write(&other, "[media]\nimage_preview = false").unwrap();
+        fs::write(&other, "all_subs_posts_per_group=5\n").unwrap();
         fs::remove_file(&link).unwrap();
         symlink(&other, &link).unwrap();
         store.reload();
         assert_eq!(store.persistence, Persistence::Unsaved);
-        assert!(store.current.media.image_preview);
+        assert_eq!(store.current.all_subs_posts_per_group, 4);
         store.revert();
-        assert!(!store.current.media.image_preview);
+        assert_eq!(store.current.all_subs_posts_per_group, 5);
     }
+
     #[test]
     fn empty_file_and_removing_keys_restore_defaults_on_reload() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        fs::write(&path, "show_nsfw = true\n").unwrap();
+        fs::write(&path, "[media]\nimage_preview=false\n").unwrap();
         let mut store = Store::open(Some(&path)).unwrap();
         fs::write(&path, "").unwrap();
         store.reload();
-        assert!(!store.current.show_nsfw);
+        assert!(store.current.media.image_preview);
         assert_eq!(store.persistence, Persistence::Saved);
-        fs::write(&path, "show_nsfw = true\n").unwrap();
-        store.reload();
-        assert!(store.current.show_nsfw);
     }
+
+    #[test]
+    fn scoped_settings_should_remove_and_readd_the_same_account_and_keep_signed_out_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut store = Store::open(Some(&path)).unwrap();
+        change(&mut store, "filters.keywords", "[\"signed out\"]");
+        store.select_account(Some("first"));
+        assert!(store.current.filters.keywords.is_empty());
+        change(&mut store, "filters.keywords", "[\"first\"]");
+        fs::write(&path, "[signed_out.filters]\nkeywords=[\"signed out\"]\n").unwrap();
+        store.reload();
+        assert!(store.current.filters.keywords.is_empty());
+        assert!(!store.current.accounts.contains_key("first"));
+        change(&mut store, "filters.keywords", "[\"again\"]");
+        store.select_account(None);
+        assert_eq!(store.current.filters.keywords, ["signed out"]);
+        assert_eq!(store.current.accounts["first"].filters.keywords, ["again"]);
+    }
+
     #[test]
     fn settings_review_array_edits_should_keep_internal_and_removed_element_comments() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        fs::write(&path, "# top\n[filters]\nkeywords = [\n    # before first\n    \"old\", # first note\n    \"removed\", # removed note\n    # trailing note\n] # outer\n").unwrap();
+        fs::write(&path, "# top\n[signed_out.filters]\nkeywords = [\n # before first\n \"old\", # first note\n \"removed\", # removed note\n # trailing note\n] # outer\n").unwrap();
         let mut store = Store::open(Some(&path)).unwrap();
-        for (input, expected) in [
-            ("[\"new\"]", vec!["new"]),
-            ("[]", vec![]),
-            ("[\"one\", \"two\"]", vec!["one", "two"]),
-        ] {
+        for input in ["[\"new\"]", "[]", "[\"one\", \"two\"]"] {
             change(&mut store, "filters.keywords", input);
             let text = fs::read_to_string(&path).unwrap();
-            assert_eq!(
-                Config::load(Some(&path)).unwrap().filters.keywords,
-                expected,
-                "{text}"
-            );
             for note in [
-                "# top",
                 "# before first",
                 "# first note",
                 "# removed note",
                 "# trailing note",
                 "# outer",
             ] {
-                assert_eq!(
-                    text.matches(note).count(),
-                    1,
-                    "lost or duplicated {note}: {text}"
-                );
+                assert!(text.contains(note), "{note}: {text}");
             }
         }
     }

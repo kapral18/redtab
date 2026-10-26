@@ -79,6 +79,9 @@ requires an interactive terminal.
 Defaults are `~/.local/state` for state and `~/.cache` for cache. Clearing the
 cache keeps bookmarks and history. Reading state and content caches are separated
 by account; unidentified sessions use a session fingerprint for their cache.
+Reader filters and highlights are also account-specific, stored in the shared
+TOML file under Reddit usernames. Reddit preferences stay on Reddit; terminal
+settings stay shared across accounts. See [Settings](configuration.md).
 Reconnecting preserves the current reading state when redtab recognizes the same
 account, or the same cookie for an unidentified account.
 
@@ -90,8 +93,10 @@ Cached content can include private posts your account can access.
 
 redtab connects directly, ignoring `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and
 `NO_PROXY`. External video players receive a loopback stream, so keep redtab open
-while they play. Authenticated requests start at least one second apart and slow
-further when Reddit reports a smaller remaining budget. Media uses a separate path.
+while they play. Authenticated requests start at least 500 ms apart. When Reddit
+reports available quota, short bursts can start at that spacing; consumed credits
+refill no faster than once per second and stay capped by the reported remaining
+budget. Media uses a separate path.
 
 On a rate limit, safe background reads stay pending until Reddit's wait expires
 (60 seconds when no interval is supplied). Foreground work takes priority. Writes

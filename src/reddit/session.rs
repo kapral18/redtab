@@ -76,6 +76,16 @@ impl Session {
             .any(|c| c.name == "reddit_session" && c.path == "/" && c.valid(now()))
     }
 
+    pub(super) fn csrf_token(&self) -> Result<&str> {
+        self.cookies
+            .iter()
+            .find(|cookie| {
+                cookie.name == "csrf_token" && cookie.matches("/svc/shreddit/graphql", now())
+            })
+            .map(|cookie| cookie.value.as_str())
+            .context("Reconnect with A to refresh the browser's settings token")
+    }
+
     pub fn export(&self, connection: Connection) -> Result<String> {
         let mut text = format!("{CONNECTION}{}\n", serde_json::to_string(&connection)?);
         for cookie in &self.cookies {

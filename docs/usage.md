@@ -4,19 +4,50 @@
 
 ## Feeds and tabs
 
-The sidebar contains Home, Bookmarks, All subs, subscriptions and opened subreddit
-tabs. Number keys switch tabs; `p` finds a tab or opens a subreddit. `\` hides the sidebar.
+The sidebar contains Home, Bookmarks, All subs, Subscriptions, Following and opened
+tabs. Subscriptions are communities; Following contains people you follow. Number
+keys switch tabs; `p` finds a tab or opens a subreddit or `u/name`. `\` hides the sidebar.
 
 Home uses Reddit's personalized Best feed, including recommendations. All subs
 groups the top non-stickied posts from each joined community. Press `r` there to
 refresh subscriptions and posts. A failed refresh keeps the last known community list.
 
-`V` switches Card/Compact view in Home, subreddit feeds, search and Bookmarks;
+Selecting a person in Following shows their submitted posts across communities in
+Card or Compact view. User feeds support New, Hot, Top and Controversial, with the
+same pagination, media and post details as community feeds. All subs contains
+communities only. `O` opens the user profile; sidebar `o` does too. In the list,
+`o` opens the selected post. In a user feed or its sidebar entry, `S` follows or
+unfollows the person, and `B` opens profile tools with that action first. The header
+shows Following, Not following or unknown status with its shortcut. In post details,
+`S` and `B` use the post's actual community or profile.
+
+Follow/unfollow uses the same confirmation as community join/leave. After a change,
+redtab refreshes Following automatically. Unfollowed feeds move to Opened with their
+posts and reading position intact. `x` closes opened tabs; followed users and joined
+communities stay pinned, with a hint to use `S` to remove the membership.
+
+`V` switches Card/Compact view in Home, community/user feeds, search and Bookmarks;
 the choice survives restarts. All subs keeps its community islands. At 158 columns,
 or 128 with the sidebar hidden, an open post appears beside the list and follows
 its selection. In narrower terminals it replaces the list.
 
-`Space` opens the selected post's community. `S` opens Join/Leave; `Enter` confirms
+Subreddit badges count unread posts redtab has fetched, across feeds and searches.
+Opening a loaded, revealed post clears that post. Moving through the sidebar,
+changing sort and failed loads leave the count alone. `?` means no retained listing
+history; a blank badge means no known unread posts or unavailable community access.
+Counts follow your filters and NSFW setting, survive restarts, and use local history
+rather than fetching every community in the background. Reading history
+expires after 90 days without another observation. Previously opened
+posts keep their read marks; old whole-visit marks no longer hide unopened posts.
+
+`B` opens community or profile actions from the sidebar, a list or a post. **Mark community
+read** clears all fetched unread posts for that community, including posts hidden
+by filters. New posts remain unread. This changes local reading history only.
+`O` opens the focused community or profile in your configured browser. In the sidebar, `o` also opens
+that destination; in lists and detail it opens the selected post/comment, falling
+back to the community when a feed is empty.
+
+`Space` opens the selected post's community. `S` opens Join/Leave or Follow/Unfollow; `Enter` confirms
 the Reddit account change. Leaving moves an open community tab to **Opened** and
 keeps its reading position. Failed changes are not retried automatically; `r` in
 All subs checks membership again.
@@ -40,11 +71,20 @@ Kitty also work in tmux. `i` toggles previews. `NO_COLOR` is supported.
 With `ffmpeg`, the selected card autoplays video/GIFs after navigation settles,
 initially muted. An open detail pane takes playback instead. `P` plays/pauses,
 `a` toggles sound, and `,`/`.` seek five seconds. Scrolling within the same post
-keeps pause and position. Set `video_autoplay = false` in `[media]` for manual playback.
+keeps pause and position. Turn off **Autoplay videos** in F2 for manual playback; it saves to the current Reddit account.
 Play overlays mark paused/waiting media; links show an arrow and domain, and
 galleries show an image count.
 
-`m` opens original images in your viewer, videos in your video player and links
+Public YouTube videos and Shorts use the same inline controls, autoplay setting
+and muted card playback. Install a current `yt-dlp` and a supported JavaScript
+runtime (Deno is recommended; Node.js is also enabled). Some installations also need
+the extractor's [EJS components](https://github.com/yt-dlp/yt-dlp/wiki/EJS).
+The YouTube badge and play overlay identify these posts; their poster stays visible
+while the stream resolves. `P` retries failures; `m` opens the original YouTube page
+in your browser and pauses inline playback. Live, scheduled and login-required
+videos use this browser fallback. Redtab does not import YouTube cookies.
+
+`m` opens original images in your viewer, Reddit videos in your video player and links
 in your browser. Keep redtab open during external video playback. Use `o` to open the
 selected post/comment on Reddit, `y` to copy its link, and `b` for a local bookmark.
 Feeds, posts and still previews reuse cached data and refresh in the background.
@@ -66,7 +106,7 @@ an uncertain write: redtab waits for acknowledgment and never retries writes
 automatically. Deleting content or a custom feed requires confirmation.
 
 Items marked **open Reddit ↗** use the browser's own signed-in account. This
-covers chat/message archives, uploads, poll voting, follows/blocks, community
+covers chat/message archives, uploads, poll voting, blocks, community
 muting/favorites, flair, awards, advanced moderation, and comment/media search.
 `Ctrl+o` opens the corresponding page from Reddit tools. Community posting
 requirements, such as mandatory flair, may also require finishing in the browser;
@@ -82,12 +122,12 @@ Help scrolls with `j`/`k`; `Esc` returns to the view beneath it.
 | --- | --- | --- |
 | Tabs | `Tab` / `Shift+Tab`, `]` / `[` | Next / previous tab |
 | Tabs | `1`–`9`, `0` | Numbered tab / last tab |
-| Tabs | `p`, `x`, `\` | Jump/open subreddit, close opened tab, toggle sidebar |
+| Tabs | `p`, `x`, `\` | Jump/open subreddit or u/name, close opened tab, toggle sidebar |
 | Sidebar | `h`, then `j`/`k` or `g`/`G` | Focus sidebar, move or select first/last tab; `l`, `Enter` or `Esc` returns |
 | List | `j`/`k`, `g`/`G` | Select next/previous post, first/last post |
 | List | `Enter`, `l` | Open selected post or resume retained detail |
 | List | `V` | Switch Card/Compact |
-| List | `Space`, `S` | Open community, join/leave community |
+| List | `Space`, `S` | Open community/profile; join/leave community or follow/unfollow user |
 | Home/subreddit | `s`, `t`, `L` | Sort, time range, load next page |
 | Subreddit | `/`, `Esc` | Search, clear search |
 | Cards | `Page Down/Up`, `Ctrl+d/u`, `Ctrl+e/y` | Scroll a page, half page, line across card boundaries |

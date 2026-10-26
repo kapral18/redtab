@@ -88,6 +88,7 @@ enum MenuScope {
     Community,
     Comments,
     Message,
+    User,
 }
 
 #[derive(Clone)]
@@ -98,6 +99,9 @@ enum Command {
     Confirm(String, Action),
     Native(String),
     Subreddit(String),
+    User(String),
+    Membership(MembershipTarget),
+    MarkCommunityRead(String),
     Sort(String),
     Target(Target, Option<Post>),
 }
@@ -241,8 +245,12 @@ fn ordered_choices(choices: Vec<Choice>, scope: MenuScope) -> Vec<Choice> {
                     Command::Confirm(_, _) => (7, "Destructive"),
                     _ => (6, "On Reddit"),
                 },
+                MenuScope::User => (0, "Profile"),
                 MenuScope::Community => match &choice.command {
-                    Command::Subreddit(_) => (0, "Community"),
+                    Command::Subreddit(_) | Command::MarkCommunityRead(_) => (0, "Community"),
+                    Command::Native(path) if path.strip_prefix("/r/").is_some_and(is_community) => {
+                        (0, "Community")
+                    }
                     Command::Read(Query::Community(_) | Query::Rules(_)) => (1, "About"),
                     Command::Read(Query::Wiki { .. }) | Command::Input(_) => (2, "Wiki"),
                     Command::Read(Query::Moderators(_)) => (3, "Moderators"),
@@ -325,15 +333,46 @@ impl App {
     }
 
     fn experience_community(&self) -> String {
-        self.action_target()
-            .map(|target| target.subreddit)
-            .filter(|s| is_community(s))
-            .or_else(|| {
-                self.active_tab()
-                    .subreddit()
-                    .filter(|s| is_community(s))
-                    .map(str::to_string)
-            })
+        if matches!(self.overlay, Some(Overlay::Experience))
+            && let Some(Screen::Browse {
+                query,
+                page,
+                selected,
+                ..
+            }) = self.experience.screens.last()
+        {
+            let entry = page.entries.get(*selected);
+            if entry
+                .and_then(|entry| entry.target.as_ref())
+                .is_some_and(|target| crate::model::profile_user(&target.permalink).is_some())
+            {
+                return String::new();
+            }
+            let name = entry
+                .and_then(|entry| entry.target.as_ref())
+                .map(|target| target.subreddit.as_str())
+                .or_else(|| {
+                    entry
+                        .and_then(|entry| entry.query.as_ref())
+                        .into_iter()
+                        .chain([query])
+                        .find_map(|query| match query {
+                            Query::Community(name)
+                            | Query::Rules(name)
+                            | Query::Moderators(name)
+                            | Query::Wiki {
+                                subreddit: name, ..
+                            } => Some(name.as_str()),
+                            _ => None,
+                        })
+                });
+            return name
+                .filter(|name| is_community(name))
+                .unwrap_or_default()
+                .to_string();
+        }
+        self.community()
+            .filter(|name| is_community(name))
             .unwrap_or_default()
     }
 
@@ -555,8 +594,15 @@ impl App {
             ),
             read("Author profile", Query::Profile(target.author.clone())),
             read(
-                "Community information",
-                Query::Community(target.subreddit.clone()),
+                if crate::model::profile_user(&target.permalink).is_some() {
+                    "Profile information"
+                } else {
+                    "Community information"
+                },
+                crate::model::profile_user(&target.permalink).map_or_else(
+                    || Query::Community(target.subreddit.clone()),
+                    |name| Query::Profile(name.to_string()),
+                ),
             ),
             choice(
                 "Report content",
@@ -649,7 +695,11 @@ impl App {
             choices.push(read("Read original crosspost", Query::Thread(path)));
         }
         let profile = format!("/user/{}", target.author);
-        let sub = format!("/r/{}", target.subreddit);
+        let profile_owner = crate::model::profile_user(&target.permalink);
+        let sub = profile_owner.map_or_else(
+            || format!("/r/{}", target.subreddit),
+            |name| format!("/user/{name}/"),
+        );
         choices.extend([
             native(
                 "Open content, vote in poll or view awards",
@@ -657,7 +707,14 @@ impl App {
             ),
             native("Crosspost or manage post notifications", &target.permalink),
             native("Author profile: follow, block or chat", &profile),
-            native("Mute/favorite community or select flair", &sub),
+            native(
+                if profile_owner.is_some() {
+                    "Profile controls"
+                } else {
+                    "Mute/favorite community or select flair"
+                },
+                &sub,
+            ),
             native("Moderate this content", &target.permalink),
         ]);
         if name(&target.author).is_err() {
@@ -682,17 +739,104 @@ impl App {
         }
     }
 
+    pub fn membership_target(&self) -> Option<MembershipTarget> {
+        if matches!(self.overlay, Some(Overlay::Experience)) {
+            if let Some(Screen::Menu {
+                choices, native, ..
+            }) = self.experience.screens.last()
+            {
+                return choices
+                    .iter()
+                    .find_map(|choice| match &choice.command {
+                        Command::Membership(target) => Some(target.clone()),
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        native
+                            .strip_prefix("/r/")
+                            .filter(|name| is_community(name))
+                            .map(|name| MembershipTarget::Community(name.into()))
+                    });
+            }
+            let Screen::Browse {
+                query,
+                page,
+                selected,
+                ..
+            } = self.experience.screens.last()?
+            else {
+                return None;
+            };
+            let entry = page.entries.get(*selected);
+            if let Some(user) = entry
+                .and_then(|entry| entry.target.as_ref())
+                .and_then(|target| crate::model::profile_user(&target.permalink))
+            {
+                return Some(MembershipTarget::User(user.into()));
+            }
+            let sub = self.experience_community();
+            if !sub.is_empty() {
+                return Some(MembershipTarget::Community(sub));
+            }
+            return entry
+                .and_then(|entry| entry.query.as_ref())
+                .into_iter()
+                .chain([query])
+                .find_map(|query| match query {
+                    Query::Profile(name) | Query::User { name, .. } => {
+                        Some(MembershipTarget::User(name.clone()))
+                    }
+                    _ => None,
+                })
+                .filter(MembershipTarget::is_valid);
+        }
+        self.profile_context()
+            .map(MembershipTarget::User)
+            .or_else(|| {
+                self.community()
+                    .filter(|name| is_community(name))
+                    .map(MembershipTarget::Community)
+            })
+    }
+
     pub fn community_menu(&mut self) {
-        let sub = self.experience_community();
-        if sub.is_empty() {
+        let Some(target) = self.membership_target() else {
             self.reddit_menu();
             return;
+        };
+        if let MembershipTarget::User(user) = &target {
+            let path = format!("/user/{user}/");
+            let action = self
+                .subscribed(&target)
+                .map_or("Check following status", |joined| target.action(!joined));
+            self.push_menu(
+                &target.label(),
+                vec![
+                    choice(action, Command::Membership(target.clone())),
+                    choice("Open submitted posts", Command::User(user.clone())),
+                    choice("Open profile in browser ↗", Command::Native(path.clone())),
+                    read("Profile info", Query::Profile(user.clone())),
+                ],
+                MenuScope::User,
+            );
+            if let Some(Screen::Menu { native, .. }) = self.experience.screens.last_mut() {
+                *native = path;
+            }
+            return;
         }
+        let MembershipTarget::Community(sub) = target else {
+            unreachable!()
+        };
         let path = format!("/r/{sub}");
         self.push_menu(
             &format!("r/{sub}"),
             vec![
                 choice("Open community feed", Command::Subreddit(sub.clone())),
+                choice("Open community in browser ↗", Command::Native(path.clone())),
+                choice(
+                    "Mark community read",
+                    Command::MarkCommunityRead(sub.clone()),
+                ),
                 read("About and sidebar", Query::Community(sub.clone())),
                 read("Rules", Query::Rules(sub.clone())),
                 read(
@@ -713,7 +857,6 @@ impl App {
                 ),
                 read("Moderators", Query::Moderators(sub.clone())),
                 native("Message the mods", &format!("{path}/about/moderators")),
-                native("Mute, favorite, notifications or user flair", &path),
                 native("Moderation queue", &format!("{path}/about/modqueue")),
                 native("Mod mail", "/mod/mail"),
             ],
@@ -744,7 +887,8 @@ impl App {
     }
 
     fn write_experience(&mut self, action: Action) {
-        if self.experience.pending.is_some() || self.membership.is_some() {
+        if self.experience.pending.is_some() || self.membership.is_some() || self.settings.writing()
+        {
             self.experience.error = Some("Wait for the pending Reddit action".into());
             return;
         }
@@ -980,9 +1124,18 @@ impl App {
                 });
             }
             Command::Native(path) => self.open_reddit_link(&path),
+            Command::Membership(target) => self.show_membership_for(target),
+            Command::User(name) => {
+                self.overlay = None;
+                self.open_user(&name);
+            }
             Command::Subreddit(sub) => {
                 self.overlay = None;
                 self.open_subreddit(&sub);
+            }
+            Command::MarkCommunityRead(sub) => {
+                self.overlay = None;
+                self.mark_community_read(&sub);
             }
             Command::Sort(sort) => {
                 self.overlay = None;
@@ -1085,6 +1238,10 @@ impl App {
             return;
         }
         if self.experience.pending.is_some() {
+            return;
+        }
+        if key.code == KeyCode::Char('S') && !ctrl && !alt {
+            self.show_membership();
             return;
         }
         if ctrl && matches!(key.code, KeyCode::Char('d' | 'u' | 'e' | 'y')) {
@@ -1196,6 +1353,10 @@ impl App {
                 }
                 KeyCode::Char(';') => {
                     self.show_actions();
+                    return;
+                }
+                KeyCode::Char('B') => {
+                    self.community_menu();
                     return;
                 }
                 KeyCode::Char('o') => {
@@ -2373,16 +2534,11 @@ mod tests {
                     Screen::Input(draft.clone()),
                 ];
                 app.overlay = Some(Overlay::Experience);
-                if external {
-                    std::fs::write(&path, "show_nsfw=true\n[media]\nimage_preview=false\n")
-                        .unwrap();
-                    assert!(app.poll_settings(Instant::now() + Duration::from_secs(1)));
-                } else {
-                    crate::keys::handle(&mut app, KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-                    crate::keys::handle(
-                        &mut app,
-                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                    );
+                if !external {
+                    app.show_settings();
+                }
+                crate::app::tests::confirm_preferences(&mut app, true);
+                if !external {
                     crate::keys::handle(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
                 }
                 assert!(app.config.show_nsfw);
@@ -2428,7 +2584,7 @@ mod tests {
             };
             app.on_experience(generation, Err("fixture error".into()));
             assert!(app.experience.error.is_some());
-            app.change_setting("show_nsfw", toml::Value::Boolean(true));
+            crate::app::tests::confirm_preferences(&mut app, true);
             assert!(app.experience.input().is_some());
             assert_eq!(
                 app.experience.error.is_some(),
@@ -2446,7 +2602,7 @@ mod tests {
                 (false, true, false),
             ] {
                 let (mut app, directory, _fixture) = app();
-                app.change_setting("show_nsfw", toml::Value::Boolean(true));
+                crate::app::tests::confirm_preferences(&mut app, true);
                 let mut page = post_page();
                 page.post.nsfw = adult;
                 page.post.title = "needle".into();
@@ -2458,7 +2614,7 @@ mod tests {
                     result: Ok(Box::new(page)),
                 });
                 let path = directory.path().join("config.toml");
-                std::fs::write(&path, "show_nsfw=true\n[media]\nimage_preview=false\n").unwrap();
+                std::fs::write(&path, "[media]\nimage_preview=false\n").unwrap();
                 app.settings = super::super::settings::Settings::new(
                     crate::config::store::Store::open(Some(&path)).unwrap(),
                 );
@@ -2469,28 +2625,20 @@ mod tests {
                     "/comments/post",
                 ))];
                 app.overlay = Some(Overlay::Experience);
-                if external {
-                    std::fs::write(&path, if filter { "show_nsfw=true\n[media]\nimage_preview=false\n[filters]\nkeywords=[\"needle\"]\n" } else { "show_nsfw=false\n[media]\nimage_preview=false\n" }).unwrap();
-                    app.poll_settings(Instant::now() + Duration::from_secs(1));
-                } else {
-                    crate::keys::handle(&mut app, KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-                    if filter {
-                        app.settings.selected = 4;
-                        crate::keys::handle(
-                            &mut app,
-                            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                if filter {
+                    if external {
+                        let username = app.reddit.account().unwrap().name;
+                        std::fs::write(&path, format!("[media]\nimage_preview=false\n[accounts.{username}.filters]\nkeywords=[\"needle\"]\n")).unwrap();
+                        app.settings.store.select_account(Some(&username));
+                        app.poll_settings(Instant::now() + Duration::from_secs(2));
+                    } else {
+                        app.change_setting(
+                            "filters.keywords",
+                            toml::Value::Array(vec!["needle".into()]),
                         );
-                        crate::keys::handle(
-                            &mut app,
-                            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
-                        );
-                        crate::keys::paste(&mut app, "[\"needle\"]");
                     }
-                    crate::keys::handle(
-                        &mut app,
-                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                    );
-                    crate::keys::handle(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                } else {
+                    crate::app::tests::confirm_preferences(&mut app, false);
                 }
                 assert_eq!(app.post_view.is_some(), keep);
                 assert_eq!(
@@ -2509,5 +2657,324 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn community_menu_should_offer_a_local_read_action() {
+        let (mut app, _dir, _fixture) = app();
+        app.open_subreddit("s");
+        app.community_menu();
+        let Some(Screen::Menu { choices, .. }) = app.experience.screens.last() else {
+            panic!("menu missing")
+        };
+        assert!(
+            choices
+                .iter()
+                .any(|choice| choice.label == "Mark community read")
+        );
+    }
+    #[test]
+    fn community_read_menu_action_should_keep_its_captured_target_and_save_locally() {
+        let (mut app, dir, _fixture) = app();
+        app.open_subreddit("s");
+        let mut post = post_page().post;
+        post.subreddit = "s".into();
+        app.state.observe(
+            Some("s"),
+            std::slice::from_ref(&post),
+            Freshness {
+                fetched_at: now(),
+                source: Source::default(),
+            },
+            now(),
+        );
+        app.community_menu();
+        let Some(Screen::Menu { choices, .. }) = app.experience.screens.last() else {
+            panic!("menu missing")
+        };
+        let command = choices
+            .iter()
+            .find(|choice| choice.label == "Mark community read")
+            .unwrap()
+            .command
+            .clone();
+        app.active = 0;
+
+        app.execute_experience(command);
+
+        assert!(app.state.is_read(&post.id));
+        assert_eq!(
+            State::load(&dir.path().join("state.json"))
+                .0
+                .unread("s", &app.config),
+            Some(0)
+        );
+        assert!(app.overlay.is_none());
+        assert!(app.experience.pending.is_none());
+    }
+
+    #[test]
+    fn user_feed_tools_should_put_unfollow_first_and_capture_the_person() {
+        let (mut app, _dir, _fixture) = app();
+        app.on_msg(Msg::Subscriptions {
+            generation: 0,
+            result: Ok(vec![Subscription::User {
+                name: "blackvault".into(),
+                icon: None,
+            }]),
+        });
+        app.open_user("blackvault");
+        app.tabs[app.active].feed.posts.push(post_page().post);
+        app.focus = Focus::List;
+
+        app.community_menu();
+
+        let Some(Screen::Menu { title, choices, .. }) = app.experience.screens.last() else {
+            panic!("profile menu missing")
+        };
+        assert_eq!(title, "u/blackvault");
+        assert_eq!(choices[0].label, "Unfollow");
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Membership { target: MembershipTarget::User(name), join: false }) if name == "blackvault")
+        );
+        assert!(
+            app.membership.is_none(),
+            "confirmation must not write before Enter"
+        );
+        key(&mut app, KeyCode::Esc);
+        assert!(app.membership.is_none());
+    }
+
+    #[test]
+    fn fresh_profile_post_inspection_should_keep_profile_actions_and_native_identity() {
+        for (subreddit, subtype, permalink, profile) in [
+            (
+                "u_blackvault",
+                "user",
+                "/r/u_blackvault/comments/post/title/",
+                true,
+            ),
+            (
+                "u_ordinary",
+                "public",
+                "/r/u_ordinary/comments/post/title/",
+                false,
+            ),
+        ] {
+            let fixture = Fixture::new(move |_| {
+                Reply::json(json!([
+                    {"kind":"Listing","data":{"children":[{"kind":"t3","data":{
+                        "id":"post", "name":"t3_post", "title":"Submission", "author":"reader",
+                        "subreddit":subreddit, "subreddit_type":subtype, "permalink":permalink,
+                        "selftext":"Markdown source", "saved":true, "likes":true
+                    }}]}},
+                    {"kind":"Listing","data":{"children":[]}}
+                ]))
+            });
+            let canonical = if profile {
+                "/user/blackvault/comments/post/title/"
+            } else {
+                permalink
+            };
+            let Response::Details(details) = fixture
+                .reddit()
+                .experience(&Request::Read {
+                    query: Query::Inspect(Target {
+                        id: "t3_post".into(),
+                        author: "reader".into(),
+                        subreddit: subreddit.into(),
+                        permalink: canonical.into(),
+                    }),
+                    after: None,
+                })
+                .unwrap()
+            else {
+                panic!("details missing")
+            };
+            assert_eq!(details.target.permalink, canonical);
+            assert!(details.saved);
+            assert_eq!(details.vote, 1);
+            assert_eq!(details.raw_text, "Markdown source");
+            let (mut app, _dir, _fixture) = app();
+            app.details_menu(details);
+            let Some(Screen::Menu {
+                choices, native, ..
+            }) = app.experience.screens.last()
+            else {
+                panic!("menu missing")
+            };
+            assert_eq!(native, canonical);
+            assert_eq!(
+                choices
+                    .iter()
+                    .any(|choice| choice.label == "Profile information"),
+                profile
+            );
+            assert_eq!(
+                choices
+                    .iter()
+                    .any(|choice| choice.label == "Community information"),
+                !profile
+            );
+            assert_eq!(
+                choices
+                    .iter()
+                    .any(|choice| choice.label.starts_with("Profile controls ·")),
+                profile
+            );
+        }
+    }
+
+    #[test]
+    fn collection_source_tools_should_use_the_selected_post_before_sidebar_or_query_context() {
+        for focus in [Focus::Sidebar, Focus::List] {
+            for (subreddit, permalink, title) in [
+                ("rust", "/r/rust/comments/post/title/", "r/rust"),
+                (
+                    "u_blackvault",
+                    "/user/blackvault/comments/post/title/",
+                    "u/blackvault",
+                ),
+                (
+                    "u_ordinary",
+                    "/r/u_ordinary/comments/post/title/",
+                    "r/u_ordinary",
+                ),
+            ] {
+                let (mut app, _dir, _fixture) = app();
+                app.open_user("collection-owner");
+                app.focus = focus;
+                let mut post = post_page().post;
+                post.subreddit = subreddit.into();
+                post.permalink = permalink.into();
+                app.experience.screens.push(Screen::Browse {
+                    query: Query::User {
+                        name: "collection-owner".into(),
+                        feed: UserFeed::Posts,
+                    },
+                    page: Page {
+                        title: "Posts".into(),
+                        url: "/user/collection-owner/submitted/".into(),
+                        entries: vec![Entry {
+                            title: "Selected post".into(),
+                            body: String::new(),
+                            target: Some(Target::from_post(&post)),
+                            post: Some(post),
+                            query: None,
+                        }],
+                        after: None,
+                        text: String::new(),
+                    },
+                    selected: 0,
+                    scroll: 0,
+                });
+                app.overlay = Some(Overlay::Experience);
+
+                key(&mut app, KeyCode::Char('B'));
+
+                let Some(Screen::Menu {
+                    title: actual,
+                    choices,
+                    ..
+                }) = app.experience.screens.last()
+                else {
+                    panic!("menu missing")
+                };
+                assert_eq!(actual, title);
+                assert_eq!(
+                    choices
+                        .iter()
+                        .any(|choice| choice.label == "Mark community read"),
+                    title.starts_with("r/")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn community_menu_should_target_an_empty_selected_island() {
+        let (mut app, _dir, _fixture) = app();
+        app.on_msg(Msg::Subscriptions {
+            generation: 0,
+            result: Ok((vec!["empty".into()])
+                .into_iter()
+                .map(|name| crate::model::Subscription::Community {
+                    name,
+                    icon: crate::model::SubscriptionIcon::Unknown,
+                })
+                .collect()),
+        });
+        app.active = ALL_SUBS_TAB;
+
+        app.community_menu();
+
+        let Some(Screen::Menu { title, native, .. }) = app.experience.screens.last() else {
+            panic!("menu missing")
+        };
+        assert_eq!(title, "r/empty");
+        assert_eq!(native, "/r/empty");
+    }
+
+    #[test]
+    fn community_menu_should_target_the_selected_community_discovery_result() {
+        let (mut app, _dir, _fixture) = app();
+        app.open_subreddit("underneath");
+        app.experience.screens.push(Screen::Browse {
+            query: Query::Communities,
+            page: Page {
+                url: "/subreddits".into(),
+                title: "Communities".into(),
+                entries: vec![Entry {
+                    title: "r/picked".into(),
+                    body: String::new(),
+                    target: None,
+                    query: Some(Query::Community("picked".into())),
+                    post: None,
+                }],
+                after: None,
+                text: String::new(),
+            },
+            selected: 0,
+            scroll: 0,
+        });
+        app.overlay = Some(Overlay::Experience);
+
+        key(&mut app, KeyCode::Char('B'));
+
+        let Some(Screen::Menu { title, .. }) = app.experience.screens.last() else {
+            panic!("menu missing")
+        };
+        assert_eq!(title, "r/picked");
+    }
+    #[test]
+    fn community_menu_on_a_moderator_list_should_keep_its_parent_community() {
+        let (mut app, _dir, _fixture) = app();
+        app.open_subreddit("underneath");
+        app.experience.screens.push(Screen::Browse {
+            query: Query::Moderators("moderated".into()),
+            page: Page {
+                title: "Moderators".into(),
+                text: String::new(),
+                after: None,
+                url: "/r/moderated/about/moderators".into(),
+                entries: vec![Entry {
+                    title: "u/mod".into(),
+                    body: String::new(),
+                    target: None,
+                    query: Some(Query::Profile("mod".into())),
+                    post: None,
+                }],
+            },
+            selected: 0,
+            scroll: 0,
+        });
+        app.overlay = Some(Overlay::Experience);
+
+        key(&mut app, KeyCode::Char('B'));
+
+        let Some(Screen::Menu { title, .. }) = app.experience.screens.last() else {
+            panic!("menu missing")
+        };
+        assert_eq!(title, "r/moderated");
     }
 }

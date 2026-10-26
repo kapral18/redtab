@@ -12,7 +12,9 @@ use std::thread;
 use image::DynamicImage;
 
 use crate::cache::{CONTENT_TTL, Cache, IMAGE_TTL, Source};
-use crate::model::{Listing, Media, Post, PostPage, ReplyPage, Sort, TimeRange};
+use crate::model::{
+    Listing, Media, MembershipTarget, Post, PostPage, ReplyPage, Sort, Subscription, TimeRange,
+};
 use crate::reddit::{AccessDenied, ListingEvent, Priority, Reddit};
 
 /// Largest image edge sent to the terminal; bigger images only cost bandwidth.
@@ -39,6 +41,7 @@ pub enum FeedQuery {
 pub enum FeedTarget {
     Home,
     Subreddit(String),
+    User(String),
 }
 
 impl FeedQuery {
@@ -50,6 +53,9 @@ impl FeedQuery {
     fn cache_request(&self, target: &FeedTarget, after: Option<&str>) -> Option<String> {
         match target {
             FeedTarget::Home => serde_json::to_string(&("browser-home-v2", self, after)).ok(),
+            FeedTarget::User(name) => {
+                serde_json::to_string(&("user-submitted", name.to_lowercase(), self, after)).ok()
+            }
             FeedTarget::Subreddit(name) => {
                 serde_json::to_string(&("feed", name.to_lowercase(), self, after)).ok()
             }
@@ -73,7 +79,10 @@ impl FeedQuery {
             (FeedTarget::Subreddit(name), Self::Search { query }) => {
                 reddit.search_progress(name, query, after, progress)
             }
-            (FeedTarget::Home, Self::Search { .. }) => {
+            (FeedTarget::User(name), Self::Listing { sort, time }) => {
+                reddit.user_posts_progress(name, *sort, *time, after, progress)
+            }
+            (FeedTarget::Home | FeedTarget::User(_), Self::Search { .. }) => {
                 anyhow::bail!("search runs inside a subreddit")
             }
         }
@@ -177,7 +186,7 @@ pub enum Job {
     },
     Membership {
         generation: u64,
-        subreddit: String,
+        target: MembershipTarget,
         join: bool,
     },
     Feed {
@@ -366,7 +375,7 @@ pub enum Msg {
     },
     Subscriptions {
         generation: u64,
-        result: Result<Vec<String>, String>,
+        result: Result<Vec<Subscription>, String>,
     },
     /// Cached or freshly fetched content, with its original fetch time.
     Snapshot {
@@ -914,9 +923,9 @@ fn spawn_worker(
                             | Job::Image {
                                 background: false, ..
                             } => Priority::Selected,
-                            Job::Group { .. } | Job::Icon { .. } => Priority::Background,
+                            Job::Icon { .. } => Priority::Background,
                             Job::Subscriptions { .. } if !force => Priority::Background,
-                            Job::Feed { .. } => Priority::Listing,
+                            Job::Feed { .. } | Job::Group { .. } => Priority::Listing,
                             _ => Priority::Foreground,
                         },
                         retry_reads,
@@ -1165,7 +1174,7 @@ impl Job {
     fn cache_key(&self, namespace: &str) -> Option<(String, i64)> {
         let (request, ttl) = match self {
             Job::Subscriptions { .. } | Job::Membership { .. } => {
-                ("subscriptions".to_string(), CONTENT_TTL)
+                ("subscriptions-v3".to_string(), CONTENT_TTL)
             }
             Job::Feed {
                 target,
@@ -1486,13 +1495,11 @@ fn run(
         },
         Job::Membership {
             generation,
-            subreddit,
+            target,
             join,
         } => Msg::Membership {
             generation: *generation,
-            result: reddit
-                .set_subscription(subreddit, *join)
-                .map_err(err_string),
+            result: reddit.set_membership(target, *join).map_err(err_string),
         },
         Job::Subscriptions { generation } => Msg::Subscriptions {
             generation: *generation,
@@ -2848,7 +2855,7 @@ mod tests {
         cache
             .store(
                 &key,
-                br#"["neovim","rust"]"#,
+                br#"[{"community":{"name":"neovim","icon":{"url":"https://i.redd.it/neovim.png"}}},{"community":{"name":"rust","icon":"missing"}}]"#,
                 crate::app::now(),
                 cache.reserve_request().unwrap(),
             )
@@ -2873,7 +2880,21 @@ mod tests {
         else {
             panic!("subscription result")
         };
-        assert_eq!(names, ["neovim", "rust"]);
+        assert_eq!(
+            names,
+            [
+                Subscription::Community {
+                    name: "neovim".into(),
+                    icon: crate::model::SubscriptionIcon::Url(
+                        "https://i.redd.it/neovim.png".into()
+                    )
+                },
+                Subscription::Community {
+                    name: "rust".into(),
+                    icon: crate::model::SubscriptionIcon::Missing
+                }
+            ]
+        );
     }
 
     #[test]
@@ -2884,7 +2905,7 @@ mod tests {
         let read = Job::Subscriptions { generation: 1 };
         let job = Job::Membership {
             generation: 2,
-            subreddit: "armenia".into(),
+            target: crate::model::MembershipTarget::Community("armenia".into()),
             join: true,
         };
         let (key, _) = read.cache_key(namespace).unwrap();
@@ -2893,7 +2914,12 @@ mod tests {
             let write_start = cache.reserve_request().unwrap();
             let late_read = cache.reserve_request().unwrap();
             cache
-                .store(&key, br#"["rust"]"#, crate::app::now(), late_read)
+                .store(
+                    &key,
+                    br#"[{"community":{"name":"rust","icon":"unknown"}}]"#,
+                    crate::app::now(),
+                    late_read,
+                )
                 .unwrap();
             cache_result(
                 Msg::Membership {
@@ -2910,7 +2936,12 @@ mod tests {
                 },
             );
             cache
-                .store(&key, br#"["rust"]"#, crate::app::now(), late_read)
+                .store(
+                    &key,
+                    br#"[{"community":{"name":"rust","icon":"unknown"}}]"#,
+                    crate::app::now(),
+                    late_read,
+                )
                 .unwrap();
             let entry = cache.load(&key, crate::app::now()).unwrap();
             assert!(
@@ -2921,14 +2952,24 @@ mod tests {
             assert!(entry.order.sequence > late_read.sequence);
             let confirmed = cache.reserve_request().unwrap();
             cache
-                .store(&key, br#"["armenia","rust"]"#, crate::app::now(), confirmed)
+                .store(
+                    &key,
+                    br#"[{"community":{"name":"armenia","icon":"unknown"}},{"community":{"name":"rust","icon":"unknown"}}]"#,
+                    crate::app::now(),
+                    confirmed,
+                )
                 .unwrap();
             cache
-                .store(&key, br#"["rust"]"#, crate::app::now(), late_read)
+                .store(
+                    &key,
+                    br#"[{"community":{"name":"rust","icon":"unknown"}}]"#,
+                    crate::app::now(),
+                    late_read,
+                )
                 .unwrap();
             assert_eq!(
                 cache.load(&key, crate::app::now()).unwrap().bytes,
-                br#"["armenia","rust"]"#
+                br#"[{"community":{"name":"armenia","icon":"unknown"}},{"community":{"name":"rust","icon":"unknown"}}]"#
             );
         }
     }
@@ -2967,7 +3008,7 @@ mod tests {
         cache
             .store(
                 &key,
-                br#"["rust"]"#,
+                br#"[{"community":{"name":"rust","icon":"unknown"}}]"#,
                 crate::app::now(),
                 cache.reserve_request().unwrap(),
             )
@@ -2975,7 +3016,7 @@ mod tests {
         let (pool, messages) = Pool::start(reddit, 3, Some(cache));
         pool.submit(Job::Membership {
             generation: 2,
-            subreddit: "armenia".into(),
+            target: crate::model::MembershipTarget::Community("armenia".into()),
             join: true,
         });
         assert!(matches!(
@@ -2995,7 +3036,7 @@ mod tests {
         };
         assert!(!source.cached);
         assert!(
-            matches!(*message, Msg::Subscriptions { generation: 3, result: Ok(names) } if names == ["armenia"])
+            matches!(*message, Msg::Subscriptions { generation: 3, result: Ok(names) } if names == [Subscription::Community { name: "armenia".into(), icon: crate::model::SubscriptionIcon::Unknown }])
         );
     }
 
@@ -3579,6 +3620,35 @@ mod tests {
         ));
     }
 }
+#[test]
+fn user_submitted_cache_keys_should_not_collide_with_a_same_named_community_or_cursor() {
+    let query = FeedQuery::Listing {
+        sort: Sort::New,
+        time: TimeRange::Day,
+    };
+    let user = query
+        .cache_request(&FeedTarget::User("Same".into()), None)
+        .unwrap();
+    assert_ne!(
+        user,
+        query
+            .cache_request(&FeedTarget::Subreddit("same".into()), None)
+            .unwrap()
+    );
+    assert_ne!(
+        user,
+        query
+            .cache_request(&FeedTarget::User("same".into()), Some("next"))
+            .unwrap()
+    );
+    assert_eq!(
+        user,
+        query
+            .cache_request(&FeedTarget::User("same".into()), None)
+            .unwrap()
+    );
+}
+
 #[test]
 fn when_home_and_a_subreddit_share_a_name_their_cache_keys_should_stay_separate() {
     let query = FeedQuery::Listing {

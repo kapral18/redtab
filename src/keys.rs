@@ -226,17 +226,20 @@ fn handle_overlay(app: &mut App, overlay: Overlay, key: KeyEvent) -> Option<Over
             }
             Some(Overlay::Auth)
         }
-        Overlay::Membership { subreddit, join } => match key.code {
+        Overlay::Membership { target, join } => match key.code {
             KeyCode::Esc | KeyCode::Char('q') => None,
             KeyCode::Enter => {
-                app.set_membership(subreddit, join);
+                app.set_membership(target, join);
                 None
             }
             KeyCode::Char(' ') => {
-                app.open_subreddit(&subreddit);
+                match target {
+                    crate::model::MembershipTarget::Community(name) => app.open_subreddit(&name),
+                    crate::model::MembershipTarget::User(name) => app.open_user(&name),
+                }
                 None
             }
-            _ => Some(Overlay::Membership { subreddit, join }),
+            _ => Some(Overlay::Membership { target, join }),
         },
         Overlay::Picker(mut picker) => {
             match (key.code, ctrl) {
@@ -361,7 +364,7 @@ fn handle_global(app: &mut App, key: KeyEvent) {
     let in_post = app.post_focused();
     let all_subs = matches!(app.active_tab().kind, TabKind::AllSubs);
     let on_sub = matches!(app.active_tab().kind, TabKind::Subreddit { .. });
-    let on_feed = on_sub || matches!(app.active_tab().kind, TabKind::Home);
+    let on_feed = on_sub || matches!(app.active_tab().kind, TabKind::Home | TabKind::User { .. });
     match key.code {
         KeyCode::Char('q') if app.post_view.is_some() => app.close_post(),
         KeyCode::Char('q') => app.quit = true,
@@ -381,6 +384,7 @@ fn handle_global(app: &mut App, key: KeyEvent) {
         KeyCode::Char('i') => app.toggle_images(),
         KeyCode::Char('V') => app.toggle_list_view(),
         KeyCode::Char('o') => app.open_in_browser(),
+        KeyCode::Char('O') => app.open_source_in_browser(),
         KeyCode::Char('y') if !ctrl => app.copy_link(),
         KeyCode::Char('m') => app.open_media(),
         KeyCode::Char('P') if app.video_controls_available() => app.toggle_video_pause(),

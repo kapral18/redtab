@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use super::{Config, schema::SETTINGS, store};
+#[cfg(test)]
+use super::schema::SETTINGS;
+use super::{Config, store};
 
 struct Child {
     process: std::process::Child,
@@ -161,7 +163,7 @@ impl Request {
         }
     }
 
-    pub fn discover(self, tool: Chezmoi) -> Result<Option<Plan>> {
+    pub fn discover(mut self, tool: Chezmoi) -> Result<Option<Plan>> {
         let target = Snapshot::read(&self.after.path)?;
         let verification = self.verification.unwrap_or_else(|| Verification {
             target: target.resolved.clone(),
@@ -202,32 +204,56 @@ impl Request {
         if store::readonly(&source.resolved, &fs::metadata(&source.resolved)?) {
             bail!("The chezmoi source is read-only too. Changes remain session-only.");
         }
-        let disk = store::parse(&target.path, &target.text)?;
-        let original = store::parse(&source.path, &source.text)?;
-        let mut desired = original.clone();
-        for field in SETTINGS {
-            if field.value(&self.before) != field.value(&disk) {
+        let mut disk = store::parse(&target.path, &target.text)?;
+        let mut original = store::parse(&source.path, &source.text)?;
+        Config::align_account_names(&mut [
+            &mut original,
+            &mut disk,
+            &mut self.after,
+            &mut self.before,
+        ]);
+        let before = self.before.entries();
+        let after = self.after.entries();
+        let disk_values = disk.entries();
+        let source_values = original.entries();
+        let keys: std::collections::BTreeSet<_> = before
+            .keys()
+            .chain(after.keys())
+            .chain(disk_values.keys())
+            .collect();
+        let mut updates = Vec::new();
+        for key in keys {
+            if !Config::same_entry(key, before.get(key), disk_values.get(key)) {
                 bail!("Config changed; retry to review the latest values");
             }
-            let before = field.value(&self.before);
-            let after = field.value(&self.after);
-            if before == after {
+            let before = before.get(key);
+            let after = after.get(key);
+            if Config::same_entry(key, before, after) {
                 continue;
             }
-            if field.value(&original) != before && field.value(&original) != after {
+            if !Config::same_entry(key, source_values.get(key), before)
+                && !Config::same_entry(key, source_values.get(key), after)
+            {
                 bail!(
                     "{} changed in the chezmoi source; revert or resolve it before retrying",
-                    field.key
+                    key
                 );
             }
-            desired = field.set(&desired, after.clone())?;
+            updates.push((key.clone(), after.cloned()));
         }
-        let mut changes: Vec<_> = SETTINGS
-            .iter()
-            .filter_map(|field| {
-                let before = field.value(&disk);
-                let after = field.value(&desired);
-                (before != after).then(|| format!("{}: {} → {}", field.key, before, after))
+        let desired = original.with_entries(updates)?;
+        let desired_values = desired.entries();
+        let keys: std::collections::BTreeSet<_> =
+            disk_values.keys().chain(desired_values.keys()).collect();
+        let mut changes: Vec<_> = keys
+            .into_iter()
+            .filter_map(|key| {
+                let before = disk_values.get(key);
+                let after = desired_values.get(key);
+                let shown = |value: Option<&toml::Value>| {
+                    value.map_or_else(|| "(absent)".into(), ToString::to_string)
+                };
+                (before != after).then(|| format!("{}: {} → {}", key, shown(before), shown(after)))
             })
             .collect();
         if target.permissions != verification.permissions {
@@ -324,9 +350,7 @@ impl Plan {
         let config = store::parse(&actual.path, &actual.text)?;
         if actual.resolved != self.target.resolved
             || actual.permissions != self.verification.permissions
-            || SETTINGS
-                .iter()
-                .any(|field| field.value(&config) != field.value(&self.expected))
+            || config.entries() != self.expected.entries()
         {
             bail!("Applied config differs from the confirmed settings or permissions");
         }
@@ -360,7 +384,7 @@ pub(crate) mod tests {
             let directory = tempfile::tempdir().unwrap();
             let source = directory.path().join(source_name);
             let target = directory.path().join(target_name);
-            let text = "# mine\n[media]\nvideo_autoplay = true # keep\n[filters]\nkeywords = [\"old\"] # keep array\n";
+            let text = "# mine\n[media]\nimage_preview = true # keep\n[signed_out.filters]\nkeywords = [\"old\"] # keep array\n";
             fs::write(&source, text).unwrap();
             fs::write(&target, text).unwrap();
             fs::set_permissions(&source, Permissions::from_mode(0o640)).unwrap();
@@ -419,7 +443,7 @@ esac
                 .change(
                     SETTINGS
                         .iter()
-                        .find(|f| f.key == "media.video_autoplay")
+                        .find(|f| f.key == "media.image_preview")
                         .unwrap(),
                     toml::Value::Boolean(false),
                 )
@@ -442,6 +466,64 @@ esac
     }
 
     #[test]
+    fn when_username_rules_are_saved_through_chezmoi_the_account_scope_should_survive() {
+        let fixture = Fixture::new();
+        let mut store = fixture.store();
+        store.select_account(Some("Reader_One-Two"));
+        store
+            .change(
+                SETTINGS
+                    .iter()
+                    .find(|f| f.key == "filters.keywords")
+                    .unwrap(),
+                toml::Value::Array(vec!["mine".into()]),
+            )
+            .unwrap();
+
+        fixture.save(&mut store);
+
+        assert_eq!(store.persistence, Persistence::Saved);
+        assert_eq!(
+            store.current.accounts["Reader_One-Two"].filters.keywords,
+            ["mine"]
+        );
+        assert_eq!(
+            fs::read(&fixture.source).unwrap(),
+            fs::read(&fixture.target).unwrap()
+        );
+        assert_eq!(
+            fs::metadata(&fixture.target).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+    }
+
+    #[test]
+    fn when_username_source_case_differs_managed_saves_should_merge_under_source_spelling() {
+        let fixture = Fixture::new();
+        let mut store = fixture.store();
+        store.select_account(Some("Reader"));
+        store
+            .change(
+                SETTINGS
+                    .iter()
+                    .find(|f| f.key == "filters.keywords")
+                    .unwrap(),
+                toml::Value::Array(vec!["mine".into()]),
+            )
+            .unwrap();
+        let mut source = fs::read_to_string(&fixture.source).unwrap();
+        source.push_str("\n[accounts.reader.filters]\nauthors=[\"bot\"]\n");
+        fs::write(&fixture.source, source).unwrap();
+
+        fixture.save(&mut store);
+
+        assert_eq!(store.persistence, Persistence::Saved);
+        assert_eq!(store.current.accounts.len(), 1);
+        assert_eq!(store.current.accounts["reader"].filters.authors, ["bot"]);
+        assert_eq!(store.current.accounts["reader"].filters.keywords, ["mine"]);
+    }
+
+    #[test]
     fn when_discovered_managed_changes_should_wait_for_confirmation() {
         let fixture = Fixture::new();
         let mut store = fixture.store();
@@ -450,13 +532,13 @@ esac
 
         let plan = fixture.plan(&store);
 
-        assert_eq!(plan.changes, ["media.video_autoplay: true → false"]);
+        assert_eq!(plan.changes, ["media.image_preview: true → false"]);
         assert_eq!(plan.source(), fixture.source);
         assert_eq!(fs::read_to_string(&fixture.source).unwrap(), before);
         assert_eq!(fs::read_to_string(&fixture.target).unwrap(), before);
         assert!(!fixture.directory.path().join("applied-args").exists());
         assert_eq!(store.persistence, Persistence::Temporary);
-        assert!(!store.current.media.video_autoplay);
+        assert!(!store.current.media.image_preview);
     }
 
     #[test]
@@ -482,7 +564,7 @@ esac
                 Config::load(Some(&fixture.source))
                     .unwrap()
                     .media
-                    .video_autoplay
+                    .image_preview
             );
         }
     }
@@ -492,23 +574,23 @@ esac
         let fixture = Fixture::new();
         let mut store = fixture.store();
         fixture.change(&mut store);
-        fs::write(&fixture.source, "# mine\n[media]\nvideo_autoplay = true # keep\nimage_preview = false\n[filters]\nkeywords = [\"old\"] # keep array\n").unwrap();
+        fs::write(&fixture.source, "# mine\nall_subs_posts_per_group = 4\n[media]\nimage_preview = true # keep\n[signed_out.filters]\nkeywords = [\"old\"] # keep array\n").unwrap();
 
         let plan = fixture.plan(&store);
         assert_eq!(
             plan.changes,
             [
-                "media.image_preview: true → false",
-                "media.video_autoplay: true → false"
+                "all_subs_posts_per_group: 3 → 4",
+                "media.image_preview: true → false"
             ]
         );
         store.managed_finished(plan.verification(), plan.apply());
 
         assert_eq!(store.persistence, Persistence::Saved);
-        assert!(!store.current.media.video_autoplay && !store.current.media.image_preview);
+        assert!(!store.current.media.image_preview && store.current.all_subs_posts_per_group == 4);
         assert_eq!(
             fs::read_to_string(&fixture.source).unwrap(),
-            "# mine\n[media]\nvideo_autoplay = false # keep\nimage_preview = false\n[filters]\nkeywords = [\"old\"] # keep array\n"
+            "# mine\nall_subs_posts_per_group = 4\n[media]\nimage_preview = false # keep\n[signed_out.filters]\nkeywords = [\"old\"] # keep array\n"
         );
         assert_eq!(
             fs::read(&fixture.target).unwrap(),
@@ -548,7 +630,7 @@ esac
                 .contains("changed while confirming")
         );
         assert_eq!(store.persistence, Persistence::Unsaved);
-        assert!(!store.current.media.video_autoplay);
+        assert!(!store.current.media.image_preview);
         assert!(!fixture.directory.path().join("applied-args").exists());
     }
 
@@ -589,13 +671,13 @@ esac
             !Config::load(Some(&fixture.source))
                 .unwrap()
                 .media
-                .video_autoplay
+                .image_preview
         );
         assert!(
             Config::load(Some(&fixture.target))
                 .unwrap()
                 .media
-                .video_autoplay
+                .image_preview
         );
         fs::remove_file(fixture.directory.path().join("fail")).unwrap();
         store.save();
@@ -607,7 +689,7 @@ esac
             !Config::load(Some(&fixture.target))
                 .unwrap()
                 .media
-                .video_autoplay
+                .image_preview
         );
     }
 
@@ -626,7 +708,7 @@ esac
             Config::load(Some(&fixture.target))
                 .unwrap()
                 .media
-                .video_autoplay
+                .image_preview
         );
     }
 
@@ -645,7 +727,7 @@ esac
 
         assert!(actual.is_none());
         assert_eq!(store.persistence, Persistence::Temporary);
-        assert!(!store.current.media.video_autoplay);
+        assert!(!store.current.media.image_preview);
     }
 
     #[test]
@@ -682,7 +764,7 @@ esac
             Config::load(Some(&fixture.source))
                 .unwrap()
                 .media
-                .video_autoplay
+                .image_preview
         );
         assert!(!fixture.directory.path().join("applied-args").exists());
     }
@@ -693,7 +775,7 @@ esac
         let mut store = fixture.store();
         fixture.change(&mut store);
         let source = fixture.directory.path().join("readonly_config.toml.tmpl");
-        fs::write(&source, "[media]\nvideo_autoplay = {{ .autoplay }}\n").unwrap();
+        fs::write(&source, "[media]\nimage_preview = {{ .autoplay }}\n").unwrap();
         fs::write(
             fixture.directory.path().join("source-override"),
             source.to_str().unwrap(),
@@ -714,7 +796,7 @@ esac
         );
         assert_eq!(
             fs::read_to_string(&source).unwrap(),
-            "[media]\nvideo_autoplay = {{ .autoplay }}\n"
+            "[media]\nimage_preview = {{ .autoplay }}\n"
         );
         assert_eq!(store.persistence, Persistence::Temporary);
     }
@@ -736,13 +818,13 @@ esac
             Config::load(Some(&fixture.source))
                 .unwrap()
                 .media
-                .video_autoplay
+                .image_preview
         );
         assert!(
             Config::load(Some(&fixture.target))
                 .unwrap()
                 .media
-                .video_autoplay
+                .image_preview
         );
     }
 
@@ -822,13 +904,13 @@ esac
             Config::load(Some(&fixture.source))
                 .unwrap()
                 .media
-                .video_autoplay
+                .image_preview
         );
         assert!(
             !Config::load(Some(&fixture.target))
                 .unwrap()
                 .media
-                .video_autoplay
+                .image_preview
         );
     }
 
@@ -882,7 +964,7 @@ esac
         assert_eq!(store.persistence, Persistence::Saved);
         assert!(store.error.is_none());
         assert!(store.managed_request().is_none());
-        assert!(!store.current.media.video_autoplay);
+        assert!(!store.current.media.image_preview);
     }
 
     #[test]
@@ -901,7 +983,7 @@ esac
             Config::load(Some(&fixture.target))
                 .unwrap()
                 .media
-                .video_autoplay
+                .image_preview
         );
     }
 
@@ -920,7 +1002,7 @@ esac
             Config::load(Some(&fixture.source))
                 .unwrap()
                 .media
-                .video_autoplay
+                .image_preview
         );
         assert_eq!(
             fs::metadata(&fixture.source).unwrap().permissions().mode() & 0o777,
@@ -943,7 +1025,7 @@ esac
             .change(
                 SETTINGS
                     .iter()
-                    .find(|f| f.key == "media.video_autoplay")
+                    .find(|f| f.key == "media.image_preview")
                     .unwrap(),
                 toml::Value::Boolean(true),
             )
@@ -954,9 +1036,9 @@ esac
         assert_eq!(store.persistence, Persistence::Saved);
         assert_eq!(
             fs::read_to_string(&fixture.source).unwrap(),
-            "[media]\nvideo_autoplay = true\n"
+            "[media]\nimage_preview = true\n"
         );
-        assert!(store.current.media.video_autoplay);
+        assert!(store.current.media.image_preview);
     }
 
     #[test]
@@ -973,7 +1055,7 @@ esac
         let target = destination.join("config_run_mode.toml");
         fs::write(
             &source,
-            "# actual chezmoi fixture\n[media]\nvideo_autoplay = true # keep\n",
+            "# actual chezmoi fixture\n[media]\nimage_preview = true # keep\n",
         )
         .unwrap();
         fs::write(&target, fs::read(&source).unwrap()).unwrap();
@@ -1002,7 +1084,7 @@ esac
             .change(
                 SETTINGS
                     .iter()
-                    .find(|f| f.key == "media.video_autoplay")
+                    .find(|f| f.key == "media.image_preview")
                     .unwrap(),
                 toml::Value::Boolean(false),
             )
@@ -1019,9 +1101,9 @@ esac
         assert_eq!(store.persistence, Persistence::Saved, "{:?}", store.error);
         assert_eq!(
             fs::read_to_string(&source).unwrap(),
-            "# actual chezmoi fixture\n[media]\nvideo_autoplay = false # keep\n"
+            "# actual chezmoi fixture\n[media]\nimage_preview = false # keep\n"
         );
-        assert!(!Config::load(Some(&target)).unwrap().media.video_autoplay);
+        assert!(!Config::load(Some(&target)).unwrap().media.image_preview);
         assert!(!destination.join("other.toml").exists());
         assert_eq!(
             fs::metadata(&target).unwrap().permissions().mode() & 0o777,

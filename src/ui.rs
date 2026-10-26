@@ -25,6 +25,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{
     App, CARD_MIN_WIDTH, CardImageProtocol, CardImageSlot, CardScroll, DETAIL_MIN_WIDTH, Focus,
     Group, ImageSlot, MAIN_MIN_WIDTH, Overlay, PickerEntry, PostView, RowKind, Tab, TabKind,
+    UnreadBadge,
 };
 use crate::model::{Media, PICTURE, Post, SPOILER_END, SPOILER_START, Sort};
 use crate::reddit::{AccessDenied, Health};
@@ -160,11 +161,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let sidebar_width = app.sidebar_width();
     let [sidebar, main] =
         Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(20)]).areas(area);
+    let sidebar_layout = sidebar_layout(app, sidebar);
+    let sidebar_icons: Vec<String> = sidebar_layout
+        .rows
+        .iter()
+        .filter_map(|row| match row {
+            SideRow::Tab(index) => app.tabs[*index].subreddit().map(str::to_string),
+            _ => None,
+        })
+        .collect();
     let mut spots = Vec::new();
     let mut pictures = ListPictures::default();
-    if sidebar_width > 0 {
-        draw_sidebar(f, app, sidebar, &mut spots);
-    }
     let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(main);
     let (main, detail) = if app.post_view.is_some() {
         if app.detail_fits() {
@@ -188,7 +195,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         (body, None)
     };
     if main.is_empty() || !matches!(app.active_tab().kind, TabKind::AllSubs) {
-        app.groups_drawn(&[]);
+        app.groups_drawn(&[], &sidebar_icons);
     }
     if let Some(name) = app.active_tab().subreddit().map(str::to_string) {
         app.demand_icon(&name);
@@ -202,13 +209,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let body = main.inner(margin);
         match app.active_tab().kind {
             TabKind::Home => list_loader = draw_feed(f, app, body, &mut pictures),
-            TabKind::AllSubs => list_loader = draw_all_subs(f, app, body, &mut spots),
+            TabKind::AllSubs => {
+                list_loader = draw_all_subs(f, app, body, &mut spots, &sidebar_icons)
+            }
             TabKind::Bookmarks => draw_bookmarks(f, app, body, &mut pictures),
-            TabKind::Subreddit { .. } => list_loader = draw_feed(f, app, body, &mut pictures),
+            TabKind::Subreddit { .. } | TabKind::User { .. } => {
+                list_loader = draw_feed(f, app, body, &mut pictures)
+            }
         }
     }
     let post_loader =
         detail.and_then(|detail| draw_post(f, app, detail.inner(margin), &mut pictures));
+    if sidebar_width > 0 {
+        draw_sidebar(f, app, &sidebar_layout, &mut spots);
+    }
     spots.extend(pictures.thumbs);
     let covered = draw_overlay(f, app);
     draw_card_pictures(f, app, &pictures.cards, covered);
@@ -243,7 +257,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) -> Option<Rect> {
         Some(Overlay::Picker(p)) => Some(draw_picker(f, app, &p.input, p.selected)),
         Some(Overlay::Sort { selected }) => Some(draw_sort(f, app, *selected)),
         Some(Overlay::Search { input }) => Some(draw_search(f, app, input)),
-        Some(Overlay::Membership { subreddit, join }) => Some(draw_membership(f, subreddit, *join)),
+        Some(Overlay::Membership { target, join }) => Some(draw_membership(f, target, *join)),
         None => None,
     }
 }
@@ -295,9 +309,10 @@ fn thumb_reserve<'a>(app: &App, mut posts: impl Iterator<Item = &'a Post>) -> us
     }
 }
 
-fn tab_icon<'a>(app: &'a App, tab: &Tab) -> Option<&'a str> {
+fn tab_icon<'a>(app: &'a App, tab: &'a Tab) -> Option<&'a str> {
     match &tab.kind {
         TabKind::Subreddit { name, .. } => app.shown_icon(name),
+        TabKind::User { icon, .. } if app.thumbnails_on() => app.usable_thumb(icon.as_deref()),
         _ => None,
     }
 }
@@ -501,6 +516,14 @@ fn empty_content_state(f: &mut Frame, area: Rect, title: &str, hint: &str, show_
     }
 }
 
+fn unread_chip(badge: UnreadBadge) -> Option<Span<'static>> {
+    match badge {
+        UnreadBadge::Unknown => Some(chip("? unread", OVERLAY, SURFACE0)),
+        UnreadBadge::Count(n) if n > 0 => Some(chip(format!("● {n} unread"), CRUST, ACCENT)),
+        _ => None,
+    }
+}
+
 // ----- sidebar -------------------------------------------------------------
 
 enum SideRow {
@@ -509,9 +532,15 @@ enum SideRow {
     Blank,
 }
 
-fn draw_sidebar(f: &mut Frame, app: &App, area: Rect, spots: &mut Vec<ImageSpot>) {
-    let panel = Style::new().bg(MANTLE);
-    f.render_widget(Block::default().style(panel), area);
+struct SidebarLayout {
+    area: Rect,
+    brand: Rect,
+    list: Rect,
+    status: Rect,
+    rows: Vec<SideRow>,
+}
+
+fn sidebar_layout(app: &App, area: Rect) -> SidebarLayout {
     let inner = area.inner(Margin {
         horizontal: PANEL_PAD,
         vertical: PANEL_PAD,
@@ -523,29 +552,21 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect, spots: &mut Vec<ImageSpot>
     ])
     .areas(inner);
 
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" ◆ ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
-            Span::styled("redtab", Style::new().fg(TEXT).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                format!("  v{}", env!("CARGO_PKG_VERSION")),
-                Style::new().fg(OVERLAY),
-            ),
-        ]))
-        .style(panel),
-        brand,
-    );
-
     let mut rows = vec![
         SideRow::Tab(0),
         SideRow::Tab(1),
         SideRow::Tab(crate::app::ALL_SUBS_TAB),
     ];
-    let (pinned, opened) = app.sidebar_tabs();
+    let (pinned, following, opened) = app.sidebar_tabs();
     if !pinned.is_empty() {
         rows.push(SideRow::Blank);
         rows.push(SideRow::Section("SUBSCRIPTIONS"));
         rows.extend(pinned.into_iter().map(SideRow::Tab));
+    }
+    if !following.is_empty() {
+        rows.push(SideRow::Blank);
+        rows.push(SideRow::Section("FOLLOWING"));
+        rows.extend(following.into_iter().map(SideRow::Tab));
     }
     if !opened.is_empty() {
         rows.push(SideRow::Blank);
@@ -566,11 +587,47 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect, spots: &mut Vec<ImageSpot>
             .saturating_sub(height / 2)
             .min(rows.len() - height)
     };
+    let rows = if area.width == 0 {
+        Vec::new()
+    } else {
+        rows.into_iter().skip(start).take(height).collect()
+    };
+    SidebarLayout {
+        area,
+        brand,
+        list,
+        status,
+        rows,
+    }
+}
+
+fn draw_sidebar(f: &mut Frame, app: &App, layout: &SidebarLayout, spots: &mut Vec<ImageSpot>) {
+    let SidebarLayout {
+        area,
+        brand,
+        list,
+        status,
+        rows,
+    } = layout;
+    let (area, brand, list, status) = (*area, *brand, *list, *status);
+    let panel = Style::new().bg(MANTLE);
+    f.render_widget(Block::default().style(panel), area);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ◆ ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled("redtab", Style::new().fg(TEXT).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("  v{}", env!("CARGO_PKG_VERSION")),
+                Style::new().fg(OVERLAY),
+            ),
+        ]))
+        .style(panel),
+        brand,
+    );
+
     let width = list.width as usize;
     let lines: Vec<Line> = rows
         .iter()
-        .skip(start)
-        .take(height)
         .enumerate()
         .map(|(k, row)| match row {
             SideRow::Blank => Line::raw(""),
@@ -633,13 +690,14 @@ fn sidebar_item(app: &App, index: usize, width: usize) -> Line<'static> {
     let tab = &app.tabs[index];
     let active = index == app.active;
     let (icon, name) = match &tab.kind {
+        TabKind::User { name, .. } => ("@", name.as_str()),
         TabKind::Home => ("⌂", "Home"),
         TabKind::AllSubs => ("▦", "All subs"),
         TabKind::Bookmarks => ("★", "Bookmarks"),
         TabKind::Subreddit { name, .. } => ("#", name.as_str()),
     };
     let badge = match tab.kind {
-        TabKind::Bookmarks => app.visible_bookmarks().count(),
+        TabKind::Bookmarks => UnreadBadge::Count(app.visible_bookmarks().count()),
         _ => app.badge(tab),
     };
     // With focus in the sidebar, its row stands out more than the list's selection.
@@ -668,15 +726,18 @@ fn sidebar_item(app: &App, index: usize, width: usize) -> Line<'static> {
         Span::styled(slot, base.fg(if active { ACCENT } else { OVERLAY })),
     ];
     let badge_text = match (badge, &tab.kind) {
-        (0, _) => String::new(),
-        (n, TabKind::Bookmarks) => format!(" {n} "),
-        (n, _) if n > 99 => " 99+ ".into(),
-        (n, _) => format!(" {n} "),
+        (UnreadBadge::Count(0) | UnreadBadge::Unavailable, _) => String::new(),
+        (UnreadBadge::Unknown, _) => " ? ".into(),
+        (UnreadBadge::Count(n), TabKind::Bookmarks) => format!(" {n} "),
+        (UnreadBadge::Count(n), _) if n > 99 => " 99+ ".into(),
+        (UnreadBadge::Count(n), _) => format!(" {n} "),
     };
     let name_width = width.saturating_sub(line_width(&spans) + badge_text.width() + 1);
     let name_style = if active {
         base.fg(TEXT).add_modifier(Modifier::BOLD)
-    } else if badge > 0 && !matches!(tab.kind, TabKind::Bookmarks) {
+    } else if matches!(badge, UnreadBadge::Count(n) if n > 0)
+        && !matches!(tab.kind, TabKind::Bookmarks)
+    {
         base.fg(TEXT)
     } else {
         base.fg(SUBTEXT)
@@ -684,8 +745,9 @@ fn sidebar_item(app: &App, index: usize, width: usize) -> Line<'static> {
     spans.push(Span::styled(truncate(name, name_width), name_style));
     pad_to(&mut spans, width.saturating_sub(badge_text.width()), base);
     if !badge_text.is_empty() {
-        let (fg, bg) = match tab.kind {
-            TabKind::Bookmarks => (SUBTEXT, SURFACE0),
+        let (fg, bg) = match (badge, &tab.kind) {
+            (UnreadBadge::Unknown, _) => (OVERLAY, SURFACE0),
+            (_, TabKind::Bookmarks) => (SUBTEXT, SURFACE0),
             _ => (CRUST, ACCENT),
         };
         spans.push(Span::styled(
@@ -753,20 +815,17 @@ fn list_view_chip(app: &App) -> Span<'static> {
 
 // ----- post cards ----------------------------------------------------------
 
-struct CardOpts<'a> {
+struct CardOpts {
     selected: bool,
-    seen_key: Option<&'a str>,
     show_subreddit: bool,
     /// Columns after the selection bar kept free of text, for a thumbnail.
     reserve: usize,
 }
 
 /// Two lines per post: score gutter + title, comment gutter + meta chips.
-fn post_card(app: &App, post: &Post, width: usize, opts: &CardOpts<'_>) -> [Line<'static>; 2] {
+fn post_card(app: &App, post: &Post, width: usize, opts: &CardOpts) -> [Line<'static>; 2] {
     let bg = post_background(app, post, opts.selected);
-    let unseen = opts
-        .seen_key
-        .is_some_and(|k| !app.state.is_seen(k, &post.id));
+    let unseen = !app.state.is_read(&post.id);
     let read = app.state.is_read(&post.id);
     let bar_color = if app.focus == Focus::List {
         ACCENT
@@ -828,7 +887,7 @@ fn post_card(app: &App, post: &Post, width: usize, opts: &CardOpts<'_>) -> [Line
 fn post_background(app: &App, post: &Post, selected: bool) -> Style {
     if selected {
         Style::new().bg(SURFACE0)
-    } else if matches!(app.active_tab().kind, TabKind::Home)
+    } else if matches!(app.active_tab().kind, TabKind::Home | TabKind::User { .. })
         && app.joined(&post.subreddit) == Some(false)
     {
         Style::new().bg(MANTLE)
@@ -854,7 +913,7 @@ fn post_meta(
     }
     if show_subreddit {
         meta.push(Span::styled(
-            format!("r/{}  ", post.subreddit),
+            format!("{}  ", post.source_label()),
             bg.fg(LAVENDER),
         ));
     }
@@ -881,6 +940,7 @@ fn media_label(media: &Media, tag: &str) -> String {
         Media::Image { .. } if media.video_url().is_some() => "▶",
         Media::Image { .. } => "▣",
         Media::Video { .. } => "▶",
+        Media::Link { .. } if media.youtube_url().is_some() => "▶",
         Media::Gallery { .. } => "▦",
         Media::Link { .. } => "↗",
         Media::None => "",
@@ -891,7 +951,6 @@ fn media_label(media: &Media, tag: &str) -> String {
 struct ListSpec<'a> {
     posts: &'a [&'a Post],
     selected: usize,
-    seen_key: Option<&'a str>,
     show_subreddit: bool,
     offset: usize,
     scroll: CardScroll,
@@ -935,13 +994,7 @@ fn fit_picture(
     )
 }
 
-fn expanded_card(
-    app: &App,
-    post: &Post,
-    width: usize,
-    opts: &CardOpts<'_>,
-    height: u16,
-) -> PostCard {
+fn expanded_card(app: &App, post: &Post, width: usize, opts: &CardOpts, height: u16) -> PostCard {
     let bg = post_background(app, post, opts.selected);
     let marker = card_marker(app, opts.selected, bg);
     let meta = post_meta(post, width, opts.show_subreddit, bg, vec![marker.clone()]);
@@ -1017,7 +1070,7 @@ fn card_title(
     app: &App,
     post: &Post,
     width: usize,
-    opts: &CardOpts<'_>,
+    opts: &CardOpts,
     height: u16,
     bg: Style,
 ) -> Vec<Line<'static>> {
@@ -1034,10 +1087,7 @@ fn card_title(
         ""
     };
     let pinned = if post.stickied { "📌 " } else { "" };
-    let unseen = if opts
-        .seen_key
-        .is_some_and(|key| !app.state.is_seen(key, &post.id))
-    {
+    let unseen = if !app.state.is_read(&post.id) {
         "● "
     } else {
         ""
@@ -1139,7 +1189,7 @@ fn draw_card_list(
             width,
             &CardOpts {
                 selected: i == selected,
-                seen_key: spec.seen_key,
+
                 show_subreddit: spec.show_subreddit,
                 reserve: 0,
             },
@@ -1248,6 +1298,12 @@ fn draw_card_list(
                         Media::Image { .. } if spec.posts[i].media.video_url().is_some() => {
                             Some(Indicator::Video {
                                 gif: true,
+                                play: true,
+                            })
+                        }
+                        Media::Link { .. } if spec.posts[i].media.youtube_url().is_some() => {
+                            Some(Indicator::Video {
+                                gif: false,
                                 play: true,
                             })
                         }
@@ -1661,7 +1717,7 @@ fn draw_post_list(
         }
         let opts = CardOpts {
             selected: i == spec.selected,
-            seen_key: spec.seen_key,
+
             show_subreddit: spec.show_subreddit,
             reserve,
         };
@@ -1723,9 +1779,10 @@ fn draw_all_subs(
     app: &mut App,
     area: Rect,
     spots: &mut Vec<ImageSpot>,
+    sidebar_icons: &[String],
 ) -> Option<Rect> {
     if app.all_subs.groups.is_empty() {
-        app.groups_drawn(&[]);
+        app.groups_drawn(&[], sidebar_icons);
     }
     let total_new: usize = app
         .all_subs
@@ -1738,8 +1795,17 @@ fn draw_all_subs(
                 .and_then(crate::worker::FeedError::access)
                 .is_none()
         })
-        .map(|g| app.state.unseen(&g.subreddit, app.config.visible(&g.posts)))
+        .map(|g| match app.community_badge(&g.subreddit) {
+            UnreadBadge::Count(count) => count,
+            _ => 0,
+        })
         .sum();
+    let unknown = app
+        .all_subs
+        .groups
+        .iter()
+        .filter(|group| app.community_badge(&group.subreddit) == UnreadBadge::Unknown)
+        .count();
     let loading = app.all_subs.groups.iter().filter(|g| g.loading).count();
     let mut chips = vec![chip(
         match app.all_subs.groups.len() {
@@ -1750,7 +1816,10 @@ fn draw_all_subs(
         SURFACE0,
     )];
     if total_new > 0 {
-        chips.push(chip(format!("● {total_new} new"), CRUST, ACCENT));
+        chips.push(chip(format!("● {total_new} unread"), CRUST, ACCENT));
+    }
+    if unknown > 0 {
+        chips.push(chip(format!("{unknown} unread unknown"), OVERLAY, SURFACE0));
     }
     if loading > 0 {
         chips.push(chip(
@@ -1874,7 +1943,10 @@ fn draw_all_subs(
         y += h;
         shown += 1;
     }
-    app.groups_drawn(&visible.iter().map(|(index, _)| *index).collect::<Vec<_>>());
+    app.groups_drawn(
+        &visible.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+        sidebar_icons,
+    );
     for (index, cell) in visible {
         draw_group_card(f, app, index, cell, spots);
     }
@@ -1896,9 +1968,7 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
         .error
         .as_ref()
         .and_then(crate::worker::FeedError::access);
-    let badge = app
-        .state
-        .unseen(&group.subreddit, app.config.visible(&group.posts));
+    let badge = app.community_badge(&group.subreddit);
     let focused = selected_card && app.focus == Focus::List;
     let border = if focused {
         Style::new().fg(ACCENT)
@@ -1932,8 +2002,10 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
             Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
         ),
     ];
-    if badge > 0 && access.is_none() {
-        title.push(chip(format!("{badge} new"), CRUST, ACCENT));
+    if access.is_none()
+        && let Some(badge) = unread_chip(badge)
+    {
+        title.push(badge);
         title.push(Span::raw(" "));
     }
     if let Some(freshness) = group.freshness.filter(|_| access.is_none()) {
@@ -2055,7 +2127,7 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
             }
             let opts = CardOpts {
                 selected: selected_card && i == app.all_subs.post,
-                seen_key: Some(&group.subreddit),
+
                 show_subreddit: false,
                 reserve,
             };
@@ -2092,6 +2164,31 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
 
 // ----- subreddit feed & bookmarks --------------------------------------------
 
+fn membership_chip(app: &App, target: &crate::model::MembershipTarget) -> Span<'static> {
+    use crate::model::MembershipTarget;
+    let membership = app.subscribed(target);
+    let (status, color) = match (target, membership) {
+        (MembershipTarget::User(_), Some(true)) => ("✓ Following", GREEN),
+        (MembershipTarget::User(_), Some(false)) => ("Not following", SUBTEXT),
+        (MembershipTarget::User(_), None) => ("Following unknown", OVERLAY),
+        (_, Some(true)) => ("✓ Joined", GREEN),
+        (_, Some(false)) => ("Not joined", SUBTEXT),
+        (_, None) => ("Membership unknown", OVERLAY),
+    };
+    let label = if app.membership_progress().is_some() {
+        status.into()
+    } else {
+        format!(
+            "{status} · S {}",
+            membership.map_or_else(
+                || "check".into(),
+                |joined| target.action(!joined).to_ascii_lowercase()
+            )
+        )
+    };
+    chip(label, color, SURFACE0)
+}
+
 fn draw_feed(
     f: &mut Frame,
     app: &mut App,
@@ -2119,29 +2216,22 @@ fn draw_feed(
         .subreddit()
         .filter(|name| crate::reddit::is_community(name) && access.is_none())
     {
-        let membership = app.joined(name);
-        let (label, color) = match membership {
-            Some(true) => ("✓ Joined", GREEN),
-            Some(false) => ("Not joined", SUBTEXT),
-            None => ("Membership unknown", OVERLAY),
-        };
-        let label = if app.membership_progress().is_none() {
-            format!(
-                "{label} · S {}",
-                match membership {
-                    Some(true) => "leave",
-                    Some(false) => "join",
-                    None => "check",
-                }
-            )
-        } else {
-            label.into()
-        };
-        chips.push(chip(label, color, SURFACE0));
+        chips.push(membership_chip(
+            app,
+            &crate::model::MembershipTarget::Community(name.into()),
+        ));
+    }
+    if let TabKind::User { name, .. } = &tab.kind {
+        chips.push(membership_chip(
+            app,
+            &crate::model::MembershipTarget::User(name.clone()),
+        ));
     }
     let badge = app.badge(tab);
-    if badge > 0 && access.is_none() {
-        chips.push(chip(format!("● {badge} new"), CRUST, ACCENT));
+    if access.is_none()
+        && let Some(badge) = unread_chip(badge)
+    {
+        chips.push(badge);
     }
     if feed.loading() && !feed.loading_more() && !feed.receiving() && !feed.posts.is_empty() {
         chips.push(chip(
@@ -2177,7 +2267,7 @@ fn draw_feed(
         ));
     }
     let title = tab.title();
-    let seen_key = tab.subreddit();
+    let community = tab.subreddit();
     let error = feed.error();
     let posts: Vec<&Post> = app.config.visible(&feed.posts).collect();
     let selected = feed.selected;
@@ -2257,17 +2347,20 @@ fn draw_feed(
                 body,
                 "∅",
                 "No posts here",
-                "try another sort with s, or a different subreddit with p",
+                if matches!(tab.kind, TabKind::User { .. }) {
+                    "s changes sort · O opens this profile in browser"
+                } else {
+                    "try another sort with s, or a different subreddit with p"
+                },
             );
         }
         return None;
     }
-    let show_subreddit =
-        matches!(tab.kind, TabKind::Home) || matches!(seen_key, Some("all" | "popular"));
+    let show_subreddit = matches!(tab.kind, TabKind::Home | TabKind::User { .. })
+        || matches!(community, Some("all" | "popular"));
     let mut spec = ListSpec {
         posts: &posts,
         selected,
-        seen_key,
         show_subreddit,
         offset,
         scroll,
@@ -2349,7 +2442,7 @@ fn draw_bookmarks(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListP
     let mut spec = ListSpec {
         posts: &posts,
         selected,
-        seen_key: None,
+
         show_subreddit: true,
         offset: app.active_tab().feed.offset,
         scroll: app.active_tab().feed.cards.clone(),
@@ -2582,7 +2675,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
     let head_width = area.width.saturating_sub(4) as usize;
     let mut header = vec![Line::from({
         let mut s = vec![
-            chip(format!("r/{}", post.subreddit), CRUST, ACCENT),
+            chip(post.source_label(), CRUST, ACCENT),
             Span::styled(format!("  u/{}", post.author), Style::new().fg(SUBTEXT)),
             Span::styled(
                 Some(post.age_at(now))
@@ -2655,7 +2748,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
                 Style::new().fg(TEAL),
             ));
         }
-        Media::Link { url, .. } => {
+        Media::Link { url, .. } if post.media.youtube_url().is_none() => {
             stats.push(Span::raw("   "));
             stats.push(Span::styled(
                 truncate(&format!("↗ {url}"), head_width.saturating_sub(24)),
@@ -3060,6 +3153,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
     for url in &far {
         app.drop_text_picture(url);
     }
+    app.post_drawn(!doc_area.is_empty());
     primary_loader
 }
 
@@ -3626,6 +3720,12 @@ fn loading_activity(app: &App, loaders: &VisibleLoaders) -> Option<&'static str>
     if app.media_loading() {
         return Some("media");
     }
+    if app
+        .selected_video()
+        .is_some_and(|player| player.resolving())
+    {
+        return Some("video");
+    }
     let post = app
         .post_view
         .as_ref()
@@ -3643,7 +3743,7 @@ fn loading_activity(app: &App, loaders: &VisibleLoaders) -> Option<&'static str>
         });
     let list = if !loaders.list && (app.post_view.is_none() || app.detail_fits()) {
         match app.active_tab().kind {
-            TabKind::Home | TabKind::Subreddit { .. } => {
+            TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. } => {
                 feed_activity(&app.active_tab().feed, !app.reddit.needs_sign_in())
                     .map(|(_, activity)| activity)
             }
@@ -3733,10 +3833,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, loaders: &VisibleLoaders) {
             loading::style(loading::Kind::Action),
         )])
     } else if let Some(error) = playback_error {
+        let handoff = if app
+            .current_post()
+            .is_some_and(|post| post.media.youtube_url().is_some())
+        {
+            "m browser"
+        } else {
+            "m media"
+        };
         let label = if content_width < 28 {
             "✗ P retry".into()
         } else {
-            format!("✗ P retry · m media · {error}")
+            format!("✗ P retry · {handoff} · {error}")
         };
         Line::from(Span::styled(label, Style::new().fg(RED)))
     } else if app.health == Health::SignedOut {
@@ -3762,6 +3870,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, loaders: &VisibleLoaders) {
         let closable = matches!(
             app.active_tab().kind,
             TabKind::Subreddit { pinned: false, .. }
+                | TabKind::User {
+                    followed: false,
+                    ..
+                }
         );
         let dynamic;
         let hints: &[(&str, &str)] = if app.post_focused() {
@@ -3814,7 +3926,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, loaders: &VisibleLoaders) {
             dynamic = playback
                 .into_iter()
                 .flatten()
-                .chain([("j/k", "comments")])
+                .chain([("j/k", "comments"), ("B", "community")])
                 .chain(spoilers.then_some(("v", "spoilers")))
                 .chain(c)
                 .chain([("space", "page")])
@@ -3830,10 +3942,19 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, loaders: &VisibleLoaders) {
         } else if app.focus == Focus::Sidebar {
             dynamic = [
                 ("j/k", "tabs"),
-                ("g/G", "first/last"),
                 ("l/⏎", "list"),
-                ("p", "jump"),
                 ("S", "join/leave"),
+                (
+                    "B",
+                    if matches!(app.active_tab().kind, TabKind::User { .. }) {
+                        "profile"
+                    } else {
+                        "community"
+                    },
+                ),
+                ("o", "browser"),
+                ("g/G", "first/last"),
+                ("p", "jump"),
             ]
             .into_iter()
             .chain(closable.then_some(("x", "close")))
@@ -3883,6 +4004,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, loaders: &VisibleLoaders) {
                     ("j/k", "posts"),
                     ("J/K", "communities"),
                     ("⏎", "open"),
+                    ("B", "community"),
                     ("space", "subreddit"),
                     ("S", "join/leave"),
                     ("tab", "next"),
@@ -3891,6 +4013,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, loaders: &VisibleLoaders) {
                 TabKind::Bookmarks => &[
                     ("j/k", "move"),
                     ("⏎", "open"),
+                    ("B", "community"),
                     ("V", "view"),
                     ("PgUp/Dn", "page"),
                     ("space", "sub"),
@@ -3899,24 +4022,28 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, loaders: &VisibleLoaders) {
                     ("o", "browser"),
                     ("p", "jump"),
                 ],
-                TabKind::Home | TabKind::Subreddit { .. } => {
+                TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. } => {
                     let feed = &app.active_tab().feed;
                     let time =
                         (feed.sort.takes_time() && feed.search.is_none()).then_some(("t", "time"));
-                    dynamic = [
-                        ("j/k", "move"),
-                        ("⏎", "open"),
-                        ("V", "view"),
-                        ("PgUp/Dn", "page"),
-                        ("space", "sub"),
-                        ("s", "sort"),
-                    ]
-                    .into_iter()
-                    .chain(time)
-                    .chain(app.active_tab().subreddit().map(|_| ("/", "search")))
-                    .chain([("p", "jump")])
-                    .chain(closable.then_some(("x", "close")))
-                    .collect();
+                    dynamic = [("j/k", "move"), ("⏎", "open")]
+                        .into_iter()
+                        .chain(
+                            matches!(app.active_tab().kind, TabKind::User { .. })
+                                .then_some(("S", "follow/unfollow")),
+                        )
+                        .chain([
+                            ("B", "community"),
+                            ("V", "view"),
+                            ("PgUp/Dn", "page"),
+                            ("space", "sub"),
+                            ("s", "sort"),
+                        ])
+                        .chain(time)
+                        .chain(app.active_tab().subreddit().map(|_| ("/", "search")))
+                        .chain([("p", "jump")])
+                        .chain(closable.then_some(("x", "close")))
+                        .collect();
                     &dynamic
                 }
             }
@@ -3924,15 +4051,34 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, loaders: &VisibleLoaders) {
         // Keep whole key + label pairs; do not build pairs past the available width.
         let mut fitted = vec![Span::raw(" ")];
         let mut used = 1;
+        let target = app.membership_target();
+        let action = target.as_ref().map(|target| {
+            app.subscribed(target).map_or_else(
+                || "check".into(),
+                |joined| target.action(!joined).to_ascii_lowercase(),
+            )
+        });
         for (key, label) in hints {
-            if matches!(*key, "S" | "space")
+            if *key == "S" && target.is_none() {
+                continue;
+            }
+            if *key == "space"
                 && app
                     .community()
                     .filter(|name| crate::reddit::is_community(name))
                     .is_none()
+                && app.profile_context().is_none()
             {
                 continue;
             }
+            let label = if *key == "S" {
+                action.as_deref().unwrap_or("check")
+            } else if *key == "B" && matches!(target, Some(crate::model::MembershipTarget::User(_)))
+            {
+                "profile"
+            } else {
+                label
+            };
             if *key == "PgUp/Dn" && app.state.list_view() != ListView::Card {
                 continue;
             }
@@ -4162,13 +4308,19 @@ fn draw_picker(f: &mut Frame, app: &App, input: &str, selected: usize) -> Rect {
                             TabKind::AllSubs => "▦",
                             TabKind::Bookmarks => "★",
                             TabKind::Subreddit { .. } => "#",
+                            TabKind::User { .. } => "@",
                         };
                         spans.push(Span::styled(format!(" {icon} "), bg.fg(OVERLAY)));
                         let badge = app.badge(&app.tabs[*index]);
-                        let badge_width = if badge > 0 {
-                            format!(" {badge} ").width()
-                        } else {
+                        let label = match badge {
+                            UnreadBadge::Unknown => "?".into(),
+                            UnreadBadge::Count(n) if n > 0 => n.to_string(),
+                            _ => String::new(),
+                        };
+                        let badge_width = if label.is_empty() {
                             0
+                        } else {
+                            label.width() + 2
                         };
                         spans.push(Span::styled(
                             truncate(
@@ -4177,14 +4329,16 @@ fn draw_picker(f: &mut Frame, app: &App, input: &str, selected: usize) -> Rect {
                             ),
                             bg.fg(TEXT),
                         ));
-                        if badge > 0 {
-                            pad_to(
-                                &mut spans,
-                                width.saturating_sub(format!(" {badge} ").width()),
-                                bg,
-                            );
-                            spans.push(chip(badge.to_string(), CRUST, ACCENT));
+                        if !label.is_empty() {
+                            pad_to(&mut spans, width.saturating_sub(badge_width), bg);
+                            spans.push(match badge {
+                                UnreadBadge::Unknown => chip(label, OVERLAY, SURFACE0),
+                                _ => chip(label, CRUST, ACCENT),
+                            });
                         }
+                    }
+                    PickerEntry::OpenUser(name) => {
+                        spans.push(Span::styled(format!(" @ open u/{name}"), bg.fg(SKY)));
                     }
                     PickerEntry::Open(name) => {
                         spans.push(Span::styled(" + ", bg.fg(GREEN)));
@@ -4267,15 +4421,25 @@ fn draw_sort(f: &mut Frame, app: &App, selected: usize) -> Rect {
     area
 }
 
-fn draw_membership(f: &mut Frame, subreddit: &str, join: bool) -> Rect {
-    let action = if join { "Join" } else { "Leave" };
+fn draw_membership(f: &mut Frame, target: &crate::model::MembershipTarget, join: bool) -> Rect {
+    let action = target.action(join);
     let available = popup(f.area(), 54, u16::MAX);
     let width = usize::from(available.width.saturating_sub(4)).max(1);
-    let mut lines = identity_lines(&format!("r/{subreddit}"), width, TEXT);
+    let mut lines = identity_lines(&target.label(), width, TEXT);
     for line in &mut lines {
         line.style = line.style.bold();
     }
-    let hint = fitting_label(&["Space open subreddit", "Space open"], width);
+    let hint = fitting_label(
+        &[
+            if matches!(target, crate::model::MembershipTarget::User(_)) {
+                "Space open profile"
+            } else {
+                "Space open subreddit"
+            },
+            "Space open",
+        ],
+        width,
+    );
     let mut area = popup(
         f.area(),
         54,
@@ -4785,7 +4949,16 @@ pub(crate) mod tests {
         );
         app.on_msg(Msg::Subscriptions {
             generation: 0,
-            result: Ok(subscriptions.iter().map(|s| s.to_string()).collect()),
+            result: Ok((subscriptions
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>())
+            .into_iter()
+            .map(|name| crate::model::Subscription::Community {
+                name,
+                icon: crate::model::SubscriptionIcon::Unknown,
+            })
+            .collect()),
         });
         app.active = crate::app::ALL_SUBS_TAB;
         app
@@ -5203,11 +5376,7 @@ pub(crate) mod tests {
                     .lines()
                     .position(|line| line.contains(field.key))
                     .unwrap();
-                let list_rows = shown
-                    .lines()
-                    .filter(|line| SETTINGS.iter().any(|setting| line.contains(setting.label)))
-                    .count();
-                layouts.push((area, description, list_rows));
+                layouts.push((area, description));
                 assert!(shown.contains(field.label), "{shown}");
                 assert!(shown.contains("Esc"), "{shown}");
             }
@@ -5585,7 +5754,7 @@ pub(crate) mod tests {
             for width in [56, 80] {
                 let mut app = app(&[]);
                 app.overlay = Some(Overlay::Membership {
-                    subreddit: name.into(),
+                    target: crate::model::MembershipTarget::Community(name.into()),
                     join,
                 });
                 let shown = screen(&mut app, width, 10);
@@ -5627,7 +5796,10 @@ pub(crate) mod tests {
         app.open_subreddit("armenia");
         let shown = screen(&mut app, 120, 24);
         assert!(shown.contains("Not joined"), "{shown}");
-        app.set_membership("armenia".into(), true);
+        app.set_membership(
+            crate::model::MembershipTarget::Community("armenia".into()),
+            true,
+        );
         let shown = screen(&mut app, 120, 24);
         assert!(shown.contains("Joining r/armenia"), "{shown}");
     }
@@ -8351,6 +8523,67 @@ pub(crate) mod tests {
         app
     }
 
+    #[test]
+    fn when_a_youtube_card_waits_for_playback_it_should_show_the_provider_poster_and_play_overlay()
+    {
+        let mut app = card_feed_app(kitty());
+        app.config.media.video_autoplay = false;
+        app.tabs[3].feed.posts.truncate(1);
+        app.tabs[3].feed.posts[0].media = Media::Link {
+            url: "https://www.youtube.com/shorts/dQw4w9WgXcQ".into(),
+            thumb: Some("https://preview.redd.it/youtube.jpg".into()),
+        };
+        let mut pictures = ListPictures::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+        terminal
+            .draw(|f| {
+                draw_feed(f, &mut app, f.area(), &mut pictures);
+            })
+            .unwrap();
+
+        assert_eq!(
+            pictures.cards[0].url.as_deref(),
+            Some("https://preview.redd.it/youtube.jpg")
+        );
+        assert!(matches!(
+            pictures.cards[0].indicator,
+            Some(Indicator::Video {
+                gif: false,
+                play: true
+            })
+        ));
+        let actual = buffer_text(terminal.backend().buffer());
+        assert!(actual.contains("▶ YouTube"), "{actual}");
+    }
+
+    #[test]
+    fn when_a_youtube_detail_loads_it_should_keep_its_poster_and_provider() {
+        let mut app = open_video_post();
+        app.config.media.video_autoplay = false;
+        let media = Media::Link {
+            url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+            thumb: Some("https://preview.redd.it/youtube.jpg".into()),
+        };
+        let view = app.post_view.as_mut().unwrap();
+        view.post.media = media.clone();
+        view.page.as_mut().unwrap().post.media = media;
+        let mut pictures = ListPictures::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+        terminal
+            .draw(|f| {
+                draw_post(f, &mut app, f.area(), &mut pictures);
+            })
+            .unwrap();
+
+        assert_eq!(
+            pictures.cards[0].url.as_deref(),
+            Some("https://preview.redd.it/youtube.jpg")
+        );
+        assert!(buffer_text(terminal.backend().buffer()).contains("▶ YouTube"));
+    }
+
     fn feed_app(picker: Picker) -> App {
         let mut app = card_feed_app(picker);
         app.state.toggle_list_view();
@@ -8358,7 +8591,10 @@ pub(crate) mod tests {
     }
 
     fn feed_with_next_page(view: ListView) -> App {
-        let mut app = app(&["s"]);
+        feed_with_next_page_in(app(&["s"]), view)
+    }
+
+    fn feed_with_next_page_in(mut app: App, view: ListView) -> App {
         app.switch_tab(3);
         if app.state.list_view() != view {
             app.state.toggle_list_view();
@@ -9486,7 +9722,17 @@ pub(crate) mod tests {
 
     #[test]
     fn when_media_opening_outlasts_its_notification_the_footer_should_keep_showing_activity() {
-        let mut app = feed_with_next_page(ListView::Card);
+        use crate::reddit::tests::{Fixture, Reply};
+        let fixture = Fixture::new(|request| {
+            let body = if request.url.contains("/comments/") {
+                serde_json::from_str(include_str!("../tests/fixtures/post.json")).unwrap()
+            } else {
+                serde_json::json!({"data": {"children": [], "after": null}})
+            };
+            Reply::json(body)
+        });
+        let mut app =
+            feed_with_next_page_in(app_with_client(&["s"], fixture.reddit()), ListView::Card);
         app.tabs[3].feed.posts[0].media = Media::Video {
             gif: false,
             url: None,
@@ -11417,10 +11663,10 @@ pub(crate) mod tests {
             .lines()
             .position(|l| {
                 l.chars()
-                    .take(30)
+                    .take(app.sidebar_width() as usize)
                     .collect::<String>()
-                    .trim_end()
-                    .ends_with(" s")
+                    .split_whitespace()
+                    .any(|word| word == "s")
             })
             .unwrap() as u16;
         let card_row = s
@@ -12416,11 +12662,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn sort_help_should_only_offer_the_current_feeds_supported_sorts() {
+        for (context, rising, best) in [(0, false, false), (1, true, true), (2, true, false)] {
+            let mut app = app(&["rust"]);
+            match context {
+                0 => app.open_user("blackvault"),
+                1 => app.active = 0,
+                _ => app.open_subreddit("rust"),
+            }
+            app.overlay = Some(Overlay::Sort { selected: 0 });
+            key(
+                &mut app,
+                crossterm::event::KeyCode::F(1),
+                crossterm::event::KeyModifiers::NONE,
+            );
+            let shown = screen(&mut app, 120, 60);
+            assert_eq!(shown.contains("rising"), rising, "{shown}");
+            assert_eq!(shown.contains("best"), best, "{shown}");
+            assert!(shown.contains("controversial"), "{shown}");
+        }
+    }
+
+    #[test]
     fn dialog_help_should_show_the_active_action_before_view_shortcuts() {
         for (overlay, title, description) in [
             (
                 Overlay::Picker(crate::app::PickerState::default()),
-                "Jump / open subreddit",
+                "Jump / open community or profile",
                 "open the selected result",
             ),
             (
@@ -12437,7 +12705,7 @@ pub(crate) mod tests {
             ),
             (
                 Overlay::Membership {
-                    subreddit: "rust".into(),
+                    target: crate::model::MembershipTarget::Community("rust".into()),
                     join: true,
                 },
                 "Confirm Join / Leave",
@@ -13927,7 +14195,7 @@ pub(crate) mod tests {
                 for (width, height) in [(20, 6), (20, 8), (24, 8), (40, 12)] {
                     let mut app = app(&[]);
                     app.overlay = Some(Overlay::Membership {
-                        subreddit: name.into(),
+                        target: crate::model::MembershipTarget::Community(name.into()),
                         join,
                     });
                     let body = auth_content(&mut app, width, height);
@@ -13980,7 +14248,10 @@ pub(crate) mod tests {
     fn settings_editor_should_keep_unicode_drafts_across_help_and_reject_bad_arrays() {
         let mut app = app(&[]);
         app.show_settings();
-        app.settings.selected = 4;
+        app.settings.selected = crate::config::schema::SETTINGS
+            .iter()
+            .position(|f| f.key == "filters.keywords")
+            .unwrap();
         let key = |app: &mut App, code, modifiers| {
             crate::keys::handle(app, crossterm::event::KeyEvent::new(code, modifiers))
         };
@@ -14012,6 +14283,30 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn scoped_settings_narrow_rows_should_keep_boolean_and_command_values_visible() {
+        let mut app = app(&[]);
+        app.change_setting("media.image_preview", false.into());
+        app.change_setting("commands.image", toml::Value::Array(vec!["viewer".into()]));
+        app.show_settings();
+        for width in [24, 31, 32, 33, 40, 100] {
+            for (key, label, value) in [
+                ("media.image_preview", "Image previews", "Off"),
+                ("commands.image", "Image command", "[\"viewer\"]"),
+            ] {
+                app.settings.selected = crate::config::schema::SETTINGS
+                    .iter()
+                    .position(|f| f.key == key)
+                    .unwrap();
+                let actual = screen(&mut app, width, 12);
+                assert!(
+                    actual.contains(label) && actual.contains(value),
+                    "{width}: {actual}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn settings_small_dialogs_should_keep_selection_value_and_escape_visible() {
         let mut app = app(&[]);
         app.show_settings();
@@ -14039,7 +14334,10 @@ pub(crate) mod tests {
         let fixture = crate::config::managed::tests::Fixture::new();
         app.settings.chezmoi = fixture.tool.clone();
         app.show_settings();
-        app.settings.selected = 1;
+        app.settings.selected = crate::config::schema::SETTINGS
+            .iter()
+            .position(|f| f.key == "media.image_preview")
+            .unwrap();
         crate::keys::handle(
             &mut app,
             crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -14072,7 +14370,7 @@ pub(crate) mod tests {
         app.show_settings();
         app.settings.selected = crate::config::schema::SETTINGS
             .iter()
-            .position(|field| field.key == "media.video_autoplay")
+            .position(|field| field.key == "media.image_preview")
             .unwrap();
         crate::keys::handle(
             &mut app,
@@ -14084,26 +14382,26 @@ pub(crate) mod tests {
     #[test]
     fn managed_settings_should_confirm_before_source_writes_and_keep_session_changes_on_cancel() {
         let (mut app, fixture) = managed_settings_app();
-        assert!(!app.config.media.video_autoplay);
+        assert!(!app.config.media.image_preview);
         app.settings.wait_managed();
         app.tick();
         let actual = screen(&mut app, 100, 30);
         assert!(actual.contains("Save through chezmoi?"), "{actual}");
         assert!(
-            actual.contains("media.video_autoplay: true → false"),
+            actual.contains("media.image_preview: true → false"),
             "{actual}"
         );
         assert!(
             Config::load(Some(&fixture.source))
                 .unwrap()
                 .media
-                .video_autoplay
+                .image_preview
         );
         assert!(
             Config::load(Some(&fixture.target))
                 .unwrap()
                 .media
-                .video_autoplay
+                .image_preview
         );
 
         crate::keys::handle(
@@ -14112,7 +14410,7 @@ pub(crate) mod tests {
         );
 
         assert!(app.settings.managed.is_none());
-        assert!(!app.config.media.video_autoplay);
+        assert!(!app.config.media.image_preview);
         assert_eq!(
             app.settings.store.persistence,
             crate::config::store::Persistence::Temporary
@@ -14160,7 +14458,7 @@ pub(crate) mod tests {
             !Config::load(Some(&fixture.target))
                 .unwrap()
                 .media
-                .video_autoplay
+                .image_preview
         );
         assert!(app.help_scroll.is_some());
         crate::keys::handle(
@@ -14226,7 +14524,7 @@ pub(crate) mod tests {
             !Config::load(Some(&fixture.target))
                 .unwrap()
                 .media
-                .video_autoplay
+                .image_preview
         );
     }
 
@@ -14262,6 +14560,406 @@ pub(crate) mod tests {
         assert_ne!(
             app.settings.store.persistence,
             crate::config::store::Persistence::Saved
+        );
+    }
+    #[test]
+    fn sidebar_distinguishes_unknown_from_zero_and_keeps_badges_aligned() {
+        let mut app = app(&["longcommunityname"]);
+        let i = 3;
+        for width in [24, 30] {
+            let unknown = sidebar_item(&app, i, width);
+            assert_eq!(line_width(&unknown.spans), width);
+            assert!(unknown.to_string().trim_end().ends_with('?'));
+        }
+        app.state.observe(
+            Some("longcommunityname"),
+            &[],
+            crate::cache::Freshness {
+                fetched_at: 1,
+                source: crate::cache::Source::default(),
+            },
+            1,
+        );
+        let zero = sidebar_item(&app, i, 24).to_string();
+        assert!(!zero.contains('?'));
+        let mut post = post_with("fetched", Media::None);
+        post.subreddit = "longcommunityname".into();
+        app.state.observe(
+            Some("longcommunityname"),
+            &[post],
+            crate::cache::Freshness {
+                fetched_at: 2,
+                source: crate::cache::Source::default(),
+            },
+            2,
+        );
+        app.focus = Focus::Sidebar;
+        app.active = i;
+        for width in [24, 30] {
+            let known = sidebar_item(&app, i, width);
+            assert_eq!(line_width(&known.spans), width);
+            assert!(known.to_string().trim_end().ends_with('1'));
+        }
+    }
+
+    #[test]
+    fn loading_obscured_and_spoiler_hidden_documents_do_not_mark_posts_read() {
+        let (mut app, _) = open_long_post(|app| {
+            assert!(!app.state.is_read("p"));
+            app.overlay = Some(Overlay::Auth);
+        });
+        assert!(!app.state.is_read("p"));
+        app.overlay = None;
+        app.post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .post
+            .spoiler = true;
+        screen(&mut app, 100, 30);
+        assert!(!app.state.is_read("p"));
+
+        app.post_view.as_mut().unwrap().reveal_spoilers = true;
+        screen(&mut app, 100, 30);
+
+        assert!(app.state.is_read("p"));
+    }
+
+    #[test]
+    fn an_empty_detail_area_does_not_mark_its_loaded_page_read() {
+        let (mut app, _) = open_long_post(|app| app.overlay = Some(Overlay::Auth));
+        app.overlay = None;
+        screen(&mut app, 1, 1);
+        assert!(!app.state.is_read("p"));
+
+        screen(&mut app, 100, 30);
+
+        assert!(app.state.is_read("p"));
+    }
+
+    #[test]
+    fn the_sidebar_reflects_a_displayed_post_read_in_the_same_frame() {
+        let mut app = app(&["s"]);
+        let first = post_with("p", Media::None);
+        let second = post_with("q", Media::None);
+        app.on_msg(Msg::Group {
+            generation: app.all_subs.groups[0].generation,
+            subreddit: "s".into(),
+            result: Ok(crate::model::Listing {
+                posts: vec![first.clone(), second],
+                after: None,
+            }),
+        });
+        app.open_current_post();
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(PostPage {
+                post: first,
+                body: "Readable post".into(),
+                comments: vec![],
+            })),
+        });
+        assert_eq!(app.badge(&app.tabs[3]), UnreadBadge::Count(2));
+
+        let buffer = screen_buffer(&mut app, 100, 30);
+
+        assert_eq!(app.badge(&app.tabs[3]), UnreadBadge::Count(1));
+        let rows: Vec<_> = (0..30)
+            .map(|y| {
+                (0..app.sidebar_width())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let row = rows.iter().find(|row| row.contains("# s")).unwrap();
+        assert!(row.trim_end().ends_with('1'), "{row}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn empty_community_browser_key_should_open_the_community_without_a_post() {
+        let mut app = app(&["s"]);
+        app.active = 3;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("opened-url");
+        app.config.commands.browser = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '%s' \"$1\" > \"$0\"".into(),
+            file.to_string_lossy().into_owned(),
+        ];
+        press(&mut app, 'o');
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let actual = loop {
+            if let Ok(text) = std::fs::read_to_string(&file)
+                && !text.is_empty()
+            {
+                break text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native browser probe did not receive a URL"
+            );
+            std::thread::yield_now();
+        };
+        assert_eq!(actual, "https://www.reddit.com/r/s/");
+    }
+    #[cfg(unix)]
+    fn opened_browser_url(app: &mut App, key: char) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("opened-url");
+        app.config.commands.browser = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '%s' \"$1\" > \"$0\"".into(),
+            file.to_string_lossy().into_owned(),
+        ];
+        press(app, key);
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&file)
+                && !text.is_empty()
+            {
+                return text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native browser probe did not receive a URL"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidebar_browser_key_should_open_its_community_instead_of_its_selected_post() {
+        let mut app = feed_with_next_page(ListView::Card);
+        app.focus = Focus::Sidebar;
+
+        let actual = opened_browser_url(&mut app, 'o');
+
+        assert_eq!(actual, "https://www.reddit.com/r/s/");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn community_browser_key_on_home_should_open_the_selected_posts_community() {
+        let mut app = app(&[]);
+        app.active = 0;
+        let mut post = post_with("p", Media::None);
+        post.subreddit = "fromhome".into();
+        app.tabs[0].feed.posts = vec![post];
+
+        let actual = opened_browser_url(&mut app, 'O');
+
+        assert_eq!(actual, "https://www.reddit.com/r/fromhome/");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn community_browser_key_in_detail_should_open_the_shown_posts_community() {
+        let mut app = app(&["underlying"]);
+        app.active = 3;
+        let mut post = post_with("p", Media::None);
+        post.subreddit = "detail".into();
+        app.tabs[3].feed.posts = vec![post];
+        app.open_current_post();
+        app.focus = Focus::Post;
+
+        let actual = opened_browser_url(&mut app, 'O');
+
+        assert_eq!(actual, "https://www.reddit.com/r/detail/");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lowercase_browser_key_in_a_list_should_keep_opening_the_selected_post() {
+        let mut app = feed_with_next_page(ListView::Card);
+        app.tabs[3].feed.posts[0].permalink = "/r/s/comments/existing/title/".into();
+        app.focus = Focus::List;
+
+        let actual = opened_browser_url(&mut app, 'o');
+
+        assert_eq!(
+            actual,
+            "https://www.reddit.com/r/s/comments/existing/title/"
+        );
+    }
+    #[test]
+    fn following_should_show_submitted_posts_in_card_and_compact_views() {
+        for mode in [ListView::Card, ListView::Compact] {
+            let mut app = app(&[]);
+            app.on_msg(Msg::Subscriptions {
+                generation: 0,
+                result: Ok(vec![crate::model::Subscription::User {
+                    name: "blackvault".into(),
+                    icon: None,
+                }]),
+            });
+            app.open_user("blackvault");
+            if app.state.list_view() != mode {
+                app.state.toggle_list_view();
+            }
+            let mut post = post_with("p", Media::None);
+            post.subreddit = "UFOs".into();
+            post.title = "A submitted post from another community".into();
+            app.on_msg(Msg::Feed {
+                tab: app.active_tab().id,
+                generation: app.active_tab().feed.generation,
+                append: false,
+                result: Ok(crate::model::Listing {
+                    posts: vec![post],
+                    after: Some("next".into()),
+                }),
+            });
+
+            let actual = screen(&mut app, 120, 24);
+
+            assert!(actual.contains("FOLLOWING"), "{actual}");
+            assert!(actual.contains("u/blackvault"), "{actual}");
+            assert!(
+                actual.contains("A submitted post from another community"),
+                "{actual}"
+            );
+            assert!(actual.contains("r/UFOs"), "{actual}");
+            assert!(
+                !actual.contains("r/u_blackvault") && !actual.contains("Joined"),
+                "{actual}"
+            );
+            assert!(app.current_post().is_some());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_follow_confirmation_should_name_the_profile_and_action_in_small_terminals() {
+        for (join, title, control) in [
+            (true, "Follow on Reddit", "follow"),
+            (false, "Unfollow on Reddit", "unfollow"),
+        ] {
+            let mut app = app(&[]);
+            app.overlay = Some(Overlay::Membership {
+                target: crate::model::MembershipTarget::User("blackvault".into()),
+                join,
+            });
+
+            let shown = screen(&mut app, 48, 8);
+
+            assert!(
+                shown.contains(title) && shown.contains("u/blackvault"),
+                "{shown}"
+            );
+            assert!(
+                shown.contains(control) && shown.contains("Esc cancel"),
+                "{shown}"
+            );
+            assert!(shown.contains("Space open profile"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn closing_a_followed_user_should_explain_how_to_unfollow() {
+        let mut app = app(&[]);
+        app.on_msg(Msg::Subscriptions {
+            generation: 0,
+            result: Ok(vec![crate::model::Subscription::User {
+                name: "blackvault".into(),
+                icon: None,
+            }]),
+        });
+        app.open_user("blackvault");
+        let tab = app.active_tab().id;
+
+        press(&mut app, 'x');
+
+        assert_eq!(app.active_tab().id, tab);
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|status| status.text.contains("S to unfollow"))
+        );
+    }
+
+    #[test]
+    fn unknown_follow_status_should_not_claim_the_person_is_unfollowed() {
+        let mut app = app(&[]);
+        app.open_user("blackvault");
+        app.all_subs.freshness = None;
+
+        let shown = screen(&mut app, 120, 24);
+
+        assert!(
+            shown.contains("Following unknown") && shown.contains("S check"),
+            "{shown}"
+        );
+        assert!(!shown.contains("Not following"), "{shown}");
+    }
+
+    #[test]
+    fn followed_user_header_should_show_the_unfollow_shortcut() {
+        let mut app = app(&[]);
+        app.on_msg(Msg::Subscriptions {
+            generation: 0,
+            result: Ok(vec![crate::model::Subscription::User {
+                name: "blackvault".into(),
+                icon: None,
+            }]),
+        });
+        app.open_user("blackvault");
+
+        let shown = screen(&mut app, 120, 24);
+
+        assert!(
+            shown.contains("Following") && shown.contains("S unfollow"),
+            "{shown}"
+        );
+        assert!(
+            shown.lines().last().unwrap().contains("unfollow"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn followed_user_browser_keys_should_target_the_user_profile_even_when_empty() {
+        let mut app = app(&[]);
+        app.open_user("blackvault");
+        app.focus = Focus::Sidebar;
+        assert_eq!(
+            opened_browser_url(&mut app, 'o'),
+            "https://www.reddit.com/user/blackvault/"
+        );
+        app.focus = Focus::List;
+        assert_eq!(
+            opened_browser_url(&mut app, 'O'),
+            "https://www.reddit.com/user/blackvault/"
+        );
+        assert_eq!(
+            opened_browser_url(&mut app, 'o'),
+            "https://www.reddit.com/user/blackvault/"
+        );
+    }
+
+    #[test]
+    fn followed_user_sidebar_tools_should_offer_profile_actions_without_subreddit_actions() {
+        let mut app = app(&[]);
+        app.open_user("blackvault");
+        app.focus = Focus::Sidebar;
+        press(&mut app, 'B');
+
+        let actual = screen(&mut app, 120, 24);
+
+        assert!(
+            actual.contains("u/blackvault") && actual.contains("Open submitted posts"),
+            "{actual}"
+        );
+        assert!(actual.contains("Open profile in browser"), "{actual}");
+        assert!(
+            !actual.contains("Mark community read")
+                && !actual.contains("Wiki")
+                && !actual.contains("Rules"),
+            "{actual}"
         );
     }
 }

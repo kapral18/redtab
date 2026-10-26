@@ -21,13 +21,15 @@ const LIST: &[(&str, &str)] = &[
     ("j k", "next / previous post"),
     ("Enter l", "open the post, or resume the one shown"),
     ("g G", "first / last post"),
+    ("B", "tools for this community or profile"),
+    ("O", "open this community or profile in browser"),
     ("V", "Card / Compact view (saved)"),
     ("PgDn/PgUp · C-d/u", "cards: scroll a page / half page"),
     ("C-e C-y", "cards: scroll down / up one line"),
     ("C-d C-u", "Compact: page down / up"),
     ("J K", "All subs: next / previous community island"),
-    ("Space", "open the selected community"),
-    ("s · t", "Home/subreddit: sort · time range"),
+    ("Space", "open this community or profile"),
+    ("s · t", "Home/community/user: sort · time range"),
     ("/ · Esc", "subreddit: search · clear search"),
     ("L", "feed: next page (automatic near end)"),
 ];
@@ -40,6 +42,8 @@ const POST: &[(&str, &str)] = &[
     ("n N", "next / previous top-level comment"),
     (";", "actions for the selected post or comment"),
     ("o · y", "open or copy the selected comment/post link"),
+    ("O", "open this post’s community or profile in browser"),
+    ("B", "tools for this community or profile"),
     ("f", "comment sort and find in loaded comments"),
     ("v", "show / hide spoilers"),
     ("g G", "top of post / last comment"),
@@ -56,17 +60,19 @@ const MEDIA: &[(&str, &str)] = &[
 const TABS: &[(&str, &str)] = &[
     ("Tab ] / S-Tab [", "next / previous tab"),
     ("1-9 / 0", "jump to a tab / the last tab"),
-    ("p", "jump to a tab or open any subreddit"),
+    ("p", "jump to a tab or open r/name or u/name"),
     ("x", "close a tab opened with p"),
     ("\\", "hide or show the sidebar"),
     ("h · l Enter Esc", "focus the sidebar · back to the list"),
     ("j k · g G", "sidebar: next / previous tab · first / last"),
+    ("o O", "open this community or profile in browser"),
+    ("B", "tools for this community or profile"),
 ];
 const REDDIT: &[(&str, &str)] = &[
     (":", "Reddit: saved, profiles, inbox, search"),
     (";", "post/comment: vote, save, reply, edit"),
-    ("B", "community info, rules, wiki and actions"),
-    ("S", "join or leave a community on Reddit"),
+    ("B", "tools for this community or profile"),
+    ("S", "join/leave a community · follow/unfollow a user"),
     ("C-s (composer)", "submit to Reddit; Tab field, Esc back"),
     ("C-o (Reddit)", "open the corresponding Reddit page"),
     ("A", "saved accounts: switch, add or reconnect"),
@@ -98,6 +104,7 @@ fn list_section(app: &App) -> Section {
         );
     }
     let list_title = match app.active_tab().kind {
+        TabKind::User { .. } => "User posts",
         TabKind::Home => "Home",
         TabKind::Subreddit { .. } => "Subreddit feed / search",
         TabKind::AllSubs => "All subs",
@@ -116,12 +123,18 @@ fn list_section(app: &App) -> Section {
         },
         LIST,
     );
+    if matches!(app.active_tab().kind, TabKind::User { .. }) {
+        lists.keys.retain(|(key, _)| *key != "/ · Esc");
+        if let Some((_, description)) = lists.keys.iter_mut().find(|(key, _)| *key == "O") {
+            *description = "open this user's profile in browser";
+        }
+    }
     let page_key = if app.state.list_view() == ListView::Card {
         "PgDn/PgUp · C-d/u"
     } else {
         "C-d C-u"
     };
-    let mut first = vec!["j k", "Enter l", page_key];
+    let mut first = vec!["j k", "Enter l", "B", "O", page_key];
     if app.state.list_view() == ListView::Card {
         first.push("C-e C-y");
         if app.video_controls_available() {
@@ -137,7 +150,7 @@ fn list_section(app: &App) -> Section {
             first.insert(2, "b");
         }
         TabKind::Subreddit { .. } => first.extend(["/ · Esc", "s · t", "L", "Space"]),
-        TabKind::Home => first.extend(["s · t", "L", "Space"]),
+        TabKind::Home | TabKind::User { .. } => first.extend(["s · t", "L", "Space"]),
     }
     prioritize(&mut lists.keys, &first);
     lists
@@ -186,7 +199,10 @@ fn media_section(app: &App) -> Section {
 fn view_sections(app: &App) -> Vec<Section> {
     let mut tabs = section("Sidebar and tabs", TABS);
     if app.focus == Focus::Sidebar {
-        prioritize(&mut tabs.keys, &["j k · g G", "h · l Enter Esc", "p"]);
+        prioritize(
+            &mut tabs.keys,
+            &["j k · g G", "h · l Enter Esc", "o O", "B", "p"],
+        );
     }
     let selected = app.post_view.as_ref().is_some_and(|v| !v.free_scroll);
     let media_active = app.post_view.as_ref().is_some_and(|v| {
@@ -225,10 +241,10 @@ fn view_sections(app: &App) -> Vec<Section> {
 fn action_section(app: &App) -> Option<Section> {
     Some(match app.overlay.as_ref()? {
         Overlay::Settings => {
-            if app.settings.busy() {
+            if app.settings.managed_busy() || app.settings.writing() {
                 section(
-                    "Saving settings",
-                    &[("F1 / Esc", "close help; wait for the settings task")],
+                    "Account and file settings",
+                    &[("F1 / Esc", "close help; background settings work continues")],
                 )
             } else if app.settings.managed.is_some() {
                 section(
@@ -255,15 +271,18 @@ fn action_section(app: &App) -> Option<Section> {
                     &[
                         ("j k / Up Down", "choose a setting"),
                         ("Enter / Space", "toggle or edit selected value"),
-                        ("r", "retry saving unsaved changes"),
-                        ("u", "revert all session changes to the file"),
+                        (
+                            "r",
+                            "refresh Reddit values, or retry the selected file setting",
+                        ),
+                        ("u", "revert file changes; Reddit settings save directly"),
                         ("Esc / F2", "close settings"),
                     ],
                 )
             }
         }
         Overlay::Picker(_) => section(
-            "Jump / open subreddit",
+            "Jump / open community or profile",
             &[
                 ("Enter", "open the selected result"),
                 ("Up Down / Tab", "select a result"),
@@ -283,11 +302,15 @@ fn action_section(app: &App) -> Option<Section> {
             ],
         ),
         Overlay::Sort { .. } => sort_section(app),
-        Overlay::Membership { .. } => section(
-            "Confirm Join / Leave",
+        Overlay::Membership { target, .. } => section(
+            if matches!(target, crate::model::MembershipTarget::User(_)) {
+                "Confirm Follow / Unfollow"
+            } else {
+                "Confirm Join / Leave"
+            },
             &[
                 ("Enter", "confirm the membership change"),
-                ("Space", "open this community instead"),
+                ("Space", "open this community or profile instead"),
                 ("Esc q", "cancel"),
             ],
         ),
@@ -302,12 +325,12 @@ fn sort_section(app: &App) -> Section {
         &[
             ("j k / Down Up", "select a sort"),
             ("Enter", "apply the selected sort"),
-            ("h n t r c", "hot, new, top, rising, controversial"),
         ],
     );
-    if app.active_tab().sorts().contains(&Sort::Best) {
-        s.keys.push(("b", "Best recommendations"));
-    }
+    s.keys.extend(app.active_tab().sorts().iter().map(|sort| {
+        let name = sort.as_str();
+        (&name[..1], name)
+    }));
     s.keys.push(("Esc q", "cancel"));
     s
 }

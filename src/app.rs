@@ -15,8 +15,8 @@ use crate::cache::{Freshness, Source};
 use crate::config::{Config, is_subreddit_name, normalize_subreddit};
 use crate::media;
 use crate::model::{
-    Comment, CommentSources, Listing, Media, MoreReplies, ParentMembership, Post, PostPage,
-    ReplyPage, SPOILER_START, Sort, THREAD_ROOT, TimeRange,
+    Comment, CommentSources, Listing, Media, MembershipTarget, MoreReplies, ParentMembership, Post,
+    PostPage, ReplyPage, SPOILER_START, Sort, Subscription, THREAD_ROOT, TimeRange,
 };
 use crate::reddit::{AccessDenied, Health, Reddit, is_community};
 use crate::state::{ListView, State};
@@ -25,8 +25,6 @@ use crate::worker::{FeedError, FeedQuery, FeedTarget, ImageMetadata, Job, Msg, P
 
 const SAVE_INTERVAL: Duration = Duration::from_secs(60);
 const STATUS_TTL: Duration = Duration::from_secs(6);
-/// A tab's posts count as seen once you stay this long or interact with it.
-const SEEN_DWELL: Duration = Duration::from_secs(2);
 /// Load the next page when the selection gets this close to the end.
 const PREFETCH_MARGIN: usize = 5;
 /// Bound automatic Home fill when filters or missing post details leave pages empty.
@@ -214,10 +212,6 @@ impl Feed {
         }
     }
 
-    pub fn is_default_view(&self) -> bool {
-        self.search.is_none() && self.sort == Sort::Hot
-    }
-
     pub fn refreshing(&self) -> bool {
         !self.refreshing.is_empty()
     }
@@ -402,8 +396,20 @@ impl Feed {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnreadBadge {
+    Unknown,
+    Count(usize),
+    Unavailable,
+}
+
 #[derive(Debug)]
 pub enum TabKind {
+    User {
+        name: String,
+        followed: bool,
+        icon: Option<String>,
+    },
     Home,
     Bookmarks,
     AllSubs,
@@ -419,22 +425,22 @@ pub struct Tab {
     pub id: u64,
     pub kind: TabKind,
     pub feed: Feed,
-    /// When the tab became active, and whether you moved or opened anything since.
-    entered: Option<Instant>,
-    engaged: bool,
 }
 
 impl Tab {
     fn feed_target(&self) -> Option<FeedTarget> {
         match &self.kind {
             TabKind::Home => Some(FeedTarget::Home),
+            TabKind::User { name, .. } => Some(FeedTarget::User(name.clone())),
             TabKind::Subreddit { name, .. } => Some(FeedTarget::Subreddit(name.clone())),
             _ => None,
         }
     }
 
     pub fn sorts(&self) -> &[Sort] {
-        if matches!(self.kind, TabKind::Home) {
+        if matches!(self.kind, TabKind::User { .. }) {
+            &[Sort::New, Sort::Hot, Sort::Top, Sort::Controversial]
+        } else if matches!(self.kind, TabKind::Home) {
             &Sort::ALL
         } else {
             &Sort::ALL[1..]
@@ -450,6 +456,7 @@ impl Tab {
 
     pub fn title(&self) -> String {
         match &self.kind {
+            TabKind::User { name, .. } => format!("u/{name}"),
             TabKind::Home => "Home".into(),
             TabKind::AllSubs => "All subs".into(),
             TabKind::Bookmarks => "Bookmarks".into(),
@@ -888,10 +895,17 @@ pub enum Overlay {
     Settings,
     Experience,
     Auth,
-    Membership { subreddit: String, join: bool },
+    Membership {
+        target: MembershipTarget,
+        join: bool,
+    },
     Picker(PickerState),
-    Sort { selected: usize },
-    Search { input: String },
+    Sort {
+        selected: usize,
+    },
+    Search {
+        input: String,
+    },
 }
 
 /// Refetch state of a loaded picture; its pixels stay drawn whatever this says.
@@ -949,6 +963,7 @@ pub struct Status {
 pub enum PickerEntry {
     Tab { index: usize, title: String },
     Open(String),
+    OpenUser(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -960,7 +975,7 @@ pub enum Focus {
 
 struct MembershipChange {
     generation: u64,
-    subreddit: String,
+    target: MembershipTarget,
     join: bool,
     checking: bool,
     error: Option<String>,
@@ -971,6 +986,11 @@ struct CardPlayback {
     url: String,
     since: Instant,
     shown: bool,
+}
+
+struct IconMetadata {
+    url: Option<String>,
+    source: Source,
 }
 
 pub struct App {
@@ -990,6 +1010,7 @@ pub struct App {
     content_generation_floor: u64,
     pub all_subs: AllSubs,
     community_access: HashMap<String, CommunityAccess>,
+    read_redraw: bool,
     membership: Option<MembershipChange>,
     pub post_view: Option<PostView>,
     pub overlay: Option<Overlay>,
@@ -1028,7 +1049,7 @@ pub struct App {
     /// List-row thumbnails and subreddit icons, keyed by image URL.
     pub thumbs: HashMap<String, ImageSlot>,
     /// Subreddit icon URLs, keyed by lowercase subreddit name; `None` when it has none.
-    icons: HashMap<String, Option<String>>,
+    icons: HashMap<String, IconMetadata>,
     /// Subreddits whose icon lookup has not answered yet.
     icon_lookups: HashSet<String>,
     icon_demands: HashSet<String>,
@@ -1059,12 +1080,17 @@ pub struct App {
 
 impl App {
     pub fn new(
-        config: Config,
+        mut config: Config,
         pool: Pool,
         reddit: Reddit,
         state_path: PathBuf,
         image_picker: Picker,
     ) -> Self {
+        if let Some(account) = reddit.account() {
+            config.select_account(Some(&account.name));
+            config.show_nsfw = false;
+            config.media.video_autoplay = false;
+        }
         let (state, warning) = State::load(&state_path);
         let show_images = config.media.image_preview;
         let mut app = Self {
@@ -1084,6 +1110,7 @@ impl App {
             content_generation_floor: 0,
             all_subs: AllSubs::default(),
             community_access: HashMap::new(),
+            read_redraw: false,
             post_view: None,
             overlay: None,
             help_scroll: None,
@@ -1134,7 +1161,6 @@ impl App {
         app.push_tab(TabKind::Bookmarks);
         app.push_tab(TabKind::AllSubs);
         app.tabs[0].feed.sort = Sort::Best;
-        app.tabs[0].entered = Some(Instant::now());
         if let Some(w) = warning {
             app.error(w);
         }
@@ -1142,6 +1168,7 @@ impl App {
     }
 
     pub fn start(&mut self) {
+        self.load_account_preferences(false);
         self.sync_feed_demand();
         if self.reddit.needs_sign_in() {
             return;
@@ -1151,7 +1178,7 @@ impl App {
     }
 
     pub fn show_auth(&mut self) {
-        if self.membership.is_some() || self.experience.writing() {
+        if self.membership.is_some() || self.experience.writing() || self.settings.writing() {
             self.info("Wait for the pending Reddit action before reconnecting");
             return;
         }
@@ -1163,6 +1190,11 @@ impl App {
 
     /// Returns whether the account dialog should close.
     pub fn select_auth(&mut self) -> bool {
+        if self.settings.writing() {
+            self.auth.message =
+                Some("Wait for the pending Reddit preference save before changing accounts".into());
+            return false;
+        }
         if self.auth.phase == crate::auth::Phase::Accounts
             && let Some(account) = self.auth.accounts.get(self.auth.selected)
         {
@@ -1176,7 +1208,6 @@ impl App {
                 self.auth.cancel();
                 return true;
             }
-            self.mark_active_seen();
             if let Err(error) = self.persist_checked() {
                 self.auth.message = Some(format!(
                     "Could not save the current reading state; connection unchanged: {error}"
@@ -1201,11 +1232,15 @@ impl App {
     }
 
     pub fn confirm_auth(&mut self) {
+        if self.settings.writing() {
+            self.auth.message =
+                Some("Wait for the pending Reddit preference save before changing accounts".into());
+            return;
+        }
         use crate::auth::Phase;
         if !matches!(self.auth.phase, Phase::Confirm | Phase::DisconnectConfirm) {
             return;
         }
-        self.mark_active_seen();
         match self.persist_checked() {
             Ok(_) if self.auth.phase == Phase::DisconnectConfirm => {
                 self.auth.disconnect(self.config.show_nsfw)
@@ -1224,13 +1259,42 @@ impl App {
     }
 
     fn install_connection(&mut self, reddit: Reddit) {
-        let reddit = reddit.with_nsfw(self.config.show_nsfw);
         let disconnected = reddit.needs_sign_in();
         let same_account = !disconnected
             && match self.reddit.account().zip(reddit.account()) {
                 Some((old, new)) => old.id == new.id,
                 None => self.reddit.session_fingerprint() == reddit.session_fingerprint(),
             };
+        let account = reddit.account();
+        let same_settings_scope = same_account
+            && self
+                .config
+                .active_account
+                .as_deref()
+                .zip(account.as_ref())
+                .is_some_and(|(name, account)| name.eq_ignore_ascii_case(&account.name));
+        let show_nsfw = same_settings_scope && self.config.show_nsfw;
+        let reddit = reddit.with_nsfw(show_nsfw);
+        let confirmed = same_settings_scope
+            .then(|| self.settings.account.values.take())
+            .flatten();
+        self.settings.account = settings::AccountSettings::default();
+        self.settings.account.values = confirmed;
+        if !same_settings_scope
+            && self.settings.editing.is_some()
+            && crate::config::schema::SETTINGS[self.settings.selected].scope
+                != crate::config::schema::Scope::Device
+        {
+            self.settings.editing = None;
+            self.settings.message =
+                Some("Account changed; the previous account's draft was not applied".into());
+        }
+        self.settings
+            .store
+            .select_account(account.as_ref().map(|a| a.name.as_str()));
+        let mut config = self.settings.store.current.clone();
+        config.show_nsfw = show_nsfw;
+        config.media.video_autoplay = same_settings_scope && self.config.media.video_autoplay;
         self.pool.stop();
         self.reddit.retire();
         let (pool, messages) = self.pool.restart(reddit.clone());
@@ -1281,6 +1345,14 @@ impl App {
             }
         }
         if same_account {
+            self.config = config;
+            if self
+                .post_view
+                .as_ref()
+                .is_some_and(|v| self.config.hides(v.shown_post()))
+            {
+                self.close_post();
+            }
             self.pool = pool;
             self.reddit = reddit;
             self.state_path = state_path;
@@ -1293,7 +1365,7 @@ impl App {
             }
         } else {
             let image_picker = std::mem::replace(&mut self.image_picker, Picker::halfblocks());
-            let mut next = Self::new(self.config.clone(), pool, reddit, state_path, image_picker);
+            let mut next = Self::new(config, pool, reddit, state_path, image_picker);
             state_warning = state_warning.or_else(|| {
                 next.status
                     .as_ref()
@@ -1428,26 +1500,61 @@ impl App {
         }
     }
 
-    fn sync_subscription_tabs(&mut self, names: &[String]) {
+    fn sync_subscription_tabs(&mut self, entries: &[Subscription]) {
         let active = self.active_tab().id;
-        let order: HashMap<_, _> = names
+        let communities: HashMap<_, _> = entries
+            .iter()
+            .filter_map(|entry| entry.community())
+            .enumerate()
+            .map(|(index, name)| (name.to_ascii_lowercase(), index))
+            .collect();
+        let follows: HashMap<_, _> = entries
             .iter()
             .enumerate()
-            .map(|(i, name)| (name.to_ascii_lowercase(), i))
+            .filter_map(|(index, entry)| match entry {
+                Subscription::User { name, icon } => {
+                    Some((name.to_ascii_lowercase(), (index, icon.clone())))
+                }
+                _ => None,
+            })
             .collect();
         for tab in &mut self.tabs {
-            if let TabKind::Subreddit { name, pinned } = &mut tab.kind {
-                *pinned = order.contains_key(&name.to_ascii_lowercase());
+            match &mut tab.kind {
+                TabKind::Subreddit { name, pinned } => {
+                    *pinned = communities.contains_key(&name.to_ascii_lowercase())
+                }
+                TabKind::User {
+                    name,
+                    followed,
+                    icon,
+                } => {
+                    *followed = follows.contains_key(&name.to_ascii_lowercase());
+                    if let Some(updated) = follows.get(&name.to_ascii_lowercase()) {
+                        icon.clone_from(&updated.1);
+                    }
+                }
+                _ => {}
             }
         }
-        for name in names {
-            if !self.tabs.iter().any(|tab| {
-                tab.subreddit()
-                    .is_some_and(|s| s.eq_ignore_ascii_case(name))
-            }) {
-                self.push_tab(TabKind::Subreddit {
-                    name: name.clone(),
-                    pinned: true,
+        for entry in entries {
+            let existing = self.tabs.iter().any(|tab| match (&tab.kind, entry) {
+                (TabKind::Subreddit { name, .. }, Subscription::Community { name: wanted, .. })
+                | (TabKind::User { name, .. }, Subscription::User { name: wanted, .. }) => {
+                    name.eq_ignore_ascii_case(wanted)
+                }
+                _ => false,
+            });
+            if !existing {
+                self.push_tab(match entry {
+                    Subscription::Community { name, .. } => TabKind::Subreddit {
+                        name: name.clone(),
+                        pinned: true,
+                    },
+                    Subscription::User { name, icon } => TabKind::User {
+                        name: name.clone(),
+                        icon: icon.clone(),
+                        followed: true,
+                    },
                 });
             }
         }
@@ -1455,8 +1562,15 @@ impl App {
             TabKind::Home => (0, 0),
             TabKind::Bookmarks => (1, 0),
             TabKind::AllSubs => (2, 0),
-            TabKind::Subreddit { name, pinned: true } => (3, order[&name.to_ascii_lowercase()]),
-            _ => (4, 0),
+            TabKind::Subreddit { name, pinned: true } => {
+                (3, communities[&name.to_ascii_lowercase()])
+            }
+            TabKind::User {
+                name,
+                followed: true,
+                ..
+            } => (4, follows[&name.to_ascii_lowercase()].0),
+            _ => (5, 0),
         });
         self.active = self
             .tabs
@@ -1517,7 +1631,7 @@ impl App {
     fn on_subscriptions(
         &mut self,
         generation: u64,
-        result: Result<Vec<String>, String>,
+        result: Result<Vec<Subscription>, String>,
         freshness: Freshness,
         refreshing: bool,
     ) {
@@ -1538,17 +1652,33 @@ impl App {
             self.membership
                 .as_ref()
                 .filter(|change| change.checking)
-                .map(|change| {
-                    names
-                        .iter()
-                        .any(|name| name.eq_ignore_ascii_case(&change.subreddit))
-                        == change.join
-                })
+                .map(|change| names.iter().any(|entry| change.target.matches(entry)) == change.join)
         });
         match result {
             Ok(names) => {
+                for entry in &names {
+                    if let Subscription::Community { name, icon } = entry {
+                        match icon {
+                            crate::model::SubscriptionIcon::Unknown => {}
+                            crate::model::SubscriptionIcon::Missing => {
+                                self.observe_icon(name, None, freshness.source)
+                            }
+                            crate::model::SubscriptionIcon::Url(url) => {
+                                self.observe_icon(name, Some(url.clone()), freshness.source)
+                            }
+                        }
+                    }
+                }
                 self.sync_subscription_tabs(&names);
-                self.sync_islands(names);
+                self.sync_islands(
+                    names
+                        .into_iter()
+                        .filter_map(|entry| match entry {
+                            Subscription::Community { name, .. } => Some(name),
+                            _ => None,
+                        })
+                        .collect(),
+                );
                 self.all_subs.error = None;
                 self.all_subs.freshness = Some(freshness);
             }
@@ -1565,14 +1695,19 @@ impl App {
             let change = self.membership.take().expect("checked pending membership");
             if confirmation == Some(true) {
                 self.info(format!(
-                    "{} r/{} on Reddit",
-                    if change.join { "Joined" } else { "Left" },
-                    change.subreddit
+                    "{} {} on Reddit",
+                    match (&change.target, change.join) {
+                        (MembershipTarget::User(_), true) => "Following",
+                        (MembershipTarget::User(_), false) => "Unfollowed",
+                        (_, true) => "Joined",
+                        (_, false) => "Left",
+                    },
+                    change.target.label()
                 ));
             } else {
                 self.error(change.error.unwrap_or_else(|| format!(
-                    "Could not confirm membership for r/{}; r in All subs refreshes the account list",
-                    change.subreddit
+                    "Could not confirm membership for {}; r in All subs refreshes the account list",
+                    change.target.label()
                 )));
             }
         }
@@ -1592,12 +1727,18 @@ impl App {
 
     fn push_tab(&mut self, kind: TabKind) -> usize {
         self.next_id += 1;
+        let feed = if matches!(kind, TabKind::User { .. }) {
+            Feed {
+                sort: Sort::New,
+                ..Feed::default()
+            }
+        } else {
+            Feed::default()
+        };
         self.tabs.push(Tab {
             id: self.next_id,
             kind,
-            feed: Feed::default(),
-            entered: None,
-            engaged: false,
+            feed,
         });
         self.sync_community_access();
         self.tabs.len() - 1
@@ -1638,7 +1779,8 @@ impl App {
     /// frames. True when something visible changed.
     pub fn tick(&mut self) -> bool {
         let now = Instant::now();
-        let mut changed = self.poll_settings(now);
+        let mut changed = std::mem::take(&mut self.read_redraw);
+        changed |= self.poll_settings(now);
         if let Some(since) = self.loading_since
             && self.loading_active()
             && now.saturating_duration_since(since) >= Duration::from_millis(100)
@@ -1746,7 +1888,7 @@ impl App {
             return false;
         }
         match self.active_tab().kind {
-            TabKind::Home | TabKind::Subreddit { .. } => {
+            TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. } => {
                 let feed = &self.active_tab().feed;
                 feed.loading()
                     || feed.refreshing()
@@ -1807,6 +1949,7 @@ impl App {
             .and_then(|p| p.wake_in(now))
             .into_iter()
             .chain(settle)
+            .chain(self.read_redraw.then_some(Duration::ZERO))
             .chain(media)
             .chain(self.post_settle.wake_in(now))
             .chain(self.feed_settle.wake_in(now))
@@ -1916,7 +2059,11 @@ impl App {
             }
             &card.url
         };
-        self.reddit.media_url(url).ok()
+        if let Some(id) = crate::model::youtube_id(url) {
+            Some(format!("https://www.youtube.com/watch?v={id}"))
+        } else {
+            self.reddit.media_url(url).ok()
+        }
     }
 
     /// Starts, stops, pauses and advances the inline video to match the post view. It
@@ -2133,6 +2280,8 @@ impl App {
         self.last_save = Instant::now();
         let before = self.bookmark_ids();
         let before_view = self.state.list_view();
+        let before_reads = self.state.read_revision();
+        let before_badges: Vec<_> = self.tabs.iter().map(|tab| self.badge(tab)).collect();
         let selected = self.selected_bookmark_id();
         let result = self.state.save(&self.state_path, now());
         let changed = self.bookmark_ids() != before;
@@ -2140,7 +2289,15 @@ impl App {
             self.reselect_bookmark(selected);
         }
         result?;
-        Ok(changed || before_view != self.state.list_view())
+        Ok(changed
+            || before_view != self.state.list_view()
+            || before_reads != self.state.read_revision()
+            || before_badges
+                != self
+                    .tabs
+                    .iter()
+                    .map(|tab| self.badge(tab))
+                    .collect::<Vec<_>>())
     }
 
     /// Bookmarks ignore keyword filters, but still respect the adult-content preference.
@@ -2176,7 +2333,6 @@ impl App {
     }
 
     pub fn save_state(&mut self) {
-        self.mark_active_seen();
         self.persist();
     }
 
@@ -2186,24 +2342,16 @@ impl App {
         &self.tabs[self.active]
     }
 
-    fn engage(&mut self) {
-        self.tabs[self.active].engaged = true;
-    }
-
     pub fn switch_tab(&mut self, index: usize) {
         if index >= self.tabs.len() || index == self.active {
             return;
         }
-        self.mark_active_seen();
         self.enter_tab(index);
     }
 
     fn enter_tab(&mut self, index: usize) {
         self.active = index;
         self.sync_feed_demand();
-        let tab = &mut self.tabs[index];
-        tab.entered = Some(Instant::now());
-        tab.engaged = false;
         self.close_post();
         let now = Instant::now();
         if self.focus == Focus::Sidebar {
@@ -2225,6 +2373,30 @@ impl App {
             (self.active + n - 1) % n
         };
         self.switch_tab(next);
+    }
+
+    pub fn open_user(&mut self, name: &str) {
+        if !crate::model::is_username(name) {
+            self.error("Invalid Reddit username");
+            return;
+        }
+        let index = self.tabs.iter().position(|tab| matches!(&tab.kind, TabKind::User { name: existing, .. } if existing.eq_ignore_ascii_case(name)))
+            .unwrap_or_else(|| self.push_tab(TabKind::User { name: name.to_string(), followed: false, icon: None }));
+        self.switch_tab(index);
+        self.ensure_feed_loaded(index);
+    }
+
+    pub fn profile_context(&self) -> Option<String> {
+        if !self.post_focused() {
+            if let TabKind::User { name, .. } = &self.active_tab().kind {
+                return Some(name.clone());
+            }
+            if self.focus == Focus::Sidebar {
+                return None;
+            }
+        }
+        self.current_post()
+            .and_then(|post| post.profile_user().map(str::to_string))
     }
 
     /// Switch to the tab for `name`, opening a new tab when needed.
@@ -2250,45 +2422,60 @@ impl App {
 
     pub fn close_active_tab(&mut self) {
         match &self.active_tab().kind {
-            TabKind::Subreddit { pinned: false, .. } => {
-                self.mark_active_seen();
+            TabKind::Subreddit { pinned: false, .. }
+            | TabKind::User {
+                followed: false, ..
+            } => {
                 self.tabs.remove(self.active);
                 self.enter_tab(self.active.min(self.tabs.len() - 1));
             }
-            _ => self.info("Only tabs opened with p can be closed; subscriptions stay"),
+            TabKind::User { followed: true, .. } => {
+                self.info("Following this user — press S to unfollow")
+            }
+            TabKind::Subreddit { pinned: true, .. } => {
+                self.info("Joined this community — press S to leave")
+            }
+            _ => self.info("Home, Bookmarks and All subs stay open"),
         }
     }
 
-    /// Mark listed posts seen when leaving a subreddit tab you looked at (moved, opened,
-    /// or stayed a moment); passing through keeps "new" badges.
-    fn mark_active_seen(&mut self) {
-        let tab = &self.tabs[self.active];
-        let looked = tab.engaged || tab.entered.is_some_and(|t| t.elapsed() >= SEEN_DWELL);
-        if !looked || !tab.feed.loaded || !tab.feed.is_default_view() {
+    pub fn community_badge(&self, name: &str) -> UnreadBadge {
+        if !is_community(name)
+            || self
+                .community_access
+                .get(&name.to_lowercase())
+                .is_some_and(|access| access.denied.is_some())
+        {
+            return UnreadBadge::Unavailable;
+        }
+        match self.state.unread(name, &self.config) {
+            Some(count) => UnreadBadge::Count(count),
+            None => UnreadBadge::Unknown,
+        }
+    }
+
+    pub fn badge(&self, tab: &Tab) -> UnreadBadge {
+        tab.subreddit()
+            .map_or(UnreadBadge::Unavailable, |name| self.community_badge(name))
+    }
+
+    /// The document was actually drawn; a request or an obscured page is not a read.
+    pub fn post_drawn(&mut self, visible: bool) {
+        if !visible || self.popup_open() || self.focus == Focus::Sidebar {
             return;
         }
-        if let Some(name) = tab.subreddit() {
-            self.state
-                .mark_seen(name, tab.feed.posts.iter().map(|p| p.id.as_str()), now());
-        }
-    }
-
-    pub fn badge(&self, tab: &Tab) -> usize {
-        let Some(name) = tab.subreddit() else {
-            return 0;
+        let Some(view) = &self.post_view else {
+            return;
         };
-        if tab.feed.loaded && tab.feed.is_default_view() {
-            return self
-                .state
-                .unseen(name, self.config.visible(&tab.feed.posts));
+        let Some(page) = &view.page else {
+            return;
+        };
+        if view.spoiler_hidden() {
+            return;
         }
-        self.all_subs
-            .groups
-            .iter()
-            .find(|g| g.subreddit.eq_ignore_ascii_case(name))
-            .map_or(0, |g| {
-                self.state.unseen(name, self.config.visible(&g.posts))
-            })
+        let was_read = self.state.is_read(&page.post.id);
+        self.state.mark_read(&page.post, now());
+        self.read_redraw |= !was_read;
     }
 
     // ----- feeds ------------------------------------------------------------
@@ -2469,7 +2656,7 @@ impl App {
                 }
             }
             TabKind::Bookmarks => {}
-            TabKind::Home | TabKind::Subreddit { .. } => {
+            TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. } => {
                 let feed = &self.tabs[self.active].feed;
                 let failed_pages: Vec<_> = feed
                     .pages
@@ -2499,7 +2686,7 @@ impl App {
         });
     }
 
-    pub fn groups_drawn(&mut self, indices: &[usize]) {
+    pub fn groups_drawn(&mut self, indices: &[usize], sidebar_icons: &[String]) {
         let names: Vec<_> = indices
             .iter()
             .filter_map(|&i| self.all_subs.groups.get(i).map(|g| g.subreddit.as_str()))
@@ -2511,12 +2698,16 @@ impl App {
             }
         }
         let mut icons = names;
+        icons.extend(sidebar_icons.iter().map(String::as_str));
         if let Some(name) = self.active_tab().subreddit() {
             icons.push(name);
         }
         self.pool.set_visible_icons(&icons);
         let visible: HashSet<_> = icons.iter().map(|name| name.to_ascii_lowercase()).collect();
         self.icon_demands.retain(|name| visible.contains(name));
+        for name in sidebar_icons {
+            self.demand_icon(name);
+        }
         for &index in indices {
             self.ensure_group_loaded(index);
         }
@@ -2567,10 +2758,7 @@ impl App {
         let Some(view) = &mut self.post_view else {
             return;
         };
-        // A preview still held back loads here first: it now counts as read.
-        if self.post_settle.take() == Some(view.generation) {
-            self.state.mark_read(&view.post, now());
-        }
+        self.post_settle.take();
         view.generation = generation;
         view.loading = true;
         view.error = None;
@@ -2682,7 +2870,6 @@ impl App {
         if tab.subreddit().is_some() && tab.feed.access_denied().is_some() {
             return;
         }
-        self.engage();
         let before = self.active_tab().feed.selected;
         match self.active_tab().kind {
             TabKind::AllSubs => self.move_all_subs(delta),
@@ -2691,7 +2878,7 @@ impl App {
                 let feed = &mut self.tabs[self.active].feed;
                 feed.selected = step(feed.selected, delta, len);
             }
-            TabKind::Home | TabKind::Subreddit { .. } => {
+            TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. } => {
                 let len = self
                     .config
                     .visible(&self.tabs[self.active].feed.posts)
@@ -2728,15 +2915,16 @@ impl App {
         {
             return;
         }
-        self.engage();
         let cards = &mut self.tabs[self.active].feed.cards;
         cards.pending = cards.pending.saturating_add(delta);
     }
 
     fn prefetch_list(&mut self, last_visible: usize) {
         let tab = self.active_tab();
-        if !matches!(tab.kind, TabKind::Home | TabKind::Subreddit { .. })
-            || (tab.subreddit().is_some() && tab.feed.access_denied().is_some())
+        if !matches!(
+            tab.kind,
+            TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. }
+        ) || (tab.subreddit().is_some() && tab.feed.access_denied().is_some())
         {
             return;
         }
@@ -2851,7 +3039,7 @@ impl App {
             return self
                 .post_view
                 .as_ref()
-                .map(|view| view.shown_post().subreddit.clone());
+                .and_then(|view| view.shown_post().community().map(str::to_string));
         }
         match &self.active_tab().kind {
             TabKind::AllSubs => self
@@ -2860,13 +3048,42 @@ impl App {
                 .get(self.all_subs.group)
                 .map(|group| group.subreddit.clone()),
             TabKind::Subreddit { name, .. } if is_community(name) => Some(name.clone()),
-            _ => self.current_post().map(|post| post.subreddit),
+            _ => self
+                .current_post()
+                .and_then(|post| post.community().map(str::to_string)),
         }
     }
 
     pub fn open_current_community(&mut self) {
         if let Some(name) = self.community().filter(|name| is_community(name)) {
             self.open_subreddit(&name);
+        } else if let Some(user) = self.profile_context() {
+            self.open_user(&user);
+        }
+    }
+
+    pub fn mark_community_read(&mut self, name: &str) {
+        let count = self.state.mark_community_read(name, now());
+        self.info(match count {
+            0 => format!("No fetched unread posts in r/{name}"),
+            1 => format!("Marked 1 fetched post read in r/{name}"),
+            n => format!("Marked {n} fetched posts read in r/{name}"),
+        });
+        self.persist();
+    }
+
+    pub fn open_source_in_browser(&mut self) {
+        if let Some(user) = self.profile_context() {
+            self.open_reddit_link(&format!("/user/{user}/"));
+            return;
+        }
+        let name = self
+            .community()
+            .or_else(|| self.active_tab().subreddit().map(str::to_string));
+        if let Some(name) = name.filter(|name| crate::config::is_subreddit_name(name)) {
+            self.open_reddit_link(&format!("/r/{name}/"));
+        } else {
+            self.info("No community selected");
         }
     }
 
@@ -2882,15 +3099,18 @@ impl App {
     pub fn membership_progress(&self) -> Option<String> {
         self.membership.as_ref().map(|change| {
             format!(
-                "{} r/{}…",
+                "{} {}…",
                 if change.checking {
                     "Checking membership for"
-                } else if change.join {
-                    "Joining"
                 } else {
-                    "Leaving"
+                    match (&change.target, change.join) {
+                        (MembershipTarget::User(_), true) => "Following",
+                        (MembershipTarget::User(_), false) => "Unfollowing",
+                        (_, true) => "Joining",
+                        (_, false) => "Leaving",
+                    }
                 },
-                change.subreddit
+                change.target.label()
             )
         })
     }
@@ -2900,23 +3120,57 @@ impl App {
             self.info(progress);
             return;
         }
-        let Some(subreddit) = self.community().filter(|name| is_community(name)) else {
-            self.info("Select an individual subreddit first");
+        let Some(target) = self.membership_target() else {
+            self.info("Select an individual community or user first");
             return;
         };
-        let Some(joined) = self.joined(&subreddit) else {
+        self.show_membership_for(target);
+    }
+
+    pub fn subscribed(&self, target: &MembershipTarget) -> Option<bool> {
+        match target {
+            MembershipTarget::Community(name) => self.joined(name),
+            MembershipTarget::User(name) => (self.all_subs.freshness.is_some() && self.all_subs.error.is_none()).then(|| {
+                self.tabs.iter().any(|tab| matches!(&tab.kind,
+                    TabKind::User { name: actual, followed: true, .. } if actual.eq_ignore_ascii_case(name)))
+            }),
+        }
+    }
+
+    pub fn show_membership_for(&mut self, target: MembershipTarget) {
+        if !target.is_valid() {
+            self.info("Select an individual community or user first");
+            return;
+        }
+        if let Some(progress) = self.membership_progress() {
+            self.info(progress);
+            return;
+        }
+        if self.experience.pending.is_some() {
+            self.info("Wait for the pending Reddit request");
+            return;
+        }
+        if self.reddit.needs_sign_in() {
+            self.show_auth();
+            return;
+        }
+        let Some(joined) = self.subscribed(&target) else {
             self.load_subscriptions(true);
             self.info("Loading account subscriptions; press S again when ready");
             return;
         };
         self.overlay = Some(Overlay::Membership {
-            subreddit,
+            target,
             join: !joined,
         });
     }
 
-    pub fn set_membership(&mut self, subreddit: String, join: bool) {
-        if self.membership.is_some() || !is_community(&subreddit) {
+    pub fn set_membership(&mut self, target: MembershipTarget, join: bool) {
+        if self.membership.is_some()
+            || self.experience.pending.is_some()
+            || self.settings.writing()
+            || !target.is_valid()
+        {
             return;
         }
         let generation = self.generation();
@@ -2925,7 +3179,7 @@ impl App {
         self.all_subs.loading = false;
         self.membership = Some(MembershipChange {
             generation,
-            subreddit: subreddit.clone(),
+            target: target.clone(),
             join,
             checking: false,
             error: None,
@@ -2933,7 +3187,7 @@ impl App {
         self.status = None;
         self.pool.submit(Job::Membership {
             generation,
-            subreddit,
+            target,
             join,
         });
     }
@@ -2958,7 +3212,7 @@ impl App {
                 .visible_bookmarks()
                 .nth(tab.feed.selected)
                 .map(|b| b.post.clone()),
-            TabKind::Home | TabKind::Subreddit { .. } => self
+            TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. } => self
                 .config
                 .visible(&tab.feed.posts)
                 .nth(tab.feed.selected)
@@ -2969,7 +3223,6 @@ impl App {
     // ----- post view --------------------------------------------------------
 
     pub fn open_current_post(&mut self) {
-        self.engage();
         if let Some(post) = self.current_post() {
             let permalink = post.permalink.clone();
             if let Some(generation) = self
@@ -3067,12 +3320,11 @@ impl App {
         Some(generation)
     }
 
-    /// Ask for the shown post's page; from now on the post counts as read.
+    /// Ask for the shown post's page; it counts as read when its document is drawn.
     fn load_post(&mut self, permalink: String) {
         let Some(view) = &mut self.post_view else {
             return;
         };
-        self.state.mark_read(&view.post, now());
         if let Some(&generation) = self.pending_posts.get(&permalink)
             && generation > self.content_generation_floor
         {
@@ -3467,15 +3719,22 @@ impl App {
     }
 
     /// Tab indexes in sidebar order after Home, Bookmarks and All subs.
-    pub fn sidebar_tabs(&self) -> (Vec<usize>, Vec<usize>) {
-        let of = |pinned_wanted: bool| {
-            (0..self.tabs.len())
-                .filter(|&i| {
-                    matches!(self.tabs[i].kind, TabKind::Subreddit { pinned, .. } if pinned == pinned_wanted)
-                })
-                .collect()
-        };
-        (of(true), of(false))
+    pub fn sidebar_tabs(&self) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+        let mut communities = Vec::new();
+        let mut following = Vec::new();
+        let mut opened = Vec::new();
+        for (index, tab) in self.tabs.iter().enumerate() {
+            match tab.kind {
+                TabKind::Subreddit { pinned: true, .. } => communities.push(index),
+                TabKind::User { followed: true, .. } => following.push(index),
+                TabKind::Subreddit { pinned: false, .. }
+                | TabKind::User {
+                    followed: false, ..
+                } => opened.push(index),
+                _ => {}
+            }
+        }
+        (communities, following, opened)
     }
 
     /// `h` in a list: move focus to the sidebar, showing it while focused if hidden.
@@ -3498,10 +3757,11 @@ impl App {
 
     /// Switch to the tab `delta` rows away in the sidebar, stopping at the ends.
     pub fn move_sidebar(&mut self, delta: isize) {
-        let (pinned, opened) = self.sidebar_tabs();
+        let (pinned, following, opened) = self.sidebar_tabs();
         let order: Vec<usize> = [0, BOOKMARKS_TAB, ALL_SUBS_TAB]
             .into_iter()
             .chain(pinned)
+            .chain(following)
             .chain(opened)
             .collect();
         let at = order.iter().position(|&i| i == self.active).unwrap_or(0);
@@ -3742,7 +4002,18 @@ impl App {
         } else {
             self.icons.get(subreddit)
         };
-        self.usable_thumb(icon.and_then(Option::as_deref))
+        self.usable_thumb(icon.and_then(|metadata| metadata.url.as_deref()))
+    }
+
+    fn observe_icon(&mut self, name: &str, url: Option<String>, source: Source) {
+        let key = name.to_ascii_lowercase();
+        if self
+            .icons
+            .get(&key)
+            .is_none_or(|old| source.may_replace(old.source))
+        {
+            self.icons.insert(key, IconMetadata { url, source });
+        }
     }
 
     /// Request missing icon metadata once per visible demand. Leaving the view or
@@ -3830,6 +4101,15 @@ impl App {
     }
 
     pub fn open_in_browser(&mut self) {
+        if self.focus == Focus::Sidebar
+            && matches!(
+                self.active_tab().kind,
+                TabKind::Subreddit { .. } | TabKind::User { .. }
+            )
+        {
+            self.open_source_in_browser();
+            return;
+        }
         if let Some((name, _)) = self.restricted_community() {
             self.open_reddit_link(&format!("/r/{name}/"));
             return;
@@ -3839,6 +4119,7 @@ impl App {
             return;
         }
         let Some(post) = self.current_post() else {
+            self.open_source_in_browser();
             return;
         };
         match media::spawn_detached(&self.config.commands.browser, &[post.reddit_url()]) {
@@ -3889,19 +4170,13 @@ impl App {
 
     fn hand_off_media(&mut self, permalink: &str, media: Media) {
         let commands = &self.config.commands;
-        let result = if let Some(url) = media.video_url() {
-            let started = self
-                .reddit
+        let video = media.video_url().is_some();
+        let result = if let Some(url) = media.youtube_url() {
+            media::spawn_detached(&commands.browser, &[url.to_owned()])
+        } else if let Some(url) = media.video_url() {
+            self.reddit
                 .media_url(url)
-                .and_then(|url| media::spawn_media(&commands.video, &[url]));
-            // The window plays it now: the inline copy waits, so two do not sound.
-            if started.is_ok()
-                && let Some(player) = &mut self.video
-                && !player.paused()
-            {
-                player.toggle_pause(Instant::now());
-            }
-            started
+                .and_then(|url| media::spawn_media(&commands.video, &[url]))
         } else {
             match media {
                 Media::None => {
@@ -3928,6 +4203,13 @@ impl App {
                 }
             }
         };
+        if video
+            && result.is_ok()
+            && let Some(player) = &mut self.video
+            && !player.paused()
+        {
+            player.toggle_pause(Instant::now());
+        }
         match result {
             Ok(()) => self.info("Opened media"),
             Err(e) => self.error(format!("{e:#}")),
@@ -3967,15 +4249,40 @@ impl App {
             index,
             title: t.title(),
         };
-        let query = normalize_subreddit(input);
+        let raw = input.trim().trim_start_matches('/');
+        let user_prefix = raw
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("u/"));
+        let sub_prefix = raw
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("r/"));
+        let query = if user_prefix {
+            raw[2..].trim_end_matches('/')
+        } else {
+            normalize_subreddit(input)
+        };
+        let eligible = |tab: &Tab| {
+            (!user_prefix || matches!(tab.kind, TabKind::User { .. }))
+                && (!sub_prefix || matches!(tab.kind, TabKind::Subreddit { .. }))
+        };
         if query.is_empty() {
             return self.tabs.iter().enumerate().map(tab_entry).collect();
         }
         let lower = query.to_lowercase();
-        let name_of = |t: &Tab| t.title().trim_start_matches("r/").to_lowercase();
+        let name_of = |t: &Tab| {
+            t.title()
+                .trim_start_matches("r/")
+                .trim_start_matches("u/")
+                .to_lowercase()
+        };
         let mut prefix: Vec<(usize, &Tab)> = Vec::new();
         let mut inside: Vec<(usize, &Tab)> = Vec::new();
-        for (i, t) in self.tabs.iter().enumerate() {
+        for (i, t) in self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| eligible(tab))
+        {
             let name = name_of(t);
             if name.starts_with(&lower) {
                 prefix.push((i, t));
@@ -3987,11 +4294,17 @@ impl App {
         let mut entries: Vec<PickerEntry> = prefix.into_iter().map(tab_entry).collect();
         // Only an exact subreddit tab makes "open r/<query>" redundant; Home and Bookmarks
         // aren't subreddits.
-        let exact = self
-            .tabs
-            .iter()
-            .any(|t| matches!(t.kind, TabKind::Subreddit { .. }) && name_of(t) == lower);
-        if !exact && is_subreddit_name(query) {
+        let exact = self.tabs.iter().any(|t| {
+            (if user_prefix {
+                matches!(t.kind, TabKind::User { .. })
+            } else {
+                matches!(t.kind, TabKind::Subreddit { .. })
+            }) && name_of(t) == lower
+        });
+        if !exact && user_prefix && crate::model::is_username(query) {
+            entries.push(PickerEntry::OpenUser(query.to_string()));
+        }
+        if !exact && !user_prefix && is_subreddit_name(query) {
             entries.push(PickerEntry::Open(query.to_string()));
         }
         entries.extend(inside.into_iter().map(tab_entry));
@@ -4000,6 +4313,7 @@ impl App {
         let titles: Vec<String> = self.tabs.iter().map(Tab::title).collect();
         for (title, _) in pattern.match_list(titles.iter().map(String::as_str), &mut matcher) {
             if let Some(index) = titles.iter().position(|t| t == title)
+                && eligible(&self.tabs[index])
                 && !entries
                     .iter()
                     .any(|e| matches!(e, PickerEntry::Tab { index: i, .. } if *i == index))
@@ -4021,6 +4335,7 @@ impl App {
         {
             Some(PickerEntry::Tab { index, .. }) => self.switch_tab(index),
             Some(PickerEntry::Open(name)) => self.open_subreddit(&name),
+            Some(PickerEntry::OpenUser(name)) => self.open_user(&name),
             None => {}
         }
     }
@@ -4536,7 +4851,7 @@ impl App {
                 }
                 // A failure keeps a stale disk answer; with none, the next load asks again.
                 if let Ok(icon) = result {
-                    self.icons.insert(key, icon);
+                    self.observe_icon(&key, icon, source);
                 }
             }
             // Forget it so it reloads if it scrolls back; a skipped refresh of a shown
@@ -4838,8 +5153,20 @@ impl App {
             feed.after = None;
             feed.freshness = None;
         }
+        let observed_id = post.id.clone();
         if !feed.progress_post(cursor, post, source) {
             return;
+        }
+        if let Some(observed) = feed.posts.iter().find(|post| post.id == observed_id) {
+            self.state.observe(
+                None,
+                std::slice::from_ref(observed),
+                Freshness {
+                    fetched_at: now(),
+                    source,
+                },
+                now(),
+            );
         }
         feed.shown_query = Some(feed.query());
         let visible: Vec<_> = self.config.visible(&feed.posts).collect();
@@ -4928,6 +5255,18 @@ impl App {
                 ) {
                     return;
                 }
+                let page_index = feed
+                    .pages
+                    .iter()
+                    .position(|page| page.cursor == cursor)
+                    .unwrap();
+                let start: usize = feed.pages[..page_index].iter().map(|page| page.len).sum();
+                self.state.observe(
+                    name.as_deref(),
+                    &feed.posts[start..start + feed.pages[page_index].len],
+                    freshness,
+                    now(),
+                );
                 // Any provably newer successful page can establish access again.
                 feed.failures.retain(|_, failure| {
                     !community
@@ -4964,12 +5303,6 @@ impl App {
                 feed.offset = feed.selected.saturating_sub(screen_row);
                 feed.loaded = true;
                 feed.shown_query = Some(feed.query());
-                let feed = &tab.feed;
-                if feed.is_default_view()
-                    && let Some(name) = tab.subreddit()
-                {
-                    self.state.baseline(name, &feed.posts, now());
-                }
                 if !append && let Some(name) = tab.subreddit().map(str::to_string) {
                     if freshness.source.cached {
                         self.pool.cached(Job::Icon {
@@ -5095,7 +5428,8 @@ impl App {
                     std::mem::take(&mut listing.posts)
                 };
                 group.error = None;
-                self.state.baseline(subreddit, &group.posts, now());
+                self.state
+                    .observe(Some(subreddit), &group.posts, freshness, now());
                 if freshness.source.cached {
                     self.pool.cached(Job::Icon {
                         subreddit: subreddit.to_ascii_lowercase(),
@@ -5581,12 +5915,12 @@ mod tests {
                 "a successful listing must not retry its failed icon in the same demand"
             );
             app.active = 0;
-            app.groups_drawn(&[]);
+            app.groups_drawn(&[], &[]);
             app.active = if group { ALL_SUBS_TAB } else { 3 };
             if group {
-                app.groups_drawn(&[0]);
+                app.groups_drawn(&[0], &[]);
             } else {
-                app.groups_drawn(&[]);
+                app.groups_drawn(&[], &[]);
                 demand(&mut app);
             }
             assert!(
@@ -5840,6 +6174,74 @@ mod tests {
         let later = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
         app.sync_video_with(later, |url, area, _| Player::unavailable(&url, area));
         app
+    }
+
+    #[test]
+    fn when_a_youtube_card_is_selected_it_should_reuse_debounce_and_manual_play_gates() {
+        let mut app = card_playback_app();
+        app.tabs[0].feed.posts[0].media = Media::Link {
+            url: "https://youtu.be/dQw4w9WgXcQ?feature=share".into(),
+            thumb: None,
+        };
+        app.card_video_drawn(Some(Size::new(68, 38)));
+        let now = app.card_video.as_ref().unwrap().since;
+        assert_eq!(app.wanted_video(now), None);
+        let settled = now + NAV_SETTLE;
+        assert_eq!(
+            app.wanted_video(settled).as_deref(),
+            Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        );
+        app.config.media.video_autoplay = false;
+        assert_eq!(app.wanted_video(settled), None);
+
+        app.toggle_video_pause();
+
+        assert_eq!(
+            app.wanted_video(settled).as_deref(),
+            Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        );
+    }
+
+    #[test]
+    fn when_youtube_media_opens_it_should_use_the_original_browser_url_and_pause_inline() {
+        let mut app = card_playback_app();
+        let url = "https://youtu.be/dQw4w9WgXcQ?feature=share";
+        app.tabs[0].feed.posts[0].media = Media::Link {
+            url: url.into(),
+            thumb: None,
+        };
+        app.card_video_drawn(Some(Size::new(68, 38)));
+        let at = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+        app.sync_video_with(at, |url, _, _| {
+            Player::showing(
+                &url,
+                video::Frame {
+                    width: 1,
+                    height: 1,
+                    pixels: video::Pixels::Png(vec![]),
+                    same_as_first: false,
+                },
+            )
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("browser.sh");
+        let output = dir.path().join("url");
+        std::fs::write(&script, "printf '%s' \"$2\" > \"$1\"\n").unwrap();
+        app.config.commands.browser = vec![
+            "/bin/sh".into(),
+            script.to_string_lossy().into(),
+            output.to_string_lossy().into(),
+        ];
+
+        app.open_media();
+
+        assert!(app.selected_video().unwrap().paused());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while std::fs::read_to_string(&output).ok().as_deref() != Some(url) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(std::fs::read_to_string(output).unwrap(), url);
     }
 
     #[test]
@@ -7297,6 +7699,104 @@ mod tests {
     }
 
     #[test]
+    fn when_congestion_icon_snapshots_arrive_late_the_newer_metadata_should_remain() {
+        let mut app = app_with(&[]);
+        show_thumbnails(&mut app);
+        app.on_result(
+            Msg::Icon {
+                subreddit: "Rust".into(),
+                result: Ok(Some("https://i.redd.it/new.png".into())),
+            },
+            ordered_source(2, false),
+            false,
+        );
+
+        app.on_result(
+            Msg::Icon {
+                subreddit: "rust".into(),
+                result: Ok(None),
+            },
+            ordered_source(1, true),
+            false,
+        );
+
+        assert_eq!(app.shown_icon("RUST"), Some("https://i.redd.it/new.png"));
+    }
+
+    #[test]
+    fn when_congestion_membership_icons_arrive_visible_pixels_should_load_without_metadata() {
+        let mut app = app_with(&[]);
+        show_thumbnails(&mut app);
+        let entries: Vec<Subscription> = serde_json::from_value(serde_json::json!([
+            {"community":{"name":"rust","icon":{"url":"https://i.redd.it/rust.png"}}},
+            {"community":{"name":"vim","icon":"missing"}}
+        ]))
+        .unwrap();
+        app.on_subscriptions(
+            app.all_subs.generation,
+            Ok(entries),
+            Freshness {
+                fetched_at: now(),
+                source: ordered_source(2, false),
+            },
+            false,
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 20)).unwrap();
+
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        assert!(app.thumbs.contains_key("https://i.redd.it/rust.png"));
+        assert!(!app.icon_lookups.contains("rust"));
+        assert!(!app.icon_lookups.contains("vim"));
+        assert_eq!(app.shown_icon("rust"), Some("https://i.redd.it/rust.png"));
+    }
+
+    #[test]
+    fn when_congestion_subscription_icon_is_removed_and_readded_metadata_should_follow_order() {
+        let mut app = app_with(&[]);
+        show_thumbnails(&mut app);
+        let events = [
+            (
+                1,
+                crate::model::SubscriptionIcon::Url("https://i.redd.it/old.png".into()),
+                Some("https://i.redd.it/old.png"),
+            ),
+            (2, crate::model::SubscriptionIcon::Missing, None),
+            (
+                3,
+                crate::model::SubscriptionIcon::Url("https://i.redd.it/new.png".into()),
+                Some("https://i.redd.it/new.png"),
+            ),
+        ];
+        for (sequence, icon, expected) in events {
+            app.on_subscriptions(
+                app.all_subs.generation,
+                Ok(vec![Subscription::Community {
+                    name: "Rust".into(),
+                    icon,
+                }]),
+                Freshness {
+                    fetched_at: now(),
+                    source: ordered_source(sequence, false),
+                },
+                false,
+            );
+            app.on_result(
+                Msg::Icon {
+                    subreddit: "rust".into(),
+                    result: Ok(None),
+                },
+                ordered_source(0, true),
+                false,
+            );
+            assert_eq!(app.shown_icon("rust"), expected);
+            app.demand_icon("Rust");
+            assert!(!app.icon_lookups.contains("rust"));
+        }
+    }
+
+    #[test]
     fn icon_lookup_should_reuse_known_or_pending_metadata_and_allow_retry_after_failure() {
         let (mut app, messages) = app_with_messages(&[]);
         show_thumbnails(&mut app);
@@ -7314,7 +7814,7 @@ mod tests {
 
         let first = load(&mut app);
         let after_failure = load(&mut app);
-        app.icons.insert("s".into(), Some("/icon/s.png".into()));
+        app.observe_icon("s", Some("/icon/s.png".into()), Source::default());
         let known = load(&mut app);
         app.icons.remove("s");
         app.icon_lookups.insert("s".into());
@@ -7658,15 +8158,11 @@ mod tests {
     }
 
     #[test]
-    fn when_a_saved_switch_reports_expiry_it_should_have_persisted_the_current_feed_seen_state() {
-        let mut app = app_with(&["rust"]);
+    fn a_failed_account_switch_persists_individual_reads_without_clearing_the_feed() {
+        let (mut app, i) = unread_badge_app();
         let directory = tempfile::tempdir().unwrap();
         app.state_path = directory.path().join("state.json");
-        app.active = tab_index(&app, "rust");
-        let feed = &mut app.tabs[app.active].feed;
-        feed.posts = vec![post("viewed", "rust")];
-        feed.loaded = true;
-        app.engage();
+        app.state.mark_read(&post("new1", "s"), now());
         app.auth.phase = crate::auth::Phase::Accounts;
         app.auth.accounts = vec![crate::reddit::SavedAccount {
             id: "second".into(),
@@ -7674,13 +8170,14 @@ mod tests {
             expired: true,
             source: None,
         }];
-        assert!(!app.state.is_seen("rust", "viewed"));
 
         app.select_auth();
 
         let saved = State::load(&app.state_path).0;
-        assert!(saved.is_seen("rust", "viewed"));
-        assert_eq!(app.auth.phase, crate::auth::Phase::Accounts);
+        assert!(saved.is_read("new1"));
+        assert!(!saved.is_read("new2"));
+        assert_eq!(saved.unread("s", &app.config), Some(1));
+        assert_eq!(app.badge(&app.tabs[i]), UnreadBadge::Count(1));
         assert!(app.auth.message.as_deref().unwrap().contains("expired"));
         assert!(!app.auth.busy());
     }
@@ -8778,7 +9275,13 @@ mod tests {
         let old_generation = app.all_subs.groups[0].generation;
         app.on_msg(Msg::Subscriptions {
             generation: 0,
-            result: Ok(vec![]),
+            result: Ok((vec![])
+                .into_iter()
+                .map(|name| crate::model::Subscription::Community {
+                    name,
+                    icon: crate::model::SubscriptionIcon::Unknown,
+                })
+                .collect()),
         });
         assert_eq!(app.active_tab().id, tab_id);
         assert_eq!(app.active_tab().feed.selected, 3);
@@ -8790,7 +9293,13 @@ mod tests {
 
         app.on_msg(Msg::Subscriptions {
             generation: 0,
-            result: Ok(vec!["rust".into()]),
+            result: Ok((vec!["rust".into()])
+                .into_iter()
+                .map(|name| crate::model::Subscription::Community {
+                    name,
+                    icon: crate::model::SubscriptionIcon::Unknown,
+                })
+                .collect()),
         });
         app.on_msg(Msg::Group {
             generation: old_generation,
@@ -8816,6 +9325,177 @@ mod tests {
         crate::keys::handle(
             app,
             crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+        );
+    }
+
+    #[test]
+    fn following_unfollowing_and_refollowing_should_preserve_the_same_reading_tab() {
+        use crate::reddit::tests::{Fixture, Reply};
+        use crossterm::event::KeyCode;
+        use serde_json::json;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let followed = std::sync::Arc::new(AtomicBool::new(false));
+        let writes = std::sync::Arc::new(AtomicUsize::new(0));
+        let actual = followed.clone();
+        let count = writes.clone();
+        let fixture = Fixture::new(move |request| {
+            let path = request.url.split('?').next().unwrap();
+            match path {
+                "/api/me.json" => {
+                    Reply::json(json!({"data":{"name":"reader","modhash":"fixture-csrf"}}))
+                }
+                "/user/blackvault/about.json" => {
+                    Reply::json(json!({"data":{"name":"blackvault","subreddit":{
+                        "name":"t5_profile", "subreddit_type":"user", "url":"/user/blackvault/"
+                    }}}))
+                }
+                "/api/subscribe" => {
+                    let form: HashMap<_, _> = url::form_urlencoded::parse(request.body.as_bytes())
+                        .into_owned()
+                        .collect();
+                    assert_eq!(form["sr"], "t5_profile");
+                    actual.store(form["action"] == "sub", Ordering::SeqCst);
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Reply::json(json!({}))
+                }
+                "/subreddits/mine/subscriber.json" => {
+                    let mut children =
+                        vec![json!({"kind":"t5","data":{"display_name":"blackvault"}})];
+                    if actual.load(Ordering::SeqCst) {
+                        children.push(json!({"kind":"t5","data":{"display_name":"u_blackvault", "subreddit_type":"user", "url":"/user/blackvault/"}}));
+                    }
+                    Reply::json(json!({"kind":"Listing","data":{"children":children,"after":null}}))
+                }
+                "/user/blackvault/submitted.json" => {
+                    Reply::json(json!({"kind":"Listing","data":{"children":[
+                    {"kind":"t3","data":{"id":"a","title":"a","subreddit":"rust","author":"blackvault","permalink":"/r/rust/comments/a/title/"}},
+                    {"kind":"t3","data":{"id":"b","title":"b","subreddit":"rust","author":"blackvault","permalink":"/r/rust/comments/b/title/"}},
+                    {"kind":"t3","data":{"id":"c","title":"c","subreddit":"rust","author":"blackvault","permalink":"/r/rust/comments/c/title/"}}
+                ],"after":null}}))
+                }
+                "/r/rust/comments/c/title/.json" | "/comments/c.json" => Reply::json(json!([
+                    {"kind":"Listing","data":{"children":[{"kind":"t3","data":{"id":"c","title":"c","subreddit":"rust","author":"blackvault","permalink":"/r/rust/comments/c/title/", "url":"https://i.redd.it/c.png","post_hint":"image"}}]}},
+                    {"kind":"Listing","data":{"children":[]}}
+                ])),
+                _ => Reply::status(404),
+            }
+        });
+        let (mut app, messages) = app_at(&fixture.base, &["blackvault"]);
+        app.open_user("blackvault");
+        while app.active_tab().feed.loading() {
+            app.on_msg(
+                messages
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("user feed response"),
+            );
+        }
+        app.tabs[app.active].feed.selected = 2;
+        app.tabs[app.active].feed.offset = 1;
+        app.open_current_post();
+        while app
+            .post_view
+            .as_ref()
+            .is_some_and(|view| view.page.is_none() && view.error.is_none())
+        {
+            app.on_msg(
+                messages
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("post response"),
+            );
+        }
+        assert!(app.post_view.as_ref().unwrap().page.is_some());
+        app.post_view.as_mut().unwrap().scroll = 7;
+        app.focus = Focus::Sidebar;
+        let tab = app.active_tab().id;
+
+        for (expected_writes, join) in [(1, true), (2, false), (3, true)] {
+            press(&mut app, KeyCode::Char('S'));
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Membership { target: MembershipTarget::User(name), join: action }) if name == "blackvault" && *action == join)
+            );
+            press(&mut app, KeyCode::Enter);
+            while app.membership.is_some() {
+                app.on_msg(
+                    messages
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("follow response"),
+                );
+            }
+            assert_eq!(writes.load(Ordering::SeqCst), expected_writes);
+            assert_eq!(app.active_tab().id, tab);
+            assert_eq!(app.active_tab().feed.selected, 2);
+            assert_eq!(app.active_tab().feed.offset, 1);
+            assert_eq!(app.active_tab().feed.posts.len(), 3);
+            assert_eq!(app.post_view.as_ref().unwrap().scroll, 7);
+            assert_eq!(app.post_view.as_ref().unwrap().shown_post().id, "c");
+            assert_eq!(
+                app.post_view
+                    .as_ref()
+                    .unwrap()
+                    .shown_post()
+                    .media
+                    .preview_image(),
+                Some("https://i.redd.it/c.png")
+            );
+            assert_eq!(
+                app.subscribed(&MembershipTarget::User("blackvault".into())),
+                Some(join)
+            );
+            assert_eq!(app.joined("blackvault"), Some(true));
+            let (_, following, opened) = app.sidebar_tabs();
+            assert_eq!(following.contains(&app.active), join);
+            assert_eq!(opened.contains(&app.active), !join);
+        }
+        remove_state(&app.state_path);
+    }
+
+    #[test]
+    fn membership_progress_should_remain_visible_when_no_source_is_selected() {
+        let mut app = app_with(&[]);
+        app.set_membership(MembershipTarget::User("blackvault".into()), true);
+        app.active = BOOKMARKS_TAB;
+
+        app.show_membership();
+
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|status| status.text == "Following u/blackvault…")
+        );
+        assert!(app.membership.is_some());
+    }
+
+    #[test]
+    fn a_failed_user_follow_should_reconcile_without_confusing_a_same_named_community() {
+        let mut app = app_with(&["blackvault"]);
+        app.open_user("blackvault");
+        app.set_membership(MembershipTarget::User("blackvault".into()), true);
+        let generation = app.membership.as_ref().unwrap().generation;
+        app.set_membership(MembershipTarget::User("other".into()), true);
+        assert_eq!(
+            app.membership.as_ref().unwrap().target,
+            MembershipTarget::User("blackvault".into())
+        );
+        app.on_msg(Msg::Membership {
+            generation,
+            result: Err("follow denied".into()),
+        });
+        app.on_msg(Msg::Subscriptions {
+            generation: app.all_subs.generation,
+            result: Ok(vec![Subscription::Community {
+                name: "blackvault".into(),
+                icon: crate::model::SubscriptionIcon::Unknown,
+            }]),
+        });
+        assert!(app.membership.is_none());
+        assert_eq!(
+            app.subscribed(&MembershipTarget::User("blackvault".into())),
+            Some(false)
+        );
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|status| status.error && status.text == "follow denied")
         );
     }
 
@@ -8876,7 +9556,7 @@ mod tests {
         for (expected_count, join) in [(1, true), (2, false), (3, true)] {
             press(&mut app, KeyCode::Char('S'));
             assert!(
-                matches!(&app.overlay, Some(Overlay::Membership { subreddit, join: action }) if subreddit == "armenia" && *action == join)
+                matches!(&app.overlay, Some(Overlay::Membership { target: MembershipTarget::Community(subreddit), join: action }) if subreddit == "armenia" && *action == join)
             );
             press(&mut app, KeyCode::Enter);
             assert!(app.overlay.is_none());
@@ -8910,13 +9590,25 @@ mod tests {
     fn when_membership_is_pending_it_should_ignore_duplicate_writes_and_old_or_cached_lists() {
         let mut app = app_with(&["rust"]);
         let old = app.all_subs.generation;
-        app.set_membership("armenia".into(), true);
+        app.set_membership(
+            crate::model::MembershipTarget::Community("armenia".into()),
+            true,
+        );
         let generation = app.membership.as_ref().unwrap().generation;
-        app.set_membership("neovim".into(), true);
+        app.set_membership(
+            crate::model::MembershipTarget::Community("neovim".into()),
+            true,
+        );
         assert_eq!(app.membership.as_ref().unwrap().generation, generation);
         app.on_msg(Msg::Subscriptions {
             generation: old,
-            result: Ok(vec![]),
+            result: Ok((vec![])
+                .into_iter()
+                .map(|name| crate::model::Subscription::Community {
+                    name,
+                    icon: crate::model::SubscriptionIcon::Unknown,
+                })
+                .collect()),
         });
         assert_eq!(app.joined("rust"), Some(true));
         app.on_msg(Msg::Membership {
@@ -8932,7 +9624,13 @@ mod tests {
         app.on_msg(Msg::Snapshot {
             message: Box::new(Msg::Subscriptions {
                 generation: read,
-                result: Ok(vec!["armenia".into()]),
+                result: Ok((vec!["armenia".into()])
+                    .into_iter()
+                    .map(|name| crate::model::Subscription::Community {
+                        name,
+                        icon: crate::model::SubscriptionIcon::Unknown,
+                    })
+                    .collect()),
             }),
             fetched_at: now(),
             refreshing: false,
@@ -8945,12 +9643,24 @@ mod tests {
         assert_eq!(app.joined("armenia"), Some(false));
         app.on_msg(Msg::Subscriptions {
             generation: read,
-            result: Ok(vec!["armenia".into(), "rust".into()]),
+            result: Ok((vec!["armenia".into(), "rust".into()])
+                .into_iter()
+                .map(|name| crate::model::Subscription::Community {
+                    name,
+                    icon: crate::model::SubscriptionIcon::Unknown,
+                })
+                .collect()),
         });
         assert!(app.membership.is_none());
         app.on_msg(Msg::Subscriptions {
             generation: old,
-            result: Ok(vec![]),
+            result: Ok((vec![])
+                .into_iter()
+                .map(|name| crate::model::Subscription::Community {
+                    name,
+                    icon: crate::model::SubscriptionIcon::Unknown,
+                })
+                .collect()),
         });
         assert_eq!(app.joined("armenia"), Some(true));
     }
@@ -8960,7 +9670,10 @@ mod tests {
         for (confirmed, read_fails) in [(false, false), (true, false), (false, true)] {
             let mut app = app_with(&["rust"]);
             app.open_subreddit("armenia");
-            app.set_membership("armenia".into(), true);
+            app.set_membership(
+                crate::model::MembershipTarget::Community("armenia".into()),
+                true,
+            );
             let generation = app.membership.as_ref().unwrap().generation;
             app.on_msg(Msg::Membership {
                 generation,
@@ -8969,9 +9682,21 @@ mod tests {
             let result = if read_fails {
                 Err("read unavailable".into())
             } else if confirmed {
-                Ok(vec!["armenia".into(), "rust".into()])
+                Ok(vec![
+                    Subscription::Community {
+                        name: "armenia".into(),
+                        icon: crate::model::SubscriptionIcon::Unknown,
+                    },
+                    Subscription::Community {
+                        name: "rust".into(),
+                        icon: crate::model::SubscriptionIcon::Unknown,
+                    },
+                ])
             } else {
-                Ok(vec!["rust".into()])
+                Ok(vec![Subscription::Community {
+                    name: "rust".into(),
+                    icon: crate::model::SubscriptionIcon::Unknown,
+                }])
             };
             app.on_msg(Msg::Subscriptions {
                 generation: app.all_subs.generation,
@@ -9003,7 +9728,7 @@ mod tests {
         );
         press(&mut app, KeyCode::Char('S'));
         assert!(
-            matches!(&app.overlay, Some(Overlay::Membership { subreddit, join: false }) if subreddit == "rust")
+            matches!(&app.overlay, Some(Overlay::Membership { target: MembershipTarget::Community(subreddit), join: false }) if subreddit == "rust")
         );
         press(&mut app, KeyCode::Esc);
         assert!(app.membership.is_none());
@@ -9012,7 +9737,7 @@ mod tests {
         app.focus = Focus::Sidebar;
         press(&mut app, KeyCode::Char('S'));
         assert!(
-            matches!(&app.overlay, Some(Overlay::Membership { subreddit, join: true }) if subreddit == "armenia")
+            matches!(&app.overlay, Some(Overlay::Membership { target: MembershipTarget::Community(subreddit), join: true }) if subreddit == "armenia")
         );
         press(&mut app, KeyCode::Char(' '));
         assert!(app.membership.is_none());
@@ -9044,7 +9769,13 @@ mod tests {
         assert_eq!(app.all_subs.groups[0].subreddit, "rust");
         app.on_msg(Msg::Subscriptions {
             generation: generation - 1,
-            result: Ok(vec![]),
+            result: Ok((vec![])
+                .into_iter()
+                .map(|name| crate::model::Subscription::Community {
+                    name,
+                    icon: crate::model::SubscriptionIcon::Unknown,
+                })
+                .collect()),
         });
         assert_eq!(app.all_subs.groups.len(), 1);
     }
@@ -9055,7 +9786,13 @@ mod tests {
         app.all_subs.group = 1;
         app.on_msg(Msg::Subscriptions {
             generation: 0,
-            result: Ok(vec!["neovim".into(), "rust".into(), "vim".into()]),
+            result: Ok((vec!["neovim".into(), "rust".into(), "vim".into()])
+                .into_iter()
+                .map(|name| crate::model::Subscription::Community {
+                    name,
+                    icon: crate::model::SubscriptionIcon::Unknown,
+                })
+                .collect()),
         });
         assert_eq!(app.all_subs.groups[app.all_subs.group].subreddit, "vim");
         assert_eq!(app.active, ALL_SUBS_TAB);
@@ -9086,7 +9823,16 @@ mod tests {
         let mut app = App::new(Config::default(), pool, reddit, state, Picker::halfblocks());
         app.on_msg(Msg::Subscriptions {
             generation: 0,
-            result: Ok(subscriptions.iter().map(|s| s.to_string()).collect()),
+            result: Ok((subscriptions
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>())
+            .into_iter()
+            .map(|name| crate::model::Subscription::Community {
+                name,
+                icon: crate::model::SubscriptionIcon::Unknown,
+            })
+            .collect()),
         });
         app.active = ALL_SUBS_TAB;
         (app, messages)
@@ -9695,10 +10441,13 @@ mod tests {
 
         assert_eq!(app.post_view.as_ref().unwrap().post.id, "run4");
         assert_eq!(app.focus, Focus::List, "the list keeps focus");
-        // A post counts as read exactly when its page is asked for.
         assert!(
-            app.state.is_read("run2"),
+            app.pending_posts.contains_key("/r/s/comments/run2/x/"),
             "a move after a pause loads at once"
+        );
+        assert!(
+            !app.state.is_read("run2"),
+            "a request is not a displayed page"
         );
         assert!(!app.state.is_read("run4"), "mid-run nothing loads");
         assert!(!app.load_settled(Instant::now()));
@@ -9707,7 +10456,8 @@ mod tests {
             !app.state.is_read("run3"),
             "a post passed over stays unread"
         );
-        assert!(app.state.is_read("run4"));
+        assert!(app.pending_posts.contains_key("/r/s/comments/run4/x/"));
+        assert!(!app.state.is_read("run4"));
     }
 
     #[test]
@@ -9720,7 +10470,8 @@ mod tests {
         app.open_current_post();
 
         assert_eq!(app.focus, Focus::Post);
-        assert!(app.state.is_read("hold3"));
+        assert!(app.pending_posts.contains_key("/r/s/comments/hold3/x/"));
+        assert!(!app.state.is_read("hold3"));
         assert!(
             !app.load_settled(Instant::now() + NAV_SETTLE),
             "opening ended the wait"
@@ -9906,7 +10657,7 @@ mod tests {
     }
 
     #[test]
-    fn reloading_a_held_back_preview_marks_it_read() {
+    fn reloading_a_held_preview_requests_it_without_marking_unshown_content_read() {
         let (mut app, _) = split_feed(&["rel1", "rel2", "rel3"]);
         app.move_selection(1);
         app.move_selection(1);
@@ -9914,7 +10665,8 @@ mod tests {
 
         app.reload();
 
-        assert!(app.state.is_read("rel3"));
+        assert!(app.pending_posts.contains_key("/r/s/comments/rel3/x/"));
+        assert!(!app.state.is_read("rel3"));
     }
 
     #[test]
@@ -10007,7 +10759,7 @@ mod tests {
     fn entry_title(app: &App, entry: &PickerEntry) -> Option<String> {
         match entry {
             PickerEntry::Tab { index, .. } => Some(app.tabs[*index].title()),
-            PickerEntry::Open(_) => None,
+            PickerEntry::Open(_) | PickerEntry::OpenUser(_) => None,
         }
     }
 
@@ -10291,34 +11043,18 @@ mod tests {
     }
 
     #[test]
-    fn passing_through_a_tab_keeps_its_new_badge_but_engaging_clears_it() {
-        let mut app = app_with(&["a", "b", "c"]);
-        app.on_msg(Msg::Group {
-            generation: 0,
-            subreddit: "b".into(),
-            result: Ok(listing("b", &["b1"], None)),
-        });
-        // New posts appear in r/b after the baseline.
-        app.on_msg(Msg::Group {
-            generation: 0,
-            subreddit: "b".into(),
-            result: Ok(listing("b", &["b1", "b2", "b3"], None)),
-        });
-        let b = tab_index(&app, "b");
-        assert_eq!(app.badge(&app.tabs[b]), 2);
-
-        app.switch_tab(b);
-        app.switch_tab(tab_index(&app, "c"));
-        assert_eq!(
-            app.badge(&app.tabs[b]),
-            2,
-            "a quick pass must not mark posts seen"
-        );
-
-        app.switch_tab(b);
+    fn navigating_a_loaded_community_never_clears_its_unread_posts() {
+        let (mut app, i) = unread_badge_app();
+        app.focus = Focus::Sidebar;
+        app.switch_tab(0);
+        app.switch_tab(i);
+        app.focus = Focus::List;
         app.move_selection(1);
-        app.switch_tab(tab_index(&app, "c"));
-        assert_eq!(app.badge(&app.tabs[b]), 0);
+        app.switch_tab(0);
+
+        assert_eq!(app.badge(&app.tabs[i]), UnreadBadge::Count(2));
+        assert!(!app.state.is_read("new1"));
+        assert!(!app.state.is_read("new2"));
     }
 
     #[test]
@@ -10690,21 +11426,14 @@ mod tests {
     }
 
     #[test]
-    fn closing_a_tab_starts_a_fresh_visit_on_the_next_one() {
-        let mut app = app_with(&["a"]);
-        let a = tab_index(&app, "a");
-        app.switch_tab(a);
-        app.engage();
-        app.open_subreddit("b");
-        app.on_msg(Msg::Group {
-            generation: 0,
-            subreddit: "a".into(),
-            result: Ok(listing("a", &["a2", "a1"], None)),
-        });
+    fn closing_a_tab_preserves_the_next_communitys_unread_count() {
+        let (mut app, i) = unread_badge_app();
+        app.open_subreddit("other");
 
         app.close_active_tab();
 
-        assert!(!app.tabs[app.active].engaged);
+        assert_eq!(app.active, i);
+        assert_eq!(app.badge(&app.tabs[i]), UnreadBadge::Count(2));
     }
 
     #[test]
@@ -13424,6 +14153,15 @@ mod tests {
             );
         }
     }
+    pub(super) fn confirm_preferences(app: &mut App, show_nsfw: bool) {
+        app.settings.account.values = Some(crate::reddit::Preferences {
+            show_nsfw,
+            video_autoplay: true,
+            mature_content_editable: true,
+        });
+        app.apply_settings();
+    }
+
     #[test]
     fn settings_external_reload_should_apply_all_values_and_keep_valid_runtime_after_bad_edits() {
         let dir = tempfile::tempdir().unwrap();
@@ -13431,10 +14169,10 @@ mod tests {
         let mut app = app_with(&["rust"]);
         app.settings =
             settings::Settings::new(crate::config::store::Store::open(Some(&path)).unwrap());
-        std::fs::write(&path, "all_subs_posts_per_group=1\n[media]\nimage_preview=false\nvideo_autoplay=false\n[filters]\nkeywords=[\"hidden\"]\nflairs=[\"Meme\"]\nauthors=[\"bot\"]\n[highlight]\nkeywords=[\"rust\"]\n[commands]\nbrowser=[\"browser-fixture\"]\nvideo=[\"video-fixture\",\"--flag\"]\nimage=[\"image-fixture\"]\n").unwrap();
+        std::fs::write(&path, "all_subs_posts_per_group=1\n[media]\nimage_preview=false\n[signed_out.filters]\nkeywords=[\"hidden\"]\nflairs=[\"Meme\"]\nauthors=[\"bot\"]\n[signed_out.highlight]\nkeywords=[\"rust\"]\n[commands]\nbrowser=[\"browser-fixture\"]\nvideo=[\"video-fixture\",\"--flag\"]\nimage=[\"image-fixture\"]\n").unwrap();
         assert!(app.poll_settings(Instant::now() + Duration::from_secs(1)));
         assert_eq!(app.config.all_subs_posts_per_group, 1);
-        assert!(!app.show_images && !app.config.media.video_autoplay);
+        assert!(!app.show_images);
         assert_eq!(app.config.filters.keywords, ["hidden"]);
         assert_eq!(app.config.filters.flairs, ["Meme"]);
         assert_eq!(app.config.filters.authors, ["bot"]);
@@ -13443,7 +14181,7 @@ mod tests {
         assert_eq!(app.config.commands.video, ["video-fixture", "--flag"]);
         assert_eq!(app.config.commands.image, ["image-fixture"]);
         let working = app.config.clone();
-        std::fs::write(&path, "[media]\nvideo_autoplay=42").unwrap();
+        std::fs::write(&path, "[media]\nimage_preview=42").unwrap();
         assert!(app.poll_settings(Instant::now() + Duration::from_secs(2)));
         assert_eq!(app.config, working);
         assert!(app.settings.store.error.is_some());
@@ -13456,22 +14194,21 @@ mod tests {
         let mut app = app_with(&[]);
         app.settings =
             settings::Settings::new(crate::config::store::Store::open(Some(&path)).unwrap());
-        std::fs::write(&path, "show_nsfw=true").unwrap();
+        std::fs::write(&path, "[media]\nimage_preview=false").unwrap();
         app.membership = Some(MembershipChange {
             generation: 9,
-            subreddit: "rust".into(),
+            target: crate::model::MembershipTarget::Community("rust".into()),
             join: true,
             checking: false,
             error: None,
         });
         assert!(!app.poll_settings(Instant::now() + Duration::from_secs(1)));
-        app.change_setting("show_nsfw", toml::Value::Boolean(true));
-        assert!(!app.config.show_nsfw);
+        app.change_setting("media.image_preview", toml::Value::Boolean(false));
+        assert!(app.config.media.image_preview);
         app.membership = None;
         assert!(app.poll_settings(Instant::now() + Duration::from_secs(2)));
-        assert!(app.config.show_nsfw);
-        assert!(app.reddit.cache_namespace().contains("nsfw=true"));
-        assert!(app.take_replacement_messages().is_some());
+        assert!(!app.config.media.image_preview);
+        assert!(!app.show_images);
     }
 
     #[test]
@@ -13499,7 +14236,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_nsfw_rebind_should_clear_old_content_and_keep_account_reading_and_temporary_preferences()
+    fn settings_nsfw_rebind_should_clear_old_content_without_carrying_preferences_to_another_account()
      {
         use crate::reddit::tests::{Fixture, Reply, saved_export};
         let fixture = Fixture::new(|_| Reply::json(serde_json::json!({"data":{"children":[]}})));
@@ -13512,22 +14249,24 @@ mod tests {
         app.state.toggle_bookmark(&adult, 2);
         app.tabs[0].feed.posts = vec![adult];
         let fingerprint = app.reddit.session_fingerprint().to_string();
-        app.change_setting("show_nsfw", toml::Value::Boolean(true));
+        confirm_preferences(&mut app, true);
         assert_eq!(app.reddit.session_fingerprint(), fingerprint);
         assert!(app.tabs[0].feed.posts.is_empty());
         assert_eq!(app.visible_bookmarks().count(), 2);
-        app.change_setting("show_nsfw", toml::Value::Boolean(false));
+        confirm_preferences(&mut app, false);
         assert_eq!(app.visible_bookmarks().count(), 1);
         assert!(app.state.is_bookmarked("adult"));
-        app.change_setting("show_nsfw", toml::Value::Boolean(true));
+        confirm_preferences(&mut app, true);
+        app.change_setting("media.image_preview", toml::Value::Boolean(false));
         app.install_connection(fixture.saved_reddit(&saved_export("other", "reader")));
-        assert!(app.config.show_nsfw && app.settings.store.current.show_nsfw);
+        assert!(!app.config.show_nsfw && !app.settings.store.current.show_nsfw);
+        assert!(!app.show_images);
         assert!(app.settings.store.dirty());
         assert_eq!(
             app.settings.store.persistence,
             crate::config::store::Persistence::Temporary
         );
-        assert!(app.reddit.cache_namespace().contains("nsfw=true"));
+        assert!(app.reddit.cache_namespace().contains("nsfw=false"));
     }
     #[test]
     fn settings_nsfw_changes_should_keep_a_safe_open_detail_and_its_reading_position() {
@@ -13536,13 +14275,13 @@ mod tests {
         app.tabs[0].feed.posts = vec![post("safe", "rust")];
         app.open_current_post();
         app.post_view.as_mut().unwrap().scroll = 23;
-        app.change_setting("show_nsfw", toml::Value::Boolean(true));
+        confirm_preferences(&mut app, true);
         let view = app.post_view.as_ref().unwrap();
         assert_eq!(view.post.id, "safe");
         assert_eq!(view.scroll, 23);
         assert!(view.loading);
         app.post_view.as_mut().unwrap().post.nsfw = true;
-        app.change_setting("show_nsfw", toml::Value::Boolean(false));
+        confirm_preferences(&mut app, false);
         assert!(app.post_view.is_none());
     }
     #[test]
@@ -13568,7 +14307,10 @@ mod tests {
             },
         ));
         app.show_settings();
-        app.settings.selected = 4;
+        app.settings.selected = crate::config::schema::SETTINGS
+            .iter()
+            .position(|f| f.key == "filters.keywords")
+            .unwrap();
         app.settings_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Enter,
             crossterm::event::KeyModifiers::NONE,
@@ -13606,7 +14348,8 @@ mod tests {
         ));
     }
     #[test]
-    fn settings_review_thread_and_account_completions_should_preserve_the_active_editor() {
+    fn settings_review_thread_completion_should_keep_editor_but_account_switch_should_cancel_scoped_draft()
+     {
         use crate::app::experience::Screen;
         use crate::reddit::experience::{Query, Request, Response};
         let mut app = app_with(&[]);
@@ -13640,7 +14383,14 @@ mod tests {
             fixture.saved_reddit(&crate::reddit::tests::saved_export("switch", "reader"));
         app.behind_settings(|app| app.install_connection(connection));
         assert!(matches!(app.overlay, Some(Overlay::Settings)));
-        assert_eq!(app.settings.editing.as_ref().unwrap().value, "[]draft");
+        assert!(app.settings.editing.is_none());
+        assert!(
+            app.settings
+                .message
+                .as_ref()
+                .unwrap()
+                .contains("previous account")
+        );
     }
     #[test]
     fn when_resizing_video_scrolls_offscreen_its_settle_deadline_should_be_cancelled() {
@@ -13679,5 +14429,443 @@ mod tests {
         });
         assert!(app.video_resize.is_none());
         assert_eq!(app.video.as_ref().unwrap().area, Size::new(40, 80));
+    }
+    fn unread_badge_app() -> (App, usize) {
+        let mut app = app_with(&["s"]);
+        app.state.mark_read(&post("old", "s"), now());
+        app.on_msg(Msg::Group {
+            generation: 0,
+            subreddit: "s".into(),
+            result: Ok(listing("s", &["old", "new1", "new2"], None)),
+        });
+        let i = tab_index(&app, "s");
+        app.active = i;
+        assert_eq!(app.badge(&app.tabs[i]), UnreadBadge::Count(2));
+        (app, i)
+    }
+
+    #[test]
+    fn returning_to_hot_keeps_unread_count_while_waiting_or_after_failure() {
+        let (mut app, i) = unread_badge_app();
+        app.set_sort(Sort::Top);
+        let (tab, generation) = (app.tabs[i].id, app.tabs[i].feed.generation);
+        app.on_msg(Msg::Feed {
+            tab,
+            generation,
+            append: false,
+            result: Ok(listing("s", &["old"], None)),
+        });
+        app.set_sort(Sort::Hot);
+        assert_eq!(app.badge(&app.tabs[i]), UnreadBadge::Count(2));
+
+        let generation = app.tabs[i].feed.generation;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation,
+            append: false,
+            result: Err("fixture unavailable".into()),
+        });
+
+        assert_eq!(app.badge(&app.tabs[i]), UnreadBadge::Count(2));
+    }
+
+    #[test]
+    fn sorting_cannot_replace_newer_observations_with_older_group_counts() {
+        let (mut app, i) = unread_badge_app();
+        app.load_feed(i, false);
+        let (tab, generation) = (app.tabs[i].id, app.tabs[i].feed.generation);
+        app.on_msg(Msg::Feed {
+            tab,
+            generation,
+            append: false,
+            result: Ok(listing("s", &["old", "new1", "new2", "new3"], None)),
+        });
+        assert_eq!(app.badge(&app.tabs[i]), UnreadBadge::Count(3));
+
+        app.search("some query".into());
+        app.set_sort(Sort::Top);
+
+        assert_eq!(app.badge(&app.tabs[i]), UnreadBadge::Count(3));
+    }
+
+    #[test]
+    fn an_unfetched_or_failed_listing_does_not_claim_zero_unread() {
+        let mut app = app_with(&["s"]);
+        let i = tab_index(&app, "s");
+        assert_eq!(app.badge(&app.tabs[i]), UnreadBadge::Unknown);
+        app.active = i;
+        app.load_feed(i, false);
+        let (tab, generation) = (app.tabs[i].id, app.tabs[i].feed.generation);
+
+        app.on_msg(Msg::Feed {
+            tab,
+            generation,
+            append: false,
+            result: Err("fixture unavailable".into()),
+        });
+
+        assert_eq!(app.badge(&app.tabs[i]), UnreadBadge::Unknown);
+    }
+
+    #[test]
+    fn partial_records_union_with_known_unread_and_survive_terminal_failure() {
+        let (mut app, i) = unread_badge_app();
+        app.search("query".into());
+        let (tab, generation) = (app.tabs[i].id, app.tabs[i].feed.generation);
+        app.on_feed_progress(tab, generation, post("streamed", "s"), Source::default());
+        assert_eq!(app.badge(&app.tabs[i]), UnreadBadge::Count(3));
+
+        app.on_msg(Msg::Feed {
+            tab,
+            generation,
+            append: false,
+            result: Err("fixture unavailable".into()),
+        });
+
+        assert_eq!(app.badge(&app.tabs[i]), UnreadBadge::Count(3));
+    }
+
+    #[test]
+    fn unread_observations_survive_saving_and_another_instances_reads_trigger_redraw() {
+        let (mut app, i) = unread_badge_app();
+        let dir = tempfile::tempdir().unwrap();
+        app.state_path = dir.path().join("state.json");
+        app.save_state();
+        assert_eq!(
+            State::load(&app.state_path).0.unread("s", &app.config),
+            Some(2)
+        );
+        let (mut other, _) = State::load(&app.state_path);
+        other.mark_read(&post("new1", "s"), now());
+        other.save(&app.state_path, now()).unwrap();
+
+        let redraw = app.persist_checked().unwrap();
+
+        assert!(redraw);
+        assert_eq!(app.badge(&app.tabs[i]), UnreadBadge::Count(1));
+        assert!(!app.state.is_read("new2"));
+    }
+
+    #[test]
+    fn only_a_revealed_drawn_page_records_a_read_and_requests_one_redraw() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        app.post_drawn(true);
+        assert!(!app.state.is_read("p"));
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(thread_message(generation, vec![]));
+        app.post_drawn(false);
+        assert!(!app.state.is_read("p"));
+        app.overlay = Some(Overlay::Auth);
+        app.post_drawn(true);
+        assert!(!app.state.is_read("p"));
+        app.overlay = None;
+        app.post_view.as_mut().unwrap().post.spoiler = true;
+        app.post_drawn(true);
+        assert!(!app.state.is_read("p"));
+        app.post_view.as_mut().unwrap().reveal_spoilers = true;
+
+        app.post_drawn(true);
+
+        assert!(app.state.is_read("p"));
+        assert_eq!(app.wake_in(), Duration::ZERO);
+        assert!(app.tick());
+        assert!(!app.read_redraw);
+        app.post_drawn(true);
+        assert!(!app.read_redraw);
+    }
+    #[test]
+    fn merged_reads_redraw_home_posts_even_without_a_subreddit_tab() {
+        let mut app = app_with(&[]);
+        app.active = 0;
+        app.load_feed(0, false);
+        let (tab, generation) = (app.tabs[0].id, app.tabs[0].feed.generation);
+        app.on_msg(Msg::Feed {
+            tab,
+            generation,
+            append: false,
+            result: Ok(listing("unjoined", &["homepost"], None)),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        app.state_path = dir.path().join("state.json");
+        app.save_state();
+        let (mut other, _) = State::load(&app.state_path);
+        other.mark_read(&post("homepost", "unjoined"), now());
+        other.save(&app.state_path, now()).unwrap();
+
+        let redraw = app.persist_checked().unwrap();
+
+        assert!(redraw);
+        assert!(app.state.is_read("homepost"));
+        assert!(
+            !app.tabs
+                .iter()
+                .any(|tab| tab.subreddit() == Some("unjoined"))
+        );
+    }
+    #[test]
+    fn badge_metadata_should_ignore_a_rejected_page() {
+        let mut app = app_with(&["s"]);
+        app.config.filters.keywords = vec!["blocked".into()];
+        let i = tab_index(&app, "s");
+        app.active = i;
+        let (tab, generation) = (app.tabs[i].id, app.tabs[i].feed.generation);
+        let mut fresh = listing("s", &["a"], None);
+        fresh.posts[0].title = "blocked".into();
+        app.on_feed(
+            tab,
+            generation,
+            false,
+            Ok(fresh),
+            Freshness {
+                fetched_at: 1000,
+                source: ordered_source(2, false),
+            },
+            false,
+        );
+        assert_eq!(app.badge(&app.tabs[i]), UnreadBadge::Count(0));
+        app.on_feed(
+            tab,
+            generation,
+            false,
+            Ok(listing("s", &["a"], None)),
+            Freshness {
+                fetched_at: 2000,
+                source: ordered_source(1, false),
+            },
+            false,
+        );
+        assert_eq!(app.tabs[i].feed.posts[0].title, "blocked");
+        assert_eq!(app.badge(&app.tabs[i]), UnreadBadge::Count(0));
+    }
+
+    #[test]
+    fn badge_metadata_should_follow_an_accepted_page_after_clock_rollback() {
+        let mut app = app_with(&["s"]);
+        app.config.filters.keywords = vec!["blocked".into()];
+        let i = tab_index(&app, "s");
+        app.active = i;
+        let (tab, generation) = (app.tabs[i].id, app.tabs[i].feed.generation);
+        let mut old = listing("s", &["a"], None);
+        old.posts[0].title = "blocked".into();
+        app.on_feed(
+            tab,
+            generation,
+            false,
+            Ok(old),
+            Freshness {
+                fetched_at: 1000,
+                source: ordered_source(1, false),
+            },
+            false,
+        );
+        app.on_feed(
+            tab,
+            generation,
+            false,
+            Ok(listing("s", &["a"], None)),
+            Freshness {
+                fetched_at: 900,
+                source: ordered_source(2, false),
+            },
+            false,
+        );
+        assert_ne!(app.tabs[i].feed.posts[0].title, "blocked");
+        assert_eq!(app.badge(&app.tabs[i]), UnreadBadge::Count(1));
+    }
+
+    #[test]
+    fn rereading_a_bookmark_should_renew_its_read_history_without_a_listing() {
+        let mut app = app_with(&[]);
+        let post = post("p", "s");
+        app.state.mark_read(&post, now() - 89 * 86_400);
+        app.state.toggle_bookmark(&post, now() - 89 * 86_400);
+        app.open_post_permalink(post, "/r/s/comments/p/x/".into());
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(thread_message(generation, vec![]));
+        app.post_drawn(true);
+        let dir = tempfile::tempdir().unwrap();
+        app.state
+            .save(&dir.path().join("state.json"), now() + 2 * 86_400)
+            .unwrap();
+        assert!(app.state.is_read("p"));
+        assert!(
+            !app.read_redraw,
+            "renewal does not change visible read status"
+        );
+    }
+    #[test]
+    fn sidebar_should_keep_an_icon_lookup_alive_after_leaving_its_feed() {
+        use crate::reddit::tests::{Fixture, Reply};
+        let (started, began) = std::sync::mpsc::channel();
+        let (finish, wait) = std::sync::mpsc::channel();
+        let fixture = Fixture::new(move |request| {
+            if request.url.starts_with("/r/blocker/about.json") {
+                started.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(3)).unwrap();
+                Reply::json(serde_json::json!({"data":{"icon_img":"/icon/s.png"}}))
+            } else if request.url.starts_with("/r/s/about.json") {
+                Reply::json(serde_json::json!({"data":{"icon_img":"/icon/s.png"}}))
+            } else {
+                Reply::json(
+                    serde_json::json!({"kind":"Listing","data":{"children":[],"after":null}}),
+                )
+            }
+        });
+        let (mut app, messages) = app_at(&fixture.base, &["blocker", "s"]);
+        show_thumbnails(&mut app);
+        app.active = 3;
+        app.groups_drawn(&[], &[]);
+        app.demand_icon("blocker");
+        began.recv_timeout(Duration::from_secs(2)).unwrap();
+        app.active = 4;
+        app.groups_drawn(&[], &[]);
+        app.demand_icon("s");
+        app.active = 0;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        finish.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.icon_lookups.contains("s") {
+            let message = messages
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            app.on_msg(message);
+        }
+        assert_eq!(app.shown_icon("s"), Some("/icon/s.png"));
+    }
+    #[test]
+    fn followed_users_should_have_distinct_tabs_and_stay_out_of_community_islands() {
+        let mut app = app_with(&[]);
+        app.on_msg(Msg::Subscriptions {
+            generation: 0,
+            result: Ok(vec![
+                Subscription::Community {
+                    name: "same".into(),
+                    icon: crate::model::SubscriptionIcon::Unknown,
+                },
+                Subscription::User {
+                    name: "same".into(),
+                    icon: None,
+                },
+                Subscription::User {
+                    name: "blackvault".into(),
+                    icon: None,
+                },
+                Subscription::Community {
+                    name: "u_ordinary".into(),
+                    icon: crate::model::SubscriptionIcon::Unknown,
+                },
+            ]),
+        });
+        assert_eq!(
+            app.all_subs
+                .groups
+                .iter()
+                .map(|group| group.subreddit.as_str())
+                .collect::<Vec<_>>(),
+            ["same", "u_ordinary"]
+        );
+        let (communities, follows, opened) = app.sidebar_tabs();
+        assert_eq!(communities.len(), 2);
+        assert_eq!(follows.len(), 2);
+        assert!(opened.is_empty());
+        app.open_user("same");
+        let user_tab = app.active;
+        assert!(
+            matches!(app.active_tab().feed_target(), Some(FeedTarget::User(name)) if name == "same")
+        );
+        assert_eq!(app.active_tab().feed.sort, Sort::New);
+        assert_eq!(app.badge(app.active_tab()), UnreadBadge::Unavailable);
+        let entries = app.picker_entries("u/same");
+        assert_eq!(
+            entries,
+            [PickerEntry::Tab {
+                index: user_tab,
+                title: "u/same".into()
+            }]
+        );
+        app.open_subreddit("same");
+        assert_ne!(app.active, user_tab);
+    }
+
+    #[test]
+    fn a_removed_follow_should_keep_its_open_tab_under_opened_and_preserve_selection() {
+        let mut app = app_with(&[]);
+        app.on_msg(Msg::Subscriptions {
+            generation: 0,
+            result: Ok(vec![Subscription::User {
+                name: "blackvault".into(),
+                icon: None,
+            }]),
+        });
+        app.open_user("blackvault");
+        let id = app.active_tab().id;
+        app.on_msg(Msg::Subscriptions {
+            generation: 0,
+            result: Ok(vec![]),
+        });
+        let (_, following, opened) = app.sidebar_tabs();
+        assert!(following.is_empty());
+        assert_eq!(opened, [app.active]);
+        assert_eq!(app.active_tab().id, id);
+        assert!(matches!(
+            app.active_tab().kind,
+            TabKind::User {
+                followed: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn explicit_user_jump_should_open_a_user_instead_of_a_subreddit() {
+        let mut app = app_with(&[]);
+        assert_eq!(
+            app.picker_entries("u/black-vault"),
+            [PickerEntry::OpenUser("black-vault".into())]
+        );
+        app.picker_accept(&PickerState {
+            input: "u/black-vault".into(),
+            selected: 0,
+        });
+        assert_eq!(app.active_tab().title(), "u/black-vault");
+        assert!(app.active_tab().subreddit().is_none());
+    }
+    #[test]
+    fn user_feed_pagination_and_sort_should_reuse_the_reader_without_losing_posts() {
+        let mut app = app_with(&[]);
+        app.open_user("blackvault");
+        let i = app.active;
+        let tab = app.active_tab().id;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("UFOs", &["a"], Some("next"))),
+        });
+        app.load_feed(i, true);
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: true,
+            result: Ok(listing("UFOs", &["b"], None)),
+        });
+        assert_eq!(
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|post| post.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(app.current_post().unwrap().id, "a");
+        app.set_sort(Sort::Top);
+        assert_eq!(app.tabs[i].feed.sort, Sort::Top);
+        assert_eq!(app.active_tab().title(), "u/blackvault");
+        app.set_sort(Sort::Rising);
+        assert_eq!(app.tabs[i].feed.sort, Sort::Top);
     }
 }

@@ -5,14 +5,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+mod accounts;
 pub mod managed;
 pub mod schema;
 pub mod store;
+pub use accounts::ReaderSettings;
 
 use crate::model::Post;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(from = "accounts::Document", into = "accounts::Document")]
 pub struct Config {
     /// Posts per subreddit island in All subs.
     pub all_subs_posts_per_group: usize,
@@ -21,9 +23,12 @@ pub struct Config {
     pub filters: Filters,
     pub highlight: Highlight,
     pub commands: Commands,
+    pub accounts: std::collections::BTreeMap<String, ReaderSettings>,
+    pub signed_out: ReaderSettings,
+    /// Selected reader username; an empty name means the connection is unidentified.
+    pub active_account: Option<String>,
     /// The loaded file, empty for a config built in code. Error messages and `--check`
     /// name it.
-    #[serde(skip)]
     pub path: PathBuf,
 }
 
@@ -100,6 +105,9 @@ impl Default for Config {
             filters: Filters::default(),
             highlight: Highlight::default(),
             commands: Commands::default(),
+            accounts: Default::default(),
+            signed_out: ReaderSettings::default(),
+            active_account: None,
             path: PathBuf::new(),
         }
     }
@@ -159,6 +167,7 @@ impl Config {
 
     /// Catch values that would only fail later, with a vaguer message.
     fn validate(&self) -> Result<()> {
+        self.validate_accounts()?;
         for field in schema::SETTINGS {
             field.validate_value(&field.value(self))?;
         }
@@ -166,18 +175,23 @@ impl Config {
     }
 
     pub fn hides(&self, post: &Post) -> bool {
-        if post.nsfw && !self.show_nsfw {
+        self.hides_metadata(&post.title, &post.author, post.flair.as_deref(), post.nsfw)
+    }
+
+    pub(crate) fn hides_metadata(
+        &self,
+        title: &str,
+        author: &str,
+        flair: Option<&str>,
+        nsfw: bool,
+    ) -> bool {
+        if nsfw && !self.show_nsfw {
             return true;
         }
         let f = &self.filters;
-        contains_keyword(&post.title, &f.keywords)
-            || post
-                .flair
-                .as_deref()
-                .is_some_and(|flair| f.flairs.iter().any(|x| x.eq_ignore_ascii_case(flair)))
-            || f.authors
-                .iter()
-                .any(|a| a.eq_ignore_ascii_case(&post.author))
+        contains_keyword(title, &f.keywords)
+            || flair.is_some_and(|flair| f.flairs.iter().any(|x| x.eq_ignore_ascii_case(flair)))
+            || f.authors.iter().any(|a| a.eq_ignore_ascii_case(author))
     }
 
     pub fn highlights(&self, post: &Post) -> bool {
@@ -228,15 +242,23 @@ mod tests {
     use crate::model::Media;
 
     #[test]
-    fn card_media_config_should_allow_disabling_autoplay() {
-        let actual: Config = toml::from_str("[media]\nvideo_autoplay = false").unwrap();
-        assert!(!actual.media.video_autoplay);
+    fn scoped_config_should_reject_retired_shared_settings() {
+        for old in [
+            "show_nsfw = true",
+            "[media]\nvideo_autoplay = false",
+            "[filters]\nkeywords = [\"old\"]",
+            "[highlight]\nkeywords = [\"old\"]",
+        ] {
+            assert!(
+                toml::from_str::<Config>(old).is_err(),
+                "accepted retired setting: {old}"
+            );
+        }
     }
 
     #[test]
     fn grouped_settings_should_parse_media_and_reject_obsolete_root_keys() {
-        let grouped =
-            toml::from_str::<Config>("[media]\nimage_preview = false\nvideo_autoplay = false\n");
+        let grouped = toml::from_str::<Config>("[media]\nimage_preview = false\n");
         assert!(grouped.is_ok(), "{grouped:?}");
         for old in ["image_preview = false", "video_autoplay = false"] {
             assert!(
@@ -336,7 +358,7 @@ mod tests {
     fn config_file_rejects_unknown_keys() {
         let dir = tempdir::Dir::new();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "show_nsfw = true\nunknown = 1\n").unwrap();
+        std::fs::write(&path, "all_subs_posts_per_group = 3\nunknown = 1\n").unwrap();
 
         assert!(Config::load(Some(&path)).is_err());
     }

@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::text;
-use crate::model::{Comment, Listing, Media, MoreReplies, Post, PostPage, ReplyPage, THREAD_ROOT};
+use crate::model::{
+    Comment, Listing, Media, MoreReplies, Post, PostPage, ReplyPage, Subscription, THREAD_ROOT,
+};
 
 #[derive(Deserialize)]
 struct Envelope {
@@ -212,10 +214,55 @@ impl<'de> Visitor<'de> for ListingSeed<'_, '_> {
     }
 }
 
-pub(super) fn parse_subscriptions(value: Value) -> Result<(Vec<String>, Option<String>)> {
+pub(super) fn parse_subscriptions(value: Value) -> Result<(Vec<Subscription>, Option<String>)> {
     let data = listing(value)?;
     let mut names = Vec::new();
     for thing in data.children {
+        if thing.kind != "t5" {
+            bail!("expected Reddit subreddit in subscriptions");
+        }
+        let profile = thing.data["subreddit_type"] == "user"
+            || thing.data["display_name_prefixed"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("u/"))
+            || thing.data["url"]
+                .as_str()
+                .and_then(crate::model::profile_user)
+                .is_some();
+        if profile {
+            if thing.data["subreddit_type"]
+                .as_str()
+                .is_some_and(|kind| kind != "user")
+            {
+                bail!("conflicting Reddit subscription type");
+            }
+            let canonical = thing.data["url"]
+                .as_str()
+                .and_then(crate::model::profile_user);
+            let prefixed = thing.data["display_name_prefixed"]
+                .as_str()
+                .and_then(|name| name.strip_prefix("u/"));
+            let displayed = thing.data["display_name"]
+                .as_str()
+                .and_then(|name| name.strip_prefix("u_"));
+            let name = canonical
+                .or(prefixed)
+                .or(displayed)
+                .filter(|name| crate::model::is_username(name))
+                .context("invalid Reddit followed user name")?;
+            if [canonical, prefixed, displayed]
+                .into_iter()
+                .flatten()
+                .any(|other| !other.eq_ignore_ascii_case(name))
+            {
+                bail!("conflicting Reddit followed user identity");
+            }
+            names.push(Subscription::User {
+                name: name.to_string(),
+                icon: media_url(&thing.data["icon_img"]),
+            });
+            continue;
+        }
         let name = thing.data["display_name"]
             .as_str()
             .filter(|name| {
@@ -224,10 +271,22 @@ pub(super) fn parse_subscriptions(value: Value) -> Result<(Vec<String>, Option<S
                     && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
             })
             .context("invalid Reddit subscription name")?;
-        if thing.kind != "t5" {
-            bail!("expected Reddit subreddit in subscriptions");
-        }
-        names.push(name.to_string());
+        let icon = ["community_icon", "icon_img"]
+            .into_iter()
+            .find_map(|key| media_url(&thing.data[key]));
+        let icon = match icon {
+            Some(url) => crate::model::SubscriptionIcon::Url(url),
+            None if thing.data.get("community_icon").is_some()
+                || thing.data.get("icon_img").is_some() =>
+            {
+                crate::model::SubscriptionIcon::Missing
+            }
+            None => crate::model::SubscriptionIcon::Unknown,
+        };
+        names.push(Subscription::Community {
+            name: name.to_string(),
+            icon,
+        });
     }
     Ok((names, data.after.filter(|s| !s.is_empty())))
 }
@@ -276,8 +335,30 @@ fn optional(s: Option<String>) -> Option<String> {
     s.map(|s| clean(&s)).filter(|s| !s.is_empty())
 }
 
+pub(super) fn canonicalize_profile_post(
+    value: &Value,
+    subreddit: &str,
+    permalink: &mut String,
+) -> Result<()> {
+    if value["subreddit_type"] == "user" && crate::model::profile_user(permalink).is_none() {
+        let owner = value["subreddit_name_prefixed"]
+            .as_str()
+            .and_then(|name| name.strip_prefix("u/"))
+            .or_else(|| subreddit.strip_prefix("u_"))
+            .filter(|name| crate::model::is_username(name))
+            .context("invalid profile post owner")?;
+        let prefix = format!("/r/{subreddit}/");
+        let tail = permalink
+            .strip_prefix(&prefix)
+            .context("invalid profile post location")?;
+        *permalink = format!("/user/{owner}/{tail}");
+    }
+    Ok(())
+}
+
 pub(super) fn post(value: Value) -> Result<(Post, String)> {
-    let data = PostData::deserialize(&value).context("invalid Reddit post")?;
+    let mut data = PostData::deserialize(&value).context("invalid Reddit post")?;
+    canonicalize_profile_post(&value, &data.subreddit, &mut data.permalink)?;
     if !id_valid(&data.id) || post_id(&data.permalink) != Some(data.id.as_str()) {
         bail!("invalid Reddit post identity");
     }
@@ -308,13 +389,24 @@ pub(super) fn post(value: Value) -> Result<(Post, String)> {
         .as_array()
         .and_then(|items| items.first())
     {
-        body.push_str(&format!(
-            "\n\nCrossposted from r/{} by u/{}: {}\n{}",
-            clean(original["subreddit"].as_str().unwrap_or_default()),
-            clean(original["author"].as_str().unwrap_or_default()),
-            clean(original["title"].as_str().unwrap_or_default()),
-            clean(original["permalink"].as_str().unwrap_or_default())
-        ));
+        let subreddit = original["subreddit"].as_str().unwrap_or_default();
+        let mut permalink = original["permalink"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        // Invalid optional attribution must not hide the crosspost itself.
+        if canonicalize_profile_post(original, subreddit, &mut permalink).is_ok() {
+            body.push_str(&format!(
+                "\n\nCrossposted from {} by u/{}: {}\n{}",
+                crate::model::profile_user(&permalink).map_or_else(
+                    || format!("r/{}", clean(subreddit)),
+                    |name| format!("u/{name}")
+                ),
+                clean(original["author"].as_str().unwrap_or_default()),
+                clean(original["title"].as_str().unwrap_or_default()),
+                clean(&permalink)
+            ));
+        }
     }
     if let Some(items) = media_source(&value)["gallery_data"]["items"].as_array() {
         for (index, item) in items.iter().enumerate() {
@@ -1686,5 +1778,52 @@ mod tests {
         assert!(page.body.ends_with("Poll: 61 votes\n• Yes\n• No"));
         assert_eq!(page.comments.last().unwrap().id, "more:t3_1x4v4sn");
         assert!(page.comments.last().unwrap().author.is_empty());
+    }
+    #[test]
+    fn crosspost_attribution_should_use_the_parents_canonical_profile_identity() {
+        for (subreddit, subtype, permalink, label) in [
+            (
+                "u_blackvault",
+                "user",
+                "/r/u_blackvault/comments/parent/title/",
+                "u/blackvault",
+            ),
+            (
+                "u_ordinary",
+                "public",
+                "/r/u_ordinary/comments/parent/title/",
+                "r/u_ordinary",
+            ),
+        ] {
+            let (_, body) = post(json!({
+                "id":"p", "title":"Crosspost", "subreddit":"rust", "permalink":"/r/rust/comments/p/title/",
+                "crosspost_parent_list":[{"subreddit":subreddit, "subreddit_type":subtype,
+                    "permalink":permalink, "author":"reader", "title":"Parent"}]
+            })).unwrap();
+            assert!(
+                body.contains(&format!("Crossposted from {label} by u/reader")),
+                "{body}"
+            );
+            if subtype == "user" {
+                assert!(body.contains("/user/blackvault/comments/parent/title/"));
+            }
+        }
+        let (_, body) = post(json!({
+            "id":"p", "title":"Crosspost", "subreddit":"rust", "permalink":"/r/rust/comments/p/title/",
+            "crosspost_parent_list":[{"subreddit":"u_blackvault", "subreddit_type":"user", "permalink":"/invalid"}]
+        })).unwrap();
+        assert!(!body.contains("r/u_blackvault"));
+    }
+
+    #[test]
+    fn profile_owned_posts_should_keep_profile_identity_and_an_ordinary_u_community_should_not_change()
+     {
+        let (profile, _) = post(json!({"id":"p","title":"Profile post","author":"blackvault","subreddit":"u_blackvault", "subreddit_type":"user","subreddit_name_prefixed":"u/blackvault", "permalink":"/r/u_blackvault/comments/p/title/"})).unwrap();
+        assert_eq!(profile.permalink, "/user/blackvault/comments/p/title/");
+        assert_eq!(profile.source_label(), "u/blackvault");
+        assert_eq!(profile.community(), None);
+        let (community, _) = post(json!({"id":"q","title":"Community post","subreddit":"u_regular","subreddit_type":"public","permalink":"/r/u_regular/comments/q/title/"})).unwrap();
+        assert_eq!(community.source_label(), "r/u_regular");
+        assert_eq!(community.community(), Some("u_regular"));
     }
 }

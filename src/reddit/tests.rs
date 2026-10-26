@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::MembershipTarget;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -103,7 +104,10 @@ fn when_a_connection_is_retired_queued_account_writes_should_not_reach_reddit() 
     reddit.retire();
     assert!(
         reddit
-            .set_subscription("neovim", true)
+            .set_membership(
+                &crate::model::MembershipTarget::Community("neovim".into()),
+                true
+            )
             .unwrap_err()
             .to_string()
             .contains("replaced")
@@ -237,6 +241,82 @@ fn empty_listing() -> Value {
 }
 
 #[test]
+fn following_users_should_write_their_verified_profile_subscription() {
+    let followed = Arc::new(AtomicBool::new(false));
+    let actual = followed.clone();
+    let fixture = Fixture::new(move |request| match request.url.as_str() {
+        "/api/me.json" => Reply::json(json!({"data":{"name":"reader","modhash":"fixture-csrf"}})),
+        "/user/black-vault/about.json" => {
+            Reply::json(json!({"data":{"name":"black-vault","subreddit":{
+                "name":"t5_profile", "subreddit_type":"user", "url":"/user/black-vault/"
+            }}}))
+        }
+        "/api/subscribe" => {
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.headers["x-modhash"], "fixture-csrf");
+            let form: HashMap<_, _> = url::form_urlencoded::parse(request.body.as_bytes())
+                .into_owned()
+                .collect();
+            assert_eq!(form["sr"], "t5_profile");
+            assert!(!form.contains_key("sr_name"));
+            actual.store(form["action"] == "sub", Ordering::SeqCst);
+            Reply::json(json!({}))
+        }
+        _ => panic!("unexpected follow request"),
+    });
+    let target = MembershipTarget::User("black-vault".into());
+    let reddit = fixture.saved_reddit(&saved_export("reader", "reader"));
+    for join in [true, true, false, false, true] {
+        reddit.set_membership(&target, join).unwrap();
+        assert_eq!(followed.load(Ordering::SeqCst), join);
+    }
+}
+
+#[test]
+fn invalid_profile_identity_should_never_change_membership() {
+    for profile in [
+        json!({}),
+        json!({"name":"other","subreddit":{"name":"t5_valid","subreddit_type":"user","url":"/user/reader/"}}),
+        json!({"name":"reader","subreddit":{"name":"t5_valid","subreddit_type":"public","url":"/user/reader/"}}),
+        json!({"name":"reader","subreddit":{"name":"t5_valid","subreddit_type":"user","url":"/user/other/"}}),
+        json!({"name":"reader","subreddit":{"name":"t5_bad,other","subreddit_type":"user","url":"/user/reader/"}}),
+    ] {
+        let fixture = Fixture::new(move |request| {
+            assert_eq!(
+                request.method, "GET",
+                "invalid profile must not reach a write"
+            );
+            match request.url.as_str() {
+                "/api/me.json" => {
+                    Reply::json(json!({"data":{"name":"reader","modhash":"fixture-csrf"}}))
+                }
+                "/user/reader/about.json" => Reply::json(json!({"data":profile})),
+                _ => panic!("unexpected profile request"),
+            }
+        });
+        assert!(
+            fixture
+                .reddit()
+                .set_membership(&MembershipTarget::User("reader".into()), true)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn invalid_user_membership_names_should_fail_before_http() {
+    let fixture = Fixture::new(|_| panic!("invalid user reached HTTP"));
+    for name in ["", "../reader", "u/reader", "Հայաստան"] {
+        assert!(
+            fixture
+                .reddit()
+                .set_membership(&MembershipTarget::User(name.into()), true)
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn membership_changes_should_not_write_through_a_different_signed_in_account() {
     let writes = std::sync::Arc::new(AtomicUsize::new(0));
     let actual = writes.clone();
@@ -251,7 +331,10 @@ fn membership_changes_should_not_write_through_a_different_signed_in_account() {
     let reddit = fixture.saved_reddit(&saved_export("reader", "reader"));
 
     for join in [true, false] {
-        let result = reddit.set_subscription("rust", join);
+        let result = reddit.set_membership(
+            &crate::model::MembershipTarget::Community("rust".into()),
+            join,
+        );
         assert!(result.unwrap_err().to_string().contains("account changed"));
     }
     assert_eq!(writes.load(Ordering::SeqCst), 0);
@@ -290,14 +373,41 @@ fn when_community_membership_changes_it_should_mutate_the_server_for_join_leave_
     });
     let reddit = fixture.saved_reddit(&saved_export("reader", "reader"));
 
-    reddit.set_subscription("armenia", true).unwrap();
+    reddit
+        .set_membership(
+            &crate::model::MembershipTarget::Community("armenia".into()),
+            true,
+        )
+        .unwrap();
     assert!(joined.load(Ordering::SeqCst));
-    reddit.set_subscription("armenia", true).unwrap();
+    reddit
+        .set_membership(
+            &crate::model::MembershipTarget::Community("armenia".into()),
+            true,
+        )
+        .unwrap();
     assert!(joined.load(Ordering::SeqCst));
-    reddit.set_subscription("armenia", false).unwrap();
+    reddit
+        .set_membership(
+            &crate::model::MembershipTarget::Community("armenia".into()),
+            false,
+        )
+        .unwrap();
     assert!(!joined.load(Ordering::SeqCst));
-    assert!(reddit.set_subscription("armenia", false).is_err());
-    reddit.set_subscription("armenia", true).unwrap();
+    assert!(
+        reddit
+            .set_membership(
+                &crate::model::MembershipTarget::Community("armenia".into()),
+                false
+            )
+            .is_err()
+    );
+    reddit
+        .set_membership(
+            &crate::model::MembershipTarget::Community("armenia".into()),
+            true,
+        )
+        .unwrap();
     assert!(joined.load(Ordering::SeqCst));
 }
 
@@ -317,7 +427,10 @@ fn when_membership_identity_is_incomplete_it_should_never_post() {
         });
         let error = fixture
             .reddit()
-            .set_subscription("armenia", true)
+            .set_membership(
+                &crate::model::MembershipTarget::Community("armenia".into()),
+                true,
+            )
             .unwrap_err();
         assert!(!format!("{error:#}").contains("fixture-secret"));
     }
@@ -335,7 +448,15 @@ fn when_membership_target_is_not_a_community_it_should_not_request_anything() {
         "POPULAR",
         "Հայաստան",
     ] {
-        assert!(fixture.reddit().set_subscription(name, true).is_err());
+        assert!(
+            fixture
+                .reddit()
+                .set_membership(
+                    &crate::model::MembershipTarget::Community(name.into()),
+                    true
+                )
+                .is_err()
+        );
     }
 }
 
@@ -369,7 +490,10 @@ fn when_membership_has_no_success_acknowledgement_it_should_fail_without_echoing
                 }
             }
         });
-        let result = fixture.reddit().set_subscription("armenia", true);
+        let result = fixture.reddit().set_membership(
+            &crate::model::MembershipTarget::Community("armenia".into()),
+            true,
+        );
         assert_eq!(result.is_ok(), success, "response {body}");
         if let Err(error) = result {
             assert!(!format!("{error:#}").contains("fixture-secret"));
@@ -398,11 +522,37 @@ fn when_membership_http_fails_it_should_not_redirect_retry_or_echo_the_body() {
         });
         let error = fixture
             .reddit()
-            .set_subscription("armenia", true)
+            .set_membership(
+                &crate::model::MembershipTarget::Community("armenia".into()),
+                true,
+            )
             .unwrap_err();
         assert!(!format!("{error:#}").contains("fixture-secret"));
         assert_eq!(posts.load(Ordering::SeqCst), 1);
     }
+}
+
+#[test]
+fn when_congestion_subscription_icons_are_available_they_should_survive_the_payload() {
+    let fixture = Fixture::new(|_| {
+        Reply::json(json!({"kind":"Listing","data":{"children":[
+        {"kind":"t5","data":{"display_name":"rust","community_icon":"https://styles.redditmedia.com/main.png","icon_img":"https://i.redd.it/fallback.png"}},
+        {"kind":"t5","data":{"display_name":"vim","community_icon":"","icon_img":"https://i.redd.it/fallback.png"}},
+        {"kind":"t5","data":{"display_name":"none","community_icon":"https://example.com/untrusted.png"}}
+    ],"after":null}}))
+    });
+
+    let actual = serde_json::to_value(fixture.reddit().subscriptions().unwrap()).unwrap();
+
+    assert_eq!(actual[0]["community"]["icon"], "missing");
+    assert_eq!(
+        actual[1]["community"]["icon"]["url"],
+        "https://styles.redditmedia.com/main.png"
+    );
+    assert_eq!(
+        actual[2]["community"]["icon"]["url"],
+        "https://i.redd.it/fallback.png"
+    );
 }
 
 #[test]
@@ -428,7 +578,16 @@ fn when_subscriptions_span_pages_they_should_all_load_without_duplicates() {
 
     assert_eq!(
         fixture.reddit().subscriptions().unwrap(),
-        ["neovim", "rust"]
+        [
+            crate::model::Subscription::Community {
+                name: "neovim".into(),
+                icon: crate::model::SubscriptionIcon::Unknown
+            },
+            crate::model::Subscription::Community {
+                name: "rust".into(),
+                icon: crate::model::SubscriptionIcon::Unknown
+            }
+        ]
     );
 }
 
@@ -806,8 +965,15 @@ fn when_every_response_repeats_quota_navigation_should_not_get_unlimited_bursts(
     visible.search("rust", "first", None).unwrap();
     visible.search("rust", "second", None).unwrap();
     visible.search("rust", "third", None).unwrap();
+    visible.search("rust", "fourth", None).unwrap();
+    visible.search("rust", "fifth", None).unwrap();
+    visible.search("rust", "sixth", None).unwrap();
+    visible.search("rust", "seventh", None).unwrap();
+    visible.search("rust", "eighth", None).unwrap();
+    visible.search("rust", "ninth", None).unwrap();
+    visible.search("rust", "tenth", None).unwrap();
 
-    let actual = visible.search("rust", "fourth", None);
+    let actual = visible.search("rust", "eleventh", None);
 
     assert_eq!(actual.unwrap_err().to_string(), REQUEST_CANCELLED);
 }
@@ -1096,7 +1262,14 @@ fn when_a_transmitted_write_becomes_obsolete_its_acknowledgment_should_still_fin
             obsolete.load(Ordering::Acquire)
         });
 
-    assert!(scoped.set_subscription("rust", true).is_ok());
+    assert!(
+        scoped
+            .set_membership(
+                &crate::model::MembershipTarget::Community("rust".into()),
+                true
+            )
+            .is_ok()
+    );
 }
 
 #[test]
@@ -1119,7 +1292,10 @@ fn when_a_write_receives429_even_a_read_retry_context_should_not_replay_it() {
         fixture
             .reddit()
             .for_worker(Priority::Foreground, true, || false)
-            .set_subscription("rust", true)
+            .set_membership(
+                &crate::model::MembershipTarget::Community("rust".into()),
+                true
+            )
             .is_err()
     );
     assert_eq!(count.load(Ordering::SeqCst), 1);
@@ -1834,4 +2010,95 @@ fn settings_policy_clone_should_share_session_health_and_identity_but_isolate_ns
     assert!(original.cache_namespace().contains("nsfw=false"));
     assert!(adult.cache_namespace().contains("nsfw=true"));
     assert!(Arc::ptr_eq(&adult.0, &original.0));
+}
+
+#[test]
+fn followed_profiles_should_preserve_type_and_identity_in_subscription_discovery() {
+    let fixture = Fixture::new(|_| {
+        Reply::json(serde_json::json!({
+            "kind":"Listing", "data":{"after":null, "children":[
+                {"kind":"t5","data":{"display_name":"u_regular","subreddit_type":"public","url":"/r/u_regular/"}},
+                {"kind":"t5","data":{"display_name":"u_blackvault","subreddit_type":"user","display_name_prefixed":"u/blackvault","url":"/user/blackvault/","icon_img":"https://styles.redditmedia.com/avatar.png"}}
+            ]}
+        }))
+    });
+
+    let actual = serde_json::to_value(fixture.reddit().subscriptions().unwrap()).unwrap();
+
+    assert!(
+        actual
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["user"]["name"] == "blackvault"),
+        "{actual}"
+    );
+    assert!(
+        actual
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["community"]["name"] == "u_regular"),
+        "{actual}"
+    );
+}
+
+#[test]
+fn user_submissions_should_stream_posts_with_sort_time_and_cursor() {
+    let fixture = Fixture::new(|request| {
+        let url = Url::parse(&format!("http://fixture{}", request.url)).unwrap();
+        assert_eq!(url.path(), "/user/black-vault/submitted.json");
+        let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(params["sort"], "top");
+        assert_eq!(params["t"], "week");
+        assert_eq!(params["after"], "t3_cursor&next");
+        Reply::json(
+            json!({"kind":"Listing","data":{"after":"t3_next","children":[
+                {"kind":"t3","data":{"id":"p","title":"A submitted post","subreddit":"UFOs","author":"black-vault","permalink":"/r/UFOs/comments/p/title/"}}
+            ]}}),
+        )
+    });
+    let mut streamed = Vec::new();
+
+    let actual = fixture
+        .reddit()
+        .user_posts_progress(
+            "black-vault",
+            crate::model::Sort::Top,
+            crate::model::TimeRange::Week,
+            Some("t3_cursor&next"),
+            &mut |event| {
+                if let super::ListingEvent::Post(post) = event {
+                    streamed.push(post.id.clone());
+                }
+            },
+        )
+        .unwrap();
+
+    assert_eq!(streamed, ["p"]);
+    assert_eq!(actual.posts[0].subreddit, "UFOs");
+    assert_eq!(actual.after.as_deref(), Some("t3_next"));
+}
+
+#[test]
+fn user_submissions_should_reject_unsupported_sort_before_http() {
+    let fixture = Fixture::new(|_| panic!("unsupported sort reached HTTP"));
+    let actual = fixture.reddit().user_posts_progress(
+        "blackvault",
+        crate::model::Sort::Rising,
+        crate::model::TimeRange::Day,
+        None,
+        &mut |_| {},
+    );
+    assert!(actual.is_err());
+}
+
+#[test]
+fn conflicting_follow_identity_should_reject_the_whole_subscription_snapshot() {
+    let fixture = Fixture::new(|_| {
+        Reply::json(json!({"kind":"Listing","data":{"after":null,"children":[
+            {"kind":"t5","data":{"display_name":"u_blackvault","subreddit_type":"user","url":"/user/another/","display_name_prefixed":"u/blackvault"}}
+        ]}}))
+    });
+    assert!(fixture.reddit().subscriptions().is_err());
 }

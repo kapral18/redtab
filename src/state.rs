@@ -1,14 +1,17 @@
-//! Reading state (seen and opened posts, bookmarks) in `$XDG_STATE_HOME/redtab/state.json`.
+//! Reading history and bookmarks in `$XDG_STATE_HOME/redtab/state.json`.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::cache::{Freshness, Source};
+use crate::config::Config;
 use crate::model::Post;
 
-/// Seen/read marks not refreshed for this long are dropped on save.
+/// Observations and read marks not refreshed for this long are dropped on save.
 const RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,10 +37,10 @@ pub struct State {
     list_view: ListView,
     #[serde(default)]
     list_view_changed_at: i64,
-    /// Per subreddit (lowercase): post id → unix time it was last seen listed.
+    /// Compact records from fetched listings; old visit-based `seen` marks are ignored.
     #[serde(default)]
-    seen: HashMap<String, HashMap<String, i64>>,
-    /// Post id → unix time it was opened.
+    observed: HashMap<String, ObservedCommunity>,
+    /// Post id → last refresh of its opened/read mark.
     #[serde(default)]
     read: HashMap<String, i64>,
     #[serde(default)]
@@ -48,6 +51,52 @@ pub struct State {
     /// Set when the file exists but cannot be read: never overwrite it.
     #[serde(skip)]
     read_only: bool,
+    #[serde(skip)]
+    unread_counts: RefCell<Option<UnreadCounts>>,
+    #[serde(skip)]
+    read_revision: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ObservedCommunity {
+    observed_at: i64,
+    posts: HashMap<String, ObservedPost>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ObservedPost {
+    title: String,
+    author: String,
+    flair: Option<String>,
+    nsfw: bool,
+    fetched_at: i64,
+    observed_at: i64,
+    source: Source,
+}
+
+impl ObservedPost {
+    fn compare_metadata(&self, incoming: Freshness) -> std::cmp::Ordering {
+        use std::cmp::Ordering::{Greater, Less};
+        if let Some(order) = incoming.source.compare_requests(self.source) {
+            return order.then_with(|| self.source.cached.cmp(&incoming.source.cached));
+        }
+        // A live refresh supersedes history from an incomparable cache generation.
+        // An unordered disk read cannot roll back this process's live observation.
+        if incoming.source.cached && !self.source.cached && self.source.observed.is_some() {
+            return Less;
+        }
+        if incoming.source.cached {
+            incoming.fetched_at.cmp(&self.fetched_at)
+        } else {
+            Greater
+        }
+    }
+}
+
+#[derive(Debug)]
+struct UnreadCounts {
+    config: Config,
+    counts: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,17 +416,47 @@ impl State {
             self.list_view = disk.list_view;
             self.list_view_changed_at = disk.list_view_changed_at;
         }
-        for (sub, ids) in disk.seen {
-            let mine = self.seen.entry(sub).or_default();
-            for (id, t) in ids {
-                mine.entry(id).and_modify(|x| *x = (*x).max(t)).or_insert(t);
-            }
-        }
+        self.unread_counts.get_mut().take();
         for (id, t) in disk.read {
+            if !self.read.contains_key(&id) {
+                self.read_revision = self.read_revision.wrapping_add(1);
+            }
             self.read
                 .entry(id)
                 .and_modify(|x| *x = (*x).max(t))
                 .or_insert(t);
+        }
+        for (sub, community) in disk.observed {
+            let mine = self.observed.entry(sub).or_default();
+            mine.observed_at = mine.observed_at.max(community.observed_at);
+            for (id, mut incoming) in community.posts {
+                if self.read.contains_key(&id) {
+                    continue;
+                }
+                match mine.posts.get_mut(&id) {
+                    Some(existing) => {
+                        let observed_at = existing.observed_at.max(incoming.observed_at);
+                        if existing
+                            .compare_metadata(Freshness {
+                                fetched_at: incoming.fetched_at,
+                                source: Source {
+                                    cached: true,
+                                    ..incoming.source
+                                },
+                            })
+                            .is_gt()
+                        {
+                            incoming.observed_at = observed_at;
+                            *existing = incoming;
+                        } else {
+                            existing.observed_at = observed_at;
+                        }
+                    }
+                    None => {
+                        mine.posts.insert(id, incoming);
+                    }
+                }
+            }
         }
         for (id, t) in disk.removed {
             self.removed
@@ -404,59 +483,212 @@ impl State {
 
     fn prune(&mut self, now: i64) {
         let cutoff = now - RETENTION_SECS;
-        for ids in self.seen.values_mut() {
-            ids.retain(|_, t| *t >= cutoff);
+        self.unread_counts.get_mut().take();
+        for community in self.observed.values_mut() {
+            community
+                .posts
+                .retain(|id, post| post.observed_at >= cutoff && !self.read.contains_key(id));
         }
-        self.seen.retain(|_, ids| !ids.is_empty());
+        self.observed
+            .retain(|_, community| community.observed_at >= cutoff);
+        let read_before = self.read.len();
         self.read.retain(|_, t| *t >= cutoff);
+        if self.read.len() != read_before {
+            self.read_revision = self.read_revision.wrapping_add(1);
+        }
         self.removed.retain(|_, t| *t >= cutoff);
     }
 
-    /// A subreddit's first load sets the baseline; only later posts count as new.
-    pub fn baseline(&mut self, subreddit: &str, posts: &[Post], now: i64) {
-        let key = subreddit.to_lowercase();
-        if !self.seen.contains_key(&key) {
-            self.mark_seen(subreddit, posts.iter().map(|p| p.id.as_str()), now);
-        }
-    }
-
-    /// Refreshing the time keeps long-pinned posts from expiring and reappearing as new.
-    pub fn mark_seen<'a>(
+    /// Remember fetched identities independently of the listing currently displayed.
+    /// An empty successful listing establishes known zero; failures never call this.
+    pub fn observe(
         &mut self,
-        subreddit: &str,
-        ids: impl IntoIterator<Item = &'a str>,
+        subreddit: Option<&str>,
+        posts: &[Post],
+        freshness: Freshness,
         now: i64,
     ) {
-        let entry = self.seen.entry(subreddit.to_lowercase()).or_default();
-        for id in ids {
-            entry.insert(id.to_string(), now);
+        let cache = self.unread_counts.get_mut();
+        if let Some(sub) = subreddit {
+            let key = sub.to_lowercase();
+            let community = self.observed.entry(key.clone()).or_default();
+            community.observed_at = community.observed_at.max(now);
+            if let Some(cache) = cache {
+                cache.counts.entry(key).or_default();
+            }
+        }
+        for post in posts {
+            if post.community().is_none() {
+                if let Some(read) = self.read.get_mut(&post.id) {
+                    *read = (*read).max(now);
+                }
+                continue;
+            }
+            let key = post.subreddit.to_lowercase();
+            let community = self.observed.entry(key.clone()).or_default();
+            community.observed_at = community.observed_at.max(now);
+            if let Some(cache) = cache {
+                cache.counts.entry(key.clone()).or_default();
+            }
+            if let Some(read) = self.read.get_mut(&post.id) {
+                *read = (*read).max(now);
+                community.posts.remove(&post.id);
+                continue;
+            }
+            let old = community.posts.get_mut(&post.id);
+            let old = if let Some(old) = old {
+                old.observed_at = old.observed_at.max(now);
+                if old.compare_metadata(freshness).is_lt() {
+                    continue;
+                }
+                Some(old)
+            } else {
+                None
+            };
+            if let Some(cache) = cache {
+                let before = old.as_ref().is_some_and(|old| {
+                    !cache.config.hides_metadata(
+                        &old.title,
+                        &old.author,
+                        old.flair.as_deref(),
+                        old.nsfw,
+                    )
+                });
+                let after = !cache.config.hides(post);
+                let count = cache.counts.entry(key).or_default();
+                match (before, after) {
+                    (false, true) => *count += 1,
+                    (true, false) => *count -= 1,
+                    _ => {}
+                }
+            }
+            if let Some(old) = old {
+                old.title.clone_from(&post.title);
+                old.author.clone_from(&post.author);
+                old.flair.clone_from(&post.flair);
+                old.nsfw = post.nsfw;
+                old.fetched_at = freshness.fetched_at;
+                old.source = freshness.source;
+            } else {
+                community.posts.insert(
+                    post.id.clone(),
+                    ObservedPost {
+                        title: post.title.clone(),
+                        author: post.author.clone(),
+                        flair: post.flair.clone(),
+                        nsfw: post.nsfw,
+                        fetched_at: freshness.fetched_at,
+                        observed_at: now,
+                        source: freshness.source,
+                    },
+                );
+            }
         }
     }
 
-    /// Listed in a load of its subreddit, or opened: a post you read is never new.
-    pub fn is_seen(&self, subreddit: &str, id: &str) -> bool {
-        self.read.contains_key(id)
-            || self
-                .seen
-                .get(&subreddit.to_lowercase())
-                .is_some_and(|ids| ids.contains_key(id))
-    }
-
-    pub fn unseen<'a>(&self, subreddit: &str, posts: impl IntoIterator<Item = &'a Post>) -> usize {
-        let seen = self.seen.get(&subreddit.to_lowercase());
-        posts
-            .into_iter()
-            .filter(|p| !self.is_read(&p.id) && seen.is_none_or(|ids| !ids.contains_key(&p.id)))
-            .count()
+    /// Count unread fetched posts using the current filters. None means no retained observation.
+    pub fn unread(&self, subreddit: &str, config: &Config) -> Option<usize> {
+        let mut cache = self.unread_counts.borrow_mut();
+        if cache.as_ref().is_none_or(|cache| {
+            cache.config.filters != config.filters || cache.config.show_nsfw != config.show_nsfw
+        }) {
+            let counts = self
+                .observed
+                .iter()
+                .map(|(sub, community)| {
+                    let count = community
+                        .posts
+                        .iter()
+                        .filter(|(id, post)| {
+                            !self.read.contains_key(*id)
+                                && !config.hides_metadata(
+                                    &post.title,
+                                    &post.author,
+                                    post.flair.as_deref(),
+                                    post.nsfw,
+                                )
+                        })
+                        .count();
+                    (sub.clone(), count)
+                })
+                .collect();
+            *cache = Some(UnreadCounts {
+                config: config.clone(),
+                counts,
+            });
+        }
+        cache
+            .as_ref()
+            .unwrap()
+            .counts
+            .get(&subreddit.to_lowercase())
+            .copied()
     }
 
     pub fn mark_read(&mut self, post: &Post, now: i64) {
-        self.read.insert(post.id.clone(), now);
-        // Only where a baseline exists: creating the list here would skip the first
-        // load's baseline.
-        if let Some(ids) = self.seen.get_mut(&post.subreddit.to_lowercase()) {
-            ids.insert(post.id.clone(), now);
+        let was_read = self.read.contains_key(&post.id);
+        if !was_read {
+            self.read_revision = self.read_revision.wrapping_add(1);
         }
+        self.read
+            .entry(post.id.clone())
+            .and_modify(|time| *time = (*time).max(now))
+            .or_insert(now);
+        if let Some(key) = post.community().map(str::to_lowercase) {
+            let community = self.observed.entry(key.clone()).or_default();
+            community.observed_at = community.observed_at.max(now);
+            if let Some(cache) = self.unread_counts.get_mut() {
+                cache.counts.entry(key).or_default();
+            }
+        }
+        if was_read {
+            return;
+        }
+        for (subreddit, community) in &mut self.observed {
+            let Some(old) = community.posts.remove(&post.id) else {
+                continue;
+            };
+            if let Some(cache) = self.unread_counts.get_mut()
+                && !cache.config.hides_metadata(
+                    &old.title,
+                    &old.author,
+                    old.flair.as_deref(),
+                    old.nsfw,
+                )
+            {
+                *cache.counts.get_mut(subreddit).unwrap() -= 1;
+            }
+        }
+    }
+
+    pub fn read_revision(&self) -> u64 {
+        self.read_revision
+    }
+
+    /// Clear known fetched IDs, without a cutoff that would hide future arrivals.
+    pub fn mark_community_read(&mut self, subreddit: &str, now: i64) -> usize {
+        let Some(community) = self.observed.get_mut(&subreddit.to_lowercase()) else {
+            return 0;
+        };
+        community.observed_at = community.observed_at.max(now);
+        let mut count = 0;
+        for (id, _) in std::mem::take(&mut community.posts) {
+            self.read
+                .entry(id)
+                .and_modify(|time| *time = (*time).max(now))
+                .or_insert_with(|| {
+                    count += 1;
+                    now
+                });
+        }
+        if count > 0 {
+            self.read_revision = self.read_revision.wrapping_add(1);
+            self.unread_counts.get_mut().take();
+            for community in self.observed.values_mut() {
+                community.posts.retain(|id, _| !self.read.contains_key(id));
+            }
+        }
+        count
     }
 
     pub fn is_read(&self, id: &str) -> bool {
@@ -507,6 +739,16 @@ impl State {
 mod tests {
     use super::*;
     use crate::model::Media;
+
+    fn cached(fetched_at: i64) -> Freshness {
+        Freshness {
+            fetched_at,
+            source: Source {
+                cached: true,
+                ..Source::default()
+            },
+        }
+    }
 
     fn post(id: &str, sub: &str) -> Post {
         Post {
@@ -609,28 +851,43 @@ mod tests {
     }
 
     #[test]
-    fn first_load_is_a_baseline_and_later_posts_count_as_new() {
+    fn fetched_posts_remain_unread_when_later_listings_omit_them() {
         let mut state = State::default();
-        let first = [post("a", "Neovim"), post("b", "Neovim")];
-        state.baseline("Neovim", &first, 100);
-        assert_eq!(state.unseen("neovim", &first), 0);
+        let config = Config::default();
+        state.observe(
+            Some("Neovim"),
+            &[post("a", "Neovim"), post("b", "Neovim")],
+            cached(100),
+            100,
+        );
+        assert_eq!(state.unread("neovim", &config), Some(2));
 
-        let later = [post("c", "neovim"), post("a", "neovim")];
-        state.baseline("neovim", &later, 200);
+        state.observe(
+            Some("neovim"),
+            &[post("c", "neovim"), post("a", "neovim")],
+            cached(200),
+            200,
+        );
 
-        assert_eq!(state.unseen("NEOVIM", &later), 1);
+        assert_eq!(state.unread("NEOVIM", &config), Some(3));
     }
 
     #[test]
-    fn reading_a_post_marks_it_seen_and_read() {
+    fn reading_a_post_clears_only_that_post() {
         let mut state = State::default();
-        state.baseline("vim", &[], 1);
-        let p = post("x", "vim");
+        state.observe(
+            Some("vim"),
+            &[post("x", "vim"), post("y", "vim")],
+            cached(1),
+            1,
+        );
+        assert_eq!(state.unread("vim", &Config::default()), Some(2));
 
-        state.mark_read(&p, 5);
+        state.mark_read(&post("x", "vim"), 5);
 
         assert!(state.is_read("x"));
-        assert!(state.is_seen("vim", "x"));
+        assert!(!state.is_read("y"));
+        assert_eq!(state.unread("vim", &Config::default()), Some(1));
     }
 
     #[test]
@@ -667,14 +924,20 @@ mod tests {
     }
 
     #[test]
-    fn seeing_a_post_again_keeps_it_from_expiring() {
+    fn observing_a_read_pinned_post_keeps_its_read_mark_from_expiring() {
         let mut state = State::default();
-        state.mark_seen("s", ["pinned"], 0);
-        state.mark_seen("s", ["pinned"], RETENTION_SECS);
+        state.mark_read(&post("pinned", "s"), 0);
+        state.observe(
+            Some("s"),
+            &[post("pinned", "s")],
+            cached(RETENTION_SECS),
+            RETENTION_SECS,
+        );
 
         state.prune(RETENTION_SECS + 10);
 
-        assert!(state.is_seen("s", "pinned"));
+        assert!(state.is_read("pinned"));
+        assert_eq!(state.unread("s", &Config::default()), Some(0));
     }
 
     #[test]
@@ -898,28 +1161,22 @@ mod tests {
     }
 
     #[test]
-    fn opening_a_post_before_its_subreddit_loads_keeps_the_first_load_baseline() {
+    fn reading_before_observation_never_resurrects_an_unread_post() {
         let mut state = State::default();
-        let listing = [post("a", "pics"), post("b", "pics"), post("x", "pics")];
-        let later = post("y", "pics");
+        state.mark_read(&post("x", "pics"), 1);
+        state.mark_read(&post("y", "pics"), 1);
 
-        // Opened from r/popular before r/pics ever loaded; `y` is not on its
-        // first page and shows up later.
-        state.mark_read(&listing[2], 1);
-        state.mark_read(&later, 1);
-        state.baseline("pics", &listing, 2);
+        state.observe(
+            Some("pics"),
+            &[post("a", "pics"), post("b", "pics"), post("x", "pics")],
+            cached(2),
+            2,
+        );
+        state.observe(Some("pics"), &[post("y", "pics")], cached(3), 3);
 
+        assert_eq!(state.unread("pics", &Config::default()), Some(2));
         assert!(state.is_read("x"));
-        assert_eq!(
-            state.unseen("pics", &listing),
-            0,
-            "the first load is the baseline"
-        );
-        assert_eq!(
-            state.unseen("pics", [&later]),
-            0,
-            "a read post is never new"
-        );
+        assert!(state.is_read("y"));
     }
 
     #[test]
@@ -1117,5 +1374,360 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert!(lost.is_empty(), "lost {} bookmarks: {lost:?}", lost.len());
+    }
+    #[test]
+    fn unread_distinguishes_unknown_from_a_successful_empty_listing() {
+        let mut state = State::default();
+        let config = Config::default();
+        assert_eq!(state.unread("s", &config), None);
+        state.observe(Some("s"), &[], cached(1), 1);
+        assert_eq!(state.unread("S", &config), Some(0));
+        state.mark_read(&post("read", "other"), 2);
+        assert_eq!(state.unread("other", &config), Some(0));
+    }
+
+    #[test]
+    fn legacy_visit_marks_do_not_hide_unopened_posts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"seen":{"s":{"opened":100,"unopened":100}},"read":{"opened":100}}"#,
+        )
+        .unwrap();
+        let (mut state, warning) = State::load(&path);
+        assert!(warning.is_none());
+
+        state.observe(
+            Some("s"),
+            &[post("opened", "s"), post("unopened", "s")],
+            cached(101),
+            101,
+        );
+        state.save(&path, 101).unwrap();
+
+        assert_eq!(state.unread("s", &Config::default()), Some(1));
+        assert!(state.is_read("opened"));
+        assert!(!state.is_read("unopened"));
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(saved.get("seen").is_none());
+        assert!(saved.get("unread_counts").is_none());
+        assert!(saved.get("read_revision").is_none());
+    }
+
+    #[test]
+    fn unread_filter_cache_tracks_both_directions_of_every_filter() {
+        let mut state = State::default();
+        let mut title = post("title", "s");
+        title.title = "Blocked title".into();
+        let mut author = post("author", "s");
+        author.author = "FilteredAuthor".into();
+        let mut flair = post("flair", "s");
+        flair.flair = Some("FilteredFlair".into());
+        let mut adult = post("adult", "s");
+        adult.nsfw = true;
+        state.observe(Some("s"), &[title, author, flair, adult], cached(1), 1);
+        let mut config = Config::default();
+        assert_eq!(state.unread("s", &config), Some(3));
+        config.show_nsfw = true;
+        assert_eq!(state.unread("s", &config), Some(4));
+        config.filters.keywords = vec!["BLOCKED".into()];
+        assert_eq!(state.unread("s", &config), Some(3));
+        config.filters.keywords.clear();
+        config.filters.authors = vec!["filteredauthor".into()];
+        assert_eq!(state.unread("s", &config), Some(3));
+        config.filters.authors.clear();
+        config.filters.flairs = vec!["filteredflair".into()];
+        assert_eq!(state.unread("s", &config), Some(3));
+        config.filters.flairs.clear();
+        config.show_nsfw = false;
+        assert_eq!(state.unread("s", &config), Some(3));
+    }
+
+    #[test]
+    fn merging_an_older_instance_preserves_reads_and_new_observations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut first = State::default();
+        first.observe(
+            Some("s"),
+            &[post("a", "s"), post("b", "s")],
+            cached(100),
+            100,
+        );
+        first.save(&path, 100).unwrap();
+        let (mut second, _) = State::load(&path);
+        assert_eq!(second.unread("s", &Config::default()), Some(2));
+        first.mark_read(&post("a", "s"), 101);
+        first.save(&path, 101).unwrap();
+        second.observe(
+            Some("s"),
+            &[post("a", "s"), post("c", "s")],
+            cached(100),
+            102,
+        );
+
+        second.save(&path, 103).unwrap();
+        first.save(&path, 104).unwrap();
+
+        assert!(second.is_read("a"));
+        assert_eq!(second.unread("s", &Config::default()), Some(2));
+        assert_eq!(first.unread("s", &Config::default()), Some(2));
+        assert_eq!(
+            State::load(&path).0.unread("s", &Config::default()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn older_cached_metadata_cannot_replace_a_newer_filter_observation() {
+        let mut state = State::default();
+        let safe = post("a", "s");
+        let mut adult = safe.clone();
+        adult.nsfw = true;
+        let config = Config::default();
+        state.observe(Some("s"), &[safe], cached(200), 200);
+        assert_eq!(state.unread("s", &config), Some(1));
+
+        state.observe(Some("s"), std::slice::from_ref(&adult), cached(100), 300);
+        assert_eq!(state.unread("s", &config), Some(1));
+        state.observe(Some("s"), &[adult], cached(400), 400);
+        assert_eq!(state.unread("s", &config), Some(0));
+    }
+
+    #[test]
+    fn unread_history_prunes_only_expired_observations() {
+        let mut state = State::default();
+        state.observe(Some("expired"), &[post("old", "expired")], cached(0), 0);
+        state.observe(
+            Some("recent"),
+            &[post("new", "recent")],
+            cached(RETENTION_SECS),
+            RETENTION_SECS,
+        );
+
+        state.prune(RETENTION_SECS + 1);
+
+        assert_eq!(state.unread("expired", &Config::default()), None);
+        assert_eq!(state.unread("recent", &Config::default()), Some(1));
+        assert!(!state.is_read("new"));
+    }
+    #[test]
+    fn duplicate_observations_and_global_read_ids_keep_cached_counts_consistent() {
+        let mut state = State::default();
+        let config = Config::default();
+        state.observe(
+            None,
+            &[post("a", "s"), post("a", "s"), post("a", "other")],
+            cached(1),
+            1,
+        );
+        assert_eq!(state.unread("s", &config), Some(1));
+        assert_eq!(state.unread("other", &config), Some(1));
+
+        state.mark_read(&post("a", "s"), 2);
+        state.observe(None, &[post("a", "s"), post("a", "other")], cached(3), 3);
+
+        assert_eq!(state.unread("s", &config), Some(0));
+        assert_eq!(state.unread("other", &config), Some(0));
+    }
+    fn ordered_freshness(sequence: u64, fetched_at: i64, cached: bool) -> Freshness {
+        Freshness {
+            fetched_at,
+            source: Source {
+                order: Some(crate::cache::RequestOrder {
+                    generation: [1; 16],
+                    sequence,
+                }),
+                observed: Some((sequence, sequence)),
+                cached,
+            },
+        }
+    }
+
+    #[test]
+    fn observation_metadata_keeps_request_order_across_save_merge_and_clock_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut newest = State::default();
+        newest.observe(
+            Some("s"),
+            &[post("a", "s")],
+            ordered_freshness(2, 1000, false),
+            1000,
+        );
+        newest.save(&path, 1000).unwrap();
+        let mut old = State::default();
+        let mut adult = post("a", "s");
+        adult.nsfw = true;
+        old.observe(
+            Some("s"),
+            std::slice::from_ref(&adult),
+            ordered_freshness(1, 2000, false),
+            2000,
+        );
+        old.save(&path, 2000).unwrap();
+        assert_eq!(old.unread("s", &Config::default()), Some(1));
+        newest.observe(Some("s"), &[adult], ordered_freshness(3, 900, false), 2001);
+        newest.save(&path, 2001).unwrap();
+        old.save(&path, 2002).unwrap();
+        assert_eq!(old.unread("s", &Config::default()), Some(0));
+        let (loaded, warning) = State::load(&path);
+        assert!(warning.is_none());
+        assert_eq!(loaded.unread("s", &Config::default()), Some(0));
+        let record = &loaded.observed["s"].posts["a"];
+        assert_eq!(record.source.order.unwrap().sequence, 3);
+        assert!(
+            record.source.observed.is_none(),
+            "process-local events never persist"
+        );
+    }
+
+    #[test]
+    fn unordered_cached_metadata_cannot_replace_a_current_live_observation() {
+        let mut state = State::default();
+        let mut adult = post("a", "s");
+        adult.nsfw = true;
+        state.observe(Some("s"), &[adult], ordered_freshness(3, 900, false), 1000);
+        let disk = Freshness {
+            fetched_at: 2000,
+            source: Source {
+                cached: true,
+                observed: Some((10, 11)),
+                ..Source::default()
+            },
+        };
+        state.observe(Some("s"), &[post("a", "s")], disk, 1001);
+        assert_eq!(state.unread("s", &Config::default()), Some(0));
+    }
+    #[test]
+    fn merging_an_incomparable_disk_source_cannot_roll_back_a_current_live_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut state = State::default();
+        let mut old = post("a", "s");
+        old.nsfw = true;
+        state.observe(Some("s"), &[old], ordered_freshness(1, 1000, false), 1000);
+        state.save(&path, 1000).unwrap();
+        let mut new_source = ordered_freshness(2, 900, false);
+        new_source.source.order.as_mut().unwrap().generation = [2; 16];
+        state.observe(Some("s"), &[post("a", "s")], new_source, 1001);
+        assert_eq!(state.unread("s", &Config::default()), Some(1));
+        state.save(&path, 1001).unwrap();
+        assert_eq!(state.unread("s", &Config::default()), Some(1));
+    }
+    #[test]
+    fn equivalent_disk_snapshots_cannot_discard_live_metadata_ordering() {
+        for save in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("state.json");
+            let mut state = State::default();
+            let mut adult = post("a", "s");
+            adult.nsfw = true;
+            state.observe(
+                Some("s"),
+                std::slice::from_ref(&adult),
+                ordered_freshness(3, 900, false),
+                1000,
+            );
+            if save {
+                state.save(&path, 1000).unwrap();
+                state.save(&path, 1001).unwrap();
+            } else {
+                state.observe(Some("s"), &[adult], ordered_freshness(3, 900, true), 1001);
+            }
+            let old_disk = Freshness {
+                fetched_at: 2000,
+                source: Source {
+                    cached: true,
+                    observed: Some((10, 11)),
+                    ..Source::default()
+                },
+            };
+            state.observe(Some("s"), &[post("a", "s")], old_disk, 1002);
+            assert_eq!(
+                state.unread("s", &Config::default()),
+                Some(0),
+                "save={save}"
+            );
+        }
+    }
+    #[test]
+    fn marking_a_community_read_should_clear_filtered_ids_and_keep_later_arrivals_unread() {
+        let mut state = State::default();
+        let mut adult = post("adult", "s");
+        adult.nsfw = true;
+        state.observe(Some("s"), &[post("a", "s"), adult], cached(100), 100);
+        state.observe(Some("other"), &[post("other", "other")], cached(100), 100);
+        assert_eq!(state.unread("s", &Config::default()), Some(1));
+
+        let actual = state.mark_community_read("S", 101);
+
+        assert_eq!(actual, 2);
+        assert!(state.is_read("a") && state.is_read("adult"));
+        assert_eq!(state.unread("s", &Config::default()), Some(0));
+        assert_eq!(state.unread("other", &Config::default()), Some(1));
+        state.observe(
+            Some("s"),
+            &[post("a", "s"), post("new", "s")],
+            cached(102),
+            102,
+        );
+        assert_eq!(state.unread("s", &Config::default()), Some(1));
+        assert_eq!(state.mark_community_read("s", 103), 1);
+        assert_eq!(state.mark_community_read("s", 104), 0);
+    }
+
+    #[test]
+    fn community_read_marks_should_survive_an_older_instances_save_with_new_arrivals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut first = State::default();
+        first.observe(
+            Some("s"),
+            &[post("a", "s"), post("b", "s")],
+            cached(100),
+            100,
+        );
+        first.save(&path, 100).unwrap();
+        let (mut second, _) = State::load(&path);
+        first.mark_community_read("s", 101);
+        first.save(&path, 101).unwrap();
+        second.observe(
+            Some("s"),
+            &[post("a", "s"), post("c", "s")],
+            cached(102),
+            102,
+        );
+
+        second.save(&path, 102).unwrap();
+
+        let (actual, warning) = State::load(&path);
+        assert!(warning.is_none());
+        assert!(actual.is_read("a") && actual.is_read("b"));
+        assert!(!actual.is_read("c"));
+        assert_eq!(actual.unread("s", &Config::default()), Some(1));
+    }
+
+    #[test]
+    fn marking_an_unfetched_community_read_should_preserve_unknown() {
+        let mut state = State::default();
+
+        let actual = state.mark_community_read("unknown", 100);
+
+        assert_eq!(actual, 0);
+        assert_eq!(state.unread("unknown", &Config::default()), None);
+    }
+    #[test]
+    fn profile_owned_posts_should_record_reads_without_creating_a_fake_community_badge() {
+        let mut state = State::default();
+        let mut profile = post("p", "u_blackvault");
+        profile.permalink = "/user/blackvault/comments/p/title/".into();
+        state.observe(None, std::slice::from_ref(&profile), cached(100), 100);
+        assert_eq!(state.unread("u_blackvault", &Config::default()), None);
+        state.mark_read(&profile, 101);
+        assert!(state.is_read("p"));
+        assert_eq!(state.unread("u_blackvault", &Config::default()), None);
     }
 }

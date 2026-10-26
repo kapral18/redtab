@@ -15,7 +15,9 @@ pub(crate) enum Priority {
 }
 
 const CLASSES: usize = Priority::Selected as usize + 1;
-const INTERACTIVE_CAPACITY: f64 = 3.0;
+const INTERACTIVE_RESERVE: f64 = 3.0;
+const BURST_CAPACITY: f64 = 32.0;
+const MAX_START_SPACING: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pause {
@@ -49,16 +51,16 @@ struct Budget {
 impl Budget {
     fn tokens(&self, now: Instant) -> f64 {
         let accrued = if self.interval.is_zero() {
-            INTERACTIVE_CAPACITY
+            BURST_CAPACITY
         } else {
             now.saturating_duration_since(self.credited).as_secs_f64() / self.interval.as_secs_f64()
         };
         (self.tokens + accrued)
-            .min(INTERACTIVE_CAPACITY)
+            .min(BURST_CAPACITY)
             .min(self.remaining)
     }
 
-    fn ready(&self, now: Instant, base: Duration, rank: usize) -> Instant {
+    fn ready(&self, now: Instant, base: Duration, rank: usize, background_due: bool) -> Instant {
         let Some(until) = self.until else {
             return self.next;
         };
@@ -68,8 +70,13 @@ impl Budget {
         if self.remaining < 1.0 {
             return until;
         }
-        let ready = now + self.interval.mul_f64((1.0 - self.tokens(now)).max(0.0));
-        if rank == Priority::Background as usize {
+        let needed = if rank == Priority::Background as usize && !background_due {
+            (INTERACTIVE_RESERVE + 1.0).min(self.remaining)
+        } else {
+            1.0
+        };
+        let ready = now + self.interval.mul_f64((needed - self.tokens(now)).max(0.0));
+        if rank == Priority::Background as usize && !background_due {
             ready.max(self.next).min(until)
         } else {
             ready.min(until)
@@ -77,9 +84,14 @@ impl Budget {
     }
 }
 
-// Home partials and JSON report independent budgets on the same origin.
+// Native HTML/GraphQL and classic JSON report independent quotas on the same origin.
 fn budget_index(url: &Url) -> usize {
-    usize::from(url.path() == super::home::PATH)
+    usize::from(
+        matches!(
+            url.path(),
+            "/settings/preferences" | "/svc/shreddit/graphql"
+        ) || url.path() == super::home::PATH,
+    )
 }
 
 pub(super) struct Rate {
@@ -122,8 +134,8 @@ impl Rate {
                     cause: String::new(),
                     sequence: 0,
                     outstanding: HashSet::new(),
-                    remaining: INTERACTIVE_CAPACITY,
-                    tokens: INTERACTIVE_CAPACITY,
+                    remaining: BURST_CAPACITY,
+                    tokens: BURST_CAPACITY,
                     credited: now,
                 }),
             }),
@@ -149,7 +161,7 @@ impl Rate {
                         .filter(|(rank, count)| {
                             *rank > Priority::Background as usize && **count > 0
                         })
-                        .map(move |(rank, _)| (budget, budget.ready(now, self.base, rank)))
+                        .map(move |(rank, _)| (budget, budget.ready(now, self.base, rank, false)))
                 })
                 .min_by_key(|(_, ready)| *ready)?;
             let (budget, ready) = budget;
@@ -194,8 +206,8 @@ impl Rate {
                     budget.interval = self.base;
                     budget.until = None;
                     budget.next = budget.started + self.base;
-                    budget.remaining = INTERACTIVE_CAPACITY;
-                    budget.tokens = INTERACTIVE_CAPACITY;
+                    budget.remaining = BURST_CAPACITY;
+                    budget.tokens = BURST_CAPACITY;
                     budget.credited = now;
                 }
             }
@@ -205,20 +217,34 @@ impl Rate {
                     "Reddit requests paused; wait before retrying"
                 ));
             }
-            let ready = state
-                .next
-                .max(state.budgets[index].ready(now, self.base, rank))
-                .max(cooldown.unwrap_or(now));
-            let eligible: [bool; CLASSES] = std::array::from_fn(|class| {
+            let mut eligible: [bool; CLASSES] = std::array::from_fn(|class| {
                 state.budgets.iter().enumerate().any(|(index, budget)| {
-                    budget.ready(now, self.base, class) <= now && state.waiting[index][class] > 0
+                    budget.ready(now, self.base, class, false) <= now
+                        && state.waiting[index][class] > 0
                 })
             });
+            // A continuously ready higher class yields one reserved credit after two starts.
+            let background_due = eligible
+                .iter()
+                .enumerate()
+                .skip(1)
+                .any(|(class, ready)| *ready && state.bursts[class] >= 2);
+            if background_due {
+                eligible[Priority::Background as usize] =
+                    state.budgets.iter().enumerate().any(|(index, budget)| {
+                        budget.ready(now, self.base, Priority::Background as usize, true) <= now
+                            && state.waiting[index][Priority::Background as usize] > 0
+                    });
+            }
+            let ready = state
+                .next
+                .max(state.budgets[index].ready(now, self.base, rank, background_due))
+                .max(cooldown.unwrap_or(now));
             let next = (0..CLASSES).rev().find(|&class| {
                 eligible[class] && (state.bursts[class] < 2 || !eligible[..class].contains(&true))
             });
             if now >= ready && next == Some(rank) {
-                state.next = now + self.base;
+                state.next = now + self.base.min(MAX_START_SPACING);
                 let budget = &mut state.budgets[index];
                 if budget.until.is_some() {
                     budget.tokens = (budget.tokens(now) - 1.0).max(0.0);
@@ -306,7 +332,7 @@ impl Rate {
         {
             let budget = &mut state.budgets[budget_index(url)];
             let tokens = if budget.until.is_none_or(|until| until <= now) {
-                INTERACTIVE_CAPACITY
+                BURST_CAPACITY
             } else {
                 budget.tokens(now)
             };
@@ -343,6 +369,7 @@ fn operation(url: &Url) -> String {
         ["subreddits", "mine", ..] => "subscriptions".into(),
         ["comments", ..] => "post/comments".into(),
         ["by_id", ..] => "post details".into(),
+        ["settings", "preferences"] | ["svc", "shreddit", "graphql"] => "account settings".into(),
         ["svc", "shreddit", ..] => "Home".into(),
         ["api", ..] => "account/action".into(),
         _ => "Reddit content".into(),
@@ -377,14 +404,175 @@ mod tests {
         (rate, url)
     }
 
+    fn rapid_listings(rate: &Rate, url: &Url, count: usize) -> usize {
+        for started in 0..count {
+            let deadline = Instant::now() + Duration::from_millis(50);
+            if rate
+                .admit(url, Priority::Listing, true, || Instant::now() >= deadline)
+                .is_err()
+            {
+                return started;
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn when_reddit_has_quota_headroom_rapid_community_navigation_should_not_pause_early() {
+        let (rate, url) = quota("56", "300");
+
+        let actual = rapid_listings(&rate, &url, 18);
+
+        assert_eq!(actual, 18, "visible navigation paused with quota remaining");
+    }
+
+    #[test]
+    fn when_congestion_native_settings_reply_arrives_json_quota_should_remain_independent() {
+        use crate::reddit::{
+            tests::{Fixture, Reply},
+            transport::{self, Transport},
+        };
+        let fixture = Fixture::new(|_| Reply {
+            status: 200,
+            body: String::new(),
+            headers: vec![
+                ("X-Ratelimit-Remaining".into(), "600".into()),
+                ("X-Ratelimit-Reset".into(), "600".into()),
+            ],
+        });
+        let (rate, json) = quota("10", "30");
+        let native = Url::parse(&fixture.base)
+            .unwrap()
+            .join("settings/preferences")
+            .unwrap();
+        let response = transport::wait(
+            Transport::new().unwrap().client.get(native.as_str()).send(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        rate.observe(&response, &native, Instant::now(), 0, 0);
+
+        assert_eq!(
+            rate.state.lock().budgets[budget_index(&json)].interval,
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            budget_index(&native),
+            budget_index(&Url::parse("https://www.reddit.com/svc/shreddit/graphql").unwrap())
+        );
+    }
+
+    #[test]
+    fn when_congestion_background_uses_idle_capacity_three_navigation_starts_should_remain() {
+        let (rate, url) = quota("100", "30");
+        {
+            let mut state = rate.state.lock();
+            state.budgets[0].next = Instant::now();
+            state.budgets[0].credited = Instant::now() - Duration::from_secs(2);
+        }
+        let deadline = Instant::now() + Duration::from_millis(50);
+        rate.admit(&url, Priority::Background, true, || {
+            Instant::now() >= deadline
+        })
+        .unwrap();
+
+        let actual: Vec<_> = [Priority::Listing, Priority::Selected, Priority::Foreground]
+            .into_iter()
+            .map(|rank| {
+                let deadline = Instant::now() + Duration::from_millis(50);
+                rate.admit(&url, rank, true, || Instant::now() >= deadline)
+                    .is_ok()
+            })
+            .collect();
+
+        assert_eq!(actual, [true, true, true]);
+    }
+
+    #[test]
+    fn when_background_uses_one_credit_eighteen_navigation_starts_should_remain() {
+        let (rate, url) = quota("100", "600");
+        rate.state.lock().budgets[0].next = Instant::now();
+        rate.admit(&url, Priority::Background, true, || false)
+            .unwrap();
+
+        let actual = rapid_listings(&rate, &url, 18);
+
+        assert_eq!(actual, 18);
+    }
+
+    #[test]
+    fn when_background_arrives_after_a_burst_it_should_not_wait_for_all_credits() {
+        let (rate, url) = quota("100", "10");
+        for _ in 0..6 {
+            rate.admit(&url, Priority::Listing, true, || false).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_millis(450);
+
+        let actual = rate.admit(&url, Priority::Background, true, || {
+            Instant::now() >= deadline
+        });
+
+        assert!(actual.is_ok(), "background waited for a full burst refill");
+    }
+
+    #[test]
+    fn when_navigation_drains_the_burst_background_should_resume_after_four_refills() {
+        let (rate, url) = quota("100", "600");
+        assert_eq!(rapid_listings(&rate, &url, 32), 32);
+        {
+            let mut state = rate.state.lock();
+            let budget = &mut state.budgets[0];
+            budget.credited = Instant::now() - budget.interval.mul_f64(4.0);
+            budget.next = Instant::now();
+        }
+        let deadline = Instant::now() + Duration::from_millis(50);
+
+        let actual = rate.admit(&url, Priority::Background, true, || {
+            Instant::now() >= deadline
+        });
+
+        assert!(actual.is_ok(), "background waited for the enlarged reserve");
+    }
+
+    #[test]
+    fn when_congestion_quota_cannot_hold_the_full_reserve_background_should_still_progress() {
+        let (rate, url) = quota("2", "30");
+        rate.state.lock().budgets[0].next = Instant::now();
+        let deadline = Instant::now() + Duration::from_millis(50);
+
+        let actual = rate.admit(&url, Priority::Background, true, || {
+            Instant::now() >= deadline
+        });
+
+        assert!(
+            actual.is_ok(),
+            "the reserve must shrink with remaining quota"
+        );
+        let deadline = Instant::now() + Duration::from_millis(50);
+        assert!(
+            rate.admit(&url, Priority::Listing, true, || Instant::now() >= deadline)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn when_congestion_native_preferences_are_paced_labels_should_identify_account_settings() {
+        assert_eq!(
+            operation(&Url::parse("https://www.reddit.com/settings/preferences").unwrap()),
+            "account settings"
+        );
+        assert_eq!(
+            operation(&Url::parse("https://www.reddit.com/svc/shreddit/graphql").unwrap()),
+            "account settings"
+        );
+    }
+
     #[test]
     fn when_interactive_capacity_is_spent_further_navigation_should_wait() {
-        let (rate, url) = quota("10", "30");
-        rate.admit(&url, Priority::Listing, true, || false).unwrap();
-        rate.admit(&url, Priority::Selected, true, || false)
-            .unwrap();
-        rate.admit(&url, Priority::Foreground, true, || false)
-            .unwrap();
+        let (rate, url) = quota("100", "600");
+        assert_eq!(rapid_listings(&rate, &url, 32), 32);
         let deadline = Instant::now() + Duration::from_millis(50);
 
         let actual = rate.admit(&url, Priority::Listing, true, || Instant::now() >= deadline);
@@ -455,6 +643,34 @@ mod tests {
             .unwrap();
 
         assert!(started.elapsed() >= Duration::from_millis(65));
+    }
+
+    #[test]
+    fn when_navigation_has_quota_credit_the_next_listing_should_not_wait_a_full_second() {
+        let (mut rate, url) = quota("100", "300");
+        rate.base = Duration::from_secs(1);
+        rate.admit(&url, Priority::Listing, true, || false).unwrap();
+        let started = Instant::now();
+
+        rate.admit(&url, Priority::Listing, true, || false).unwrap();
+
+        let elapsed = started.elapsed();
+        assert!(
+            (Duration::from_millis(450)..Duration::from_millis(850)).contains(&elapsed),
+            "available navigation credit waited {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn when_quota_is_unknown_the_same_pool_should_keep_conservative_pacing() {
+        let rate = Rate::new(Duration::from_secs(1));
+        let url = Url::parse("https://www.reddit.com/r/rust/hot.json").unwrap();
+        rate.admit(&url, Priority::Listing, true, || false).unwrap();
+        let started = Instant::now();
+
+        rate.admit(&url, Priority::Listing, true, || false).unwrap();
+
+        assert!(started.elapsed() >= Duration::from_millis(900));
     }
 
     #[test]
@@ -666,6 +882,40 @@ mod tests {
     }
 
     #[test]
+    fn when_background_is_waiting_after_two_selected_starts_it_should_get_its_fair_turn() {
+        use std::sync::{Arc, mpsc::channel};
+
+        let (rate, url) = quota("100", "300");
+        let rate = Arc::new(rate);
+        rate.admit(&url, Priority::Selected, true, || false)
+            .unwrap();
+        rate.admit(&url, Priority::Selected, true, || false)
+            .unwrap();
+        let (entered, waiting) = channel();
+        let background_rate = Arc::clone(&rate);
+        let background_url = url.clone();
+        let background = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(600);
+            background_rate
+                .admit(&background_url, Priority::Background, true, || {
+                    let _ = entered.send(());
+                    Instant::now() >= deadline
+                })
+                .is_ok()
+        });
+        waiting.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        rate.admit(&url, Priority::Selected, true, || false)
+            .unwrap();
+        let actual = background.join().unwrap();
+
+        assert!(
+            actual,
+            "selected starts repeatedly delayed the waiting background"
+        );
+    }
+
+    #[test]
     fn when_quota_is_replenished_continuous_navigation_should_not_postpone_background() {
         use std::sync::{
             Arc,
@@ -697,11 +947,19 @@ mod tests {
         });
         waiting.recv_timeout(Duration::from_secs(1)).unwrap();
         let deadline = Instant::now() + Duration::from_millis(250);
+        let registered_at = AtomicUsize::new(usize::MAX);
 
         let actual = rate.admit(&url, Priority::Background, true, || {
+            let _ = registered_at.compare_exchange(
+                usize::MAX,
+                starts.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
             Instant::now() >= deadline
         });
         let before = starts.load(Ordering::SeqCst);
+        let while_waiting = before.saturating_sub(registered_at.load(Ordering::SeqCst));
         stop.store(true, Ordering::Release);
         rate.wake();
         producer.join().unwrap();
@@ -711,8 +969,8 @@ mod tests {
             "navigation repeatedly postponed the background slot"
         );
         assert!(
-            before <= 5,
-            "background waited for {before} selected starts"
+            while_waiting <= 3,
+            "background waited for {while_waiting} selected starts after registering"
         );
     }
 

@@ -29,10 +29,11 @@ fn valid_header(header: &[u8; HEADER as usize]) -> bool {
 }
 
 /// Where a snapshot came from, for ordering.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Source {
     pub order: Option<RequestOrder>,
     /// Local event window: a disk read interval, or an HTTP start.
+    #[serde(skip)]
     pub observed: Option<(u64, u64)>,
     pub cached: bool,
 }
@@ -127,7 +128,7 @@ pub struct Entry {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RequestOrder {
     pub generation: [u8; 16],
     pub sequence: u64,

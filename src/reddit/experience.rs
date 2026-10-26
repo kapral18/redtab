@@ -280,12 +280,7 @@ pub enum Response {
 }
 
 pub fn name(value: &str) -> Result<&str> {
-    if value.is_empty()
-        || value.len() > 64
-        || !value
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
-    {
+    if !crate::model::is_username(value) {
         bail!("Enter a Reddit name using letters, numbers, underscores or hyphens");
     }
     Ok(value)
@@ -760,6 +755,9 @@ fn inspect(value: Value, fallback: &Target) -> Result<Details> {
         target.subreddit = fallback.subreddit.clone();
     }
     let comment = target.id.starts_with("t1_");
+    if !comment {
+        parse::canonicalize_profile_post(data, &target.subreddit, &mut target.permalink)?;
+    }
     Ok(Details {
         target,
         raw_text: data[if comment { "body" } else { "selftext" }]
@@ -1028,9 +1026,9 @@ fn entry(thing: &Value) -> Result<Option<Entry>> {
         Some("t3") => {
             let (post, _) = parse::post(data.clone())?;
             entry.title = format!(
-                "{} · r/{} · {} points",
+                "{} · {} · {} points",
                 post.title,
-                post.subreddit,
+                post.source_label(),
                 post.score.map_or("?".into(), |n| n.to_string())
             );
             entry.target = Some(Target::from_post(&post));
@@ -1859,6 +1857,34 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn collection_post_titles_should_distinguish_profile_posts_from_communities() {
+        for (subreddit, permalink, label) in [
+            (
+                "u_blackvault",
+                "/user/blackvault/comments/post/title/",
+                "u/blackvault",
+            ),
+            (
+                "u_ordinary",
+                "/r/u_ordinary/comments/post/title/",
+                "r/u_ordinary",
+            ),
+        ] {
+            let actual = entry(&json!({"kind":"t3", "data":{
+                "id":"post", "title":"Submission", "subreddit":subreddit,
+                "author":"reader", "permalink":permalink
+            }}))
+            .unwrap()
+            .unwrap();
+            assert!(
+                actual.title.contains(&format!(" · {label} · ")),
+                "{}",
+                actual.title
+            );
+        }
     }
 
     #[test]

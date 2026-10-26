@@ -212,7 +212,16 @@ fn main() -> Result<()> {
             }
         );
         match &subscriptions {
-            Ok(names) => println!("subscriptions  {} (Reddit account)", names.len()),
+            Ok(entries) => {
+                let communities = entries
+                    .iter()
+                    .filter(|entry| entry.community().is_some())
+                    .count();
+                println!(
+                    "subscriptions  {communities} communities, {} following (Reddit account)",
+                    entries.len() - communities
+                );
+            }
             Err(error) => println!("subscriptions  unavailable: {error}"),
         }
         println!(
@@ -291,7 +300,7 @@ fn main() -> Result<()> {
         auth::account_state_path(&state_root, reddit.account().as_ref())
     };
     let mut app = App::new(config, pool, reddit, state_path, image_picker);
-    app.settings = app::settings::Settings::new(settings_store.unwrap());
+    app.install_settings_store(settings_store.unwrap());
     app.no_color = no_color;
     app.start();
     if args.signin || app.reddit.needs_sign_in() {

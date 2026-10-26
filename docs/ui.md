@@ -67,19 +67,19 @@ Rendering: [main UI](../src/ui.rs).
 | --- | --- |
 | Frame | Sidebar, list, retained detail, focus divider, footer and overlays; split/fullscreen follows width |
 | Sidebar identity | Name and version, separate from navigation |
-| Sidebar navigation | Home, Bookmarks, All subs, Subscriptions, Opened; selected tab stays visible |
-| Sidebar tab | Number, icon, name, new-post count and selection; name fits around icon/badge |
+| Sidebar navigation | Home, Bookmarks, All subs, Subscriptions, Following, Opened; selected tab stays visible |
+| Sidebar tab | Number, community icon or user avatar/person glyph, name, community unread count (`?` when unknown), selection |
 | Sidebar status | Reddit up/unknown/paused/down/signed out; images on/off; signed out offers `A` |
-| Home/community header | Title, Card/Compact, sort, eligible time range, search; stable title/state rows |
-| Membership | Joined/Not joined/unknown beside `S leave`/`S join`/`S check`; confirmation and progress |
-| Feed activity | Unseen count, loading, refresh/continuation error and freshness; refresh errors retain posts |
-| Compact post | Two rows: selection, thumbnail, score, unseen/bookmark/pin, title; then comments, safety labels, community, author, age, flair and media/domain |
+| Home/community/user header | Title, Card/Compact, sort, eligible time range, search; stable title/state rows |
+| Membership | User feeds show Following/Not following/unknown beside `S unfollow`/`S follow`/`S check`; communities show Joined/Not joined/unknown and leave/join/check. Both use confirmation, progress and automatic sidebar reconciliation |
+| Feed activity | Unread count, loading, refresh/continuation error and freshness; refresh errors retain posts |
+| Compact post | Two rows: selection, thumbnail, score, unread/bookmark/pin, title; then comments, safety labels, community, author, age, flair and media/domain |
 | Expanded card | Metadata, wrapped title, media, score and comment count; stable loading geometry and continuous scrolling |
 | Media indicator | Centered play/link symbol, VIDEO/GIF badge, domain or gallery count; dark backing; play symbol hides during playback |
 | List boundary | Shared load-more loader in Card/Compact, outside real-post geometry; failures offer `L` retry |
 | Scrollbar | Visible thumb and track, separate from text |
-| All subs header | Community/unseen/loading counts, subscription sync, error and freshness |
-| Community island | Icon, name, unseen badge, freshness, refresh error and focus border; 1–3 columns; lower-border retry |
+| All subs header | Community/unread/unknown/loading counts, subscription sync, error and freshness |
+| Community island | Icon, name, unread badge, freshness, refresh error and focus border; 1–3 columns; lower-border retry |
 | Island post | Compact post fields; clipping keeps the selection visible |
 | Bookmarks | Count, view mode, stored posts, selection and removal; label as local bookmarks |
 | Detail header | Community, author, age, flair, bookmark, NSFW/spoiler, bounded title, score and comment count |
@@ -105,7 +105,16 @@ Video/GIF state includes playback, loading/error, pause, position/duration and
 sound. One player serves the settled selected card, or detail when open. Keep
 geometry stable without a poster; retain pause within the same item. Show status
 beside the picture and controls in the footer. Failures keep the poster and
-retry/media guidance. `media.video_autoplay = false` requires `P` to start.
+retry/media guidance. Turning off **Autoplay videos** in F2 requires `P` to start.
+
+Unread counts share local observation/read history across sidebar, Jump, feeds and
+islands. Only an accepted, revealed post document drawn outside overlays records a
+read; loading/error screens and sidebar focus do not. The sidebar updates in that
+frame; other list labels receive one follow-up redraw. `B` captures the relevant
+community or user for its tools; local bulk-read applies to communities. `O` opens
+the source directly. Empty successful listings
+establish known zero; unfetched/failed listings remain unknown. See the
+[reading-history limits](usage.md#feeds-and-tabs).
 
 ## Form fields
 
@@ -160,7 +169,7 @@ Presentation: [menu renderer](../src/ui/experience.rs).
 | Content / On Reddit | Content/polls/awards, crosspost/notifications, author follow/block/chat, community mute/favorite/flair, moderation |
 | Content / Destructive | Delete own content; last, with confirmation |
 | Message actions | Mark read/unread, native notifications |
-| Community / Community | Open feed |
+| Community / Community | Open feed, open community in browser, mark all fetched posts read |
 | Community / About | About/sidebar, rules |
 | Community / Wiki | Wiki index, page |
 | Community / Moderators | Moderator list |
@@ -182,14 +191,14 @@ Presentation: [dialogs](../src/ui/experience.rs).
 | Surface | Contents and behavior |
 | --- | --- |
 | Jump/search | Query and caret, selected result with icon/badge, no-match state, Enter/Esc and movement |
-| Join/Leave | Exact community, confirm/cancel, `Space` to open community |
+| Join/Leave / Follow/Unfollow | Captured community or user, confirm/cancel, `Space` to open its feed |
 | Content/feed deletion | Named target, irreversible Reddit consequence, confirm/cancel |
 | Loading read | Action/page, destination, pending state, cancel/back and native fallback |
 | Failed first read | Error, `r` retry, `Esc` back, `Ctrl+o` native fallback |
 | Failed continuation | Retain entries/selection; `L` retries next page |
 | Pending/successful write | Sending state blocks duplicate actions; update only after acknowledgment |
 | Profile | Username, karma/description, Overview/Posts/Comments |
-| User feed | Feed name, post/comment entries, metadata, preview, actions and pagination |
+| User feed | Following tabs show submitted posts in Card/Compact with community metadata, sorting and pagination. `S` and the first profile tool follow/unfollow; unfollow moves the retained feed to Opened. Post details target the actual community/profile |
 | Inbox | Category, entries, read/unread actions, preview and pagination |
 | Search | Posts/Communities/People, query, supported sort/time, results, preview and pagination |
 | Community | Title, members, description/sidebar, Rules and Wiki |
@@ -233,8 +242,10 @@ the name. Hide credentials; selecting a source precedes importing it.
 
 ## Settings and help
 
-[Settings](../src/ui/settings.rs) lists every TOML key with a readable label/value;
-the selection shows its exact key and description. Booleans toggle; other
+[Settings](../src/ui/settings.rs) groups Reddit account preferences, local reader
+rules for the named account, and device settings shared by all accounts;
+the selection shows its exact local file key and description. Account values load
+in the background and display unknown/error states until confirmed. Booleans toggle; other
 values use a TOML editor. Keep editing, validation and save/conflict feedback
 visible. See [Settings](configuration.md#save-status-and-recovery) for status and recovery.
 

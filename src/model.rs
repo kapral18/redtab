@@ -1,6 +1,104 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionIcon {
+    Unknown,
+    Missing,
+    Url(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Subscription {
+    Community {
+        name: String,
+        icon: SubscriptionIcon,
+    },
+    User {
+        name: String,
+        icon: Option<String>,
+    },
+}
+
+impl Subscription {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Community { name, .. } | Self::User { name, .. } => name,
+        }
+    }
+
+    pub fn community(&self) -> Option<&str> {
+        match self {
+            Self::Community { name, .. } => Some(name),
+            Self::User { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MembershipTarget {
+    Community(String),
+    User(String),
+}
+
+impl MembershipTarget {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Community(name) | Self::User(name) => name,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        format!(
+            "{}/{}",
+            if matches!(self, Self::User(_)) {
+                "u"
+            } else {
+                "r"
+            },
+            self.name()
+        )
+    }
+
+    pub fn action(&self, join: bool) -> &'static str {
+        match (self, join) {
+            (Self::Community(_), true) => "Join",
+            (Self::Community(_), false) => "Leave",
+            (Self::User(_), true) => "Follow",
+            (Self::User(_), false) => "Unfollow",
+        }
+    }
+
+    pub fn matches(&self, entry: &Subscription) -> bool {
+        match (self, entry) {
+            (Self::Community(name), Subscription::Community { name: other, .. })
+            | (Self::User(name), Subscription::User { name: other, .. }) => {
+                name.eq_ignore_ascii_case(other)
+            }
+            _ => false,
+        }
+    }
+}
+
+pub fn is_username(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+}
+
+pub fn profile_user(path: &str) -> Option<&str> {
+    let path = path
+        .strip_prefix("/user/")
+        .or_else(|| path.strip_prefix("/u/"))?;
+    let mut parts = path.trim_end_matches('/').split('/');
+    let name = parts.next().filter(|name| is_username(name))?;
+    matches!(parts.next(), None | Some("comments")).then_some(name)
+}
+
 pub const PREVIEW_EDGE: u32 = 1600;
 pub const PREVIEW_PIXELS: u64 = 16_000_000;
 
@@ -37,7 +135,17 @@ pub enum Media {
 }
 
 impl Media {
+    pub fn youtube_url(&self) -> Option<&str> {
+        match self {
+            Self::Link { url, .. } if youtube_id(url).is_some() => Some(url),
+            _ => None,
+        }
+    }
+
     pub fn tag(&self) -> Option<String> {
+        if self.youtube_url().is_some() {
+            return Some("YouTube".into());
+        }
         match self {
             Media::None => None,
             Media::Image { .. } if self.video_url().is_some() => Some("gif".into()),
@@ -50,17 +158,17 @@ impl Media {
         }
     }
 
-    /// Playable media, including GIFs stored as images in posts and bookmarks.
+    /// Playback identity, including GIFs and YouTube page URLs resolved by the player.
     pub fn video_url(&self) -> Option<&str> {
         match self {
             Media::Video { url, .. } => url.as_deref(),
             Media::Image { url, .. } if is_gif(url) => Some(url),
+            Media::Link { .. } => self.youtube_url(),
             _ => None,
         }
     }
 
-    /// The best still image to preview inline. A link's preview picture is not one: shown
-    /// under the post it reads as the post's own image (it stays the list thumbnail).
+    /// Inline still or video poster. Ordinary link previews stay list thumbnails.
     pub fn preview_image(&self) -> Option<&str> {
         self.preview_image_at(0)
     }
@@ -83,6 +191,7 @@ impl Media {
                         .unwrap_or(original)
                 })
             }
+            Media::Link { thumb, .. } if self.youtube_url().is_some() => thumb.as_deref(),
             Media::Link { .. } | Media::None => None,
         }
     }
@@ -101,6 +210,44 @@ impl Media {
             _ => self.preview_image(),
         }
     }
+}
+
+pub(crate) fn youtube_id(url: &str) -> Option<String> {
+    if url.len() > 8192 {
+        return None;
+    }
+    let url = url::Url::parse(url).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        return None;
+    }
+    let path: Vec<_> = url
+        .path()
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let id = match (url.host_str()?, path.as_slice()) {
+        ("youtu.be" | "www.youtu.be", [id]) => (*id).to_owned(),
+        ("youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com", ["watch"]) => {
+            let mut ids = url.query_pairs().filter(|(key, _)| key == "v");
+            let id = ids.next()?.1.into_owned();
+            if ids.next().is_some() {
+                return None;
+            }
+            id
+        }
+        ("youtube.com" | "www.youtube.com" | "m.youtube.com", ["shorts" | "embed", id])
+        | ("www.youtube-nocookie.com" | "youtube-nocookie.com", ["embed", id]) => (*id).to_owned(),
+        _ => return None,
+    };
+    (id.len() == 11
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+    .then_some(id)
 }
 
 /// A `.gif` path, whatever its query or fragment.
@@ -151,6 +298,23 @@ pub const PICTURE: char = '\u{FDD2}';
 pub const THREAD_ROOT: &str = "more:";
 
 impl Post {
+    pub fn profile_user(&self) -> Option<&str> {
+        profile_user(&self.permalink)
+    }
+
+    pub fn community(&self) -> Option<&str> {
+        self.profile_user()
+            .is_none()
+            .then_some(self.subreddit.as_str())
+    }
+
+    pub fn source_label(&self) -> String {
+        self.profile_user().map_or_else(
+            || format!("r/{}", self.subreddit),
+            |name| format!("u/{name}"),
+        )
+    }
+
     pub fn reddit_url(&self) -> String {
         format!("https://www.reddit.com{}", self.permalink)
     }
@@ -338,6 +502,58 @@ impl TimeRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn when_a_youtube_link_is_loaded_it_should_have_inline_video_and_poster_semantics() {
+        let media = Media::Link {
+            url: "https://youtu.be/dQw4w9WgXcQ".into(),
+            thumb: Some("https://external-preview.redd.it/poster.jpg".into()),
+        };
+
+        assert_eq!(media.video_url(), Some("https://youtu.be/dQw4w9WgXcQ"));
+        assert_eq!(media.tag().as_deref(), Some("YouTube"));
+        assert_eq!(
+            media.preview_image(),
+            Some("https://external-preview.redd.it/poster.jpg")
+        );
+        assert!(media.shows_inline());
+    }
+
+    #[test]
+    fn when_youtube_urls_are_classified_only_supported_video_shapes_should_match() {
+        for url in [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&feature=share",
+            "https://m.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+            "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ",
+        ] {
+            assert_eq!(youtube_id(url).as_deref(), Some("dQw4w9WgXcQ"), "{url}");
+        }
+        for url in [
+            "",
+            "https://youtube.com/playlist?list=foo",
+            "https://youtube.com/@channel",
+            "https://youtube.com/watch?v=short",
+            "https://youtube.com/watch?v=dQw4w9WgXcQ&v=abcdefghijk",
+            "https://youtube.com.attacker.test/watch?v=dQw4w9WgXcQ",
+            "https://user:secret@youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtube.com:444/watch?v=dQw4w9WgXcQ",
+            "file:///youtube.com/watch?v=dQw4w9WgXcQ",
+        ] {
+            assert_eq!(youtube_id(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn when_a_saved_youtube_link_is_deserialized_it_should_gain_playback_without_rewriting_storage()
+    {
+        let stored = serde_json::json!({"Link":{"url":"https://www.youtube.com/shorts/dQw4w9WgXcQ","thumb":null}});
+        let media: Media = serde_json::from_value(stored.clone()).unwrap();
+
+        assert!(media.shows_inline());
+        assert_eq!(serde_json::to_value(media).unwrap(), stored);
+    }
 
     #[test]
     fn card_media_saved_video_without_a_gif_flag_should_still_be_a_video() {

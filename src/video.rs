@@ -1,6 +1,8 @@
 //! Inline video: ffmpeg decodes raw frames for the scrolling tile renderer. One
 //! player owns playback; ffplay plays optional sound in its own process.
 
+mod youtube;
+
 use std::io::{self, BufRead, BufReader};
 use std::process::{Child, Stdio};
 use std::sync::Arc;
@@ -68,7 +70,12 @@ struct Decoder {
 }
 
 impl Decoder {
-    fn spawn(url: &str, start: f64, frame_box: (u32, u32)) -> io::Result<Self> {
+    fn spawn(
+        url: &str,
+        start: f64,
+        frame_box: (u32, u32),
+        headers: &[(String, String)],
+    ) -> io::Result<Self> {
         let filter = video_filter(frame_box);
         let mut child = crate::media::local_command("ffmpeg")
             .args([
@@ -78,6 +85,7 @@ impl Decoder {
                 "-loglevel",
                 "level+info",
             ])
+            .args(header_args(headers))
             .args(input_args(url, start))
             .args(["-an", "-sn", "-dn", "-vf", &filter])
             // 8-bit RGB even for 10-bit sources.
@@ -153,6 +161,19 @@ fn input_args(url: &str, start: f64) -> Vec<String> {
         args.extend(["-ss".into(), start, "-i".into(), url.into()]);
     }
     args
+}
+
+fn header_args(headers: &[(String, String)]) -> Vec<String> {
+    if headers.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        "-headers".into(),
+        headers
+            .iter()
+            .map(|(key, value)| format!("{key}: {value}\r\n"))
+            .collect(),
+    ]
 }
 
 /// A `.gif` file served as itself: Reddit's `.gif?format=mp4` previews are MP4.
@@ -364,12 +385,14 @@ impl Clock {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct Sources {
     video: String,
     audio: Option<String>,
     /// `audio` is the video's own file; whether it has sound shows once ffmpeg reads it.
     audio_in_file: bool,
+    headers: Vec<(String, String)>,
+    audio_headers: Vec<(String, String)>,
 }
 
 impl Sources {
@@ -378,6 +401,8 @@ impl Sources {
             video: url.to_string(),
             audio: Some(url.to_string()),
             audio_in_file: true,
+            headers: Vec::new(),
+            audio_headers: Vec::new(),
         }
     }
 }
@@ -436,6 +461,8 @@ fn resolve(
             video,
             audio: join(&audio).and_then(file).ok(),
             audio_in_file: false,
+            headers: Vec::new(),
+            audio_headers: Vec::new(),
         },
         None => Sources::file(&video),
     })
@@ -542,6 +569,7 @@ pub struct Player {
     pub area: Size,
     /// Resolving the stream to its files; `sources` holds the answer.
     resolving: Option<Receiver<Result<Sources, String>>>,
+    resolve_cancel: Option<Arc<youtube::Cancellation>>,
     sources: Option<Sources>,
     spawn: Spawn,
     decoder: Option<Decoder>,
@@ -602,17 +630,22 @@ impl Player {
         let frame_box = frame_box(area, font);
         let (tx, rx) = sync_channel(1);
         let target = url.clone();
+        let cancelled = Arc::new(youtube::Cancellation::default());
+        let cancel = Arc::clone(&cancelled);
         std::thread::spawn(move || {
-            let _ = tx.send(resolve(
-                &target,
-                frame_box,
-                frame_box.1,
-                Some(MAX_VIDEO_PIXELS),
-            ));
+            let result = if crate::model::youtube_id(&target).is_some() {
+                youtube::resolve(&target, &cancel)
+            } else {
+                resolve(&target, frame_box, frame_box.1, Some(MAX_VIDEO_PIXELS))
+            };
+            let _ = tx.send(result);
         });
-        let spawn: Spawn =
-            Box::new(move |sources: &Sources, at| Decoder::spawn(&sources.video, at, frame_box));
-        Self::new(url, area, Some(rx), None, spawn, resume, now)
+        let spawn: Spawn = Box::new(move |sources: &Sources, at| {
+            Decoder::spawn(&sources.video, at, frame_box, &sources.headers)
+        });
+        let mut player = Self::new(url, area, Some(rx), None, spawn, resume, now);
+        player.resolve_cancel = Some(cancelled);
+        player
     }
 
     fn new(
@@ -632,6 +665,7 @@ impl Player {
             url,
             area,
             resolving,
+            resolve_cancel: None,
             sources,
             spawn,
             decoder: None,
@@ -979,6 +1013,7 @@ impl Player {
         let at = format!("{:.3}", self.clock.position(now));
         let started = crate::media::local_command("ffplay")
             .args(["-nodisp", "-vn", "-autoexit", "-loglevel", "quiet"])
+            .args(header_args(&self.sources.as_ref().unwrap().audio_headers))
             .args(["-ss", &at, url])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1051,7 +1086,20 @@ impl Player {
     }
 
     pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
+        self.error.as_deref().map(|error| {
+            if crate::model::youtube_id(&self.url).is_some()
+                && self.sources.is_some()
+                && error != "ffmpeg is not installed"
+            {
+                "YouTube playback failed; m opens browser"
+            } else {
+                error
+            }
+        })
+    }
+
+    pub fn resolving(&self) -> bool {
+        self.resolving.is_some()
     }
 
     #[cfg(test)]
@@ -1100,6 +1148,8 @@ impl Player {
             video: url.into(),
             audio: None,
             audio_in_file: false,
+            headers: Vec::new(),
+            audio_headers: Vec::new(),
         };
         Self::new(
             url.into(),
@@ -1122,6 +1172,8 @@ impl Player {
                 video: url.into(),
                 audio: None,
                 audio_in_file: false,
+                headers: Vec::new(),
+                audio_headers: Vec::new(),
             }),
             Box::new(|_, _| Err(io::Error::other("fixture decoder unavailable"))),
             Resume::default(),
@@ -1139,6 +1191,12 @@ impl Player {
 
 impl Drop for Player {
     fn drop(&mut self) {
+        if let Some(cancelled) = &self.resolve_cancel {
+            cancelled.cancel();
+        }
+        if self.error.is_some() {
+            youtube::invalidate(&self.url);
+        }
         self.stop_audio();
     }
 }
@@ -1297,6 +1355,62 @@ pub fn clock_text(seconds: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn when_a_resolving_player_is_dropped_it_should_cancel_without_waiting_for_the_worker() {
+        let (_sender, resolving) = sync_channel(1);
+        let cancelled = Arc::new(youtube::Cancellation::default());
+        let mut player = Player::new(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+            Size::new(20, 10),
+            Some(resolving),
+            None,
+            Box::new(|_, _| Err(io::Error::other("unused"))),
+            Resume::default(),
+            Instant::now(),
+        );
+        player.resolve_cancel = Some(cancelled.clone());
+        assert!(player.resolving());
+        let started = Instant::now();
+
+        drop(player);
+
+        assert!(cancelled.is_cancelled());
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn when_youtube_decoding_fails_it_should_hide_stream_tokens_and_keep_install_guidance() {
+        let mut player = Player::unavailable(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            Size::new(20, 10),
+        );
+        player.error = Some("failed https://rr1.googlevideo.com/file?token=PRIVATE".into());
+        assert_eq!(
+            player.error(),
+            Some("YouTube playback failed; m opens browser")
+        );
+
+        player.error = Some("ffmpeg is not installed".into());
+
+        assert_eq!(player.error(), Some("ffmpeg is not installed"));
+    }
+
+    #[test]
+    fn when_stream_headers_are_forwarded_they_should_precede_the_input_as_http_header_lines() {
+        let actual = header_args(&[
+            ("User-Agent".into(), "fixture-agent".into()),
+            ("Referer".into(), "https://www.youtube.com/".into()),
+        ]);
+
+        assert_eq!(
+            actual,
+            [
+                "-headers",
+                "User-Agent: fixture-agent\r\nReferer: https://www.youtube.com/\r\n"
+            ]
+        );
+    }
     use std::io::Read;
 
     /// Hands out one byte per read, so every header field and frame crosses reads.
@@ -1442,7 +1556,7 @@ mod tests {
             ))
             .unwrap();
         drop(encoder);
-        let decoder = Decoder::spawn(path.to_str().unwrap(), 0.0, frame_box).unwrap();
+        let decoder = Decoder::spawn(path.to_str().unwrap(), 0.0, frame_box, &[]).unwrap();
         let frame = decoder
             .frames
             .recv_timeout(Duration::from_secs(20))
@@ -1668,6 +1782,8 @@ mod tests {
             video: "v".into(),
             audio: None,
             audio_in_file: false,
+            headers: Vec::new(),
+            audio_headers: Vec::new(),
         }
     }
 
@@ -2124,6 +2240,8 @@ mod tests {
             video: "v".into(),
             audio: Some("a".into()),
             audio_in_file: false,
+            headers: Vec::new(),
+            audio_headers: Vec::new(),
         };
         let mut player = Player::new(
             "u".into(),
@@ -2165,6 +2283,8 @@ mod tests {
             video: "v".into(),
             audio: Some("v".into()),
             audio_in_file: true,
+            headers: Vec::new(),
+            audio_headers: Vec::new(),
         };
         let mut player = Player::new(
             "u".into(),
@@ -2203,6 +2323,8 @@ mod tests {
             video: "v".into(),
             audio: Some("v".into()),
             audio_in_file: true,
+            headers: Vec::new(),
+            audio_headers: Vec::new(),
         };
         let with_sound = Resume {
             sound: true,

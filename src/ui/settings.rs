@@ -1,7 +1,7 @@
 //! Compact preferences dialog using the same gutters and selection style as other menus.
 use super::*;
 use crate::config::{
-    schema::{Kind, SETTINGS},
+    schema::{Kind, SETTINGS, Scope},
     store::Persistence,
 };
 
@@ -10,34 +10,8 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) -> Rect {
         return draw_managed(f, app);
     }
     let field = &SETTINGS[app.settings.selected];
-    let width = popup(f.area(), 84, 25).width.saturating_sub(4);
-    let description_rows = SETTINGS
-        .iter()
-        .map(|setting| {
-            identity_lines(
-                &format!("{} · {}", setting.key, setting.description),
-                usize::from(width),
-                SUBTEXT,
-            )
-            .len()
-            .min(4)
-        })
-        .max()
-        .unwrap_or(0);
-    let error = app
-        .settings
-        .message
-        .as_ref()
-        .or(app.settings.store.error.as_ref());
-    let bottom_rows = 2
-        + usize::from(!app.config.path.as_os_str().is_empty())
-        + error.map_or(0, |e| wrapped_rows(e, width).min(3));
-    let body_rows = if app.settings.editing.is_some() {
-        2 + wrapped_rows(field.input_hint(), width).min(3)
-    } else {
-        SETTINGS.len() + 1 + description_rows
-    };
-    let area = popup(f.area(), 84, (2 + body_rows + bottom_rows).min(25) as u16);
+    let account = app.reddit.account();
+    let area = popup(f.area(), 84, 29);
     f.render_widget(Clear, area);
     let block = popup_block("Settings", area.width);
     let inner = block.inner(area);
@@ -46,118 +20,129 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) -> Rect {
         return area;
     }
     let width = usize::from(inner.width);
-    let status = match app.settings.store.persistence {
-        Persistence::Saved => "Saved",
-        Persistence::Temporary => "Temporary · session only",
-        Persistence::Unsaved => "Unsaved · retry or revert",
+    let file_status = match app.settings.store.persistence {
+        Persistence::Saved => "File: Saved",
+        Persistence::Temporary => "File: Temporary · session only",
+        Persistence::Unsaved => "File: Unsaved · retry or revert",
     };
-    let color = if app.settings.store.persistence == Persistence::Saved {
-        GREEN
+    let reddit_status = if app.settings.writing() {
+        "Reddit: Saving…"
+    } else if app.settings.account.pending() {
+        "Reddit: Loading…"
+    } else if app.settings.account.error.is_some() {
+        "Reddit: Unavailable · r reloads"
+    } else if app.settings.account.values.is_some() {
+        "Reddit: Saved on account"
     } else {
-        YELLOW
+        "Reddit: Sign in to configure"
     };
     let editing = app.settings.editing.as_ref();
     let controls = if editing.is_some() {
         "Enter apply · Esc cancel · F1 help"
+    } else if field.scope == Scope::Reddit {
+        "Enter toggle · r refresh Reddit · Esc close · F1 help"
     } else {
-        "Enter edit · r retry save · u revert to file · Esc close · F1 help"
+        "Enter edit · r retry file save · u revert file · Esc close · F1 help"
     };
-    let controls = if width >= controls.width() {
+    let controls = if controls.width() <= width {
         controls
-    } else if editing.is_some() {
-        fitting_label(
-            &[
-                "Enter apply · Esc cancel",
-                "⏎ apply · Esc",
-                "⏎ · Esc",
-                "Esc",
-            ],
-            width,
-        )
     } else {
         fitting_label(
-            &[
-                "⏎ edit · r save · u revert · Esc",
-                "⏎ edit · Esc close",
-                "⏎ · Esc",
-                "Esc",
-            ],
+            &["⏎ edit · r retry · Esc", "⏎ edit · Esc", "⏎ · Esc", "Esc"],
             width,
         )
     };
-    let mut bottom = vec![Line::styled(status, Style::new().fg(color))];
-    let error = app
-        .settings
-        .message
-        .as_ref()
-        .or(app.settings.store.error.as_ref());
-    if let Some(error) = error {
-        let mut lines = identity_lines(error, width, YELLOW);
-        if lines.len() > 3 {
-            lines.truncate(3);
-            let text = format!(
-                "{}…",
-                truncate(&lines[2].to_string(), width.saturating_sub(1))
-            );
-            lines[2] = Line::styled(text, Style::new().fg(YELLOW));
+    let error = app.settings.message.as_ref().or_else(|| {
+        if field.scope == Scope::Reddit {
+            app.settings.account.error.as_ref()
+        } else {
+            app.settings.store.error.as_ref()
         }
-        bottom.extend(lines);
+    });
+    let mut bottom = Vec::new();
+    if let Some(error) = error {
+        bottom.extend(identity_lines(error, width, YELLOW).into_iter().take(3));
     }
-    if !app.settings.store.current.path.as_os_str().is_empty() && inner.height >= 12 {
+    bottom.push(Line::styled(
+        reddit_status,
+        Style::new().fg(if app.settings.account.error.is_some() {
+            YELLOW
+        } else {
+            SUBTEXT
+        }),
+    ));
+    bottom.push(Line::styled(
+        file_status,
+        Style::new().fg(if app.settings.store.persistence == Persistence::Saved {
+            GREEN
+        } else {
+            YELLOW
+        }),
+    ));
+    if inner.height >= 20 && !app.config.path.as_os_str().is_empty() {
         bottom.push(Line::styled(
-            truncate(
-                &app.settings.store.current.path.display().to_string(),
-                width,
-            ),
-            Style::new().fg(OVERLAY),
+            truncate(&app.config.path.display().to_string(), width),
+            Style::new().fg(SUBTEXT),
         ));
     }
     bottom.push(Line::styled(controls, Style::new().fg(SUBTEXT)));
-    // Keep the actual action and persistence state visible before optional descriptions.
+    let reserved_content = if inner.height >= 3 { 2 } else { 1 };
     let bottom_height = bottom
         .len()
-        .min(usize::from(inner.height.saturating_sub(1))) as u16;
-    if bottom.len() > usize::from(bottom_height) {
-        bottom = vec![
-            Line::styled(status, Style::new().fg(color)),
-            Line::styled(controls, Style::new().fg(SUBTEXT)),
-        ];
-        bottom.truncate(usize::from(bottom_height));
+        .min(usize::from(inner.height.saturating_sub(reserved_content)));
+    if bottom.len() > bottom_height {
+        bottom = vec![Line::styled(controls, Style::new().fg(SUBTEXT))];
     }
+    let bottom_height = bottom.len() as u16;
     let content_height = inner.height.saturating_sub(bottom_height);
     let mut content = Vec::new();
     let mut edit_row = inner.y;
     if let Some(input) = editing {
         content.push(Line::styled(
+            truncate(
+                &app.settings.scope_label(field.scope, account.as_ref()),
+                width,
+            ),
+            Style::new().fg(SUBTEXT),
+        ));
+        content.push(Line::styled(
             truncate(&input.label, width),
             Style::new().fg(ACCENT).bold(),
         ));
-        let available = content_height.saturating_sub(2).min(3);
         content.extend(
             identity_lines(field.input_hint(), width, SUBTEXT)
                 .into_iter()
-                .take(usize::from(available)),
+                .take(usize::from(content_height.saturating_sub(2)).min(3)),
         );
-
         edit_row = inner.y + content.len() as u16;
     } else {
-        let description = identity_lines(
-            &format!("{} · {}", field.key, field.description),
-            width,
-            SUBTEXT,
-        );
-        let description_height =
-            description_rows.min(usize::from(content_height.saturating_sub(1)));
-        let list_height = usize::from(content_height)
-            .saturating_sub(description_height + usize::from(content_height > 5));
-        let start = app
-            .settings
-            .selected
-            .saturating_sub(list_height.saturating_sub(1))
-            .min(SETTINGS.len().saturating_sub(list_height));
-        for (index, setting) in SETTINGS.iter().enumerate().skip(start).take(list_height) {
+        let mut rows = Vec::new();
+        let mut selected_row = 0;
+        let mut selected_end = 0;
+        for (index, setting) in SETTINGS.iter().enumerate() {
+            if index == 0 || setting.scope != SETTINGS[index - 1].scope {
+                rows.push(Line::styled(
+                    truncate(
+                        &app.settings.scope_label(setting.scope, account.as_ref()),
+                        width,
+                    ),
+                    Style::new().fg(ACCENT).bold(),
+                ));
+            }
+            let selected = index == app.settings.selected;
+            if selected {
+                selected_row = rows.len();
+            }
             let value = setting.value(&app.config);
-            let shown = if setting.kind == Kind::Boolean {
+            let shown = if setting.scope == Scope::Reddit && app.settings.account.values.is_none() {
+                if app.settings.account.pending() {
+                    "Loading…".into()
+                } else if account.is_some() {
+                    "Unavailable".into()
+                } else {
+                    "Sign in".into()
+                }
+            } else if setting.kind == Kind::Boolean {
                 if value.as_bool().unwrap() {
                     "On".into()
                 } else {
@@ -166,37 +151,49 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) -> Rect {
             } else {
                 value.to_string()
             };
-            let selected = index == app.settings.selected;
-            let label_width = width.saturating_sub(5).min(27);
-            let label = truncate(setting.label, label_width);
-            let text = if width >= 24 {
-                format!(
-                    "{} {:label_width$} {}",
-                    if selected { "›" } else { " " },
-                    label,
-                    shown
-                )
+            let prefix = if selected { "›" } else { " " };
+            let fits = setting.label.width() + shown.width() + 3 <= width;
+            let label_width = width.saturating_sub(shown.width() + 3).min(25);
+            let text = format!("{prefix} {:label_width$} {shown}", setting.label);
+            let style = if selected {
+                Style::new().bg(SURFACE1).fg(TEXT).bold()
             } else {
-                format!(
-                    "{} {} {}",
-                    if selected { "›" } else { " " },
-                    setting.label,
-                    shown
-                )
+                Style::new().fg(TEXT)
             };
-            content.push(Line::styled(
-                truncate(&text, width),
-                if selected {
-                    Style::new().bg(SURFACE1).fg(TEXT).bold()
-                } else {
-                    Style::new().fg(TEXT)
-                },
-            ));
+            if !fits {
+                rows.push(Line::styled(
+                    truncate(&format!("{prefix} {}", setting.label), width),
+                    style,
+                ));
+                rows.push(Line::styled(truncate(&format!("  {shown}"), width), style));
+            } else {
+                rows.push(Line::styled(truncate(&text, width), style));
+            }
+            if selected {
+                selected_end = rows.len().saturating_sub(1);
+            }
         }
-        if content_height > 5 {
-            content.push(Line::default());
-        }
-        content.extend(description.into_iter().take(description_height));
+        let description_height =
+            usize::from(content_height.saturating_sub(1)).min(if content_height > 9 {
+                4
+            } else if content_height > 5 {
+                1
+            } else {
+                0
+            });
+        let list_height = usize::from(content_height).saturating_sub(description_height);
+        let start = selected_end
+            .saturating_sub(list_height.saturating_sub(1))
+            .min(selected_row)
+            .min(rows.len().saturating_sub(list_height));
+        content.extend(rows.into_iter().skip(start).take(list_height));
+        content.resize(list_height, Line::default());
+        let description = format!("{} · {}", field.file_key(&app.config), field.description);
+        content.extend(
+            identity_lines(&description, width, SUBTEXT)
+                .into_iter()
+                .take(description_height),
+        );
     }
     f.render_widget(
         Paragraph::new(content),
