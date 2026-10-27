@@ -463,16 +463,32 @@ impl Reddit {
         self.fetch_listing(url, sort, time, after, progress)
     }
 
-    fn home_partial(&self, cursor: Option<&str>) -> Result<home::Page> {
+    fn home_partial(
+        &self,
+        cursor: Option<&str>,
+        progress: &mut dyn FnMut(&Post),
+    ) -> Result<home::Page> {
         let url = home::url(
             &self.0.api,
             cursor.unwrap_or("/svc/shreddit/feeds/home-feed?sort=BEST"),
         )?;
-        let html = transport::html(
-            self.request(url, home::ACCEPT)?,
-            Some(self.read_cancellation()),
-        )?;
-        home::parse(&html, &self.0.api)
+        let cancelled = self.read_cancellation();
+        home::stream(
+            transport::Reader::new(
+                self.request(url, home::ACCEPT)?,
+                16 * 1024 * 1024,
+                Some(cancelled.clone()),
+            ),
+            &self.0.api,
+            progress,
+        )
+        .map_err(|error| {
+            if cancelled() {
+                anyhow::anyhow!(REQUEST_CANCELLED)
+            } else {
+                error
+            }
+        })
     }
 
     fn browser_home(
@@ -480,26 +496,36 @@ impl Reddit {
         after: Option<&str>,
         progress: &mut dyn FnMut(ListingEvent<'_>),
     ) -> Result<Listing> {
-        let mut page = self.home_partial(after)?;
+        let mut seen = HashSet::new();
+        let mut emit = |post: &Post| {
+            if seen.insert(post.id.clone()) && (self.1 || !post.nsfw) {
+                progress(ListingEvent::Post(post));
+            }
+        };
+        let mut page = self.home_partial(after, &mut emit)?;
         let mut failure = None;
-        // Hydrate a tiny starter together with its continuation, saving one quotaed JSON call.
         if after.is_none()
-            && page.ids.len() <= 3
+            && page.posts.len() <= 3
             && let Some(next) = page.after.clone()
         {
-            match self.home_partial(Some(&next)).and_then(|continuation| {
-                if continuation.after.as_deref() == Some(&next) {
-                    bail!("Reddit repeated a Home cursor");
-                }
-                Ok(continuation)
-            }) {
+            match self
+                .home_partial(Some(&next), &mut |_| {})
+                .and_then(|continuation| {
+                    if continuation.after.as_deref() == Some(&next) {
+                        bail!("Reddit repeated a Home cursor");
+                    }
+                    Ok(continuation)
+                }) {
                 Ok(continuation) => {
-                    let mut seen: HashSet<_> = page.ids.iter().cloned().collect();
-                    page.ids.extend(
+                    for post in &continuation.posts {
+                        emit(post);
+                    }
+                    let mut ids: HashSet<_> = page.posts.iter().map(|p| p.id.clone()).collect();
+                    page.posts.extend(
                         continuation
-                            .ids
+                            .posts
                             .into_iter()
-                            .filter(|id| seen.insert(id.clone())),
+                            .filter(|p| ids.insert(p.id.clone())),
                     );
                     page.after = continuation.after;
                 }
@@ -507,48 +533,12 @@ impl Reddit {
                 Err(error) => failure = Some((next, error.to_string())),
             }
         }
-        let mut details = std::collections::HashMap::new();
-        let mut posts = Vec::new();
-        let mut emitted = 0;
-        for ids in page.ids.chunks(100) {
-            let mut url = self.0.api.join(&format!("by_id/{}.json", ids.join(",")))?;
-            url.query_pairs_mut().append_pair("raw_json", "1");
-            transport::listing(
-                self.request(url, "application/json")?,
-                self.read_cancellation(),
-                &mut |post| {
-                    let id = format!("t3_{}", post.id);
-                    if ids.contains(&id) {
-                        details.insert(id, post.clone());
-                    }
-                    while let Some(id) = ids.get(emitted) {
-                        let Some(post) = details.remove(id) else {
-                            break;
-                        };
-                        if self.1 || !post.nsfw {
-                            progress(ListingEvent::Post(&post));
-                            posts.push(post);
-                        }
-                        emitted += 1;
-                    }
-                },
-            )?;
-            // A missing earlier ID cannot block later records once this response is complete.
-            for id in &ids[emitted..] {
-                if let Some(post) = details.remove(id)
-                    && (self.1 || !post.nsfw)
-                {
-                    progress(ListingEvent::Post(&post));
-                    posts.push(post);
-                }
-            }
-            emitted = 0;
-        }
+        page.posts.retain(|post| self.1 || !post.nsfw);
         if let Some((cursor, error)) = &failure {
             progress(ListingEvent::ContinuationFailed { cursor, error });
         }
         Ok(Listing {
-            posts,
+            posts: page.posts,
             after: page.after,
         })
     }

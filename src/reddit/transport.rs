@@ -239,12 +239,6 @@ pub(super) fn json(
     serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("Reddit returned invalid JSON"))
 }
 
-pub(super) fn html(response: Response, cancelled: Option<Cancellation>) -> Result<String> {
-    let mut bytes = Vec::new();
-    Reader::new(response, 16 * 1024 * 1024, cancelled).read_to_end(&mut bytes)?;
-    String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("Reddit returned invalid Home HTML"))
-}
-
 pub(super) fn listing(
     response: Response,
     cancelled: Cancellation,

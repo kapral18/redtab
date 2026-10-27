@@ -8465,9 +8465,9 @@ mod tests {
                     r#"{"kind":"Listing","data":{"children":[{"kind":"t5","data":{"display_name":"rust"}}],"after":null}}"#
                 }
                 "/svc/shreddit/feeds/home-feed" => {
-                    "<shreddit-post id='t3_1x4v4sn'></shreddit-post>"
+                    "<shreddit-post id='t3_1x4v4sn' post-title='native' subreddit-name='rust' author='reader' permalink='/r/rust/comments/1x4v4sn/title/' post-type='text'></shreddit-post>"
                 }
-                "/by_id/t3_1x4v4sn.json" | "/r/rust/hot.json" => {
+                "/r/rust/hot.json" => {
                     include_str!("../tests/fixtures/sub.json")
                 }
                 "/r/rust/about.json" => r#"{"data":{}}"#,
@@ -8534,7 +8534,7 @@ mod tests {
         let base = format!("http://{}", server.server_addr());
         let handler = std::thread::spawn(move || {
             let mut completed = 0;
-            while completed < 3 {
+            while completed < 2 {
                 let request = server
                     .recv_timeout(Duration::from_secs(5))
                     .unwrap()
@@ -8546,9 +8546,9 @@ mod tests {
                 let path = request.url().split('?').next().unwrap();
                 let body = match path {
                     "/svc/shreddit/feeds/home-feed" => {
-                        "<shreddit-post id='t3_1x4v4sn'></shreddit-post>"
+                        "<shreddit-post id='t3_1x4v4sn' post-title='native' subreddit-name='rust' author='reader' permalink='/r/rust/comments/1x4v4sn/title/' post-type='text'></shreddit-post>"
                     }
-                    "/by_id/t3_1x4v4sn.json" | "/r/rust/hot.json" => {
+                    "/r/rust/hot.json" => {
                         include_str!("../tests/fixtures/sub.json")
                     }
                     "/subreddits/mine/subscriber.json" => {
@@ -8565,7 +8565,19 @@ mod tests {
         let (mut app, messages) = app_at(&base, &[]);
         app.active = 0;
         app.start();
+        let deadline = Instant::now() + Duration::from_secs(5);
         while !app.tabs[0].feed.loaded || app.all_subs.groups.first().is_none_or(|g| g.loading) {
+            assert!(
+                Instant::now() < deadline,
+                "Home loaded={} error={:?} groups={:?}",
+                app.tabs[0].feed.loaded,
+                app.tabs[0].feed.error(),
+                app.all_subs
+                    .groups
+                    .iter()
+                    .map(|g| (&g.subreddit, g.loading))
+                    .collect::<Vec<_>>()
+            );
             app.on_msg(
                 messages
                     .recv_timeout(Duration::from_secs(5))
@@ -8596,16 +8608,13 @@ mod tests {
                 if request.url.contains("cursor=next") {
                     count.fetch_add(1, Ordering::SeqCst);
                     return Reply{status:if failure==0 {500}else{200},body:if failure==2 {
-                        "<shreddit-post id='t3_d'></shreddit-post><faceplate-partial id='feed-next-page-partial' src='/svc/shreddit/feeds/home-feed?cursor=next'></faceplate-partial>"
+                        "<shreddit-post id='t3_d' post-title='d' subreddit-name='s' author='reader' permalink='/r/s/comments/d/title/' post-type='text'></shreddit-post><faceplate-partial id='feed-next-page-partial' src='/svc/shreddit/feeds/home-feed?cursor=next'></faceplate-partial>"
                     }else{"not a feed"}.into(),headers:vec![]};
                 }
                 if request.url.starts_with("/svc/shreddit/feeds/home-feed") {
-                    return Reply{status:200,body:"<shreddit-post id='t3_a'></shreddit-post><shreddit-post id='t3_b'></shreddit-post><shreddit-post id='t3_c'></shreddit-post><faceplate-partial id='feed-next-page-partial' src='/svc/shreddit/feeds/home-feed?cursor=next'></faceplate-partial>".into(),headers:vec![]};
+                    return Reply{status:200,body:"<shreddit-post id='t3_a' post-title='a' subreddit-name='s' author='reader' permalink='/r/s/comments/a/title/' post-type='text'></shreddit-post><shreddit-post id='t3_b' post-title='b' subreddit-name='s' author='reader' permalink='/r/s/comments/b/title/' post-type='text'></shreddit-post><shreddit-post id='t3_c' post-title='c' subreddit-name='s' author='reader' permalink='/r/s/comments/c/title/' post-type='text'></shreddit-post><faceplate-partial id='feed-next-page-partial' src='/svc/shreddit/feeds/home-feed?cursor=next'></faceplate-partial>".into(),headers:vec![]};
                 }
-                let children:[serde_json::Value;3]=["a","b","c"].map(|id|serde_json::json!({"kind":"t3","data":{"id":id,"title":id,"subreddit":"s","permalink":format!("/comments/{id}/")}}));
-                Reply::json(
-                    serde_json::json!({"kind":"Listing","data":{"children":children,"after":null}}),
-                )
+                panic!("unexpected Home lookup: {}", request.url);
             });
             let directory = tempfile::tempdir().unwrap();
             let cache_path = directory.path().join("cache");
@@ -8813,7 +8822,7 @@ mod tests {
     }
 
     #[test]
-    fn when_home_has_a_three_post_primer_it_should_stream_one_combined_details_request() {
+    fn when_home_has_a_three_post_primer_it_should_stream_native_cards_without_lookups() {
         assert_feed_arrives_before_tail(true, false);
     }
 
@@ -8848,16 +8857,15 @@ mod tests {
                 }
                 let path = request.url().to_string();
                 log.lock().unwrap().push(path.clone());
-                if path.starts_with("/svc/shreddit/feeds/home-feed") {
-                    let html = if path.contains("cursor=next") {
-                        "<shreddit-post id='t3_d'></shreddit-post><shreddit-post id='t3_e'></shreddit-post>"
-                    } else {
-                        "<shreddit-post id='t3_a'></shreddit-post><shreddit-post id='t3_b'></shreddit-post><shreddit-post id='t3_c'></shreddit-post><faceplate-partial id='feed-next-page-partial' src='/svc/shreddit/feeds/home-feed?cursor=next'></faceplate-partial>"
-                    };
+                if home && path.contains("cursor=next") {
                     request
-                        .respond(tiny_http::Response::from_string(html))
+                        .respond(tiny_http::Response::from_string(
+                            ["d", "e"]
+                                .map(|id| crate::reddit::tests::native_post(id, "s"))
+                                .join(""),
+                        ))
                         .unwrap();
-                    continue;
+                    break;
                 }
                 if path.contains("about.json") {
                     request
@@ -8879,6 +8887,21 @@ mod tests {
                     "{}],\"after\":null}}}}",
                     ["b", "c", "d", "e"].map(child).join(",")
                 );
+                let (first, rest) = if home {
+                    let first = crate::reddit::tests::native_post("a", "s").replace(
+                        " post-type='text'",
+                        " spoiler post-type='image' content-href='https://i.redd.it/picture.png'",
+                    );
+                    let rest = format!(
+                        "{}<faceplate-partial id='feed-next-page-partial' src='/svc/shreddit/feeds/home-feed?cursor=next'></faceplate-partial>",
+                        ["b", "c"]
+                            .map(|id| crate::reddit::tests::native_post(id, "s"))
+                            .join("")
+                    );
+                    (first, rest)
+                } else {
+                    (first, rest)
+                };
                 let mut writer = request.into_writer();
                 write!(writer,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",first.len()+rest.len(),first).unwrap();
                 writer.flush().unwrap();
@@ -8886,7 +8909,9 @@ mod tests {
                 let _ = tail.recv_timeout(Duration::from_secs(3));
                 writer.write_all(rest.as_bytes()).unwrap();
                 writer.flush().unwrap();
-                break;
+                if !home {
+                    break;
+                }
             }
         });
         let (mut app, messages) = app_at(&base, &["s"]);
@@ -8943,15 +8968,13 @@ mod tests {
         );
         if home {
             let requests = requests.lock().unwrap();
-            assert_eq!(
-                requests.iter().filter(|p| p.starts_with("/by_id/")).count(),
-                1
-            );
             assert!(
                 requests
                     .iter()
-                    .any(|p| p.starts_with("/by_id/t3_a,t3_b,t3_c,t3_d,t3_e.json"))
+                    .all(|p| p.starts_with("/svc/shreddit/feeds/home-feed")),
+                "unexpected lookup: {requests:?}"
             );
+            assert_eq!(requests.len(), 2);
         }
     }
 
@@ -8962,7 +8985,7 @@ mod tests {
         let handler = std::thread::spawn(move || {
             let mut completed = 0;
             let deadline = Instant::now() + Duration::from_secs(5);
-            while completed < 3 {
+            while completed < 2 {
                 let request = server
                     .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                     .unwrap()
@@ -8972,7 +8995,7 @@ mod tests {
                     continue;
                 }
                 let url = url::Url::parse(&format!("http://fixture{}", request.url())).unwrap();
-                let body = match url.path() {
+                let body: String = match url.path() {
                     "/svc/shreddit/feeds/home-feed" => {
                         if url
                             .query_pairs()
@@ -8980,26 +9003,15 @@ mod tests {
                         {
                             (0..25)
                                 .map(|id| {
-                                    format!(
-                                        "<shreddit-post id='t3_recommended{id}'></shreddit-post>"
+                                    crate::reddit::tests::native_post(
+                                        &format!("recommended{id}"),
+                                        "unjoined",
                                     )
                                 })
                                 .collect()
                         } else {
-                            "<shreddit-post id='t3_a'></shreddit-post><shreddit-post id='t3_b'></shreddit-post><shreddit-post id='t3_c'></shreddit-post><faceplate-partial id='feed-next-page-partial' src='/svc/shreddit/feeds/home-feed?sort=BEST&amp;cursor=next%26batch'></faceplate-partial>".into()
+                            "<shreddit-post id='t3_a' post-title='a' subreddit-name='s' author='reader' permalink='/r/s/comments/a/title/' post-type='text'></shreddit-post><shreddit-post id='t3_b' post-title='b' subreddit-name='s' author='reader' permalink='/r/s/comments/b/title/' post-type='text'></shreddit-post><shreddit-post id='t3_c' post-title='c' subreddit-name='s' author='reader' permalink='/r/s/comments/c/title/' post-type='text'></shreddit-post><faceplate-partial id='feed-next-page-partial' src='/svc/shreddit/feeds/home-feed?sort=BEST&amp;cursor=next%26batch'></faceplate-partial>".into()
                         }
-                    }
-                    path if path.starts_with("/by_id/") => {
-                        let ids = path
-                            .strip_prefix("/by_id/")
-                            .unwrap()
-                            .strip_suffix(".json")
-                            .unwrap();
-                        let children: Vec<_> = ids.split(',').map(|id| {
-                            let id = id.strip_prefix("t3_").unwrap();
-                            serde_json::json!({"kind":"t3","data":{"id":id,"title":id,"subreddit":"unjoined","author":"reader","permalink":format!("/r/unjoined/comments/{id}/title/")}})
-                        }).collect();
-                        serde_json::json!({"kind":"Listing","data":{"children":children,"after":null}}).to_string()
                     }
                     path => panic!("unexpected path: {path}"),
                 };
@@ -9016,7 +9028,7 @@ mod tests {
             app.on_msg(
                 messages
                     .recv_timeout(Duration::from_secs(2))
-                    .expect("Home should continue automatically"),
+                    .unwrap_or_else(|error|panic!("Home did not continue: {error:?}; loaded={} loading={} posts={} failure={:?}",app.tabs[0].feed.loaded,app.tabs[0].feed.loading(),app.tabs[0].feed.posts.len(),app.tabs[0].feed.error())),
             );
         }
         handler.join().unwrap();

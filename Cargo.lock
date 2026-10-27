@@ -3452,6 +3452,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "gif",
+ "html5ever",
  "image",
  "libc",
  "nucleo-matcher",

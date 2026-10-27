@@ -71,9 +71,10 @@ connection paused; server cooldowns remain global.
 
 Feed responses publish complete post records as the body arrives. Provisional pages
 keep their request pending and cursor unchanged; only complete responses enter the
-cache. Refreshes retain an existing page until its replacement completes. Home combines
-an initial partial of up to three IDs with one continuation before JSON hydration,
-saving the starter's separate details request. Hydration retains browser order.
+cache. Refreshes retain an existing page until its replacement completes. Best Home
+streams complete cards from the browser's ranked HTML, including media and flags,
+without separate post lookups. An initial partial of up to three posts fetches one
+continuation. Cards from that continuation publish after its cursor is validated.
 Failed continuations keep existing content. Cold loads retain the starter with `L`
 retry; reloads retain the shown page with `r` retry. Failed combined loads are not cached.
 

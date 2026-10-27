@@ -5,6 +5,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tiny_http::{Header, Response, Server};
 
+pub(crate) fn native_post(id: &str, subreddit: &str) -> String {
+    format!(
+        "<shreddit-post id='t3_{id}' post-title='{id}' subreddit-name='{subreddit}' author='reader' permalink='/r/{subreddit}/comments/{id}/title/' post-type='text'></shreddit-post>"
+    )
+}
+
 pub(crate) fn saved_export(id: &str, name: &str) -> String {
     format!(
         "# redtab-connection {}\n.reddit.com\tTRUE\t/\tTRUE\t0\treddit_session\tfixture-session\n",
@@ -645,6 +651,42 @@ fn when_nsfw_is_disabled_streamed_callbacks_should_only_publish_visible_posts() 
 }
 
 #[test]
+fn when_home_lookups_are_denied_it_should_use_complete_native_cards() {
+    let fixture = Fixture::new(|request| {
+        if request.url.starts_with("/svc/shreddit/feeds/home-feed") {
+            Reply {
+                status: 200,
+                body: r#"<shreddit-post id="t3_native" post-title="Native &amp; complete" subreddit-name="unjoined" author="reader" score="42" comment-count="7" created-timestamp="2026-10-27T00:00:00Z" permalink="/r/unjoined/comments/native/title/" post-type="image" content-href="https://i.redd.it/original.jpg" spoiler><div slot="post-media-container"><img data-post-media-primary src="https://preview.redd.it/native.jpg?width=640" width="640" height="480" srcset="https://preview.redd.it/native.jpg?width=1080 1080w"></div></shreddit-post><faceplate-partial id="feed-next-page-partial"></faceplate-partial>"#.into(),
+                headers: vec![],
+            }
+        } else {
+            Reply::status(403)
+        }
+    });
+
+    let listing = fixture
+        .reddit()
+        .home(Sort::Best, TimeRange::Day, None)
+        .unwrap();
+
+    let post = &listing.posts[0];
+    assert_eq!(post.id, "native");
+    assert_eq!(post.title, "Native & complete");
+    assert_eq!(post.subreddit, "unjoined");
+    assert_eq!((post.score, post.comments), (Some(42), 7));
+    assert!(post.spoiler && !post.nsfw);
+    assert_eq!(post.preview_size, Some((1080, 810)));
+    assert_eq!(
+        post.media,
+        crate::model::Media::Image {
+            url: "https://i.redd.it/original.jpg".into(),
+            preview: Some("https://preview.redd.it/native.jpg?width=1080".into()),
+        }
+    );
+    assert!(listing.after.is_none());
+}
+
+#[test]
 fn when_best_home_loads_it_should_preserve_browser_recommendations_and_order() {
     let fixture = Fixture::new(|request| {
         let url = Url::parse(&format!("http://fixture{}", request.url)).unwrap();
@@ -657,11 +699,16 @@ fn when_best_home_loads_it_should_preserve_browser_recommendations_and_order() {
                     url.query_pairs()
                         .any(|(key, value)| key == "sort" && value == "BEST")
                 );
-                Reply { status: 200, body: r#"<shreddit-post id="t3_recommended" recommendation-source="discovery"></shreddit-post><shreddit-ad-post id="t3_ad"></shreddit-ad-post><shreddit-post id="t3_joined"></shreddit-post><shreddit-post id="t3_gonea"></shreddit-post><shreddit-post id="t3_goneb"></shreddit-post><faceplate-partial id="feed-next-page-partial" src="/svc/shreddit/feeds/home-feed?sort=BEST&amp;after=t3_joined&amp;cursor=opaque%26next"></faceplate-partial>"#.into(), headers: vec![] }
+                Reply {
+                    status: 200,
+                    body: format!(
+                        "{}<shreddit-ad-post id='t3_ad'></shreddit-ad-post>{}<faceplate-partial id='feed-next-page-partial' src='/svc/shreddit/feeds/home-feed?sort=BEST&amp;after=t3_joined&amp;cursor=opaque%26next'></faceplate-partial>",
+                        native_post("recommended", "unjoined"),
+                        native_post("joined", "rust")
+                    ),
+                    headers: vec![],
+                }
             }
-            "/by_id/t3_recommended,t3_joined,t3_gonea,t3_goneb.json" => Reply::json(
-                json!({"kind":"Listing","data":{"children":[home_post("joined","rust"),home_post("recommended","unjoined")],"after":null}}),
-            ),
             _ => panic!("unexpected Home request: {}", url.path()),
         }
     });
@@ -834,7 +881,15 @@ fn when_json_and_home_have_separate_budgets_home_should_not_reset_json() {
                 }
                 .into(),
             ),
-            ("X-Ratelimit-Reset".into(), "1.2".into()),
+            (
+                "X-Ratelimit-Reset".into(),
+                if request.url.starts_with(home::PATH) {
+                    "0.01"
+                } else {
+                    "12"
+                }
+                .into(),
+            ),
         ],
     });
     let reddit = fixture
@@ -845,13 +900,16 @@ fn when_json_and_home_have_separate_budgets_home_should_not_reset_json() {
         .request(reddit.0.api.join(home::PATH).unwrap(), home::ACCEPT)
         .unwrap();
 
-    let started = Instant::now();
-    reddit.search("rust", "next", None).unwrap();
-
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let actual = reddit.0.rate.admit(
+        &reddit.0.api.join("search.json").unwrap(),
+        Priority::Background,
+        true,
+        || Instant::now() >= deadline,
+    );
     assert!(
-        started.elapsed() >= Duration::from_millis(450),
-        "Home's budget erased JSON pacing: {:?}",
-        started.elapsed()
+        matches!(actual,Err(error) if error.to_string()==REQUEST_CANCELLED),
+        "Home erased the JSON admission delay"
     );
 }
 
@@ -1603,20 +1661,14 @@ fn check_is_up_only_when_the_listing_loads() {
 fn when_browser_home_pages_it_should_keep_the_entire_opaque_cursor() {
     let fixture = Fixture::new(|request| {
         let url = Url::parse(&format!("http://fixture{}", request.url)).unwrap();
-        if url.path() == "/svc/shreddit/feeds/home-feed" {
-            let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
-            assert_eq!(query["cursor"], "opaque&next");
-            assert_eq!(query["distance"], "25");
-            Reply {
-                status: 200,
-                body: "<shreddit-post id='t3_next'></shreddit-post>".into(),
-                headers: vec![],
-            }
-        } else {
-            assert_eq!(url.path(), "/by_id/t3_next.json");
-            Reply::json(
-                json!({"kind":"Listing","data":{"children":[home_post("next","unjoined")],"after":null}}),
-            )
+        assert_eq!(url.path(), "/svc/shreddit/feeds/home-feed");
+        let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(query["cursor"], "opaque&next");
+        assert_eq!(query["distance"], "25");
+        Reply {
+            status: 200,
+            body: native_post("next", "unjoined"),
+            headers: vec![],
         }
     });
     let cursor = format!(
@@ -1634,22 +1686,26 @@ fn when_browser_home_pages_it_should_keep_the_entire_opaque_cursor() {
 }
 
 #[test]
-fn when_home_post_details_hide_nsfw_or_disappear_it_should_keep_the_browser_cursor() {
+fn when_home_filters_nsfw_it_should_keep_the_browser_cursor() {
     let fixture = Fixture::new(|request| {
-        if request.url.starts_with("/svc/shreddit/feeds/home-feed") {
-            Reply { status: 200, body: "<shreddit-post id='t3_hidden'></shreddit-post><shreddit-post id='t3_gone'></shreddit-post><shreddit-post id='t3_gonea'></shreddit-post><shreddit-post id='t3_goneb'></shreddit-post><faceplate-partial id='feed-next-page-partial' src='/svc/shreddit/feeds/home-feed?cursor=more'></faceplate-partial>".into(), headers: vec![] }
-        } else {
-            let mut hidden = home_post("hidden", "unjoined");
-            hidden["data"]["over_18"] = json!(true);
-            Reply::json(json!({"kind":"Listing","data":{"children":[hidden],"after":null}}))
+        assert!(request.url.starts_with("/svc/shreddit/feeds/home-feed"));
+        Reply {
+            status: 200,
+            body:
+                format!(
+                    "{}<faceplate-partial id='feed-next-page-partial' src='/svc/shreddit/feeds/home-feed?cursor=more'></faceplate-partial>",
+                    ["hidden", "hiddena", "hiddenb", "hiddenc"]
+                        .map(|id| native_post(id, "unjoined")
+                            .replace(" post-type=", " nsfw post-type="))
+                        .join("")
+                ),
+            headers: vec![],
         }
     });
-
     let listing = fixture
         .reddit()
         .home(Sort::Best, TimeRange::Day, None)
         .unwrap();
-
     assert!(listing.posts.is_empty());
     assert!(listing.after.unwrap().ends_with("?cursor=more"));
 }
