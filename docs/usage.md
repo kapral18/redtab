@@ -69,7 +69,8 @@ thumbnails and community icons need Kitty, iTerm2 or Sixel graphics; Ghostty and
 Kitty also work in tmux. `i` toggles previews. `NO_COLOR` is supported.
 
 With `ffmpeg`, the selected card autoplays video/GIFs after navigation settles,
-initially muted. An open detail pane takes playback instead. `P` plays/pauses,
+initially muted, including while the sidebar has focus. An open detail pane takes
+playback instead. Return to the list to use the playback controls. `P` plays/pauses,
 `a` toggles sound, and `,`/`.` seek five seconds. Scrolling within the same post
 keeps pause and position. Turn off **Autoplay videos** in F2 for manual playback; it saves to the current Reddit account.
 Play overlays mark paused/waiting media; links show an arrow and domain, and

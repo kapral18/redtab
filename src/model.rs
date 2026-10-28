@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -169,12 +170,12 @@ impl Media {
     }
 
     /// Inline still or video poster. Ordinary link previews stay list thumbnails.
-    pub fn preview_image(&self) -> Option<&str> {
+    pub fn preview_image(&self) -> Option<Cow<'_, str>> {
         self.preview_image_at(0)
     }
 
-    pub fn preview_image_at(&self, index: usize) -> Option<&str> {
-        match self {
+    pub fn preview_image_at(&self, index: usize) -> Option<Cow<'_, str>> {
+        let source = match self {
             Media::Image { url, preview } => self
                 .video_url()
                 .is_none()
@@ -191,9 +192,17 @@ impl Media {
                         .unwrap_or(original)
                 })
             }
-            Media::Link { thumb, .. } if self.youtube_url().is_some() => thumb.as_deref(),
+            Media::Link { url, thumb } if self.youtube_url().is_some() => {
+                if thumb.is_none() {
+                    return youtube_id(url).map(|id| {
+                        Cow::Owned(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"))
+                    });
+                }
+                thumb.as_deref()
+            }
             Media::Link { .. } | Media::None => None,
-        }
+        };
+        source.map(Cow::Borrowed)
     }
 
     /// Whether the post view shows an image or plays a video under the header.
@@ -202,11 +211,15 @@ impl Media {
     }
 
     /// GIF image posts list their first frame (the fetch stops after it).
-    pub fn list_thumb(&self) -> Option<&str> {
+    pub fn list_thumb(&self) -> Option<Cow<'_, str>> {
         match self {
-            Media::Gallery { thumb, .. } => thumb.as_deref().or_else(|| self.preview_image()),
-            Media::Image { url, preview } => Some(preview.as_deref().unwrap_or(url)),
-            Media::Link { thumb, .. } => thumb.as_deref(),
+            Media::Gallery { thumb, .. } => thumb
+                .as_deref()
+                .map(Cow::Borrowed)
+                .or_else(|| self.preview_image()),
+            Media::Image { url, preview } => Some(Cow::Borrowed(preview.as_deref().unwrap_or(url))),
+            Media::Link { .. } if self.youtube_url().is_some() => self.preview_image(),
+            Media::Link { thumb, .. } => thumb.as_deref().map(Cow::Borrowed),
             _ => self.preview_image(),
         }
     }
@@ -285,6 +298,9 @@ pub struct Post {
     /// Media and body stay hidden until revealed.
     #[serde(default)]
     pub spoiler: bool,
+    /// Reddit explicitly marks the crosspost's original as deleted.
+    #[serde(default)]
+    pub original_deleted: bool,
 }
 
 /// Wrap inline `>!spoiler!<` text so the view can mask it. Unicode noncharacters;
@@ -504,6 +520,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn when_a_cached_youtube_link_has_no_reddit_thumbnail_it_should_have_a_public_poster() {
+        let media: Media = serde_json::from_value(serde_json::json!({"Link": {
+            "url":"https://www.youtube.com/watch?v=n5l_E770Ksw", "thumb":null
+        }}))
+        .unwrap();
+
+        assert_eq!(
+            media.preview_image().as_deref(),
+            Some("https://i.ytimg.com/vi/n5l_E770Ksw/hqdefault.jpg")
+        );
+        assert_eq!(
+            media.list_thumb().as_deref(),
+            Some("https://i.ytimg.com/vi/n5l_E770Ksw/hqdefault.jpg")
+        );
+    }
+
+    #[test]
     fn when_a_youtube_link_is_loaded_it_should_have_inline_video_and_poster_semantics() {
         let media = Media::Link {
             url: "https://youtu.be/dQw4w9WgXcQ".into(),
@@ -513,7 +546,7 @@ mod tests {
         assert_eq!(media.video_url(), Some("https://youtu.be/dQw4w9WgXcQ"));
         assert_eq!(media.tag().as_deref(), Some("YouTube"));
         assert_eq!(
-            media.preview_image(),
+            media.preview_image().as_deref(),
             Some("https://external-preview.redd.it/poster.jpg")
         );
         assert!(media.shows_inline());
@@ -596,7 +629,10 @@ mod tests {
             preview: None,
         };
 
-        assert_eq!(media.list_thumb(), Some("https://i.redd.it/a.gif"));
+        assert_eq!(
+            media.list_thumb().as_deref(),
+            Some("https://i.redd.it/a.gif")
+        );
         assert_eq!(media.preview_image(), None, "it plays as video instead");
     }
 
@@ -608,7 +644,7 @@ mod tests {
         };
 
         assert_eq!(
-            media.list_thumb(),
+            media.list_thumb().as_deref(),
             Some("https://external-preview.redd.it/t.png")
         );
         assert_eq!(media.preview_image(), None);
@@ -620,7 +656,10 @@ mod tests {
         let actual: Media =
             serde_json::from_str(r#"{"Image":{"url":"https://i.redd.it/old.png"}}"#).unwrap();
 
-        assert_eq!(actual.preview_image(), Some("https://i.redd.it/old.png"));
+        assert_eq!(
+            actual.preview_image().as_deref(),
+            Some("https://i.redd.it/old.png")
+        );
         assert_eq!(
             serde_json::to_value(actual).unwrap(),
             serde_json::json!({"Image":{"url":"https://i.redd.it/old.png"}})
@@ -637,7 +676,7 @@ mod tests {
         assert_eq!(actual.video_url(), Some("https://i.redd.it/movie.gif"));
         assert_eq!(actual.preview_image(), None);
         assert_eq!(
-            actual.list_thumb(),
+            actual.list_thumb().as_deref(),
             Some("https://preview.redd.it/movie.png")
         );
     }
@@ -662,6 +701,9 @@ mod tests {
         };
         let json = serde_json::to_string(&new).unwrap();
         assert_eq!(serde_json::from_str::<Media>(&json).unwrap(), new);
-        assert_eq!(new.list_thumb(), Some("https://preview.redd.it/a.jpg"));
+        assert_eq!(
+            new.list_thumb().as_deref(),
+            Some("https://preview.redd.it/a.jpg")
+        );
     }
 }

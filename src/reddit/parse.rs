@@ -396,6 +396,9 @@ pub(super) fn post(value: Value) -> Result<(Post, String)> {
             .to_string();
         // Invalid optional attribution must not hide the crosspost itself.
         if canonicalize_profile_post(original, subreddit, &mut permalink).is_ok() {
+            if original["removed_by_category"].as_str() == Some("deleted") {
+                body.push_str("\n\nOriginal post deleted");
+            }
             body.push_str(&format!(
                 "\n\nCrossposted from {} by u/{}: {}\n{}",
                 crate::model::profile_user(&permalink).map_or_else(
@@ -441,6 +444,10 @@ pub(super) fn post(value: Value) -> Result<(Post, String)> {
             stickied: data.stickied,
             nsfw: data.over_18,
             spoiler: data.spoiler,
+            original_deleted: value["crosspost_parent_list"]
+                .as_array()
+                .and_then(|parents| parents.first())
+                .is_some_and(|parent| parent["removed_by_category"].as_str() == Some("deleted")),
         },
         body,
     ))
@@ -510,13 +517,13 @@ fn preview_size(value: &Value, media: &Media) -> Option<(u32, u32)> {
             if media_url(&image["u"])
                 .or_else(|| media_url(&image["gif"]))
                 .as_deref()
-                == Some(url)
+                == Some(url.as_ref())
             {
                 return dimensions(image, "x", "y");
             }
             if let Some(previews) = source["media_metadata"][id]["p"].as_array() {
                 for preview in previews {
-                    if media_url(&preview["u"]).as_deref() == Some(url) {
+                    if media_url(&preview["u"]).as_deref() == Some(url.as_ref()) {
                         return dimensions(preview, "x", "y");
                     }
                 }
@@ -526,17 +533,17 @@ fn preview_size(value: &Value, media: &Media) -> Option<(u32, u32)> {
     let preview = &source["preview"]["images"][0]["source"];
     if let Some(previews) = source["preview"]["images"][0]["resolutions"].as_array() {
         for preview in previews {
-            if media_url(&preview["url"]).as_deref() == Some(url) {
+            if media_url(&preview["url"]).as_deref() == Some(url.as_ref()) {
                 return dimensions(preview, "width", "height");
             }
         }
     }
-    if (matches!(media, Media::Image { .. }) || preview["url"].as_str() == Some(url))
+    if (matches!(media, Media::Image { .. }) || preview["url"].as_str() == Some(url.as_ref()))
         && let Some(size) = dimensions(preview, "width", "height")
     {
         return Some(size);
     }
-    (source["thumbnail"].as_str() == Some(url))
+    (source["thumbnail"].as_str() == Some(url.as_ref()))
         .then(|| dimensions(source, "thumbnail_width", "thumbnail_height"))
         .flatten()
 }
@@ -1428,6 +1435,44 @@ mod tests {
     }
 
     #[test]
+    fn when_a_crosspost_parent_is_deleted_its_body_should_label_the_original_and_keep_media() {
+        let fields = json!({
+            "id":"cross", "title":"Shared video", "subreddit":"mechanical_gifs",
+            "permalink":"/r/mechanical_gifs/comments/cross/shared/",
+            "crosspost_parent_list":[{
+                "removed_by_category":"deleted", "author":"[deleted]", "title":"Original video",
+                "subreddit":"oddlysatisfying", "permalink":"/r/oddlysatisfying/comments/parent/original/",
+                "secure_media":{"reddit_video":{"hls_url":"https://v.redd.it/a/master.m3u8"}}
+            }]
+        });
+
+        let (actual, body) = post(fields).unwrap();
+
+        assert!(body.contains("Original post deleted"), "{body}");
+        assert_eq!(
+            actual.media.video_url(),
+            Some("https://v.redd.it/a/master.m3u8")
+        );
+    }
+
+    #[test]
+    fn when_only_the_parent_author_is_deleted_the_post_should_not_be_labeled_deleted() {
+        let fields = json!({
+            "id":"cross", "title":"Shared video", "subreddit":"mechanical_gifs",
+            "permalink":"/r/mechanical_gifs/comments/cross/shared/",
+            "crosspost_parent_list":[{
+                "author":"[deleted]", "title":"Original video",
+                "subreddit":"oddlysatisfying", "permalink":"/r/oddlysatisfying/comments/parent/original/"
+            }]
+        });
+
+        let (actual, body) = post(fields).unwrap();
+
+        assert!(!actual.original_deleted);
+        assert!(!body.contains("Original post deleted"));
+    }
+
+    #[test]
     fn media_uses_hls_gif_gallery_crosspost_and_link_previews() {
         let preview = json!({"images":[{"source":{"url":"https://preview.redd.it/post.jpg?s=x"}}]});
         let video = media(
@@ -1438,7 +1483,7 @@ mod tests {
             Some("https://v.redd.it/id/HLSPlaylist.m3u8")
         );
         assert_eq!(
-            video.preview_image(),
+            video.preview_image().as_deref(),
             Some("https://preview.redd.it/post.jpg?s=x")
         );
         assert_eq!(
@@ -1456,7 +1501,7 @@ mod tests {
         );
         let link = media(&json!({"url":"https://example.com/article","preview":preview}));
         assert_eq!(
-            link.list_thumb(),
+            link.list_thumb().as_deref(),
             Some("https://preview.redd.it/post.jpg?s=x")
         );
         assert_eq!(link.preview_image(), None);
@@ -1466,7 +1511,7 @@ mod tests {
             "preview": preview,
         });
         assert_eq!(
-            media(&external).preview_image(),
+            media(&external).preview_image().as_deref(),
             Some("https://preview.redd.it/post.jpg?s=x")
         );
     }
@@ -1491,7 +1536,7 @@ mod tests {
             serde_json::from_value(serde_json::to_value(post(fields).unwrap().0).unwrap()).unwrap();
 
         assert_eq!(
-            actual.media.preview_image(),
+            actual.media.preview_image().as_deref(),
             Some("https://preview.redd.it/guide.png?width=1080")
         );
         assert_eq!(actual.preview_size, Some((1080, 1620)));
@@ -1516,7 +1561,7 @@ mod tests {
         let actual = post(fields).unwrap().0;
 
         assert_eq!(
-            actual.media.preview_image(),
+            actual.media.preview_image().as_deref(),
             Some("https://external-preview.redd.it/sized.png")
         );
         assert_eq!(actual.preview_size, Some((1080, 1620)));
@@ -1564,7 +1609,7 @@ mod tests {
 
             let actual = post(fields).unwrap().0;
 
-            assert_eq!(actual.media.preview_image(), Some(expected));
+            assert_eq!(actual.media.preview_image().as_deref(), Some(expected));
         }
     }
 
@@ -1587,7 +1632,7 @@ mod tests {
         let actual = post(fields).unwrap().0;
 
         assert_eq!(
-            actual.media.preview_image(),
+            actual.media.preview_image().as_deref(),
             Some("https://preview.redd.it/large.png?width=1080")
         );
         assert_eq!(actual.preview_size, Some((1080, 1620)));

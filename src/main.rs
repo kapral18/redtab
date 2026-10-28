@@ -54,7 +54,7 @@ const WORKER_THREADS: usize = 6;
 /// Hidden flag for the child that queries the terminal's image protocol.
 const PROBE_ARG: &str = "--probe-image-protocol";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-/// The child's inactivity wait in tmux; the parent bounds the whole probe.
+/// The child collects replies within this deadline; the parent bounds the process.
 const PROBE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct Args {
@@ -520,34 +520,157 @@ fn spawn_input_reader() -> InputReader {
 
 /// Child side: prints `<protocol> <font width> <font height>` to stderr; stdout is the terminal.
 fn probe_image_protocol() {
-    use ratatui_image::picker::ProtocolType;
     use ratatui_image::picker::cap_parser::QueryStdioOptions;
 
-    // In tmux replies may never arrive; the parent also handles a killed probe.
-    let mut options = QueryStdioOptions::default();
-    if Picker::halfblocks().tmux_detected() {
-        options.timeout = PROBE_QUERY_TIMEOUT;
+    let tmux = Picker::halfblocks().tmux_detected();
+    let mut options = QueryStdioOptions {
+        timeout: PROBE_QUERY_TIMEOUT,
+        ..QueryStdioOptions::default()
+    };
+    if ["WEZTERM_EXECUTABLE", "KONSOLE_VERSION"]
+        .iter()
+        .any(|name| std::env::var(name).is_ok_and(|value| !value.is_empty()))
+    {
+        options.blacklist_protocols = vec![
+            ratatui_image::picker::ProtocolType::Kitty,
+            ratatui_image::picker::ProtocolType::Sixel,
+        ];
     }
-    if let Ok(picker) = Picker::from_query_stdio_with_options(options) {
-        let kind = match picker.protocol_type() {
-            ProtocolType::Kitty => "kitty",
-            ProtocolType::Sixel => "sixel",
-            ProtocolType::Iterm2 => "iterm2",
-            ProtocolType::Halfblocks => "halfblocks",
+    if crossterm::terminal::enable_raw_mode().is_err() {
+        return;
+    }
+    let result = query_image_protocol(&std::io::stdin(), &mut std::io::stdout(), tmux, options);
+    let _ = crossterm::terminal::disable_raw_mode();
+    let Ok((protocol, font)) = result else { return };
+    let Some(font) = font.or_else(|| {
+        (!tmux)
+            .then(crossterm::terminal::window_size)
+            .and_then(Result::ok)
+            .and_then(|window| {
+                Some(ratatui_image::FontSize::new(
+                    window
+                        .width
+                        .checked_div(window.columns)
+                        .filter(|n| *n > 0)?,
+                    window.height.checked_div(window.rows).filter(|n| *n > 0)?,
+                ))
+            })
+    }) else {
+        return;
+    };
+    #[allow(deprecated)]
+    let mut picker = Picker::from_fontsize(font);
+    if let Some(protocol) = protocol {
+        picker.set_protocol_type(protocol);
+    }
+    let kind = match picker.protocol_type() {
+        ratatui_image::picker::ProtocolType::Kitty => "kitty",
+        ratatui_image::picker::ProtocolType::Sixel => "sixel",
+        ratatui_image::picker::ProtocolType::Iterm2 => "iterm2",
+        ratatui_image::picker::ProtocolType::Halfblocks => "halfblocks",
+    };
+    eprintln!("{kind} {} {}", font.width, font.height);
+}
+
+fn query_image_protocol(
+    input: &impl std::os::fd::AsRawFd,
+    output: &mut impl std::io::Write,
+    tmux: bool,
+    options: ratatui_image::picker::cap_parser::QueryStdioOptions,
+) -> std::io::Result<(
+    Option<ratatui_image::picker::ProtocolType>,
+    Option<ratatui_image::FontSize>,
+)> {
+    use ratatui_image::picker::{
+        ProtocolType,
+        cap_parser::{Parser, Response},
+    };
+
+    let deadline = Instant::now() + options.timeout;
+    let blacklist = options.blacklist_protocols.clone();
+    output.write_all(Parser::query(tmux, options).as_bytes())?;
+    output.flush()?;
+    let mut parser = Parser::new();
+    let (mut protocol, mut font) = (None, None);
+    let mut remaining = 8192;
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        let mut fd = libc::pollfd {
+            fd: input.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
         };
-        let size = picker.font_size();
-        eprintln!("{kind} {} {}", size.width, size.height);
+        let ready = unsafe {
+            libc::poll(
+                &mut fd,
+                1,
+                left.as_millis().clamp(1, i32::MAX as u128) as i32,
+            )
+        };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready == 0 {
+            break;
+        }
+        let mut bytes = [0; 256];
+        let count = unsafe {
+            libc::read(
+                input.as_raw_fd(),
+                bytes.as_mut_ptr().cast(),
+                remaining.min(256),
+            )
+        };
+        if count < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        let count = count as usize;
+        if count == 0 {
+            break;
+        }
+        remaining -= count;
+        for &byte in &bytes[..count] {
+            for response in parser.push(char::from(byte)) {
+                match response {
+                    Response::Kitty if !blacklist.contains(&ProtocolType::Kitty) => {
+                        protocol = Some(ProtocolType::Kitty)
+                    }
+                    Response::Sixel
+                        if protocol.is_none() && !blacklist.contains(&ProtocolType::Sixel) =>
+                    {
+                        protocol = Some(ProtocolType::Sixel)
+                    }
+                    Response::CellSize(Some((width, height))) => {
+                        font = Some(ratatui_image::FontSize::new(width, height))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if remaining == 0 || (protocol == Some(ProtocolType::Kitty) && font.is_some()) {
+            break;
+        }
     }
+    Ok((protocol, font))
 }
 
 /// Parent side. Querying in a child means a terminal that never answers can't leave a
 /// blocked stdin reader in redtab that swallows the first key.
 fn detect_image_picker() -> Picker {
     let report = image_protocol_report();
-    let native_tmux = Picker::halfblocks().tmux_detected() && tmux_pane_gets_kitty();
-    let window = crossterm::terminal::window_size().ok();
-    let Some((protocol, font)) = image_protocol_choice(report.as_deref(), native_tmux, window)
-    else {
+    let (native_tmux, font) = if Picker::halfblocks().tmux_detected() {
+        tmux_graphics()
+    } else {
+        (false, None)
+    };
+    let Some((protocol, font)) = image_protocol_choice(report.as_deref(), native_tmux, font) else {
         return Picker::halfblocks();
     };
     // `from_fontsize` retains tmux passthrough wrapping.
@@ -593,7 +716,7 @@ fn image_protocol_report() -> Option<String> {
 fn image_protocol_choice(
     report: Option<&str>,
     native_tmux: bool,
-    window: Option<crossterm::terminal::WindowSize>,
+    tmux_font: Option<ratatui_image::FontSize>,
 ) -> Option<(ratatui_image::picker::ProtocolType, ratatui_image::FontSize)> {
     use ratatui_image::{FontSize, picker::ProtocolType};
     let reported = report.and_then(|report| {
@@ -616,15 +739,9 @@ fn image_protocol_choice(
         // tmux's own sixel answer does not mean Ghostty can display sixel.
         Some((ProtocolType::Sixel, font)) if native_tmux => Some((ProtocolType::Kitty, font)),
         Some((protocol, font)) if protocol != ProtocolType::Halfblocks => Some((protocol, font)),
-        _ if native_tmux => {
-            let window = window?;
-            let width = window
-                .width
-                .checked_div(window.columns)
-                .filter(|n| *n > 0)?;
-            let height = window.height.checked_div(window.rows).filter(|n| *n > 0)?;
-            Some((ProtocolType::Kitty, FontSize::new(width, height)))
-        }
+        _ if native_tmux => tmux_font
+            .filter(|font| font.width > 0 && font.height > 0)
+            .map(|font| (ProtocolType::Kitty, font)),
         _ => None,
     }
 }
@@ -632,12 +749,12 @@ fn image_protocol_choice(
 /// In tmux the probe may get no kitty reply even when the outer terminal supports it.
 /// Use kitty only if redtab draws straight into its pane (a nested terminal drops
 /// passthrough) and every client of every session showing the window is Ghostty or kitty.
-fn tmux_pane_gets_kitty() -> bool {
+fn tmux_graphics() -> (bool, Option<ratatui_image::FontSize>) {
     use std::os::unix::fs::MetadataExt;
     use std::process::{Command, Stdio};
 
     let Some(pane) = std::env::var("TMUX_PANE").ok() else {
-        return false;
+        return (false, None);
     };
     let tmux = |args: &[&str]| {
         Command::new("tmux")
@@ -656,10 +773,10 @@ fn tmux_pane_gets_kitty() -> bool {
         &pane,
         "#{pane_tty} #{window_id}",
     ]) else {
-        return false;
+        return (false, None);
     };
     let [pane_tty, window] = info.split_whitespace().collect::<Vec<_>>()[..] else {
-        return false;
+        return (false, None);
     };
     let same_tty = match (
         std::fs::metadata(pane_tty),
@@ -669,10 +786,10 @@ fn tmux_pane_gets_kitty() -> bool {
         _ => false,
     };
     if !same_tty {
-        return false;
+        return (false, None);
     }
     let Some(windows) = tmux(&["list-windows", "-a", "-F", "#{window_id} #{session_id}"]) else {
-        return false;
+        return (false, None);
     };
     let sessions: Vec<&str> = windows
         .lines()
@@ -680,16 +797,50 @@ fn tmux_pane_gets_kitty() -> bool {
         .filter(|(w, _)| *w == window)
         .map(|(_, s)| s)
         .collect();
-    let Some(clients) = tmux(&["list-clients", "-F", "#{session_id} #{client_termname}"]) else {
-        return false;
+    let Some(clients) = tmux(&[
+        "list-clients",
+        "-F",
+        "#{session_id} #{client_termname} #{client_cell_width} #{client_cell_height}",
+    ]) else {
+        return (false, None);
     };
-    let mut names = clients
+    tmux_client_graphics(&clients, &sessions)
+}
+
+fn tmux_client_graphics(
+    clients: &str,
+    sessions: &[&str],
+) -> (bool, Option<ratatui_image::FontSize>) {
+    let clients: Vec<_> = clients
         .lines()
-        .filter_map(|line| line.split_once(' '))
-        .filter(|(s, _)| sessions.contains(s))
-        .map(|(_, name)| name)
-        .peekable();
-    names.peek().is_some() && names.all(|name| name.contains("ghostty") || name.contains("kitty"))
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .filter(|fields| {
+            fields
+                .first()
+                .is_some_and(|session| sessions.contains(session))
+        })
+        .collect();
+    if clients.is_empty()
+        || !clients.iter().all(|fields| {
+            fields
+                .get(1)
+                .is_some_and(|name| name.contains("ghostty") || name.contains("kitty"))
+        })
+    {
+        return (false, None);
+    }
+    let mut sizes = clients.iter().map(|fields| {
+        let width = fields.get(2)?.parse::<u16>().ok().filter(|n| *n > 0)?;
+        let height = fields.get(3)?.parse::<u16>().ok().filter(|n| *n > 0)?;
+        Some((width, height))
+    });
+    let Some(first) = sizes.next().flatten() else {
+        return (true, None);
+    };
+    let font = sizes
+        .all(|size| size == Some(first))
+        .then(|| ratatui_image::FontSize::new(first.0, first.1));
+    (true, font)
 }
 
 #[cfg(test)]
@@ -850,13 +1001,75 @@ mod event_loop_tests {
         );
     }
 
-    fn graphics_window() -> crossterm::terminal::WindowSize {
-        crossterm::terminal::WindowSize {
-            columns: 100,
-            rows: 50,
-            width: 800,
-            height: 800,
+    #[test]
+    fn when_status_precedes_graphics_replies_the_probe_should_keep_the_native_protocol() {
+        use ratatui_image::picker::{ProtocolType, cap_parser::QueryStdioOptions};
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        struct Buffered(std::io::BufReader<UnixStream>);
+        impl std::os::fd::AsRawFd for Buffered {
+            fn as_raw_fd(&self) -> std::os::fd::RawFd {
+                self.0.get_ref().as_raw_fd()
+            }
         }
+        impl std::io::Read for Buffered {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.0.read(bytes)
+            }
+        }
+        let (input, mut terminal) = UnixStream::pair().unwrap();
+        let input = Buffered(std::io::BufReader::new(input));
+        terminal.write_all(&[b'x'; 260]).unwrap();
+        terminal
+            .write_all(b"\x1b[0n\x1b_Gi=31;OK\x1b\\\x1b[6;18;8t")
+            .unwrap();
+        let mut query = Vec::new();
+
+        let actual =
+            query_image_protocol(&input, &mut query, false, QueryStdioOptions::default()).unwrap();
+
+        assert_eq!(actual.0, Some(ProtocolType::Kitty));
+        assert_eq!(
+            actual.1.map(|font| (font.width, font.height)),
+            Some((8, 18))
+        );
+    }
+
+    #[test]
+    fn when_the_terminal_stays_silent_the_probe_should_return_at_its_deadline() {
+        use ratatui_image::picker::cap_parser::QueryStdioOptions;
+        use std::os::unix::net::UnixStream;
+        let (input, peer) = UnixStream::pair().unwrap();
+        let (cancel, wait) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(1));
+            drop(peer);
+        });
+        let started = Instant::now();
+
+        let actual = query_image_protocol(
+            &input,
+            &mut Vec::new(),
+            false,
+            QueryStdioOptions {
+                timeout: Duration::from_millis(20),
+                ..QueryStdioOptions::default()
+            },
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        let _ = cancel.send(());
+        watchdog.join().unwrap();
+
+        assert!(actual.0.is_none() && actual.1.is_none());
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "silent terminal blocked for {elapsed:?}"
+        );
+    }
+
+    fn graphics_font() -> ratatui_image::FontSize {
+        ratatui_image::FontSize::new(8, 16)
     }
 
     #[test]
@@ -871,7 +1084,7 @@ mod event_loop_tests {
             Some("kitty x 20"),
         ] {
             assert_eq!(
-                image_protocol_choice(report, true, Some(graphics_window()))
+                image_protocol_choice(report, true, Some(graphics_font()))
                     .map(|(p, f)| (p, f.width, f.height)),
                 Some((ProtocolType::Kitty, 8, 16)),
                 "{report:?}"
@@ -899,19 +1112,41 @@ mod event_loop_tests {
 
     #[test]
     fn when_client_support_or_cell_size_is_unverified_it_should_not_force_kitty() {
-        assert!(image_protocol_choice(None, false, Some(graphics_window())).is_none());
+        assert!(image_protocol_choice(None, false, Some(graphics_font())).is_none());
         assert!(image_protocol_choice(None, true, None).is_none());
-        for field in 0..4 {
-            let mut window = graphics_window();
-            match field {
-                0 => window.columns = 0,
-                1 => window.rows = 0,
-                2 => window.width = 0,
-                _ => window.height = 0,
-            }
+        for font in [
+            ratatui_image::FontSize::new(0, 18),
+            ratatui_image::FontSize::new(8, 0),
+        ] {
+            assert!(image_protocol_choice(None, true, Some(font)).is_none());
+        }
+    }
+
+    #[test]
+    fn when_tmux_clients_confirm_graphics_the_fallback_should_use_their_measured_cells() {
+        use ratatui_image::picker::ProtocolType;
+        let (native, font) = tmux_client_graphics(
+            "$1 xterm-ghostty 8 18\n$1 xterm-kitty 8 18\n$2 xterm-256color 16 32\n",
+            &["$1"],
+        );
+
+        let actual = image_protocol_choice(None, native, font);
+
+        assert_eq!(
+            actual.map(|(protocol, font)| (protocol, font.width, font.height)),
+            Some((ProtocolType::Kitty, 8, 18))
+        );
+        for clients in [
+            "$1 xterm-ghostty 8 18\n$1 xterm-256color 8 18",
+            "",
+            "$1 xterm-ghostty 0 0",
+            "$1 xterm-ghostty",
+            "$1 xterm-ghostty 8 18\n$1 xterm-kitty 10 20",
+        ] {
+            let (native, font) = tmux_client_graphics(clients, &["$1"]);
             assert!(
-                image_protocol_choice(None, true, Some(window)).is_none(),
-                "missing dimension {field}"
+                image_protocol_choice(None, native, font).is_none(),
+                "{clients}"
             );
         }
     }

@@ -1949,19 +1949,30 @@ fn clip_relay_acceptor_should_resume_after_capacity_frees_with_a_pipelined_clien
 }
 
 #[test]
-fn relay_answers_502_when_the_upstream_fails() {
-    let fixture = Fixture::new(|_| Reply::status(500));
+fn media_failure_should_preserve_the_upstream_status_without_its_body() {
+    let fixture = Fixture::new(|r| Reply {
+        status: r.url.trim_start_matches('/').parse().unwrap(),
+        body: "PRIVATE upstream body".into(),
+        headers: vec![],
+    });
     let reddit = Reddit::test_at(&fixture.base, false);
-    let local = reddit
-        .media_url(&format!("{}video.mp4", fixture.base))
-        .unwrap();
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .proxy(None)
         .timeout_global(Some(Duration::from_secs(5)))
         .http_status_as_error(false)
         .build()
         .into();
-    assert_eq!(agent.get(&local).call().unwrap().status().as_u16(), 502);
+    for status in [403, 404, 410, 429, 500, 503] {
+        let local = reddit
+            .media_url(&format!("{}{status}", fixture.base))
+            .unwrap();
+        let mut response = agent.get(&local).call().unwrap();
+        assert_eq!(response.status().as_u16(), status);
+        assert_eq!(
+            response.body_mut().read_to_string().unwrap(),
+            "Media unavailable"
+        );
+    }
 }
 
 #[test]

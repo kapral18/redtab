@@ -20,7 +20,7 @@ Optional programs:
 
 | Program | Used for |
 | --- | --- |
-| `ffmpeg` | Inline video and GIF playback |
+| `ffmpeg` | Inline video and GIF playback (8.1 or newer seeks YouTube faster) |
 | `yt-dlp` and Deno or Node.js | Inline public YouTube videos and Shorts |
 | `ffplay` | Sound during inline playback |
 | `mpv` | Opening videos with `m` |

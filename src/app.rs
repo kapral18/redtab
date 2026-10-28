@@ -39,6 +39,9 @@ const CARD_CACHE_MAX: usize = 64;
 const CARD_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// Small retained previews keep revisits visible while full pixels return from disk.
 const CARD_PREVIEW_MAX: usize = 256;
+/// Last frames for recent videos; decoders independently bound each frame's pixels.
+const VIDEO_PREVIEW_MAX: usize = 8;
+const VIDEO_PREVIEW_BYTES: usize = 32 * 1024 * 1024;
 /// A video area that changed size restarts the video once the size holds this long.
 const VIDEO_RESIZE_SETTLE: Duration = Duration::from_millis(250);
 /// Moves through lists, tabs and posts closer together than this count as one quick run.
@@ -563,7 +566,7 @@ pub struct Row<'a> {
 }
 
 impl PostView {
-    pub fn preview_image(&self) -> Option<&str> {
+    pub fn preview_image(&self) -> Option<std::borrow::Cow<'_, str>> {
         self.shown_post().media.preview_image_at(self.gallery_index)
     }
     pub fn shown_post(&self) -> &Post {
@@ -988,6 +991,23 @@ struct CardPlayback {
     shown: bool,
 }
 
+struct VideoPreview {
+    post: String,
+    url: String,
+    resume: video::Resume,
+    frame: Option<video::Frame>,
+}
+
+impl VideoPreview {
+    fn bytes(&self) -> usize {
+        match self.frame.as_ref().map(|frame| &frame.pixels) {
+            Some(video::Pixels::Raw(pixels)) => pixels.as_bytes().len(),
+            Some(video::Pixels::Png(png)) => png.capacity(),
+            None => 0,
+        }
+    }
+}
+
 struct IconMetadata {
     url: Option<String>,
     source: Source,
@@ -1062,7 +1082,7 @@ pub struct App {
     video_requested: Option<String>,
     video_post_id: Option<String>,
     video_is_card: bool,
-    video_resume: Option<(String, String, video::Resume)>,
+    video_previews: VecDeque<VideoPreview>,
     /// Requested sound; a fresh card selection starts muted.
     video_sound_on: bool,
     /// The box the video decodes for; the drawn picture follows each frame's shape inside.
@@ -1147,7 +1167,7 @@ impl App {
             video_requested: None,
             video_post_id: None,
             video_is_card: false,
-            video_resume: None,
+            video_previews: VecDeque::new(),
             video_sound_on: false,
             video_area: None,
             video_resize: None,
@@ -1470,7 +1490,7 @@ impl App {
         self.card_video = None;
         self.video_requested = None;
         self.video_post_id = None;
-        self.video_resume = None;
+        self.video_previews.clear();
         self.post_settle = Settle::default();
         self.feed_settle = Settle::default();
         self.picture_settle = Settle::default();
@@ -1871,9 +1891,9 @@ impl App {
         if self.media_loading()
             || self.membership.is_some()
             || self.images_loading()
-            || self
-                .selected_video()
-                .is_some_and(|p| p.frame().is_none() && p.error().is_none())
+            || self.selected_video().is_some_and(|p| {
+                (p.frame().is_none() || p.waiting_for_audio()) && p.error().is_none()
+            })
         {
             return true;
         }
@@ -1943,10 +1963,14 @@ impl App {
         });
         self.video
             .as_ref()
-            // A due frame cannot advance until its graphics finish; poll that work
-            // instead of spinning on the frame's already-expired deadline.
-            .filter(|_| !rendering)
             .and_then(|p| p.wake_in(now))
+            .map(|wait| {
+                if rendering {
+                    wait.max(Duration::from_millis(10))
+                } else {
+                    wait
+                }
+            })
             .into_iter()
             .chain(settle)
             .chain(self.read_redraw.then_some(Duration::ZERO))
@@ -1972,11 +1996,12 @@ impl App {
         let target = post.as_ref().and_then(|post| {
             post.media
                 .video_url()
-                .map(|url| (post.id.clone(), url.to_string()))
+                .and_then(|url| self.playback_url(url))
+                .map(|url| (post.id.clone(), url))
         });
         match target {
             Some((id, url)) => {
-                let shown = size.is_some() && self.focus == Focus::List && !self.popup_open();
+                let shown = size.is_some() && !self.popup_open();
                 match &mut self.card_video {
                     Some(card) if card.id == id && card.url == url => card.shown = shown,
                     _ => {
@@ -2033,11 +2058,93 @@ impl App {
             .flatten()
     }
 
+    #[cfg(test)]
     pub fn card_player(&self) -> Option<&Player> {
         let card = self.card_video.as_ref()?;
         (self.video_is_card && self.video_post_id.as_deref() == Some(&card.id))
             .then_some(self.video.as_ref())
             .flatten()
+    }
+
+    /// Selected pixels stay drawable while playback settles or a decoder restarts.
+    pub fn video_preview(&self, card: bool) -> Option<(&video::Frame, bool)> {
+        if card && self.post_view.is_some() {
+            return None;
+        }
+        let post = self.video_control_post()?;
+        let url = self.playback_url(post.media.video_url()?)?;
+        let player = self.selected_video();
+        if let Some(player) = player.filter(|player| player.url == url)
+            && let Some(frame) = player.frame()
+        {
+            return Some((frame, !player.paused() && player.error().is_none()));
+        }
+        let preview = self
+            .video_previews
+            .iter()
+            .rev()
+            .find(|preview| preview.post == post.id && preview.url == url)?;
+        let playing = !preview.resume.paused
+            && (self.config.media.video_autoplay
+                || self.video_requested.as_deref() == Some(&post.id));
+        preview.frame.as_ref().map(|frame| (frame, playing))
+    }
+
+    pub fn playback_url(&self, url: &str) -> Option<String> {
+        if let Some(id) = crate::model::youtube_id(url) {
+            Some(format!("https://www.youtube.com/watch?v={id}"))
+        } else {
+            self.reddit.media_url(url).ok()
+        }
+    }
+
+    fn retire_video(&mut self, now: Instant) -> bool {
+        let post = self.video_post_id.take();
+        let Some(player) = self.video.take() else {
+            return false;
+        };
+        if let Some(post) = post
+            && self.inline_images_on()
+        {
+            // Manual play and autoplay-off retirement also need the selected
+            // preview to survive pruning, before a replacement Player exists.
+            let protected = self
+                .video_control_post()
+                .and_then(|target| {
+                    let url = self.playback_url(target.media.video_url()?)?;
+                    self.take_video_preview(&target.id, &url)
+                })
+                .filter(|preview| preview.post != post || preview.url != player.url);
+            self.video_previews
+                .retain(|preview| preview.post != post || preview.url != player.url);
+            self.video_previews.push_back(VideoPreview {
+                post,
+                url: player.url.clone(),
+                resume: player.resume(now),
+                frame: player.frame().cloned(),
+            });
+            if let Some(protected) = protected {
+                self.video_previews.push_back(protected);
+            }
+            while self.video_previews.len() > VIDEO_PREVIEW_MAX
+                || self
+                    .video_previews
+                    .iter()
+                    .map(VideoPreview::bytes)
+                    .sum::<usize>()
+                    > VIDEO_PREVIEW_BYTES
+            {
+                self.video_previews.pop_front();
+            }
+        }
+        true
+    }
+
+    fn take_video_preview(&mut self, post: &str, url: &str) -> Option<VideoPreview> {
+        self.video_previews
+            .iter()
+            .position(|preview| preview.post == post && preview.url == url)
+            .and_then(|index| self.video_previews.remove(index))
     }
 
     /// One stream: loaded detail takes precedence; cards wait for selection to settle.
@@ -2047,8 +2154,8 @@ impl App {
         if !self.config.media.video_autoplay && !requested {
             return None;
         }
-        let url = if let Some(view) = &self.post_view {
-            view.page.as_ref()?.post.media.video_url()?
+        if let Some(view) = &self.post_view {
+            self.playback_url(view.page.as_ref()?.post.media.video_url()?)
         } else {
             let card = self.card_video.as_ref()?;
             if card.id != post.id
@@ -2057,12 +2164,7 @@ impl App {
             {
                 return None;
             }
-            &card.url
-        };
-        if let Some(id) = crate::model::youtube_id(url) {
-            Some(format!("https://www.youtube.com/watch?v={id}"))
-        } else {
-            self.reddit.media_url(url).ok()
+            Some(card.url.clone())
         }
     }
 
@@ -2087,16 +2189,26 @@ impl App {
                 self.video_area = None;
             }
             self.video_resize = None;
-            let old = self.video.take();
-            let changed = old.is_some();
-            if let Some(player) = old {
-                self.video_resume = self
-                    .video_control_post()
-                    .filter(|post| self.video_post_id.as_deref() == Some(&post.id))
-                    .map(|post| (post.id, player.url.clone(), player.resume(now)));
+            // A loaded card can pause through other cards and resume without a
+            // second network/decoder startup. Unfinished extraction still retires.
+            if self.inline_images_on()
+                && self.post_view.is_none()
+                && self.state.list_view() == ListView::Card
+                && !matches!(self.active_tab().kind, TabKind::AllSubs)
+                && self.config.media.video_autoplay
+                && self.video_control_post().is_some()
+                && let Some(player) = self
+                    .video
+                    .as_mut()
+                    .filter(|p| p.frame().is_some() && !p.resolving())
+            {
+                player.set_hidden(true, now);
+                return false;
             }
-            self.video_post_id = None;
-            return changed;
+            if !self.inline_images_on() {
+                self.video_previews.clear();
+            }
+            return self.retire_video(now);
         };
         let card = self.post_view.is_none();
         let id = self.video_control_post().map(|post| post.id).unwrap();
@@ -2129,19 +2241,26 @@ impl App {
             };
             if start {
                 // Same video, new size: go on from where it was.
-                let resume = match self.video.take() {
-                    Some(old) if same_post && old.url == url => old.resume(now),
-                    _ => self
-                        .video_resume
-                        .take()
-                        .filter(|(post, source, _)| *post == id && *source == url)
-                        .map(|(_, _, resume)| resume)
+                let continuing = self.video_post_id.as_deref() == Some(&id)
+                    && self.video.as_ref().is_some_and(|player| player.url == url);
+                // Protect the destination before retirement can evict an old entry.
+                let previous = self.take_video_preview(&id, &url);
+                self.retire_video(now);
+                let previous = self.take_video_preview(&id, &url).or(previous);
+                let mut resume =
+                    previous
+                        .as_ref()
+                        .map(|preview| preview.resume)
                         .unwrap_or(video::Resume {
                             sound: !card && self.video_sound_on,
                             ..video::Resume::default()
-                        }),
-                };
-                self.video = Some(start_player(url, area, resume));
+                        });
+                if !card && !continuing {
+                    resume.sound = self.video_sound_on;
+                }
+                let mut player = start_player(url, area, resume);
+                player.retain_frame(previous.and_then(|preview| preview.frame));
+                self.video = Some(player);
                 self.video_post_id = Some(id);
                 self.video_is_card = card;
                 if card {
@@ -2159,12 +2278,11 @@ impl App {
             } else {
                 self.post_view.as_ref().is_some_and(|v| v.image_shown)
             };
-        let advance = !self.card_renderer.pending();
+        let rendering = self.card_renderer.pending();
         if let Some(player) = &mut self.video {
             player.set_hidden(!shown, now);
-            if advance {
-                changed |= player.tick(now);
-            }
+            // Keep audio-clock catch-up independent of tile preparation.
+            changed |= player.tick(now) && !rendering;
             if let Some((text, error)) = player.take_notice() {
                 if error {
                     // No ffplay: no later video can play sound either.
@@ -2188,9 +2306,7 @@ impl App {
             .as_ref()
             .is_some_and(|id| post.as_ref().is_none_or(|post| *id != post.id))
         {
-            self.video = None;
-            self.video_post_id = None;
-            self.video_resume = None;
+            self.retire_video(Instant::now());
         }
         if self
             .video
@@ -2198,7 +2314,9 @@ impl App {
             .is_some_and(|player| player.error().is_some())
         {
             self.video = None;
-            self.video_resume = None;
+            let id = self.video_post_id.as_deref();
+            self.video_previews
+                .retain(|preview| Some(preview.post.as_str()) != id);
         }
         match &mut self.video {
             Some(player) => player.toggle_pause(Instant::now()),
@@ -2207,6 +2325,15 @@ impl App {
                     .video_control_post()
                     .filter(|p| p.media.video_url().is_some())
                 {
+                    let url = post
+                        .media
+                        .video_url()
+                        .and_then(|url| self.playback_url(url));
+                    for preview in &mut self.video_previews {
+                        if preview.post == post.id && Some(&preview.url) == url.as_ref() {
+                            preview.resume.paused = false;
+                        }
+                    }
                     self.video_requested = Some(post.id);
                 } else {
                     self.info("No video plays here");
@@ -2806,7 +2933,7 @@ impl App {
             .as_ref()
             .filter(|view| view.page.is_some())
             .and_then(PostView::preview_image)
-            .map(str::to_string);
+            .map(std::borrow::Cow::into_owned);
         if self.inline_images_on()
             && let Some(url) = image
         {
@@ -3629,6 +3756,9 @@ impl App {
     fn apply_image_setting(&mut self) {
         self.icon_demands.clear();
         self.show_images = self.config.media.image_preview;
+        if !self.show_images {
+            self.video_previews.clear();
+        }
         // Icons are looked up only while thumbnails show: fetch the ones skipped meanwhile.
         let names: Vec<String> = (self.tabs.iter().filter_map(Tab::subreddit))
             .chain(self.all_subs.groups.iter().map(|g| g.subreddit.as_str()))
@@ -3663,7 +3793,7 @@ impl App {
             // Turned on at the post's top: show the image now; same-pass changes treat the
             // top as showing it.
             let media = &page.post.media;
-            let url = view.preview_image().map(str::to_string);
+            let url = view.preview_image().map(std::borrow::Cow::into_owned);
             if view.scroll == 0 {
                 view.image_shown = media.shows_inline() && !view.spoiler_hidden();
             }
@@ -4567,10 +4697,28 @@ impl App {
                             .post
                             .media
                             .preview_image_at(view.gallery_index)
-                            .map(str::to_string);
+                            .map(std::borrow::Cow::into_owned);
                         // The bookmark learns a spoiler tag its saved listing may lack.
                         if page.post.spoiler {
                             self.state.mark_bookmark_spoiler(&page.post.id);
+                        }
+                        if page.post.original_deleted {
+                            view.post.original_deleted = true;
+                            for post in self
+                                .tabs
+                                .iter_mut()
+                                .flat_map(|tab| &mut tab.feed.posts)
+                                .chain(
+                                    self.all_subs
+                                        .groups
+                                        .iter_mut()
+                                        .flat_map(|group| &mut group.posts),
+                                )
+                                .filter(|post| post.id == page.post.id)
+                            {
+                                post.original_deleted = true;
+                            }
+                            self.state.mark_original_deleted(&page.post.id, now());
                         }
                         view.page = Some(page);
                         view.error = None;
@@ -6176,6 +6324,381 @@ mod tests {
         app
     }
 
+    fn playback_frame(shade: u8) -> video::Frame {
+        video::Frame {
+            width: 16,
+            height: 9,
+            pixels: video::Pixels::Raw(std::sync::Arc::new(image::DynamicImage::ImageRgb8(
+                image::RgbImage::from_pixel(16, 9, image::Rgb([shade, 0, 0])),
+            ))),
+            same_as_first: false,
+        }
+    }
+
+    #[test]
+    fn when_graphics_are_pending_selected_video_should_still_consume_its_frames() {
+        let mut app = card_playback_app();
+        let now = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+        app.sync_video_with(now, |url, area, _| Player::pending(&url, area));
+        app.video = Some(Player::buffered(
+            &app.video.as_ref().unwrap().url,
+            Size::new(68, 68),
+            playback_frame(2),
+        ));
+        let image = std::sync::Arc::new(image::DynamicImage::new_rgb8(4, 4));
+        let mut key = crate::card_image::Key::new(
+            "pending-video",
+            &app.image_picker,
+            Size::new(4, 4),
+            (4, 4),
+            0,
+            4,
+            0,
+        );
+        key.video = true;
+        app.card_renderer.begin();
+        app.card_renderer.tile(
+            key,
+            &image,
+            &app.image_picker,
+            crate::card_image::Preparation::Refresh,
+        );
+        app.card_renderer.finish();
+        assert!(app.card_renderer.pending());
+
+        app.sync_video_with(now, |_, _, _| panic!("keep the selected decoder"));
+
+        assert!(app.video.as_ref().unwrap().frame().is_some());
+    }
+
+    #[test]
+    fn when_a_loaded_video_is_revisited_after_an_image_it_should_keep_its_player() {
+        let mut app = card_playback_app();
+        app.tabs[0].feed.posts[1].media = Media::None;
+        let start = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+        app.sync_video_with(start, |url, area, _| {
+            let mut player = Player::showing(&url, playback_frame(1));
+            player.area = area;
+            player
+        });
+        app.tabs[0].feed.selected = 1;
+        app.card_video_drawn(Some(Size::new(68, 68)));
+        app.sync_video_with(start, |_, _, _| panic!("an image must not start a video"));
+        assert!(
+            app.selected_video().is_none(),
+            "the previous video is hidden"
+        );
+
+        app.tabs[0].feed.selected = 0;
+        app.card_video_drawn(Some(Size::new(68, 68)));
+        let returned = app.card_video.as_ref().unwrap().since;
+        app.sync_video_with(returned, |_, _, _| panic!("a warm return must not restart"));
+        assert!(
+            app.card_player().and_then(Player::frame).is_some(),
+            "show the loaded frame immediately, even during selection settling"
+        );
+        app.sync_video_with(returned + NAV_SETTLE, |_, _, _| {
+            panic!("the same decoded stream must resume")
+        });
+        assert!(!app.card_player().unwrap().hidden());
+    }
+
+    #[test]
+    fn when_switching_between_videos_the_last_frame_should_cover_decoder_startup() {
+        let mut app = card_playback_app();
+        let start = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+        app.sync_video_with(start, |url, area, _| {
+            let mut player = Player::showing(&url, playback_frame(1));
+            player.area = area;
+            player
+        });
+        app.tabs[0].feed.selected = 1;
+        app.card_video_drawn(Some(Size::new(68, 68)));
+        let next = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+        app.sync_video_with(next, |url, area, _| {
+            let mut player = Player::showing(&url, playback_frame(2));
+            player.area = area;
+            player
+        });
+        app.tabs[0].feed.selected = 0;
+        app.card_video_drawn(Some(Size::new(68, 68)));
+        let returned = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+        app.sync_video_with(returned, |url, area, _| Player::silent(&url, area));
+        let frame = app
+            .card_player()
+            .and_then(Player::frame)
+            .expect("retain the first video's frame while its decoder waits");
+        let video::Pixels::Raw(pixels) = &frame.pixels else {
+            panic!("decoded pixels")
+        };
+        assert_eq!(pixels.to_rgb8().get_pixel(0, 0).0, [1, 0, 0]);
+    }
+
+    #[test]
+    fn when_recent_video_frames_are_revisited_they_should_stay_bounded_and_match_the_source() {
+        for manual in [false, true] {
+            let mut app = card_playback_app();
+            let template = app.tabs[0].feed.posts[0].clone();
+            app.tabs[0].feed.posts = (0..10)
+                .map(|index| {
+                    let mut post = template.clone();
+                    post.id = format!("video{index}");
+                    post
+                })
+                .collect();
+            for index in 0..10 {
+                app.tabs[0].feed.selected = index;
+                app.card_video_drawn(Some(Size::new(68, 68)));
+                let at = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+                app.sync_video_with(at, |url, area, _| {
+                    let mut player = Player::showing(&url, playback_frame(index as u8 + 1));
+                    player.area = area;
+                    player
+                });
+            }
+            app.tabs[0].feed.selected = 1;
+            app.card_video_drawn(Some(Size::new(68, 68)));
+            let (frame, _) = app
+                .video_preview(true)
+                .expect("a recent frame appears before debounce");
+            let video::Pixels::Raw(pixels) = &frame.pixels else {
+                panic!("decoded pixels")
+            };
+            assert_eq!(pixels.to_rgb8().get_pixel(0, 0).0, [2, 0, 0]);
+            if manual {
+                app.toggle_video_pause();
+            }
+            let returned = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+            app.sync_video_with(returned, |url, area, _| Player::silent(&url, area));
+            assert!(
+                app.card_player().and_then(Player::frame).is_some(),
+                "retiring the outgoing player must not evict the destination"
+            );
+            app.tabs[0].feed.selected = 0;
+            app.card_video_drawn(Some(Size::new(68, 68)));
+            assert!(
+                app.video_preview(true).is_none(),
+                "the oldest of ten frames was evicted"
+            );
+            app.tabs[0].feed.selected = 1;
+            app.tabs[0].feed.posts[1].media = Media::Video {
+                gif: false,
+                url: Some("https://v.redd.it/changed.mp4".into()),
+                poster: None,
+            };
+            app.card_video_drawn(Some(Size::new(68, 68)));
+            assert!(
+                app.video_preview(true).is_none(),
+                "a new source cannot display old pixels"
+            );
+            app.show_images = false;
+            app.sync_video_with(Instant::now(), |_, _, _| panic!("images off"));
+            assert!(app.video.is_none());
+            assert!(app.video_previews.is_empty());
+        }
+    }
+
+    #[test]
+    fn when_large_video_previews_exceed_the_byte_budget_the_oldest_should_expire() {
+        let mut app = card_playback_app();
+        let template = app.tabs[0].feed.posts[0].clone();
+        app.tabs[0].feed.posts = (0..4)
+            .map(|index| {
+                let mut post = template.clone();
+                post.id = format!("video{index}");
+                post
+            })
+            .collect();
+        for index in 0..4 {
+            app.tabs[0].feed.selected = index;
+            app.card_video_drawn(Some(Size::new(68, 68)));
+            let at = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+            app.sync_video_with(at, |url, area, _| {
+                let frame = video::Frame {
+                    width: 2048,
+                    height: 2048,
+                    pixels: video::Pixels::Raw(std::sync::Arc::new(
+                        image::DynamicImage::new_rgba8(2048, 2048),
+                    )),
+                    same_as_first: false,
+                };
+                let mut player = Player::showing(&url, frame);
+                player.area = area;
+                player
+            });
+        }
+        app.tabs[0].feed.selected = 0;
+        app.card_video_drawn(Some(Size::new(68, 68)));
+        assert!(
+            app.video_preview(true).is_none(),
+            "three16MiB previews cannot all remain cached"
+        );
+        app.tabs[0].feed.selected = 1;
+        app.card_video_drawn(Some(Size::new(68, 68)));
+        assert!(
+            app.video_preview(true).is_some(),
+            "keep newer previews within32MiB"
+        );
+        app.toggle_video_pause();
+        let returned = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+        app.sync_video_with(returned, |url, area, _| Player::silent(&url, area));
+        assert!(
+            app.card_player().and_then(Player::frame).is_some(),
+            "manual play must keep the selected preview at the byte limit"
+        );
+    }
+
+    #[test]
+    fn when_a_youtube_link_changes_alias_the_loaded_player_should_stay() {
+        let mut app = card_playback_app();
+        app.tabs[0].feed.posts[0].media = Media::Link {
+            url: "https://youtu.be/abcdefghijk".into(),
+            thumb: None,
+        };
+        app.card_video_drawn(Some(Size::new(68, 68)));
+        let start = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+        app.sync_video_with(start, |url, area, _| {
+            let mut player = Player::showing(&url, playback_frame(1));
+            player.area = area;
+            player
+        });
+        app.tabs[0].feed.posts[0].media = Media::Link {
+            url: "https://www.youtube.com/watch?v=abcdefghijk&feature=share".into(),
+            thumb: None,
+        };
+        app.card_video_drawn(Some(Size::new(68, 68)));
+        app.sync_video_with(Instant::now(), |_, _, _| {
+            panic!("the same video must not restart")
+        });
+        assert!(app.card_player().and_then(Player::frame).is_some());
+    }
+
+    #[test]
+    fn when_a_detail_video_returns_it_should_use_the_current_sound_preference() {
+        let mut app = card_playback_app();
+        app.video_sound_on = true;
+        let open = |app: &mut App, index: usize| {
+            let post = app.tabs[0].feed.posts[index].clone();
+            app.show_post(post.clone(), &post.permalink);
+            app.post_view.as_mut().unwrap().page = Some(PostPage {
+                post,
+                body: String::new(),
+                comments: vec![],
+            });
+            app.video_area = Some(Rect::new(0, 0, 68, 38));
+        };
+        let showing = |url: String, area, resume: video::Resume| {
+            let mut player = Player::showing(&url, playback_frame(1));
+            player.area = area;
+            if resume.sound {
+                player.toggle_sound(Instant::now());
+            }
+            player
+        };
+        open(&mut app, 0);
+        app.sync_video_with(Instant::now(), showing);
+        open(&mut app, 1);
+        app.sync_video_with(Instant::now(), showing);
+        app.toggle_video_sound();
+        assert!(!app.video_sound_wanted());
+        open(&mut app, 0);
+        app.sync_video_with(Instant::now(), |url, area, resume| {
+            assert!(
+                !resume.sound,
+                "restoring a snapshot must respect the latest mute"
+            );
+            showing(url, area, resume)
+        });
+        app.toggle_video_sound();
+        assert!(app.video_sound_wanted());
+        assert!(
+            app.selected_video().unwrap().sound(),
+            "one press changes actual sound too"
+        );
+    }
+
+    #[test]
+    fn when_manually_started_video_is_paused_resize_should_keep_it_paused() {
+        let mut app = card_playback_app();
+        app.config.media.video_autoplay = false;
+        app.toggle_video_pause();
+        let start = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+        app.sync_video_with(start, |url, area, _| Player::silent(&url, area));
+        app.toggle_video_pause();
+        assert!(app.card_player().unwrap().paused());
+        app.card_video_drawn(Some(Size::new(40, 20)));
+        app.sync_video_with(start, |_, _, _| panic!("resize waits"));
+        app.sync_video_with(start + VIDEO_RESIZE_SETTLE, |url, area, resume| {
+            assert!(
+                resume.paused,
+                "an old play request must not unpause a resized player"
+            );
+            Player::silent(&url, area)
+        });
+    }
+
+    #[test]
+    fn when_no_card_remains_a_loaded_video_should_retire() {
+        let mut app = card_playback_app();
+        let start = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+        app.sync_video_with(start, |url, area, _| {
+            let mut player = Player::showing(&url, playback_frame(1));
+            player.area = area;
+            player
+        });
+        app.tabs[0].feed.posts.clear();
+        app.card_video_drawn(None);
+        app.sync_video_with(start, |_, _, _| {
+            panic!("an empty view must not start video")
+        });
+        assert!(app.video.is_none(), "no card remains to resume the decoder");
+        assert!(app.video_preview(true).is_none());
+    }
+
+    #[test]
+    fn when_a_cached_frame_covers_pending_resolution_leaving_should_still_retire_it() {
+        let mut app = card_playback_app();
+        app.tabs[0].feed.posts[1].media = Media::None;
+        let start = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+        app.sync_video_with(start, |url, area, _| {
+            let mut player = Player::pending(&url, area);
+            player.retain_frame(Some(playback_frame(1)));
+            player
+        });
+        assert!(app.card_player().unwrap().resolving());
+        app.tabs[0].feed.selected = 1;
+        app.card_video_drawn(Some(Size::new(68, 68)));
+        app.sync_video_with(start, |_, _, _| panic!("an image cannot start video"));
+        assert!(
+            app.video.is_none(),
+            "a retained preview must not keep obsolete extraction alive"
+        );
+    }
+
+    #[test]
+    fn when_detail_returns_to_the_same_card_its_frame_should_cover_ownership_change() {
+        let mut app = card_playback_app();
+        let post = app.tabs[0].feed.posts[0].clone();
+        app.show_post(post.clone(), &post.permalink);
+        app.post_view.as_mut().unwrap().page = Some(PostPage {
+            post,
+            body: String::new(),
+            comments: vec![],
+        });
+        app.video_area = Some(Rect::new(0, 0, 68, 68));
+        app.sync_video_with(Instant::now(), |url, area, _| {
+            let mut player = Player::showing(&url, playback_frame(1));
+            player.area = area;
+            player
+        });
+        app.close_post();
+        app.card_video_drawn(Some(Size::new(68, 68)));
+        assert!(
+            app.video_preview(true).is_some(),
+            "the next draw can reuse detail pixels before card playback settles"
+        );
+    }
+
     #[test]
     fn when_a_youtube_card_is_selected_it_should_reuse_debounce_and_manual_play_gates() {
         let mut app = card_playback_app();
@@ -6379,6 +6902,30 @@ mod tests {
         });
 
         assert!(app.card_player().is_some());
+    }
+
+    #[test]
+    fn card_media_sidebar_navigation_should_autoplay_the_visible_settled_selection() {
+        let mut app = card_playback_app();
+        app.focus = Focus::Sidebar;
+        app.card_video_drawn(Some(Size::new(68, 68)));
+        let since = app.card_video.as_ref().unwrap().since;
+
+        assert!(app.wanted_video(since).is_none());
+        assert!(app.wanted_video(since + NAV_SETTLE).is_some());
+    }
+
+    #[test]
+    fn card_media_sidebar_focus_should_not_pause_a_visible_video() {
+        let mut app = card_playback_app();
+        let later = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+        app.sync_video_with(later, |url, area, _| Player::silent(&url, area));
+        app.focus = Focus::Sidebar;
+        app.card_video_drawn(Some(Size::new(68, 68)));
+
+        app.sync_video_with(later, |_, _, _| panic!("keep the visible video"));
+
+        assert!(!app.card_player().unwrap().hidden());
     }
 
     #[test]
@@ -9446,7 +9993,8 @@ mod tests {
                     .unwrap()
                     .shown_post()
                     .media
-                    .preview_image(),
+                    .preview_image()
+                    .as_deref(),
                 Some("https://i.redd.it/c.png")
             );
             assert_eq!(
@@ -9866,6 +10414,7 @@ mod tests {
             stickied: false,
             nsfw: false,
             spoiler: false,
+            original_deleted: false,
         }
     }
 
@@ -10642,6 +11191,28 @@ mod tests {
             view.loading_more.is_empty(),
             "no reply row stays loading for a dropped answer"
         );
+    }
+
+    #[test]
+    fn when_a_loaded_page_marks_the_original_deleted_its_list_and_bookmark_should_learn_the_flag() {
+        let (mut app, _) = split_feed(&["cross", "other"]);
+        app.state.toggle_bookmark(&post("cross", "s"), 1);
+        let generation = app.post_view.as_ref().unwrap().generation;
+        let mut page_post = post("cross", "s");
+        page_post.original_deleted = true;
+
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(PostPage {
+                post: page_post,
+                body: String::new(),
+                comments: Vec::new(),
+            })),
+        });
+
+        assert!(app.active_tab().feed.posts[0].original_deleted);
+        assert!(!app.active_tab().feed.posts[1].original_deleted);
+        assert!(app.state.bookmarks()[0].post.original_deleted);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use anyhow::{Result, bail};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 use url::Url;
 
-use super::transport::{Reader, Transport};
+use super::transport::{MediaStatus, Reader, Transport};
 
 const MAX_REQUESTS: usize = 32;
 
@@ -72,9 +72,11 @@ impl Relay {
                 // occupy the workers needed to open another rendition or audio stream.
                 std::thread::spawn(move || {
                     let _slot = slot;
-                    let response = serve(&transport, &base, &request).unwrap_or_else(|_| {
+                    let response = serve(&transport, &base, &request).unwrap_or_else(|error| {
                         Response::from_string("Media unavailable")
-                            .with_status_code(502)
+                            .with_status_code(
+                                error.downcast_ref::<MediaStatus>().map_or(502, |s| s.0),
+                            )
                             .boxed()
                     });
                     let _ = request.respond(response);

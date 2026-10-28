@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use image::DynamicImage;
+use sha2::{Digest, Sha256};
 
 use crate::cache::{CONTENT_TTL, Cache, IMAGE_TTL, Source};
 use crate::model::{
@@ -149,10 +150,16 @@ pub struct LoadedImage {
 #[derive(Debug, Clone, Copy)]
 pub struct ImageMetadata {
     pub size: (u32, u32),
+    pub fingerprint: [u8; 32],
 }
 
 impl From<DynamicImage> for LoadedImage {
     fn from(image: DynamicImage) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(image.width().to_le_bytes());
+        hash.update(image.height().to_le_bytes());
+        hash.update(image.to_rgba8().as_raw());
+        let fingerprint = hash.finalize().into();
         let preview = if image.width() > 256 || image.height() > 256 {
             image.thumbnail(256, 256)
         } else {
@@ -162,6 +169,7 @@ impl From<DynamicImage> for LoadedImage {
         Self {
             metadata: ImageMetadata {
                 size: (image.width(), image.height()),
+                fingerprint,
             },
             image: Arc::new(image),
             preview: Arc::new(DynamicImage::ImageRgba8(preview)),

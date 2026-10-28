@@ -21,6 +21,12 @@ The [UI reference](ui.md) lists layout rules, screens, fields, menus and states.
 Configuration defaults live in [Config](../src/config.rs); labels, descriptions
 and generated comments use the [settings schema](../src/config/schema.rs).
 
+Startup graphics negotiation collects replies for at most one second, even when the
+status reply arrives before graphics or cell measurements. A separate child owns
+stdin and is killed/reaped after two seconds. The tmux fallback requires the actual
+pane tty, compatible clients and matching measured client cell sizes; window pixel
+defaults cannot establish native graphics support.
+
 ## Request scheduling
 
 Selected threads, active feeds and main images have separate worker capacity from
@@ -86,11 +92,29 @@ URL identifies playback; signed stream URLs stay in a 32-entry memory cache for 
 most five minutes, shortened to expire before the signed URL. Failed playback clears
 its cached source.
 
+When Reddit supplies no YouTube thumbnail, cards and detail use the public video
+thumbnail from `i.ytimg.com`. It loads through the image cache without waiting for
+`yt-dlp`; Reddit cookies never reach that host.
+
+Sound uses `ffplay`'s reported audio clock. Video waits for audio readiness and catches
+up after rendering delays without restarting sound. ffmpeg decodes sound from the
+exact start position and pipes it to `ffplay`; `ffplay`'s own seek can land seconds
+early in YouTube audio. With FFmpeg 8.1 or newer, googlevideo files load through ranged
+requests, which avoid googlevideo's near-real-time pacing; older builds wait seconds for the
+sound after a seek. Muted playback uses the local clock.
+Decoding continues while tiles encode; each picture finishes before newer pixels
+replace it in the same viewport. Slow rendering drops pictures instead of building
+a playback backlog. Viewport or source changes still cancel obsolete encodings.
+The decoder discards pictures behind the audio target even after terminal writes
+block the UI. Skipped pictures still count toward EOF.
+Direct YouTube files use a 32 KiB probe limit to avoid unnecessary frame-rate
+analysis before the first picture. Other media keeps its existing probing.
+
 One background extraction runs at a time. Player disposal cancels it; the worker
 kills and reaps its process group on cancellation, a 20-second deadline or oversized
 output. `yt-dlp` runs without user config, plugins, cookie import or filesystem cache.
 Only public, non-live metadata and HTTPS Google video streams are accepted. Only
-User-Agent, YouTube Referer and Origin headers reach ffmpeg/ffplay. This path never
+User-Agent, YouTube Referer and Origin headers reach ffmpeg. This path never
 uses the authenticated Reddit transport.
 
 Extraction skips HLS manifests, which this playback path cannot use. DASH remains
@@ -99,6 +123,28 @@ available because its metadata can also expose direct HTTPS files.
 Main media keeps its aspect ratio and fits the usable pane. Recent cards reuse
 decoded pixels and prepared graphics; rapid navigation delays uncached preparation.
 Kitty/Ghostty reuse uploaded strips across scrolling and popup clipping.
+
+Article cards limit previews to 30% of the pane height and 1.5 times the source
+resolution. Small thumbnails sit beside the headline; links without images show
+a domain monogram. A corner arrow identifies link previews. YouTube keeps video
+card behavior.
+
+The media relay preserves upstream HTTP errors without forwarding response bodies.
+Unavailable videos with no poster or retained frame leave room for the comments;
+the footer keeps the error and retry action. A deleted post's video may remain in
+Reddit metadata even after the CDN stops serving it.
+Crossposts label an explicitly deleted original separately from media availability.
+A deleted author alone does not establish post deletion. Loaded pages also update
+the matching list records and saved bookmark.
+Account-local deletion observations survive cached feed refreshes for 90 days;
+bookmarks retain their learned flag.
+
+Card navigation pauses the last loaded player so returning can reuse its decoder.
+When another video takes over, up to eight recent frames (32 MiB) and playback
+positions stay in memory, keyed by post and source. These cover selection settling
+and decoder startup. Account and content-policy changes clear them; images off
+releases them. Unfinished extraction still cancels when its selection changes.
+Returning to a detail video uses the current sound preference.
 
 Images above 16 million pixels use validated Reddit resolutions, preferring the
 smallest with a long edge of at least 1600 pixels, or the largest available below

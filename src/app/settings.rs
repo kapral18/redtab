@@ -451,7 +451,7 @@ impl App {
         if autoplay_stopped {
             self.video = None;
             self.video_requested = None;
-            self.video_resume = None;
+            self.video_previews.clear();
         }
         if filters_changed || count_changed {
             let bookmarks = self.bookmark_ids();
@@ -535,7 +535,7 @@ impl App {
         }
         self.video = None;
         self.video_requested = None;
-        self.video_resume = None;
+        self.video_previews.clear();
         self.card_video = None;
         self.pending_media.clear();
         self.queued_images.clear();

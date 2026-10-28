@@ -44,6 +44,8 @@ pub struct State {
     #[serde(default)]
     read: HashMap<String, i64>,
     #[serde(default)]
+    deleted_originals: HashMap<String, i64>,
+    #[serde(default)]
     bookmarks: Vec<Bookmark>,
     /// Removed bookmarks: id → removal time, so merging an older copy can't resurrect them.
     #[serde(default)]
@@ -376,7 +378,7 @@ impl State {
                 let disk = serde_json::from_slice::<State>(&bytes).with_context(|| {
                     format!("not saving: {} is no longer valid state", target.display())
                 })?;
-                self.merge(disk);
+                self.merge(disk, now);
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
@@ -411,7 +413,18 @@ impl State {
         Ok(())
     }
 
-    fn merge(&mut self, disk: State) {
+    fn merge(&mut self, disk: State, now: i64) {
+        for bookmark in self
+            .bookmarks
+            .iter()
+            .chain(&disk.bookmarks)
+            .filter(|bookmark| bookmark.post.original_deleted)
+        {
+            self.deleted_originals
+                .entry(bookmark.post.id.clone())
+                .and_modify(|observed| *observed = (*observed).max(now))
+                .or_insert(now);
+        }
         if disk.list_view_changed_at > self.list_view_changed_at {
             self.list_view = disk.list_view;
             self.list_view_changed_at = disk.list_view_changed_at;
@@ -464,10 +477,15 @@ impl State {
                 .and_modify(|x| *x = (*x).max(t))
                 .or_insert(t);
         }
+        for (id, observed_at) in disk.deleted_originals {
+            self.deleted_originals
+                .entry(id)
+                .and_modify(|mine| *mine = (*mine).max(observed_at))
+                .or_insert(observed_at);
+        }
         for b in disk.bookmarks {
             match self.bookmarks.iter_mut().find(|m| m.post.id == b.post.id) {
                 Some(mine) if b.saved_at > mine.saved_at => *mine = b,
-                // Same save: a spoiler tag learned by either instance sticks.
                 Some(mine) if b.saved_at == mine.saved_at => mine.post.spoiler |= b.post.spoiler,
                 Some(_) => {}
                 None => self.bookmarks.push(b),
@@ -477,12 +495,18 @@ impl State {
         let removed = &self.removed;
         self.bookmarks
             .retain(|b| removed.get(&b.post.id).is_none_or(|&t| t < b.saved_at));
+        for bookmark in &mut self.bookmarks {
+            bookmark.post.original_deleted |=
+                self.deleted_originals.contains_key(&bookmark.post.id);
+        }
         self.bookmarks
             .sort_by_key(|b| std::cmp::Reverse(b.saved_at));
     }
 
     fn prune(&mut self, now: i64) {
         let cutoff = now - RETENTION_SECS;
+        self.deleted_originals
+            .retain(|_, observed_at| *observed_at >= cutoff);
         self.unread_counts.get_mut().take();
         for community in self.observed.values_mut() {
             community
@@ -508,6 +532,9 @@ impl State {
         freshness: Freshness,
         now: i64,
     ) {
+        for post in posts.iter().filter(|post| post.original_deleted) {
+            self.mark_original_deleted(&post.id, now);
+        }
         let cache = self.unread_counts.get_mut();
         if let Some(sub) = subreddit {
             let key = sub.to_lowercase();
@@ -711,14 +738,38 @@ impl State {
         }
     }
 
+    pub fn mark_original_deleted(&mut self, id: &str, observed_at: i64) {
+        self.deleted_originals
+            .entry(id.into())
+            .and_modify(|mine| *mine = (*mine).max(observed_at))
+            .or_insert(observed_at);
+        if let Some(bookmark) = self.bookmarks.iter_mut().find(|b| b.post.id == id) {
+            bookmark.post.original_deleted = true;
+        }
+    }
+
+    pub fn original_deleted(&self, id: &str) -> bool {
+        self.deleted_originals.contains_key(id)
+            || self
+                .bookmarks
+                .iter()
+                .any(|bookmark| bookmark.post.id == id && bookmark.post.original_deleted)
+    }
+
     /// Adds or removes a bookmark; true when now bookmarked. Each event is stamped after
     /// the post's previous one, so a same-second remove and re-add still order correctly.
     pub fn toggle_bookmark(&mut self, post: &Post, now: i64) -> bool {
+        let original_deleted = post.original_deleted || self.original_deleted(&post.id);
+        if original_deleted {
+            self.mark_original_deleted(&post.id, now);
+        }
         if let Some(i) = self.bookmarks.iter().position(|b| b.post.id == post.id) {
             let saved_at = self.bookmarks.remove(i).saved_at;
             self.removed.insert(post.id.clone(), now.max(saved_at + 1));
             false
         } else {
+            let mut post = post.clone();
+            post.original_deleted = original_deleted;
             let after = self
                 .removed
                 .remove(&post.id)
@@ -726,7 +777,7 @@ impl State {
             self.bookmarks.insert(
                 0,
                 Bookmark {
-                    post: post.clone(),
+                    post,
                     saved_at: after,
                 },
             );
@@ -766,6 +817,7 @@ mod tests {
             stickied: false,
             nsfw: false,
             spoiler: false,
+            original_deleted: false,
         }
     }
 
@@ -1195,6 +1247,139 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert!(loaded.bookmarks()[0].post.spoiler);
+    }
+
+    #[test]
+    fn when_an_original_deletion_is_learned_it_should_survive_another_instances_save() {
+        let dir = scratch("original-deleted");
+        let path = dir.join("state.json");
+        let mut a = State::default();
+        a.toggle_bookmark(&post("p", "s"), 5);
+        a.save(&path, 5).unwrap();
+        let (mut b, _) = State::load(&path);
+        a.mark_original_deleted("p", 6);
+        a.save(&path, 6).unwrap();
+
+        b.save(&path, 7).unwrap();
+        let (loaded, _) = State::load(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(loaded.bookmarks()[0].post.original_deleted);
+        assert!(loaded.original_deleted("p"));
+    }
+
+    #[test]
+    fn when_a_known_deleted_original_is_bookmarked_again_its_saved_flag_should_persist() {
+        let mut state = State::default();
+        state.mark_original_deleted("p", 1);
+        state.toggle_bookmark(&post("p", "s"), 2);
+        state.toggle_bookmark(&post("p", "s"), 3);
+
+        state.toggle_bookmark(&post("p", "s"), 4);
+
+        assert!(state.bookmarks()[0].post.original_deleted);
+    }
+
+    #[test]
+    fn when_original_deletion_observations_age_out_only_older_than_ninety_days_should_expire() {
+        let mut state = State::default();
+        state.mark_original_deleted("old", 1);
+        state.mark_original_deleted("recent", 2);
+
+        state.prune(7_776_002);
+
+        assert!(!state.original_deleted("old"));
+        assert!(state.original_deleted("recent"));
+    }
+
+    #[test]
+    fn bookmark_deletion_should_survive_a_stale_readd_saved_by_another_instance() {
+        let dir = scratch("deletion-readd-merge");
+        let path = dir.join("state.json");
+        let mut a = State::default();
+        a.toggle_bookmark(&post("p", "s"), 5);
+        a.save(&path, 5).unwrap();
+        let (mut b, _) = State::load(&path);
+        a.mark_original_deleted("p", 6);
+        a.save(&path, 6).unwrap();
+        b.toggle_bookmark(&post("p", "s"), 7);
+        b.toggle_bookmark(&post("p", "s"), 8);
+
+        b.save(&path, 7_776_009).unwrap();
+        let (loaded, _) = State::load(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(loaded.original_deleted("p"));
+        assert!(loaded.bookmarks()[0].post.original_deleted);
+    }
+
+    #[test]
+    fn bookmark_deletion_should_survive_both_timestamp_orders_without_an_observation_map() {
+        for (mine_saved, mine_deleted, other_saved, other_deleted) in
+            [(5, true, 8, false), (8, false, 5, true)]
+        {
+            let mut mine = State::default();
+            let mut deleted = post("p", "s");
+            deleted.original_deleted = mine_deleted;
+            mine.toggle_bookmark(&deleted, mine_saved);
+            let mut other = State::default();
+            let mut other_post = post("p", "s");
+            other_post.original_deleted = other_deleted;
+            other.toggle_bookmark(&other_post, other_saved);
+            mine.prune(7_776_010);
+            other.prune(7_776_010);
+
+            mine.merge(other, 7_776_010);
+
+            assert!(mine.bookmarks()[0].post.original_deleted);
+            assert_eq!(mine.bookmarks()[0].saved_at, 8);
+        }
+    }
+
+    #[test]
+    fn bookmark_deletion_should_survive_remove_save_readd_after_observation_expiry() {
+        let dir = scratch("deletion-expired-readd");
+        let path = dir.join("state.json");
+        let mut state = State::default();
+        let mut deleted = post("p", "s");
+        deleted.original_deleted = true;
+        state.toggle_bookmark(&deleted, 5);
+        state.save(&path, 7_776_010).unwrap();
+        assert!(!state.deleted_originals.contains_key("p"));
+        state.toggle_bookmark(&post("p", "s"), 7_776_011);
+        state.save(&path, 7_776_011).unwrap();
+
+        state.toggle_bookmark(&post("p", "s"), 7_776_012);
+        state.save(&path, 7_776_012).unwrap();
+        let (loaded, _) = State::load(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(loaded.bookmarks()[0].post.original_deleted);
+        assert!(loaded.original_deleted("p"));
+    }
+
+    #[test]
+    fn bookmark_deletion_should_survive_stale_instance_removal_of_disk_only_knowledge() {
+        let dir = scratch("deletion-disk-only");
+        let path = dir.join("state.json");
+        let mut stale = State::default();
+        stale.toggle_bookmark(&post("p", "s"), 1);
+        let mut disk = State::default();
+        let mut deleted = post("p", "s");
+        deleted.original_deleted = true;
+        disk.toggle_bookmark(&deleted, 5);
+        disk.save(&path, 7_776_010).unwrap();
+        assert!(!disk.deleted_originals.contains_key("p"));
+        stale.toggle_bookmark(&post("p", "s"), 7_776_011);
+        stale.save(&path, 7_776_011).unwrap();
+
+        stale.toggle_bookmark(&post("p", "s"), 7_776_012);
+        stale.save(&path, 7_776_012).unwrap();
+        let (loaded, _) = State::load(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(loaded.bookmarks()[0].post.original_deleted);
+        assert!(loaded.original_deleted("p"));
     }
 
     #[test]

@@ -1,12 +1,16 @@
 //! Inline video: ffmpeg decodes raw frames for the scrolling tile renderer. One
 //! player owns playback; ffplay plays optional sound in its own process.
 
+mod audio;
 mod youtube;
+
+use audio::Audio;
 
 use std::io::{self, BufRead, BufReader};
 use std::process::{Child, Stdio};
-use std::sync::Arc;
-use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -32,6 +36,7 @@ const STALL: f64 = 0.25;
 /// How far `,` and `.` seek, in seconds.
 pub const SEEK_STEP: f64 = 5.0;
 
+#[derive(Clone)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
@@ -40,6 +45,7 @@ pub struct Frame {
     pub same_as_first: bool,
 }
 
+#[derive(Clone)]
 pub enum Pixels {
     /// Lossless PNG, ready for the kitty protocol.
     Png(Vec<u8>),
@@ -65,8 +71,20 @@ struct Log {
 struct Decoder {
     /// None for a decoder fed by a test.
     child: Option<Child>,
-    frames: Receiver<Frame>,
+    frames: Receiver<Decoded>,
     log: Arc<Mutex<Log>>,
+    progress: Arc<DecodeProgress>,
+}
+
+struct Decoded {
+    index: u64,
+    frame: Frame,
+}
+
+#[derive(Default)]
+struct DecodeProgress {
+    target: AtomicU64,
+    read: AtomicU64,
 }
 
 impl Decoder {
@@ -100,34 +118,47 @@ impl Decoder {
         let sink = Arc::clone(&log);
         std::thread::spawn(move || read_log(BufReader::new(stderr), &sink));
         let (tx, frames) = sync_channel(AHEAD);
+        let progress = Arc::new(DecodeProgress::default());
+        let reader_progress = Arc::clone(&progress);
         std::thread::spawn(move || {
-            let mut out = BufReader::with_capacity(1 << 20, stdout);
-            let mut first = FirstFrame::default();
-            while let Ok(Some((width, height, rgb))) = read_ppm(&mut out) {
-                let same_as_first = first.same(&rgb);
-                if first.wants() {
-                    first.keep(rgb.clone());
-                }
-                let Some(img) = image::RgbImage::from_raw(width, height, rgb) else {
-                    return;
-                };
-                let pixels = Pixels::Raw(Arc::new(image::DynamicImage::ImageRgb8(img)));
-                let frame = Frame {
-                    width,
-                    height,
-                    pixels,
-                    same_as_first,
-                };
-                if tx.send(frame).is_err() {
-                    return;
-                }
-            }
+            read_frames(
+                BufReader::with_capacity(1 << 20, stdout),
+                tx,
+                &reader_progress,
+            );
         });
         Ok(Self {
             child: Some(child),
             frames,
             log,
+            progress,
         })
+    }
+}
+
+fn read_frames(mut out: impl BufRead, tx: SyncSender<Decoded>, progress: &DecodeProgress) {
+    let mut first = FirstFrame::default();
+    while let Ok(Some((width, height, rgb))) = read_ppm(&mut out) {
+        let index = progress.read.fetch_add(1, Ordering::Relaxed);
+        let same_as_first = first.same(&rgb);
+        if first.wants() {
+            first.keep(rgb.clone());
+        }
+        if index < progress.target.load(Ordering::Relaxed) {
+            continue;
+        }
+        let Some(img) = image::RgbImage::from_raw(width, height, rgb) else {
+            return;
+        };
+        let frame = Frame {
+            width,
+            height,
+            pixels: Pixels::Raw(Arc::new(image::DynamicImage::ImageRgb8(img))),
+            same_as_first,
+        };
+        if tx.send(Decoded { index, frame }).is_err() {
+            return;
+        }
     }
 }
 
@@ -155,12 +186,46 @@ fn input_args(url: &str, start: f64) -> Vec<String> {
             args.extend(["-ss".into(), start]);
         }
     } else {
+        // Extracted YouTube files already identify the video track. Avoid reading
+        // seconds of compressed frames just to estimate its frame rate again.
+        // googlevideo paces one open-ended response near playback speed; ranged
+        // requests arrive at full speed, so a seek's preroll doesn't stall playback.
+        if url::Url::parse(url).is_ok_and(|url| {
+            url.scheme() == "https"
+                && url.host_str().is_some_and(|host| {
+                    host == "googlevideo.com" || host.ends_with(".googlevideo.com")
+                })
+        }) {
+            args.extend(["-probesize".into(), "32768".into()]);
+            if *RANGED_REQUESTS {
+                args.extend(
+                    ["-request_size", "1048576", "-multiple_requests", "1"].map(String::from),
+                );
+            }
+        }
         if http {
             args.extend(["-reconnect".into(), "1".into()]);
         }
         args.extend(["-ss".into(), start, "-i".into(), url.into()]);
     }
     args
+}
+
+/// Whether ffmpeg's HTTP reader can split a file into ranged requests (FFmpeg 8.1+).
+/// Older builds reject the option and would fail to open the input.
+static RANGED_REQUESTS: LazyLock<bool> = LazyLock::new(|| {
+    crate::media::local_command("ffmpeg")
+        .args(["-hide_banner", "-h", "protocol=http"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|out| supports_ranged(&String::from_utf8_lossy(&out.stdout)))
+});
+
+fn supports_ranged(http_help: &str) -> bool {
+    http_help
+        .lines()
+        .any(|line| line.trim_start().starts_with("-request_size "))
 }
 
 fn header_args(headers: &[(String, String)]) -> Vec<String> {
@@ -433,7 +498,15 @@ fn resolve(
             .get(at.as_str())
             .call()
             .and_then(|mut r| r.body_mut().with_config().limit(1 << 20).read_to_string())
-            .map_err(|e| format!("video playlist: {e}"))
+            .map_err(|e| match e {
+                ureq::Error::StatusCode(403) => {
+                    "Reddit denied access to this video (HTTP 403)".into()
+                }
+                ureq::Error::StatusCode(status @ (404 | 410)) => {
+                    format!("Video is no longer available (HTTP {status})")
+                }
+                _ => format!("video playlist: {e}"),
+            })
     };
     let join = |path: &str| {
         base.join(path)
@@ -576,7 +649,7 @@ pub struct Player {
     /// Media time of the current run's first frame.
     start: f64,
     shown: u64,
-    next: Option<Frame>,
+    next: Option<Decoded>,
     frame: Option<Frame>,
     /// Counts frames put on screen; the drawing side sends a frame once per number.
     pub frame_number: u64,
@@ -599,7 +672,7 @@ pub struct Player {
     /// Sound starts with this run's first frame, so a slow start can't start it twice.
     sound_waits: bool,
     sound: bool,
-    audio: Option<Child>,
+    audio: Option<Audio>,
     duration: Option<f64>,
     error: Option<String>,
     /// A message for the reader (no sound, no ffplay), and whether it is an error.
@@ -701,7 +774,7 @@ impl Player {
 
     /// When the next frame of this run is due, in media time.
     fn due(&self) -> f64 {
-        self.start + self.shown as f64 / FPS
+        self.start + self.next.as_ref().map_or(self.shown, |frame| frame.index) as f64 / FPS
     }
 
     /// Start a decoder run (and the sound) at `at` seconds.
@@ -714,6 +787,7 @@ impl Player {
         self.unchanged = true;
         self.still = false;
         self.clock.set(at, now);
+        self.clock.running = false;
         let Some(sources) = &self.sources else {
             return;
         };
@@ -755,6 +829,18 @@ impl Player {
         if self.error.is_some() {
             return changed;
         }
+        if let Some(succeeded) = self
+            .audio
+            .as_mut()
+            .and_then(|audio| audio.completed(now, self.duration))
+        {
+            self.release_audio(now);
+            if !succeeded {
+                self.sound = false;
+                self.notice = Some(("Audio unavailable; playing muted".into(), false));
+            }
+            changed = true;
+        }
         if !self.playing() {
             if self.show_one && self.receive(now, &mut changed) {
                 self.show_one = false;
@@ -763,20 +849,31 @@ impl Player {
             }
             return changed;
         }
-        while self.receive(now, &mut changed) {
+        if let Some(decoder) = &self.decoder
+            && let Some(at) = self.audio.as_ref().and_then(|audio| audio.position(now))
+        {
+            decoder
+                .progress
+                .target
+                .store(((at - self.start).max(0.0) * FPS) as u64, Ordering::Relaxed);
+        }
+        for _ in 0..8 {
+            if !self.receive(now, &mut changed) {
+                break;
+            }
             let due = self.due();
-            let position = self.clock.position(now);
+            let position = self.position(now);
             if position < due {
                 break;
             }
-            if position - due > STALL {
+            if self.audio.is_none() && position - due > STALL {
                 self.clock.set(due, now);
-                // The sound played on through the stall: start it again with the picture.
-                if self.audio.is_some() {
-                    self.start_audio(now);
-                }
             }
             self.show_next();
+            if self.shown == 1 {
+                self.clock.set(self.start, now);
+                self.clock.start(now);
+            }
             if self.sound_waits && self.sound {
                 self.start_audio(now);
             }
@@ -812,12 +909,13 @@ impl Player {
                 let audio = log.streams_read.then_some(log.audio);
                 drop(log);
                 if let Some(audio) = audio {
-                    self.learn_audio(audio);
+                    self.learn_audio(audio, now);
                 }
                 true
             }
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
+                let decoded = decoder.progress.read.load(Ordering::Relaxed);
                 // The frames can end before the log says why: wait for the rest of it.
                 if !log.ended {
                     return false;
@@ -831,9 +929,9 @@ impl Player {
                 let audio = log.streams_read.then_some(log.audio);
                 drop(log);
                 if let Some(audio) = audio {
-                    self.learn_audio(audio);
+                    self.learn_audio(audio, now);
                 }
-                let end = self.due();
+                let end = self.start + self.shown.max(decoded) as f64 / FPS;
                 // Cut short: before the known end, or (no duration, as for a streamed GIF)
                 // when the input failed, such as a dropped connection. Go on from there,
                 // unless resuming there already failed.
@@ -872,7 +970,7 @@ impl Player {
     }
 
     /// Learn from ffmpeg's log whether the video's own file has sound.
-    fn learn_audio(&mut self, has_audio: bool) {
+    fn learn_audio(&mut self, has_audio: bool, now: Instant) {
         let Some(sources) = &mut self.sources else {
             return;
         };
@@ -883,7 +981,7 @@ impl Player {
         if !has_audio {
             sources.audio = None;
             if self.sound {
-                self.stop_audio();
+                self.release_audio(now);
                 self.sound = false;
                 self.notice = Some(("This video has no sound".into(), false));
             }
@@ -891,11 +989,11 @@ impl Player {
     }
 
     fn show_next(&mut self) {
-        if let Some(frame) = self.next.take() {
+        if let Some(Decoded { index, frame }) = self.next.take() {
             self.unchanged &= frame.same_as_first;
             self.retried = false;
             self.frame = Some(frame);
-            self.shown += 1;
+            self.shown = index + 1;
             self.frame_number += 1;
             // Played past where resuming failed: that was an outage, not the file's end.
             if self.unresumable.is_some_and(|at| self.due() > at + 0.5) {
@@ -917,6 +1015,9 @@ impl Player {
         }
         let poll = Duration::from_millis(10);
         if self.next.is_none() || !self.playing() {
+            return Some(poll);
+        }
+        if self.audio.is_some() {
             return Some(poll);
         }
         self.clock
@@ -943,8 +1044,7 @@ impl Player {
     fn follow(&mut self, was: bool, now: Instant) {
         match (was, self.playing()) {
             (true, false) => {
-                self.clock.stop(now);
-                self.stop_audio();
+                self.release_audio(now);
             }
             (false, true) => {
                 self.clock.start(now);
@@ -961,7 +1061,7 @@ impl Player {
     pub fn toggle_sound(&mut self, now: Instant) {
         self.sound = !self.sound;
         if !self.sound {
-            self.stop_audio();
+            self.release_audio(now);
         } else if self.sources.as_ref().is_some_and(|s| s.audio.is_none()) {
             self.sound = false;
             self.notice = Some(("This video has no sound".into(), false));
@@ -972,6 +1072,12 @@ impl Player {
 
     pub fn sound(&self) -> bool {
         self.sound
+    }
+
+    pub fn waiting_for_audio(&self) -> bool {
+        self.audio
+            .as_ref()
+            .is_some_and(|audio| audio.position(Instant::now()).is_none())
     }
 
     pub fn paused(&self) -> bool {
@@ -1004,29 +1110,25 @@ impl Player {
     }
 
     fn start_audio(&mut self, now: Instant) {
+        let at = self.position(now);
         self.stop_audio();
         let Some(url) = self.sources.as_ref().and_then(|s| s.audio.as_deref()) else {
             self.sound = false;
             self.notice = Some(("This video has no sound".into(), false));
             return;
         };
-        let at = format!("{:.3}", self.clock.position(now));
-        let started = crate::media::local_command("ffplay")
-            .args(["-nodisp", "-vn", "-autoexit", "-loglevel", "quiet"])
-            .args(header_args(&self.sources.as_ref().unwrap().audio_headers))
-            .args(["-ss", &at, url])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        match started {
-            Ok(child) => self.audio = Some(child),
+        match Audio::start(url, &self.sources.as_ref().unwrap().audio_headers, at, now) {
+            Ok(audio) => {
+                self.clock.set(at, now);
+                self.clock.running = false;
+                self.audio = Some(audio);
+            }
             Err(e) => {
                 self.sound = false;
                 let text = if e.kind() == io::ErrorKind::NotFound {
                     "Sound needs ffplay (part of ffmpeg)".to_string()
                 } else {
-                    format!("ffplay: {e}")
+                    e.to_string()
                 };
                 self.notice = Some((text, true));
             }
@@ -1044,10 +1146,14 @@ impl Player {
 
     fn stop_audio(&mut self) {
         self.sound_waits = false;
-        if let Some(mut child) = self.audio.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.audio = None;
+    }
+
+    fn release_audio(&mut self, now: Instant) {
+        let at = self.position(now);
+        self.stop_audio();
+        self.clock.set(at, now);
+        self.clock.running = self.playing();
     }
 
     /// The message for the reader, once: text and whether it is an error.
@@ -1070,10 +1176,13 @@ impl Player {
     }
 
     pub fn position(&self, now: Instant) -> f64 {
-        if self.still {
+        if self.still || self.shown == 0 {
             self.start
         } else {
-            self.clock.position(now)
+            self.audio
+                .as_ref()
+                .and_then(|audio| audio.position(now))
+                .unwrap_or_else(|| self.clock.position(now))
         }
     }
 
@@ -1083,6 +1192,15 @@ impl Player {
 
     pub fn frame(&self) -> Option<&Frame> {
         self.frame.as_ref()
+    }
+
+    /// Keep the last display while a replacement decoder waits for its first frame.
+    /// This does not advance the new run's clock or start its sound.
+    pub fn retain_frame(&mut self, frame: Option<Frame>) {
+        if self.frame.is_none() && frame.is_some() {
+            self.frame = frame;
+            self.frame_number += 1;
+        }
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -1127,7 +1245,10 @@ impl Player {
     /// The next frame on screen, as if it came due.
     #[cfg(test)]
     pub fn show(&mut self, frame: Frame) {
-        self.next = Some(frame);
+        self.next = Some(Decoded {
+            index: self.shown,
+            frame,
+        });
         self.show_next();
     }
 
@@ -1142,6 +1263,7 @@ impl Player {
                 child: None,
                 frames,
                 log: Arc::new(Mutex::new(Log::default())),
+                progress: Arc::new(DecodeProgress::default()),
             })
         });
         let sources = Sources {
@@ -1157,6 +1279,45 @@ impl Player {
             None,
             Some(sources),
             spawn,
+            Resume::default(),
+            Instant::now(),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn buffered(url: &str, area: Size, frame: Frame) -> Self {
+        let mut player = Self::new(
+            url.into(),
+            area,
+            None,
+            None,
+            Box::new(|_, _| panic!("buffered fixture cannot start a decoder")),
+            Resume::default(),
+            Instant::now(),
+        );
+        let (tx, frames) = sync_channel(1);
+        tx.send(Decoded { index: 0, frame }).unwrap();
+        player.decoder = Some(Decoder {
+            child: None,
+            frames,
+            log: Arc::new(Mutex::new(Log::default())),
+            progress: Arc::new(DecodeProgress::default()),
+        });
+        player
+    }
+
+    #[cfg(test)]
+    pub fn pending(url: &str, area: Size) -> Self {
+        let (sender, resolving) = sync_channel(1);
+        Self::new(
+            url.into(),
+            area,
+            Some(resolving),
+            None,
+            Box::new(move |_, _| {
+                let _keep_open = &sender;
+                panic!("pending resolution cannot start a decoder")
+            }),
             Resume::default(),
             Instant::now(),
         )
@@ -1355,6 +1516,33 @@ pub fn clock_text(seconds: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_failure_should_explain_playlist_denial_without_exposing_the_url() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/video.m3u8?signature=PRIVATE",
+            server.server_addr()
+        );
+        let responder = std::thread::spawn(move || {
+            for status in [403, 404, 410] {
+                let request = server
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                request.respond(tiny_http::Response::empty(status)).unwrap();
+            }
+        });
+        for (status, expected) in [
+            (403, "Reddit denied access to this video (HTTP 403)"),
+            (404, "Video is no longer available (HTTP 404)"),
+            (410, "Video is no longer available (HTTP 410)"),
+        ] {
+            let error = resolve(&url, (640, 360), 360, None).unwrap_err();
+            assert_eq!(error, expected, "upstream HTTP {status}");
+        }
+        responder.join().unwrap();
+    }
 
     #[test]
     fn when_a_resolving_player_is_dropped_it_should_cancel_without_waiting_for_the_worker() {
@@ -1563,7 +1751,7 @@ mod tests {
             .unwrap();
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
-        Some((frame.width, frame.height))
+        Some((frame.frame.width, frame.frame.height))
     }
 
     #[test]
@@ -1719,9 +1907,32 @@ mod tests {
         assert_eq!(cell(1, 2).symbol(), " ", "below the placement");
     }
 
-    /// Each decoder run a test player started: its start position and the sender
-    /// that feeds it frames.
-    type Runs = std::rc::Rc<std::cell::RefCell<Vec<(f64, std::sync::mpsc::SyncSender<Frame>)>>>;
+    struct FrameSender {
+        tx: SyncSender<Decoded>,
+        index: std::cell::Cell<u64>,
+    }
+
+    impl FrameSender {
+        fn send(&self, frame: Frame) -> Result<(), std::sync::mpsc::SendError<Decoded>> {
+            let index = self.index.get();
+            self.tx.send(Decoded { index, frame })?;
+            self.index.set(index + 1);
+            Ok(())
+        }
+    }
+
+    fn frame_channel(capacity: usize) -> (FrameSender, Receiver<Decoded>) {
+        let (tx, rx) = sync_channel(capacity);
+        (
+            FrameSender {
+                tx,
+                index: std::cell::Cell::new(0),
+            },
+            rx,
+        )
+    }
+
+    type Runs = std::rc::Rc<std::cell::RefCell<Vec<(f64, FrameSender)>>>;
 
     /// Decoder runs whose frames the test feeds, with what their log says.
     fn fed_runs(duration: Option<f64>, audio: bool) -> (Spawn, Runs) {
@@ -1739,7 +1950,7 @@ mod tests {
         let runs = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let record = std::rc::Rc::clone(&runs);
         let spawn: Spawn = Box::new(move |_, at| {
-            let (tx, frames) = sync_channel(64);
+            let (tx, frames) = frame_channel(64);
             record.borrow_mut().push((at, tx));
             let log = Log {
                 duration,
@@ -1754,6 +1965,7 @@ mod tests {
                 child: None,
                 frames,
                 log: Arc::new(Mutex::new(log)),
+                progress: Arc::new(DecodeProgress::default()),
             })
         });
         (spawn, runs)
@@ -1787,6 +1999,179 @@ mod tests {
         }
     }
 
+    #[test]
+    fn when_output_stalls_the_decoder_should_discard_frames_behind_the_audio_target() {
+        let (tx, rx) = sync_channel(1);
+        let progress = Arc::new(DecodeProgress::default());
+        progress.read.store(1, Ordering::Relaxed);
+        tx.send(Decoded {
+            index: 0,
+            frame: blank(),
+        })
+        .unwrap();
+        let reader_progress = Arc::clone(&progress);
+        let source = b"P6\n1 1\n255\n\x01\x02\x03".repeat(30);
+        let worker = std::thread::spawn(move || {
+            read_frames(std::io::Cursor::new(source), tx, &reader_progress);
+        });
+
+        progress.target.store(12, Ordering::Relaxed);
+        let actual = [
+            rx.recv_timeout(Duration::from_secs(2)).unwrap().index,
+            rx.recv_timeout(Duration::from_secs(2)).unwrap().index,
+            rx.recv_timeout(Duration::from_secs(2)).unwrap().index,
+        ];
+        drop(rx);
+        worker.join().unwrap();
+
+        assert_eq!(actual[0], 0);
+        assert!(
+            actual[2] >= 12,
+            "bounded pending frames must give way to current audio: {actual:?}"
+        );
+    }
+
+    #[test]
+    fn when_audio_skips_the_remaining_video_frames_eof_should_loop_instead_of_resuming_a_cut() {
+        let now = Instant::now();
+        let (mut player, runs) = fed_player(Some(10.0), now);
+        let sender = runs.borrow_mut().remove(0).1;
+        sender.send(blank()).unwrap();
+        player.tick(now);
+        player
+            .decoder
+            .as_ref()
+            .unwrap()
+            .progress
+            .read
+            .store(240, Ordering::Relaxed);
+        player.audio = Some(Audio::fixture(0.0, now));
+        player.audio.as_ref().unwrap().observe(10.0, now);
+        drop(sender);
+
+        player.tick(now);
+
+        assert_eq!(runs.borrow()[0].0, 0.0);
+    }
+
+    #[test]
+    fn audio_master_should_hold_video_until_delayed_audio_is_ready() {
+        let now = Instant::now();
+        let (mut player, runs) = fed_player(None, now);
+        runs.borrow()[0].1.send(blank()).unwrap();
+        player.tick(now);
+        player.audio = Some(Audio::fixture(0.0, now));
+        assert!(player.waiting_for_audio());
+        player.audio.as_ref().unwrap().observe(0.0, after(now, 0.6));
+        runs.borrow()[0].1.send(blank()).unwrap();
+
+        player.tick(after(now, 0.6));
+
+        assert_eq!(player.frame_number, 1);
+        assert_eq!(player.position(after(now, 0.6)), 0.0);
+    }
+
+    #[test]
+    fn audio_master_should_catch_up_after_graphics_delay_without_restarting_sound() {
+        let now = Instant::now();
+        let (mut player, runs) = fed_player(None, now);
+        runs.borrow()[0].1.send(blank()).unwrap();
+        player.tick(now);
+        player.audio = Some(Audio::fixture(0.0, now));
+        player.audio.as_ref().unwrap().observe(0.5, after(now, 1.0));
+        for _ in 0..20 {
+            runs.borrow()[0].1.send(blank()).unwrap();
+        }
+
+        player.tick(after(now, 1.0));
+        player.tick(after(now, 1.0));
+
+        assert!(player.audio.is_some());
+        assert_eq!(player.position(after(now, 1.0)), 0.5);
+        assert_eq!(player.shown, 13);
+        assert_eq!(runs.borrow().len(), 1);
+    }
+
+    #[test]
+    fn audio_master_should_keep_its_position_when_muted() {
+        let now = Instant::now();
+        let (mut player, runs) = fed_player(None, now);
+        runs.borrow()[0].1.send(blank()).unwrap();
+        player.tick(now);
+        player.sound = true;
+        player.audio = Some(Audio::fixture(0.0, now));
+        player.audio.as_ref().unwrap().observe(0.5, after(now, 1.0));
+
+        player.toggle_sound(after(now, 1.0));
+
+        assert!((player.position(after(now, 1.1)) - 0.6).abs() < 0.001);
+        assert!(player.audio.is_none());
+    }
+
+    #[test]
+    fn audio_master_should_seek_from_heard_time() {
+        let now = Instant::now();
+        let (mut player, runs) = fed_player(None, now);
+        runs.borrow()[0].1.send(blank()).unwrap();
+        player.tick(now);
+        player.audio = Some(Audio::fixture(0.0, now));
+        player.audio.as_ref().unwrap().observe(0.5, after(now, 1.0));
+
+        player.seek(5.0, after(now, 1.0));
+
+        assert_eq!(runs.borrow()[1].0, 5.5);
+        assert_eq!(player.resume(after(now, 2.0)).at, 5.5);
+    }
+
+    #[test]
+    fn audio_master_should_pause_at_heard_time() {
+        let now = Instant::now();
+        let (mut player, runs) = fed_player(None, now);
+        runs.borrow()[0].1.send(blank()).unwrap();
+        player.tick(now);
+        player.audio = Some(Audio::fixture(0.0, now));
+        player.audio.as_ref().unwrap().observe(0.5, after(now, 1.0));
+
+        player.toggle_pause(after(now, 1.0));
+
+        assert_eq!(player.position(after(now, 2.0)), 0.5);
+        assert!(player.audio.is_none());
+    }
+
+    #[test]
+    fn audio_eof_should_keep_the_sound_preference_for_the_next_loop() {
+        let now = Instant::now();
+        let (mut player, runs) = fed_player(None, now);
+        runs.borrow()[0].1.send(blank()).unwrap();
+        player.tick(now);
+        player.sound = true;
+        let audio = Audio::fixture(0.0, now);
+        audio.observe(0.25, now);
+        audio.finish();
+        player.audio = Some(audio);
+
+        player.tick(now);
+
+        assert!(player.sound());
+        assert!(player.audio.is_none());
+        assert_eq!(player.position(now), 0.25);
+    }
+
+    #[test]
+    fn audio_eof_before_a_clock_sample_should_keep_playback_muted_with_a_notice() {
+        let now = Instant::now();
+        let (mut player, _) = fed_player(None, now);
+        player.sound = true;
+        let audio = Audio::fixture(0.0, now);
+        audio.finish();
+        player.audio = Some(audio);
+
+        player.tick(now);
+
+        assert!(!player.sound());
+        assert!(player.take_notice().is_some());
+    }
+
     /// A playing player whose decoder runs are channels the test feeds.
     fn fed_player(duration: Option<f64>, now: Instant) -> (Player, Runs) {
         let (spawn, runs) = fed_runs(duration, false);
@@ -1813,6 +2198,17 @@ mod tests {
 
     fn after(t0: Instant, seconds: f64) -> Instant {
         t0 + Duration::from_secs_f64(seconds)
+    }
+
+    #[test]
+    fn when_a_retained_frame_covers_startup_the_position_should_wait_for_new_frames() {
+        let start = Instant::now();
+        let (mut player, runs) = fed_player(Some(10.0), start);
+        player.retain_frame(Some(blank()));
+        assert_eq!(player.position(start + Duration::from_secs(5)), 0.0);
+        runs.borrow()[0].1.send(blank()).unwrap();
+        player.tick(start + Duration::from_secs(5));
+        assert_eq!(player.position(start + Duration::from_secs(6)), 1.0);
     }
 
     #[test]
@@ -2092,12 +2488,13 @@ mod tests {
         let runs: Runs = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let record = std::rc::Rc::clone(&runs);
         let spawn: Spawn = Box::new(move |_, at| {
-            let (tx, frames) = sync_channel(64);
+            let (tx, frames) = frame_channel(64);
             record.borrow_mut().push((at, tx));
             Ok(Decoder {
                 child: None,
                 frames,
                 log: Arc::clone(&shared),
+                progress: Arc::new(DecodeProgress::default()),
             })
         });
         let mut player = fed_silent_player(spawn, 0.0, t0);
@@ -2146,6 +2543,18 @@ mod tests {
     }
 
     #[test]
+    fn ranged_requests_should_need_ffmpeg_http_request_size() {
+        let before_8_1 = "HTTP AVOptions:\n  -multiple_requests <boolean>    ED......... use persistent connections (default false)\n";
+        let since_8_1 = "HTTP AVOptions:\n  -request_size      <int64>      .D......... size (in bytes) of requests to make (from 0 to I64_MAX) (default 0)\n  -initial_request_size <int64>      .D......... size (in bytes) of initial requests\n";
+        let initial_only =
+            "  -initial_request_size <int64>      .D......... size of initial requests\n";
+
+        assert!(!supports_ranged(before_8_1));
+        assert!(supports_ranged(since_8_1));
+        assert!(!supports_ranged(initial_only));
+    }
+
+    #[test]
     fn when_a_plain_gif_plays_it_should_stream_without_seeking_its_input() {
         let gif = "http://127.0.0.1:1/k/https/i.redd.it/a.gif";
         let mp4 = "http://127.0.0.1:1/k/https/preview.redd.it/a.gif?format=mp4&s=x";
@@ -2162,6 +2571,22 @@ mod tests {
             args(mp4, 5.0),
             format!("-reconnect 1 -ss 5.000 -i {mp4}"),
             "an MP4 behind a .gif name still seeks"
+        );
+        let youtube = "https://rr1---sn-x.googlevideo.com/videoplayback?itag=251";
+        let ranged = if *RANGED_REQUESTS {
+            " -request_size 1048576 -multiple_requests 1"
+        } else {
+            ""
+        };
+        assert_eq!(
+            args(youtube, 5.0),
+            format!("-probesize 32768{ranged} -reconnect 1 -ss 5.000 -i {youtube}"),
+            "googlevideo paces one open-ended response near playback speed"
+        );
+        let lookalike = "https://googlevideo.com.example/videoplayback";
+        assert_eq!(
+            args(lookalike, 5.0),
+            format!("-reconnect 1 -ss 5.000 -i {lookalike}")
         );
     }
 
@@ -2271,12 +2696,13 @@ mod tests {
         let senders = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let record = std::rc::Rc::clone(&senders);
         let spawn: Spawn = Box::new(move |_, _| {
-            let (tx, frames) = sync_channel(8);
+            let (tx, frames) = frame_channel(8);
             record.borrow_mut().push(tx);
             Ok(Decoder {
                 child: None,
                 frames,
                 log: Arc::clone(&shared),
+                progress: Arc::new(DecodeProgress::default()),
             })
         });
         let sources = Sources {
@@ -2531,7 +2957,7 @@ CMAF_720.m3u8
         assert!(app.card_renderer.pending());
         assert!(
             app.wake_in() >= Duration::from_millis(10),
-            "cannot advance a frame while graphics are pending; an overdue deadline must not spin"
+            "drain late frames while graphics are pending without spinning on expired deadlines"
         );
         let (input, events) = std::sync::mpsc::channel();
         input

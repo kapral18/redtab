@@ -20,6 +20,7 @@ pub const TILE_COLS: u16 = 256;
 pub const TILE_ROWS: u16 = 16;
 const CACHE_BYTES: usize = 256 * 1024 * 1024;
 const CACHE_TILES: usize = 512;
+const NATIVE_BYTES: usize = 128 * 1024 * 1024;
 const BADGE_MIN_PIXELS: f64 = 80.0;
 static NEXT_IMAGE_ID: LazyLock<AtomicU32> = LazyLock::new(|| {
     let seed = *uuid::Uuid::new_v4().as_bytes();
@@ -29,7 +30,7 @@ static NEXT_IMAGE_ID: LazyLock<AtomicU32> = LazyLock::new(|| {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Indicator {
     Video { gif: bool, play: bool },
-    Link(String),
+    Link,
     Gallery(usize),
 }
 
@@ -53,6 +54,7 @@ pub struct Key {
     pub overlay: Option<Overlay>,
     pub post_id: Option<String>,
     pub video: bool,
+    pub fingerprint: Option<[u8; 32]>,
     font: (u16, u16),
     protocol: u8,
     tmux: bool,
@@ -79,6 +81,7 @@ impl Key {
             overlay: None,
             post_id: None,
             video: false,
+            fingerprint: None,
             font: (picker.font_size().width, picker.font_size().height),
             protocol: picker.protocol_type() as u8,
             tmux: picker.tmux_detected(),
@@ -100,7 +103,8 @@ pub enum Tile {
         upload: String,
         size: Size,
         id: u32,
-        sent: AtomicBool,
+        decoded_bytes: usize,
+        residency: Arc<Mutex<NativeResidency>>,
     },
     Kitty {
         frame: crate::video::Frame,
@@ -109,7 +113,34 @@ pub enum Tile {
         tmux: bool,
         buffer: bool,
         sent: AtomicBool,
+        residency: Arc<Mutex<NativeResidency>>,
     },
+}
+
+/// Terminals budget decoded pixels and may discard old image IDs. Keep a smaller
+/// transmission window than Ghostty's default so expired IDs can be sent again.
+#[derive(Default)]
+pub struct NativeResidency {
+    uploads: VecDeque<(u32, usize)>,
+    bytes: usize,
+}
+
+impl NativeResidency {
+    fn contains(&self, id: u32) -> bool {
+        self.uploads.iter().any(|(known, _)| *known == id)
+    }
+
+    fn record(&mut self, id: u32, bytes: usize) {
+        if let Some(index) = self.uploads.iter().position(|(known, _)| *known == id) {
+            self.bytes -= self.uploads.remove(index).unwrap().1;
+        }
+        self.uploads.push_back((id, bytes));
+        self.bytes += bytes;
+        while self.bytes > NATIVE_BYTES || self.uploads.len() > CACHE_TILES {
+            let (_, bytes) = self.uploads.pop_front().unwrap();
+            self.bytes -= bytes;
+        }
+    }
 }
 
 impl Tile {
@@ -120,14 +151,21 @@ impl Tile {
         }
     }
 
-    pub fn render_region(&self, area: Rect, source: Position, buf: &mut ratatui::buffer::Buffer) {
+    pub fn take_upload(&self) -> Option<String> {
         match self {
-            Self::Image(protocol) => ratatui_image::Image::new(protocol).render(area, buf),
             Self::KittyImage {
-                upload, id, sent, ..
+                upload,
+                id,
+                decoded_bytes,
+                residency,
+                ..
             } => {
-                let transmit = (!sent.swap(true, Ordering::Relaxed)).then(|| upload.clone());
-                crate::video::kitty_cells(buf, area, *id, source, transmit);
+                let mut residency = residency.lock();
+                if residency.contains(*id) {
+                    return None;
+                }
+                residency.record(*id, *decoded_bytes);
+                Some(upload.clone())
             }
             Self::Kitty {
                 frame,
@@ -135,12 +173,46 @@ impl Tile {
                 id,
                 tmux,
                 sent,
+                residency,
                 ..
             } => {
-                let transmit = (!sent.swap(true, Ordering::Relaxed)).then(|| {
-                    crate::video::kitty_transmit(*id, frame, size.width, size.height, *tmux)
-                });
-                crate::video::kitty_cells(buf, area, *id, source, transmit);
+                let mut residency = residency.lock();
+                if sent.swap(true, Ordering::Relaxed) && residency.contains(*id) {
+                    return None;
+                }
+                residency.record(*id, frame.width as usize * frame.height as usize * 4);
+                Some(crate::video::kitty_transmit(
+                    *id,
+                    frame,
+                    size.width,
+                    size.height,
+                    *tmux,
+                ))
+            }
+            Self::Image(_) => None,
+        }
+    }
+
+    fn bytes(&self, fallback: usize) -> usize {
+        match self {
+            Self::KittyImage { upload, .. } => upload.capacity(),
+            Self::Kitty {
+                frame:
+                    crate::video::Frame {
+                        pixels: crate::video::Pixels::Png(data),
+                        ..
+                    },
+                ..
+            } => data.capacity(),
+            _ => fallback,
+        }
+    }
+
+    pub fn render_region(&self, area: Rect, source: Position, buf: &mut ratatui::buffer::Buffer) {
+        match self {
+            Self::Image(protocol) => ratatui_image::Image::new(protocol).render(area, buf),
+            Self::KittyImage { id, .. } | Self::Kitty { id, .. } => {
+                crate::video::kitty_cells(buf, area, *id, source, self.take_upload())
             }
         }
     }
@@ -170,6 +242,7 @@ struct Request {
 struct Completed {
     key: Key,
     image: Weak<DynamicImage>,
+    source_size: (u32, u32),
     result: Result<Arc<Tile>, String>,
 }
 
@@ -186,6 +259,7 @@ struct Work {
 struct Shared {
     work: Mutex<Work>,
     changed: Condvar,
+    residency: Arc<Mutex<NativeResidency>>,
 }
 
 #[derive(Default)]
@@ -196,6 +270,17 @@ pub struct Renderer {
     cache: HashMap<Key, Completed>,
     visible: HashSet<Key>,
     order: VecDeque<Key>,
+}
+
+impl Completed {
+    fn bytes(&self, key: &Key) -> usize {
+        std::mem::size_of::<Self>()
+            + key.url.capacity()
+            + self
+                .result
+                .as_ref()
+                .map_or_else(|error| error.capacity(), |tile| tile.bytes(key.bytes()))
+    }
 }
 
 impl Renderer {
@@ -216,11 +301,22 @@ impl Renderer {
     ) -> Option<Result<Arc<Tile>, String>> {
         self.visible.insert(key.clone());
         let cached = self.cache.get(&key);
-        let current =
-            cached.is_some_and(|entry| Weak::ptr_eq(&entry.image, &Arc::downgrade(image)));
+        let current = cached.is_some_and(|entry| {
+            Weak::ptr_eq(&entry.image, &Arc::downgrade(image))
+                || (!key.video
+                    && key.fingerprint.is_some()
+                    && entry.source_size == (image.width(), image.height()))
+        });
         let preserve =
             preparation == Preparation::Missing && cached.is_some_and(|entry| entry.result.is_ok());
-        if !current && !preserve && preparation != Preparation::Hold {
+        if !current
+            && !preserve
+            && preparation != Preparation::Hold
+            && !self
+                .frame
+                .iter()
+                .any(|request| request.key == key && Arc::ptr_eq(&request.image, image))
+        {
             self.frame.push(Request {
                 key: key.clone(),
                 image: Arc::clone(image),
@@ -247,6 +343,20 @@ impl Renderer {
             .map(|request| (request.key.clone(), Arc::downgrade(&request.image)))
             .collect();
         let mut work = self.shared.work.lock();
+        // Finish this picture despite newer pixels, including completions racing this draw.
+        if (work.wanted.iter().any(|(key, _)| key.video)
+            || work.completed.iter().any(|done| done.key.video))
+            && next.len() == work.wanted.len() + work.completed.len()
+            && next.iter().all(|(key, image)| {
+                work.wanted
+                    .iter()
+                    .map(|(key, source)| (key, source))
+                    .chain(work.completed.iter().map(|done| (&done.key, &done.image)))
+                    .any(|(old, source)| old == key && (key.video || Weak::ptr_eq(source, image)))
+            })
+        {
+            return;
+        }
         work.completed
             .retain(|done| wanted(&next, &done.key, &done.image));
         next.retain(|(key, image)| {
@@ -270,9 +380,13 @@ impl Renderer {
         work.pending = (!self.frame.is_empty()).then(|| std::mem::take(&mut self.frame));
         if !self.started && work.pending.is_some() {
             let shared = Arc::clone(&self.shared);
+            let encoder = Encoder {
+                residency: Arc::clone(&shared.residency),
+                ..Encoder::default()
+            };
             std::thread::Builder::new()
                 .name("redtab-card-render".into())
-                .spawn(move || prepare(shared, Encoder::default()))
+                .spawn(move || prepare(shared, encoder))
                 .expect("cannot start card renderer");
             self.started = true;
         }
@@ -302,10 +416,10 @@ impl Renderer {
     fn prune(&mut self) {
         let (mut count, mut bytes) = self
             .cache
-            .keys()
-            .filter(|key| !self.visible.contains(*key))
-            .fold((0usize, 0usize), |(count, bytes), key| {
-                (count + 1, bytes + key.bytes())
+            .iter()
+            .filter(|(key, _)| !self.visible.contains(*key))
+            .fold((0usize, 0usize), |(count, bytes), (key, entry)| {
+                (count + 1, bytes + entry.bytes(key))
             });
         while bytes > CACHE_BYTES || count > CACHE_TILES {
             let Some(key) = self.order.pop_front() else {
@@ -315,8 +429,8 @@ impl Renderer {
                 self.order.push_back(key);
                 continue;
             }
-            if self.cache.remove(&key).is_some() {
-                bytes -= key.bytes();
+            if let Some(entry) = self.cache.remove(&key) {
+                bytes -= entry.bytes(&key);
                 count -= 1;
             }
         }
@@ -417,6 +531,7 @@ fn prepare(shared: Arc<Shared>, mut encoder: Encoder) {
                 work.completed.push(Completed {
                     key: request.key,
                     image,
+                    source_size: (request.image.width(), request.image.height()),
                     result,
                 });
                 shared.changed.notify_all();
@@ -428,6 +543,7 @@ fn prepare(shared: Arc<Shared>, mut encoder: Encoder) {
 #[derive(Default)]
 struct Encoder {
     downscaled: Option<(Weak<DynamicImage>, u32, Arc<DynamicImage>)>,
+    residency: Arc<Mutex<NativeResidency>>,
 }
 
 impl Encoder {
@@ -481,35 +597,15 @@ impl Encoder {
             && request.picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty
         {
             let id = 0x8000_0000 | (NEXT_IMAGE_ID.fetch_add(1, Ordering::Relaxed) & 0x7fff_ffff);
-            let protocol = Protocol::Kitty(
-                ratatui_image::protocol::kitty::Kitty::new(
-                    DynamicImage::ImageRgba8(pixels),
-                    size,
-                    id,
-                    request.key.tmux,
-                    request
-                        .picker
-                        .capabilities()
-                        .contains(&ratatui_image::picker::Capability::KittyCompression),
-                )
-                .map_err(|error| error.to_string())?,
-            );
-            // Capture the library's upload once; clipped views reuse its native image ID.
-            let mut cell = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 1, 1));
-            ratatui_image::Image::new(&protocol)
-                .allow_clipping(true)
-                .render(cell.area, &mut cell);
-            let upload = cell[(0, 0)]
-                .symbol()
-                .split_once('\u{10EEEE}')
-                .ok_or("Kitty encoding omitted its placeholder")?
-                .0
-                .to_string();
+            let frame = png_frame(DynamicImage::ImageRgba8(pixels))?;
+            let upload =
+                crate::video::kitty_transmit(id, &frame, size.width, size.height, request.key.tmux);
             return Ok(Tile::KittyImage {
                 upload,
                 size,
                 id,
-                sent: AtomicBool::new(false),
+                decoded_bytes: frame.width as usize * frame.height as usize * 4,
+                residency: Arc::clone(&self.residency),
             });
         }
         if kitty_video {
@@ -519,26 +615,9 @@ impl Encoder {
             request.buffer.hash(&mut hash);
             std::process::id().hash(&mut hash);
             let id = 0x0080_0000 | (hash.finish() as u32 & 0x007f_ffff);
-            let image = DynamicImage::ImageRgba8(pixels).to_rgb8();
-            let mut png = Vec::new();
-            image::ImageEncoder::write_image(
-                image::codecs::png::PngEncoder::new_with_quality(
-                    &mut png,
-                    image::codecs::png::CompressionType::Fast,
-                    image::codecs::png::FilterType::Paeth,
-                ),
-                image.as_raw(),
-                image.width(),
-                image.height(),
-                image::ExtendedColorType::Rgb8,
-            )
-            .map_err(|error| error.to_string())?;
-            let frame = crate::video::Frame {
-                width: image.width(),
-                height: image.height(),
-                pixels: crate::video::Pixels::Png(png),
-                same_as_first: false,
-            };
+            let frame = png_frame(DynamicImage::ImageRgb8(
+                DynamicImage::ImageRgba8(pixels).to_rgb8(),
+            ))?;
             return Ok(Tile::Kitty {
                 frame,
                 size,
@@ -546,6 +625,7 @@ impl Encoder {
                 tmux: request.key.tmux,
                 buffer: request.buffer,
                 sent: AtomicBool::new(false),
+                residency: Arc::clone(&self.residency),
             });
         }
         request
@@ -558,6 +638,28 @@ impl Encoder {
             .map(Tile::Image)
             .map_err(|error| error.to_string())
     }
+}
+
+fn png_frame(image: DynamicImage) -> Result<crate::video::Frame, String> {
+    let mut png = Vec::new();
+    image::ImageEncoder::write_image(
+        image::codecs::png::PngEncoder::new_with_quality(
+            &mut png,
+            image::codecs::png::CompressionType::Fast,
+            image::codecs::png::FilterType::Paeth,
+        ),
+        image.as_bytes(),
+        image.width(),
+        image.height(),
+        image.color().into(),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(crate::video::Frame {
+        width: image.width(),
+        height: image.height(),
+        pixels: crate::video::Pixels::Png(png),
+        same_as_first: false,
+    })
 }
 
 fn tile_pixels(
@@ -680,7 +782,12 @@ impl Overlay {
                 if *gif { "GIF".into() } else { "VIDEO".into() },
                 play.then_some(false),
             ),
-            Indicator::Link(_) => ("LINK".into(), Some(true)),
+            Indicator::Link => {
+                let radius = (5 * scale).min(width.min(height) / 4).max(1);
+                let corner = (width.saturating_sub(pad + radius), top + pad + radius);
+                paint_symbol(image, origin, corner, radius, true);
+                return;
+            }
             Indicator::Gallery(count) => (format!("1/{count}"), None),
         };
         if let Some(link) = symbol {
@@ -692,18 +799,6 @@ impl Overlay {
                 origin,
                 (pad, top + pad),
                 &label,
-                width.saturating_sub(pad * 2),
-                scale,
-            );
-        }
-        if let Indicator::Link(domain) = &self.indicator
-            && height >= 32 * scale
-        {
-            paint_label(
-                image,
-                origin,
-                (pad, top + height - 11 * scale - pad),
-                domain,
                 width.saturating_sub(pad * 2),
                 scale,
             );
@@ -917,6 +1012,178 @@ mod tests {
                 buffer: false,
             })
             .unwrap()
+    }
+
+    #[test]
+    fn when_terminal_cells_change_a_still_strip_should_keep_its_fitted_grid_size() {
+        #[allow(deprecated)]
+        let mut picker = Picker::from_fontsize(ratatui_image::FontSize::new(8, 16));
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+        let image = Arc::new(DynamicImage::new_rgb8(160, 512));
+        for tmux in [false, true] {
+            let mut key = Key::new(
+                "portrait",
+                &picker,
+                Size::new(20, 32),
+                (160, 512),
+                16,
+                16,
+                0,
+            );
+            key.tmux = tmux;
+            let tile = Encoder::default()
+                .encode(&Request {
+                    key,
+                    image: Arc::clone(&image),
+                    picker: picker.clone(),
+                    buffer: false,
+                })
+                .unwrap();
+            let Tile::KittyImage { upload, .. } = tile else {
+                panic!("native still");
+            };
+            let header = upload
+                .split("_G")
+                .nth(1)
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap();
+            let values: HashMap<_, u32> = header
+                .split(',')
+                .filter_map(|field| {
+                    let (name, value) = field.split_once('=')?;
+                    Some((name, value.parse().ok()?))
+                })
+                .collect();
+
+            // Ghostty Placement.gridSize uses c/r directly; omitted values derive
+            // cells from the uploaded pixel dimensions and the current font size.
+            for (cell_width, cell_height) in [(8, 16), (16, 32), (4, 8)] {
+                let cols = values
+                    .get("c")
+                    .copied()
+                    .unwrap_or_else(|| values["s"].div_ceil(cell_width));
+                let rows = values
+                    .get("r")
+                    .copied()
+                    .unwrap_or_else(|| values["v"].div_ceil(cell_height));
+                assert_eq!(
+                    (cols, rows),
+                    (20, 16),
+                    "cell size {cell_width}x{cell_height}; {header}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn when_native_stills_are_prepared_the_upload_should_compress_the_pixels() {
+        let mut picker = picker();
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+        let tile = Encoder::default()
+            .encode(&Request {
+                key: Key::new("still", &picker, Size::new(128, 16), (1, 1), 0, 16, 0),
+                image: Arc::new(DynamicImage::new_rgba8(1, 1)),
+                picker,
+                buffer: false,
+            })
+            .unwrap();
+        let Tile::KittyImage { upload, .. } = tile else {
+            panic!("native still");
+        };
+        assert!(
+            upload.len() < 128 * 16 * 4,
+            "compress still uploads off the UI thread"
+        );
+    }
+
+    #[test]
+    fn when_compressed_native_tiles_fit_the_budget_it_should_keep_them_offscreen() {
+        #[allow(deprecated)]
+        let mut picker = Picker::from_fontsize(ratatui_image::FontSize::new(17, 37));
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+        let image = Arc::new(DynamicImage::new_rgba8(1, 1));
+        let mut renderer = Renderer::default();
+        renderer.begin();
+        for n in 0..16 {
+            renderer.tile(
+                Key::new(
+                    &format!("still{n}"),
+                    &picker,
+                    Size::new(128, 16),
+                    (1, 1),
+                    0,
+                    16,
+                    0,
+                ),
+                &image,
+                &picker,
+                Preparation::Refresh,
+            );
+        }
+        renderer.finish();
+        complete(&mut renderer);
+        renderer.begin();
+        renderer.finish();
+        assert_eq!(
+            renderer.cache.len(),
+            16,
+            "budget the encoded payload, not an uncompressed pixel multiple"
+        );
+    }
+
+    #[test]
+    fn when_native_uploads_exceed_terminal_residency_a_warm_still_should_upload_again() {
+        #[allow(deprecated)]
+        let mut picker = Picker::from_fontsize(ratatui_image::FontSize::new(17, 37));
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+        let image = Arc::new(DynamicImage::new_rgba8(1, 1));
+        let mut encoder = Encoder::default();
+        let mut video_key = Key::new("paused", &picker, Size::new(128, 16), (1, 1), 0, 16, 0);
+        video_key.video = true;
+        let video = encoder
+            .encode(&Request {
+                key: video_key,
+                image: Arc::clone(&image),
+                picker: picker.clone(),
+                buffer: false,
+            })
+            .unwrap();
+        assert!(video.take_upload().is_some());
+        assert!(video.take_upload().is_none());
+        let mut first = None;
+        for n in 0..28 {
+            let tile = encoder
+                .encode(&Request {
+                    key: Key::new(
+                        &format!("still{n}"),
+                        &picker,
+                        Size::new(128, 16),
+                        (1, 1),
+                        0,
+                        16,
+                        0,
+                    ),
+                    image: Arc::clone(&image),
+                    picker: picker.clone(),
+                    buffer: false,
+                })
+                .unwrap();
+            assert!(tile.take_upload().is_some());
+            assert!(tile.take_upload().is_none());
+            if first.is_none() {
+                first = Some(tile);
+            }
+        }
+        assert!(
+            first.unwrap().take_upload().is_some(),
+            "keep the prepared PNG, but resend IDs beyond the terminal residency budget"
+        );
+        assert!(
+            video.take_upload().is_some(),
+            "a retained paused frame must also survive terminal eviction"
+        );
     }
 
     #[test]
@@ -1155,10 +1422,12 @@ mod tests {
     }
 
     #[test]
-    fn card_media_link_should_have_an_external_arrow_and_a_domain_backing() {
-        let actual = indicator_pixels(Some(Indicator::Link("example.com".into())), 0, 100);
-        assert_eq!(actual.get_pixel(110, 40).0, [235, 237, 250, 255]);
-        assert_eq!(actual.get_pixel(3, 86).0, [17, 17, 27, 255]);
+    fn card_media_link_should_keep_its_center_clear_and_put_the_arrow_in_a_corner() {
+        let actual = indicator_pixels(Some(Indicator::Link), 0, 100);
+        assert_eq!(actual.get_pixel(100, 50).0, [75, 130, 190, 255]);
+        assert!(
+            (180..200).any(|x| (0..20).any(|y| actual.get_pixel(x, y).0 != [75, 130, 190, 255]))
+        );
     }
 
     #[test]
@@ -1216,6 +1485,7 @@ mod tests {
             let done = Completed {
                 key: key.clone(),
                 image: Arc::downgrade(&red),
+                source_size: (red.width(), red.height()),
                 result: encoder
                     .encode(&Request {
                         key: key.clone(),
@@ -1234,6 +1504,7 @@ mod tests {
         let completion = |encoder: &mut Encoder, key: &Key| Completed {
             key: key.clone(),
             image: Arc::downgrade(&blue),
+            source_size: (blue.width(), blue.height()),
             result: encoder
                 .encode(&Request {
                     key: key.clone(),
@@ -1369,6 +1640,69 @@ mod tests {
     }
 
     #[test]
+    fn when_video_advances_during_encoding_the_inflight_picture_should_finish() {
+        let picker = picker();
+        let old = Arc::new(DynamicImage::new_rgb8(4, 4));
+        let next = Arc::new(DynamicImage::new_rgb8(4, 4));
+        let mut key = Key::new("video", &picker, Size::new(4, 4), (4, 4), 0, 4, 0);
+        key.video = true;
+        let mut renderer = Renderer::default();
+        renderer.started = true;
+        renderer.begin();
+        renderer.tile(key.clone(), &old, &picker, Preparation::Refresh);
+        renderer.finish();
+
+        renderer.begin();
+        renderer.tile(key.clone(), &next, &picker, Preparation::Refresh);
+        renderer.finish();
+
+        let work = renderer.shared.work.lock();
+        assert!(Weak::ptr_eq(&work.wanted[0].1, &Arc::downgrade(&old)));
+        assert!(Arc::ptr_eq(&work.pending.as_ref().unwrap()[0].image, &old));
+    }
+
+    #[test]
+    fn when_video_finishes_during_a_draw_the_completed_picture_should_still_publish() {
+        let picker = picker();
+        let old = Arc::new(DynamicImage::new_rgb8(4, 4));
+        let next = Arc::new(DynamicImage::new_rgb8(4, 4));
+        let mut key = Key::new("video", &picker, Size::new(4, 4), (4, 4), 0, 4, 0);
+        key.video = true;
+        let mut renderer = Renderer::default();
+        renderer.started = true;
+        renderer.begin();
+        renderer.tile(key.clone(), &old, &picker, Preparation::Refresh);
+        renderer.finish();
+        renderer.begin();
+        renderer.tile(key, &next, &picker, Preparation::Refresh);
+        // The real worker completes after begin's poll and before finish.
+        let request = renderer
+            .shared
+            .work
+            .lock()
+            .pending
+            .take()
+            .unwrap()
+            .remove(0);
+        let result = Encoder::default().encode(&request).map(Arc::new);
+        {
+            let mut work = renderer.shared.work.lock();
+            work.wanted.clear();
+            work.completed.push(Completed {
+                key: request.key,
+                image: Arc::downgrade(&old),
+                source_size: (4, 4),
+                result,
+            });
+        }
+
+        renderer.finish();
+
+        assert!(renderer.poll(), "publish the picture that just finished");
+        assert!(!renderer.pending());
+    }
+
+    #[test]
     fn superseding_a_partial_video_batch_should_discard_its_pixels_and_finish_the_new_viewport() {
         let picker = picker();
         let old = Arc::new(DynamicImage::new_rgb8(4, 6));
@@ -1405,6 +1739,7 @@ mod tests {
             work.completed.push(Completed {
                 key: request.key,
                 image: Arc::downgrade(&old),
+                source_size: (old.width(), old.height()),
                 result,
             });
         }

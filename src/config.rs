@@ -284,6 +284,7 @@ mod tests {
             stickied: false,
             nsfw: false,
             spoiler: false,
+            original_deleted: false,
         }
     }
 

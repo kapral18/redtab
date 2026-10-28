@@ -89,12 +89,16 @@ struct PostCard {
     style: Style,
     image: Option<String>,
     image_size: Size,
+    image_at: ratatui::layout::Position,
     pixels: (u32, u32),
 }
 
 impl PostCard {
     fn height(&self) -> usize {
-        self.lines.len() + usize::from(self.image_size.height) + 1
+        self.lines
+            .len()
+            .max(usize::from(self.image_at.y) + usize::from(self.image_size.height))
+            + 1
     }
 
     fn visible(&self, skip: usize, rows: usize) -> Vec<Line<'static>> {
@@ -139,7 +143,7 @@ impl CardPicture {
         let prefix = match &self.indicator {
             Some(Indicator::Video { gif: true, .. }) => "▶ GIF ·",
             Some(Indicator::Video { .. }) => "▶ video ·",
-            Some(Indicator::Link(_)) => "↗ link ·",
+            Some(Indicator::Link) => "↗ link ·",
             Some(Indicator::Gallery(_)) => "▦ gallery ·",
             None => "▣",
         };
@@ -291,12 +295,14 @@ fn draw_spots(f: &mut Frame, app: &mut App, spots: &[ImageSpot], covered: Option
     app.thumbs_drawn(&urls);
 }
 
-fn row_thumb<'a>(app: &App, post: &'a Post) -> Option<&'a str> {
+fn row_thumb<'a>(app: &App, post: &'a Post) -> Option<std::borrow::Cow<'a, str>> {
     // A spoiler's picture is the spoiler.
     if !app.thumbnails_on() || post.spoiler {
         return None;
     }
-    app.usable_thumb(post.media.list_thumb())
+    post.media
+        .list_thumb()
+        .filter(|url| app.usable_thumb(Some(url.as_ref())).is_some())
 }
 
 /// Thumbnail slot width for a list: every row gets it if any non-spoiler post has a
@@ -880,7 +886,7 @@ fn post_card(app: &App, post: &Post, width: usize, opts: &CardOpts) -> [Line<'st
     ];
     [
         Line::from(title),
-        post_meta(post, width, opts.show_subreddit, bg, meta),
+        post_meta(app, post, width, opts.show_subreddit, bg, meta),
     ]
 }
 
@@ -897,6 +903,7 @@ fn post_background(app: &App, post: &Post, selected: bool) -> Style {
 }
 
 fn post_meta(
+    app: &App,
     post: &Post,
     width: usize,
     show_subreddit: bool,
@@ -910,6 +917,10 @@ fn post_meta(
     if post.spoiler {
         meta.push(Span::styled(" ", bg));
         meta.push(chip("spoiler", CRUST, YELLOW));
+    }
+    if post.original_deleted || app.state.original_deleted(&post.id) {
+        meta.push(Span::styled(" ", bg));
+        meta.push(chip("Original post deleted", YELLOW, SURFACE0));
     }
     if show_subreddit {
         meta.push(Span::styled(
@@ -997,46 +1008,101 @@ fn fit_picture(
 fn expanded_card(app: &App, post: &Post, width: usize, opts: &CardOpts, height: u16) -> PostCard {
     let bg = post_background(app, post, opts.selected);
     let marker = card_marker(app, opts.selected, bg);
-    let meta = post_meta(post, width, opts.show_subreddit, bg, vec![marker.clone()]);
-    let mut lines = card_title(app, post, width, opts, height, bg);
-    lines.insert(0, meta);
+    let article = matches!(post.media, Media::Link { .. }) && post.media.video_url().is_none();
     let image = (!post.spoiler && width >= 8 && app.inline_images_on())
         .then(|| {
             post.media
                 .preview_image()
                 .or_else(|| post.media.list_thumb())
-                .map(str::to_string)
+                .map(std::borrow::Cow::into_owned)
         })
         .flatten();
-    let image_size = post
-        .preview_size
-        .filter(|&(width, height)| width > 0 && height > 0)
-        .or_else(|| {
-            image.as_deref().and_then(|url| {
-                app.card_image_metadata
-                    .get(url)
-                    .map(|metadata| metadata.size)
-            })
-        })
-        .filter(|&(width, height)| width > 0 && height > 0);
+    let decoded_size = image
+        .as_deref()
+        .and_then(|url| app.card_image_metadata.get(url).map(|m| m.size));
+    let image_size = if article {
+        decoded_size.or(post.preview_size)
+    } else {
+        post.preview_size.or(decoded_size)
+    }
+    .filter(|&(width, height)| width > 0 && height > 0);
+    let (article_size, beside) = if article {
+        article_picture(
+            image_size,
+            app.image_picker.font_size(),
+            width as u16,
+            height,
+        )
+    } else {
+        (Size::default(), false)
+    };
+    let reserve = if article && image.is_none() && width >= 24 {
+        6
+    } else if article && beside {
+        usize::from(article_size.width) + 2
+    } else {
+        0
+    };
+    let text_width = width.saturating_sub(reserve);
+    let meta = post_meta(
+        app,
+        post,
+        text_width,
+        opts.show_subreddit,
+        bg,
+        vec![marker.clone()],
+    );
+    let mut lines = card_title(app, post, text_width, opts, height, bg);
+    lines.insert(0, meta);
+    if reserve > 0 {
+        let monogram = if image.is_none() {
+            post.media
+                .tag()
+                .unwrap_or_default()
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .take(2)
+                .collect::<String>()
+                .to_ascii_uppercase()
+        } else {
+            String::new()
+        };
+        for (index, line) in lines.iter_mut().enumerate() {
+            let mut padding = vec![Span::styled(" ".repeat(reserve), bg)];
+            if index == 0 && !monogram.is_empty() {
+                padding = vec![
+                    Span::styled(
+                        format!(" {monogram:<2} "),
+                        Style::new().fg(TEXT).bg(SURFACE1),
+                    ),
+                    Span::styled("  ", bg),
+                ];
+            }
+            line.spans.splice(1..1, padding);
+        }
+    }
     let preview = !post.spoiler
         && width >= 8
         && app.inline_images_on()
         && (image.is_some() || post.media.video_url().is_some());
     let fitted_size = if preview {
-        fit_picture(
-            image_size.unwrap_or(if post.media.video_url().is_some() {
-                (16, 9)
-            } else {
-                (1, 1)
-            }),
-            app.image_picker.font_size(),
-            Size::new(
-                width.saturating_sub(4) as u16,
-                height.saturating_sub(lines.len() as u16 + 1),
-            ),
-            height,
-        )
+        if article {
+            article_size
+        } else {
+            fit_picture(
+                image_size.unwrap_or(if post.media.video_url().is_some() {
+                    (16, 9)
+                } else {
+                    (1, 1)
+                }),
+                app.image_picker.font_size(),
+                Size::new(
+                    width.saturating_sub(4) as u16,
+                    height.saturating_sub(lines.len() as u16 + 1),
+                ),
+                height,
+            )
+        }
     } else {
         Size::default()
     };
@@ -1051,6 +1117,7 @@ fn expanded_card(app: &App, post: &Post, width: usize, opts: &CardOpts, height: 
         ),
     ])
     .style(bg);
+    let lines_len = lines.len();
     PostCard {
         lines,
         footer,
@@ -1063,7 +1130,51 @@ fn expanded_card(app: &App, post: &Post, width: usize, opts: &CardOpts, height: 
         }),
         image,
         image_size: fitted_size,
+        image_at: ratatui::layout::Position::new(
+            if article && beside {
+                2
+            } else {
+                2 + (width as u16).saturating_sub(4 + fitted_size.width) / 2
+            },
+            if article && beside {
+                0
+            } else {
+                lines_len as u16
+            },
+        ),
     }
+}
+
+fn article_picture(
+    pixels: Option<(u32, u32)>,
+    font: ratatui_image::FontSize,
+    width: u16,
+    height: u16,
+) -> (Size, bool) {
+    let cols = width.saturating_sub(4);
+    let rows = (height.saturating_sub(3)).min((u32::from(height) * 3 / 10) as u16);
+    let beside = width >= 48
+        && pixels.is_none_or(|(w, _)| {
+            f64::from(w) * 1.5 < f64::from(cols) * f64::from(font.width.max(1)) * 0.6
+        });
+    if cols == 0 || rows == 0 {
+        return (Size::default(), beside);
+    }
+    let (w, h) = pixels.unwrap_or((160, 90));
+    let natural_cols = ((f64::from(w) * 1.5 / f64::from(font.width.max(1))).floor() as u16).max(1);
+    (
+        picture_cells(
+            w,
+            h,
+            font,
+            cols.min(natural_cols)
+                .min(if beside { (width / 3).min(32) } else { cols }),
+            rows.min(if beside { 8 } else { rows }),
+            rows.min(if beside { 8 } else { rows }),
+            1.5,
+        ),
+        beside,
+    )
 }
 
 fn card_title(
@@ -1275,14 +1386,14 @@ fn draw_card_list(
             at,
         );
         if card.image_size.height > 0 {
-            let image_start = card.lines.len();
+            let image_start = usize::from(card.image_at.y);
             let image_y = y + image_start.saturating_sub(skip).min(area.height as usize) as u16;
             let skipped = skip.saturating_sub(image_start) as u16;
             if skipped < card.image_size.height && image_y < at.bottom() {
                 pictures.cards.push(CardPicture {
                     url: card.image.clone(),
                     area: Rect::new(
-                        area.x + 2 + area.width.saturating_sub(6 + card.image_size.width) / 2,
+                        area.x + card.image_at.x,
                         image_y,
                         card.image_size.width,
                         (card.image_size.height - skipped).min(at.bottom() - image_y),
@@ -1307,9 +1418,7 @@ fn draw_card_list(
                                 play: true,
                             })
                         }
-                        Media::Link { url, .. } => Some(Indicator::Link(
-                            crate::model::domain_of(url).unwrap_or_else(|| "link".into()),
-                        )),
+                        Media::Link { .. } => Some(Indicator::Link),
                         Media::Gallery { images, .. } if !images.is_empty() => {
                             Some(Indicator::Gallery(images.len()))
                         }
@@ -1372,23 +1481,18 @@ fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture], cover
     app.card_renderer.begin();
     for spot in spots {
         if spot.selected
-            && let Some(player) = if spot.detail {
-                app.selected_video()
-            } else {
-                app.card_player()
-            }
-            && let Some(video::Frame {
-                pixels: video::Pixels::Raw(image),
-                ..
-            }) = player.frame()
+            && let Some((
+                video::Frame {
+                    pixels: video::Pixels::Raw(image),
+                    ..
+                },
+                playing,
+            )) = app.video_preview(!spot.detail)
         {
             let image = image.clone();
             let mut spot = spot.clone();
             spot.video_frame = true;
-            if !player.paused()
-                && player.error().is_none()
-                && let Some(Indicator::Video { play, .. }) = &mut spot.indicator
-            {
+            if playing && let Some(Indicator::Video { play, .. }) = &mut spot.indicator {
                 *play = false;
             }
             if let Err(error) = draw_card_image(
@@ -1400,6 +1504,7 @@ fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture], cover
                     picker: &app.image_picker,
                     renderer: &mut app.card_renderer,
                     prepare: Preparation::Refresh,
+                    fingerprint: None,
                     covered,
                     phase: app.loading_frame,
                 },
@@ -1418,7 +1523,7 @@ fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture], cover
                 spot.status("select to preview")
             } else if !spot.detail && app.post_view.is_some() {
                 spot.status("open to preview")
-            } else if !app.video_controls_available() {
+            } else if !app.video_controls_available() && !app.config.media.video_autoplay {
                 spot.status("l return to preview")
             } else if app
                 .selected_video()
@@ -1471,6 +1576,10 @@ fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture], cover
                         picker: &app.image_picker,
                         renderer: &mut app.card_renderer,
                         prepare: preparation,
+                        fingerprint: app
+                            .card_image_metadata
+                            .get(url)
+                            .map(|metadata| metadata.fingerprint),
                         covered,
                         phase: app.loading_frame,
                     },
@@ -1500,6 +1609,7 @@ struct CardRender<'a> {
     picker: &'a ratatui_image::picker::Picker,
     renderer: &'a mut crate::card_image::Renderer,
     prepare: Preparation,
+    fingerprint: Option<[u8; 32]>,
     covered: Option<Rect>,
     phase: usize,
 }
@@ -1515,6 +1625,7 @@ fn draw_card_image(
         picker,
         renderer,
         prepare,
+        fingerprint,
         covered,
         phase,
     } = render;
@@ -1533,6 +1644,46 @@ fn draw_card_image(
     let Some(protocol) = protocol else {
         return Ok(());
     };
+    let native = picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty;
+    let request_key = |top, rows, left, cols| {
+        let mut request = CardImageKey::new(
+            spot.url.as_deref().unwrap_or("card-video"),
+            picker,
+            spot.size,
+            spot.pixels,
+            top,
+            rows,
+            left / TILE_COLS,
+        );
+        request.left = left;
+        request.cols = cols;
+        request.overlay = spot.overlay();
+        request.post_id = spot.video_frame.then(|| spot.post_id.clone()).flatten();
+        request.video = spot.video_frame;
+        request.fingerprint = (!spot.video_frame).then_some(fingerprint).flatten();
+        request
+    };
+    let preupload_at = visible_rects(spot.area, covered)
+        .first()
+        .map(|area| ratatui::layout::Position::new(area.x, area.y));
+    let mut prepared = Vec::new();
+    // A fitted still is bounded by the viewport. Finish its canvas while any part
+    // is visible so scrolling into the other strips does not restart preparation.
+    if native && !spot.video_frame && preupload_at.is_some() {
+        for top in (0..spot.size.height).step_by(usize::from(TILE_ROWS)) {
+            for left in (0..spot.size.width).step_by(usize::from(TILE_COLS)) {
+                let request = request_key(
+                    top,
+                    TILE_ROWS.min(spot.size.height - top),
+                    left,
+                    TILE_COLS.min(spot.size.width - left),
+                );
+                if let Some(Ok(tile)) = renderer.tile(request, image, picker, prepare) {
+                    prepared.push(tile);
+                }
+            }
+        }
+    }
     let first = spot.skipped / TILE_ROWS;
     let end = (spot.skipped + spot.area.height).div_ceil(TILE_ROWS);
     let mut visible = Vec::new();
@@ -1548,27 +1699,18 @@ fn draw_card_image(
                 let left = column * TILE_COLS + area.x - tile_area.x;
                 let key = (top, left, area.height, area.width);
                 visible.push(key);
-                let native = picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty;
                 let source_top = if native { row * TILE_ROWS } else { top };
                 let source_left = if native { column * TILE_COLS } else { left };
-                let mut request = CardImageKey::new(
-                    spot.url.as_deref().unwrap_or("card-video"),
-                    picker,
-                    spot.size,
-                    spot.pixels,
+                let request = request_key(
                     source_top,
                     if native {
                         TILE_ROWS.min(spot.size.height - source_top)
                     } else {
                         area.height
                     },
-                    column,
+                    source_left,
+                    if native { cols } else { area.width },
                 );
-                request.left = source_left;
-                request.cols = if native { cols } else { area.width };
-                request.overlay = spot.overlay();
-                request.post_id = spot.video_frame.then(|| spot.post_id.clone()).flatten();
-                request.video = spot.video_frame;
                 if let Some(result) = renderer.tile(request, image, picker, prepare) {
                     protocol.tiles.insert(key, result?);
                 }
@@ -1588,6 +1730,22 @@ fn draw_card_image(
                     );
                 }
             }
+        }
+    }
+    if let Some(position) = preupload_at {
+        let mut uploads = String::new();
+        for tile in prepared {
+            if let Some(upload) = tile.take_upload() {
+                uploads.push_str(&upload);
+            }
+        }
+        if !uploads.is_empty()
+            && let Some(cell) = f.buffer_mut().cell_mut(position)
+        {
+            uploads.push_str(cell.symbol());
+            cell.set_symbol(&uploads).set_diff_option(
+                ratatui::buffer::CellDiffOption::ForcedWidth(std::num::NonZeroU16::MIN),
+            );
         }
     }
     protocol.tiles.retain(|key, _| visible.contains(key));
@@ -2047,7 +2205,7 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
     let width = inner.width as usize;
     let posts: Vec<_> = app.group_posts(group).collect();
     // (line in the card, URL) for each post row with a thumbnail.
-    let mut thumbs: Vec<(u16, &str)> = Vec::new();
+    let mut thumbs: Vec<(u16, std::borrow::Cow<'_, str>)> = Vec::new();
     let lines: Vec<Line> = if let Some(access) = access {
         let title = if width < 24 {
             if access == AccessDenied::PrivateCommunity {
@@ -2701,6 +2859,10 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
             flags.push(chip("spoiler", CRUST, YELLOW));
             flags.push(Span::raw(" "));
         }
+        if post.original_deleted || app.state.original_deleted(&post.id) {
+            flags.push(chip("Original post deleted", YELLOW, SURFACE0));
+            flags.push(Span::raw(" "));
+        }
         flags.extend(s);
         fit_spans(flags, head_width)
     })];
@@ -2800,7 +2962,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
         app.post_view
             .as_ref()
             .and_then(PostView::preview_image)
-            .map(str::to_string)
+            .map(std::borrow::Cow::into_owned)
     });
     // Until the post page arrives, a stale list copy may lack the spoiler tag.
     let hide_image = app
@@ -2834,25 +2996,38 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
         .or_else(|| {
             video
                 .then(|| {
-                    app.selected_video()?
-                        .frame()
-                        .map(|frame| (frame.width, frame.height))
+                    app.video_preview(false)
+                        .map(|(frame, _)| (frame.width, frame.height))
                 })
                 .flatten()
         })
         .or_else(|| video.then_some((16, 9)));
-    let main_size = main_pixels.map(|pixels| {
-        fit_picture(
-            pixels,
-            app.image_picker.font_size(),
-            Size::new(width as u16, full.height.saturating_sub(2)),
-            full.height,
-        )
-    });
+    let failed_without_picture = video
+        && still_url.is_none()
+        && app.video_preview(false).is_none()
+        && app.selected_video().is_some_and(|player| {
+            player.error().is_some()
+                && post
+                    .media
+                    .video_url()
+                    .and_then(|url| app.playback_url(url))
+                    .as_deref()
+                    == Some(player.url.as_str())
+        });
+    let main_size = main_pixels
+        .filter(|_| !failed_without_picture)
+        .map(|pixels| {
+            fit_picture(
+                pixels,
+                app.image_picker.font_size(),
+                Size::new(width as u16, full.height.saturating_sub(2)),
+                full.height,
+            )
+        });
     let video_id = video.then(|| post.id.clone());
     let main_url = still_url.map(str::to_string).or_else(|| video_id.clone());
     let main_image = main_url.as_deref().filter(|_| !hide_image).map(|url| {
-        let size = if app.inline_images_on() {
+        let size = if app.inline_images_on() && !failed_without_picture {
             main_size
         } else {
             Some(Size::new(width as u16, 0))
@@ -3128,7 +3303,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
         .post_view
         .as_ref()
         .and_then(PostView::preview_image)
-        .map(str::to_string);
+        .map(std::borrow::Cow::into_owned);
     let text_pictures = || {
         app.images
             .iter()
@@ -3593,12 +3768,14 @@ fn video_status(app: &App) -> Line<'static> {
             let icon = if player.paused() { "⏸" } else { "▶" };
             let time = if player.frame().is_none() {
                 "loading video…".to_string()
+            } else if player.waiting_for_audio() {
+                "starting audio…".to_string()
             } else if let Some(total) = player.duration() {
                 format!("{at} / {}", video::clock_text(total))
             } else {
                 at
             };
-            if player.frame().is_none() {
+            if player.frame().is_none() || player.waiting_for_audio() {
                 spans
                     .extend(loading::caption(loading::Kind::Media, &time, app.loading_frame).spans);
             } else {
@@ -3722,7 +3899,7 @@ fn loading_activity(app: &App, loaders: &VisibleLoaders) -> Option<&'static str>
     }
     if app
         .selected_video()
-        .is_some_and(|player| player.resolving())
+        .is_some_and(|player| player.resolving() || player.waiting_for_audio())
     {
         return Some("video");
     }
@@ -5952,6 +6129,7 @@ pub(crate) mod tests {
             stickied: false,
             nsfw: false,
             spoiler: false,
+            original_deleted: false,
         };
         app.all_subs.groups = vec![crate::app::Group {
             subreddit: "s".into(),
@@ -6844,6 +7022,46 @@ pub(crate) mod tests {
             actual.lines().last().unwrap().contains("P retry"),
             "{actual}"
         );
+    }
+
+    #[test]
+    fn media_failure_without_a_poster_or_frame_should_not_reserve_a_blank_picture() {
+        let mut app = open_video_post();
+        let url = app.reddit.media_url(VIDEO).unwrap();
+        app.video = Some(video::Player::unavailable(&url, Size::new(70, 63)));
+
+        let pictures = detail_pictures(&mut app, 100, 50);
+        assert!(pictures.iter().all(|p| p.size.height == 0));
+        assert!(app.video_area.is_none());
+        let actual = screen(&mut app, 100, 50);
+        assert!(
+            actual.lines().last().unwrap().contains("P retry"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn media_failure_from_an_old_source_should_not_hide_the_current_video() {
+        let mut app = open_video_post();
+        let url = app.reddit.media_url(VIDEO).unwrap();
+        app.video = Some(video::Player::unavailable(&url, Size::new(70, 63)));
+        let media = &mut app
+            .post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .post
+            .media;
+        if let Media::Video { url, .. } = media {
+            *url = Some("https://v.redd.it/current/video.mp4".into());
+        }
+
+        let pictures = detail_pictures(&mut app, 100, 50);
+
+        assert!(pictures.iter().any(|p| p.size.height > 0));
+        assert!(app.video_area.is_some());
     }
 
     #[test]
@@ -8455,6 +8673,7 @@ pub(crate) mod tests {
                 stickied: false,
                 nsfw: false,
                 spoiler: false,
+                original_deleted: false,
             })
             .collect();
 
@@ -8490,6 +8709,7 @@ pub(crate) mod tests {
             stickied: false,
             nsfw: false,
             spoiler: false,
+            original_deleted: false,
         }
     }
 
@@ -8521,6 +8741,189 @@ pub(crate) mod tests {
             result: Ok(crate::model::Listing { posts, after: None }),
         });
         app
+    }
+
+    #[test]
+    fn when_a_crosspost_has_a_deleted_original_its_card_should_label_it() {
+        let app = card_feed_app(kitty());
+        let post = post_with("cross", Media::None);
+        let mut stored = serde_json::to_value(post).unwrap();
+        stored["original_deleted"] = serde_json::Value::Bool(true);
+        let post = serde_json::from_value(stored).unwrap();
+
+        let card = expanded_card(
+            &app,
+            &post,
+            120,
+            &CardOpts {
+                selected: true,
+                show_subreddit: true,
+                reserve: 0,
+            },
+            50,
+        );
+        let text = card
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<String>();
+
+        assert!(text.contains("Original post deleted"), "{text}");
+    }
+
+    #[test]
+    fn when_a_cached_crosspost_lacks_parent_status_its_card_should_keep_the_known_label() {
+        let mut app = card_feed_app(kitty());
+        app.state.mark_original_deleted("cross", crate::app::now());
+        let post = post_with("cross", Media::None);
+
+        let card = expanded_card(
+            &app,
+            &post,
+            120,
+            &CardOpts {
+                selected: true,
+                show_subreddit: true,
+                reserve: 0,
+            },
+            50,
+        );
+        let text = card
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<String>();
+
+        assert!(text.contains("Original post deleted"), "{text}");
+    }
+
+    #[test]
+    fn when_link_thumbnails_are_small_a_large_pane_should_keep_the_card_compact() {
+        let app = card_feed_app(kitty());
+        let mut post = post_with(
+            "article",
+            Media::Link {
+                url: "https://volkskrant.nl/article".into(),
+                thumb: Some("https://preview.redd.it/article.png".into()),
+            },
+        );
+        post.title = "An article headline".into();
+        post.preview_size = Some((140, 70));
+        let card = expanded_card(
+            &app,
+            &post,
+            180,
+            &CardOpts {
+                selected: true,
+                show_subreddit: true,
+                reserve: 0,
+            },
+            80,
+        );
+        assert!(
+            card.image_size.width <= 27 && card.image_size.height <= 8,
+            "140px thumbnails must not become pane-wide: {:?}",
+            card.image_size
+        );
+        assert!(
+            card.height() <= 12,
+            "compact image and text share their rows"
+        );
+    }
+
+    #[test]
+    fn when_decoded_link_pixels_are_small_the_declared_large_preview_should_not_enlarge_them() {
+        let mut app = card_feed_app(kitty());
+        app.tabs[3].feed.posts.truncate(1);
+        let url = "https://preview.redd.it/article.jpeg";
+        let post = &mut app.tabs[3].feed.posts[0];
+        post.media = Media::Link {
+            url: "https://example.com/story".into(),
+            thumb: Some(url.into()),
+        };
+        post.preview_size = Some((1600, 900));
+        app.card_image_metadata.insert(
+            url.into(),
+            crate::worker::ImageMetadata {
+                size: (140, 70),
+                fingerprint: [0; 32],
+            },
+        );
+
+        let card = expanded_card(
+            &app,
+            &app.tabs[3].feed.posts[0],
+            180,
+            &CardOpts {
+                selected: true,
+                show_subreddit: true,
+                reserve: 0,
+            },
+            80,
+        );
+        assert!(
+            card.image_size.width <= 27 && card.image_size.height <= 8,
+            "{:?}",
+            card.image_size
+        );
+    }
+
+    #[test]
+    fn when_link_images_are_large_their_preview_should_use_thirty_percent_of_the_viewport() {
+        let app = card_feed_app(kitty());
+        let mut post = post_with(
+            "article",
+            Media::Link {
+                url: "https://example.com/article".into(),
+                thumb: Some("https://preview.redd.it/article.png".into()),
+            },
+        );
+        post.preview_size = Some((1600, 900));
+        let card = expanded_card(
+            &app,
+            &post,
+            180,
+            &CardOpts {
+                selected: true,
+                show_subreddit: true,
+                reserve: 0,
+            },
+            80,
+        );
+        assert_eq!(card.image_size.height, 24);
+    }
+
+    #[test]
+    fn when_a_link_has_no_image_its_text_card_should_identify_the_domain() {
+        let app = card_feed_app(kitty());
+        let post = post_with(
+            "article",
+            Media::Link {
+                url: "https://volkskrant.nl/article".into(),
+                thumb: None,
+            },
+        );
+        let card = expanded_card(
+            &app,
+            &post,
+            100,
+            &CardOpts {
+                selected: true,
+                show_subreddit: true,
+                reserve: 0,
+            },
+            60,
+        );
+        let text = card
+            .visible(0, card.height())
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert!(
+            text.contains("VO"),
+            "use a small domain monogram when there is no image: {text}"
+        );
+        assert_eq!(card.image_size, Size::default());
     }
 
     #[test]
@@ -8675,6 +9078,79 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn when_card_previews_resize_their_native_strips_should_fill_the_fitted_box() {
+        for kind in ["image", "gallery", "video", "gif", "link"] {
+            let mut app = card_with_image(320, 640);
+            let url = "https://i.redd.it/p1.jpeg";
+            app.tabs[3].feed.posts[0].media = match kind {
+                "gallery" => Media::Gallery {
+                    images: vec![url.into()],
+                    previews: Vec::new(),
+                    thumb: None,
+                },
+                "video" | "gif" => Media::Video {
+                    url: Some(VIDEO.into()),
+                    poster: Some(url.into()),
+                    gif: kind == "gif",
+                },
+                "link" => Media::Link {
+                    url: "https://example.com/story".into(),
+                    thumb: Some(url.into()),
+                },
+                _ => Media::Image {
+                    url: url.into(),
+                    preview: None,
+                },
+            };
+            let mut fitted = Vec::new();
+            for (width, height) in [(160, 60), (100, 30), (160, 60)] {
+                let cells = placeholder_cells(&mut app, width, height);
+                let CardImageSlot::Ready {
+                    protocol: Some(protocol),
+                    ..
+                } = app.card_images.get(url).unwrap()
+                else {
+                    panic!("decoded {kind}");
+                };
+                assert!(!cells.is_empty(), "{kind} at {width}x{height}");
+                assert!(protocol.size.height <= height * 3 / 5);
+                let left = cells.iter().map(|p| p.0).min().unwrap();
+                let right = cells.iter().map(|p| p.0).max().unwrap();
+                let top = cells.iter().map(|p| p.1).min().unwrap();
+                let bottom = cells.iter().map(|p| p.1).max().unwrap();
+                assert_eq!(
+                    (right - left + 1, bottom - top + 1),
+                    (protocol.size.width, protocol.size.height)
+                );
+                for ((_, _, rows, cols), tile) in &protocol.tiles {
+                    let crate::card_image::Tile::KittyImage { upload, size, .. } = tile.as_ref()
+                    else {
+                        panic!("native still");
+                    };
+                    assert_eq!((*cols, *rows), (size.width, size.height));
+                    assert!(
+                        upload.contains(&format!(",c={cols},r={rows},")),
+                        "{kind} native placement"
+                    );
+                }
+                fitted.push(protocol.size);
+                assert!(
+                    matches!(app.card_images.get(url), Some(CardImageSlot::Ready { .. })),
+                    "resize must keep decoded {kind}"
+                );
+            }
+            assert_ne!(fitted[0], fitted[1]);
+            assert_eq!(fitted[0], fitted[2]);
+            let warm = first_screen(&mut app, 160, 60);
+            assert!(
+                !warm.contains("_G"),
+                "returning to a loaded size must reuse {kind} uploads"
+            );
+            assert!(!app.card_renderer.pending());
+        }
+    }
+
+    #[test]
     fn warm_navigation_replay_should_display_loaded_cards_without_media_work() {
         let mut app = card_feed_app(kitty());
         app.tabs[3].feed.posts = (0..12)
@@ -8725,6 +9201,74 @@ pub(crate) mod tests {
             started.elapsed()
         );
         assert_eq!((delayed, preparation, uploads), (0, 0, 0));
+    }
+
+    #[test]
+    fn when_cached_pixels_are_decoded_again_the_warm_card_should_not_reencode() {
+        let mut app = card_with_image(640, 320);
+        screen(&mut app, 201, 57);
+        let url = "https://i.redd.it/p1.jpeg";
+        app.card_pictures_drawn(&["https://i.redd.it/large.png"]);
+        app.on_msg(Msg::Image {
+            url: "https://i.redd.it/large.png".into(),
+            result: Ok(image::DynamicImage::new_rgba8(4096, 4096).into()),
+        });
+        app.card_pictures_drawn(&[]);
+        assert!(
+            !app.card_images.contains_key(url),
+            "exercise the decoded-pixel cache limit"
+        );
+        screen(&mut app, 201, 57);
+
+        app.on_msg(Msg::Image {
+            url: url.into(),
+            result: Ok(
+                image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                    640,
+                    320,
+                    image::Rgba([0, 0, 0, 255]),
+                ))
+                .into(),
+            ),
+        });
+        let shown = first_screen(&mut app, 201, 57);
+
+        assert!(
+            !app.card_renderer.pending(),
+            "identical decoded content must reuse the warm encoding"
+        );
+        assert!(!shown.contains("_G") && !shown.contains("preparing image"));
+    }
+
+    #[test]
+    fn when_a_partial_card_becomes_fully_visible_its_remaining_strips_should_be_ready() {
+        let mut app = card_with_image(640, 640);
+        app.tabs[3].feed.posts.push(post_with(
+            "p2",
+            Media::Image {
+                url: "https://i.redd.it/p2.jpeg".into(),
+                preview: None,
+            },
+        ));
+        app.card_pictures_drawn(&["https://i.redd.it/p1.jpeg", "https://i.redd.it/p2.jpeg"]);
+        app.on_msg(Msg::Image {
+            url: "https://i.redd.it/p2.jpeg".into(),
+            result: Ok(image::DynamicImage::new_rgb8(640, 640).into()),
+        });
+        screen(&mut app, 201, 57);
+
+        app.move_selection(1);
+        let shown = first_screen(&mut app, 201, 57);
+
+        assert!(
+            !shown.contains("preparing image"),
+            "already-decoded clipped cards should prepare their fitted canvas"
+        );
+        assert!(!app.card_renderer.pending());
+        assert!(
+            !shown.contains("_G"),
+            "the offscreen strips should already be uploaded"
+        );
     }
 
     #[test]
@@ -13099,6 +13643,13 @@ pub(crate) mod tests {
         let mut app = open_video_post();
         let step = |app: &mut App| {
             screen(app, 100, 30);
+            if app.video.is_none()
+                && app.inline_images_on()
+                && let Some(area) = app.video_area
+            {
+                let url = app.reddit.media_url(VIDEO).unwrap();
+                app.video = Some(video::Player::silent(&url, area.as_size()));
+            }
             app.tick();
             app.video.as_ref().map(|p| p.hidden())
         };
@@ -13192,6 +13743,8 @@ pub(crate) mod tests {
         };
         step(&mut app, 30);
         let first = app.video.as_ref().unwrap().area;
+        let url = app.reddit.media_url(VIDEO).unwrap();
+        app.video = Some(video::Player::silent(&url, first));
         press(&mut app, 'P');
 
         // Two draws at once at the new size: it has not held still yet.

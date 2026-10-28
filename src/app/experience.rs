@@ -1682,7 +1682,7 @@ impl App {
         };
         view.scroll = 0;
         view.free_scroll = true;
-        let url = view.preview_image().map(str::to_string);
+        let url = view.preview_image().map(std::borrow::Cow::into_owned);
         if let Some(url) = url {
             self.request_image(&url);
         }
@@ -2399,12 +2399,12 @@ mod tests {
         });
         app.gallery_step(false);
         assert_eq!(
-            app.post_view.as_ref().unwrap().preview_image(),
+            app.post_view.as_ref().unwrap().preview_image().as_deref(),
             Some("https://preview.redd.it/b.png?width=1080")
         );
         app.gallery_step(true);
         assert_eq!(
-            app.post_view.as_ref().unwrap().preview_image(),
+            app.post_view.as_ref().unwrap().preview_image().as_deref(),
             Some("https://preview.redd.it/a.png?width=1080")
         );
     }

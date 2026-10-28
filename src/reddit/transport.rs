@@ -13,6 +13,17 @@ use wreq::{Client, Response};
 pub(super) type Cancellation = Arc<dyn Fn() -> bool + Send + Sync>;
 pub(super) const CANCEL_POLL: Duration = Duration::from_millis(50);
 
+#[derive(Debug)]
+pub(super) struct MediaStatus(pub u16);
+
+impl std::fmt::Display for MediaStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "media: HTTP {}", self.0)
+    }
+}
+
+impl std::error::Error for MediaStatus {}
+
 /// Keep one HTTP future across polls; dropping it releases an obsolete request.
 pub(super) fn wait<F: Future>(future: F, cancelled: Option<&Cancellation>) -> Result<F::Output> {
     RUNTIME.block_on(async {
@@ -122,7 +133,7 @@ impl Transport {
                 continue;
             }
             if !response.status().is_success() {
-                bail!("media: HTTP {}", response.status().as_u16());
+                return Err(MediaStatus(response.status().as_u16()).into());
             }
             return Ok(response);
         }
@@ -143,6 +154,7 @@ pub(super) fn media_allowed(url: &Url) -> bool {
             matches!(
                 host,
                 "i.redd.it"
+                    | "i.ytimg.com"
                     | "v.redd.it"
                     | "preview.redd.it"
                     | "external-preview.redd.it"
