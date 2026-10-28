@@ -534,6 +534,7 @@ fn unread_chip(badge: UnreadBadge) -> Option<Span<'static>> {
 
 enum SideRow {
     Section(&'static str),
+    Loading,
     Tab(usize),
     Blank,
 }
@@ -564,14 +565,20 @@ fn sidebar_layout(app: &App, area: Rect) -> SidebarLayout {
         SideRow::Tab(crate::app::ALL_SUBS_TAB),
     ];
     let (pinned, following, opened) = app.sidebar_tabs();
-    if !pinned.is_empty() {
+    if !pinned.is_empty() || app.all_subs.loading {
         rows.push(SideRow::Blank);
         rows.push(SideRow::Section("SUBSCRIPTIONS"));
+        if app.all_subs.loading {
+            rows.push(SideRow::Loading);
+        }
         rows.extend(pinned.into_iter().map(SideRow::Tab));
     }
-    if !following.is_empty() {
+    if !following.is_empty() || app.all_subs.loading {
         rows.push(SideRow::Blank);
         rows.push(SideRow::Section("FOLLOWING"));
+        if app.all_subs.loading {
+            rows.push(SideRow::Loading);
+        }
         rows.extend(following.into_iter().map(SideRow::Tab));
     }
     if !opened.is_empty() {
@@ -619,14 +626,22 @@ fn draw_sidebar(f: &mut Frame, app: &App, layout: &SidebarLayout, spots: &mut Ve
     let panel = Style::new().bg(MANTLE);
     f.render_widget(Block::default().style(panel), area);
     f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" ◆ ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
-            Span::styled("redtab", Style::new().fg(TEXT).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                format!("  v{}", env!("CARGO_PKG_VERSION")),
-                Style::new().fg(OVERLAY),
-            ),
-        ]))
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(" ◆ ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled("redtab", Style::new().fg(TEXT).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("  v{}", env!("CARGO_PKG_VERSION")),
+                    Style::new().fg(OVERLAY),
+                ),
+            ]),
+            Line::from(vec![
+                key_chip("F3"),
+                Span::styled(" search ", Style::new().fg(SUBTEXT)),
+                key_chip("C-l"),
+                Span::styled(" URL", Style::new().fg(SUBTEXT)),
+            ]),
+        ])
         .style(panel),
         brand,
     );
@@ -640,6 +655,10 @@ fn draw_sidebar(f: &mut Frame, app: &App, layout: &SidebarLayout, spots: &mut Ve
             SideRow::Section(name) => Line::styled(
                 format!("  {name}"),
                 Style::new().fg(OVERLAY).add_modifier(Modifier::BOLD),
+            ),
+            SideRow::Loading => Line::styled(
+                format!("  {} Loading…", loading::glyph(app.loading_frame)),
+                loading::style(loading::Kind::Background),
             ),
             SideRow::Tab(i) => {
                 // The icon goes where the `#` glyph would: after the bar and the number.
@@ -4235,7 +4254,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, loaders: &VisibleLoaders) {
                 |joined| target.action(!joined).to_ascii_lowercase(),
             )
         });
-        for (key, label) in hints {
+        for (key, label) in hints
+            .iter()
+            .chain([("F3", "explore"), ("C-l", "URL")].iter())
+        {
             if *key == "S" && target.is_none() {
                 continue;
             }
@@ -6077,6 +6099,65 @@ pub(crate) mod tests {
         assert!(row_of("Bookmarks") < row_of("SUBSCRIPTIONS"));
         assert!(row_of("SUBSCRIPTIONS") < row_of("neovim"));
         assert!(row_of("neovim") < row_of("rust"));
+    }
+
+    #[test]
+    fn when_account_lists_load_the_sidebar_should_show_progress_and_retain_refreshed_entries() {
+        let mut app = app(&[]);
+        app.active = 0;
+        app.tabs[0].feed.loaded = true;
+        app.all_subs.loading = true;
+        let sidebar = |app: &mut App| {
+            screen(app, 120, 30)
+                .lines()
+                .map(|line| line.chars().take(28).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let actual = sidebar(&mut app);
+        assert!(actual.contains("SUBSCRIPTIONS"), "{actual}");
+        assert!(actual.contains("FOLLOWING"), "{actual}");
+        assert_eq!(actual.matches("⠋ Loading").count(), 2, "{actual}");
+
+        app.on_msg(Msg::Subscriptions {
+            generation: 0,
+            result: Ok(vec![
+                crate::model::Subscription::Community {
+                    name: "rust".into(),
+                    icon: crate::model::SubscriptionIcon::Unknown,
+                },
+                crate::model::Subscription::User {
+                    name: "reader".into(),
+                    icon: None,
+                },
+            ]),
+        });
+        let actual = sidebar(&mut app);
+        assert!(
+            actual.contains("rust") && actual.contains("reader"),
+            "{actual}"
+        );
+        assert!(!actual.contains("Loading"), "{actual}");
+
+        app.all_subs.loading = true;
+        let actual = sidebar(&mut app);
+        assert!(
+            actual.contains("rust") && actual.contains("reader"),
+            "{actual}"
+        );
+        assert_eq!(actual.matches("⠋ Loading").count(), 2, "{actual}");
+
+        app.on_msg(Msg::Subscriptions {
+            generation: 0,
+            result: Err("offline".into()),
+        });
+        let actual = sidebar(&mut app);
+        assert!(
+            actual.contains("rust") && actual.contains("reader"),
+            "{actual}"
+        );
+        assert!(!actual.contains("Loading"), "{actual}");
     }
 
     #[test]

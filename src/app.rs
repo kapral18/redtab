@@ -1889,6 +1889,7 @@ impl App {
             None => {}
         }
         if self.media_loading()
+            || (self.sidebar_width() > 0 && self.all_subs.loading)
             || self.membership.is_some()
             || self.images_loading()
             || self.selected_video().is_some_and(|p| {
@@ -6193,6 +6194,55 @@ mod tests {
             terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
             assert!(app.loading_since.is_none(), "kind {kind}: idle draw");
         }
+    }
+
+    #[test]
+    fn when_account_lists_outlast_home_the_visible_sidebar_should_keep_animating() {
+        let mut app = app_with(&[]);
+        app.active = 0;
+        app.on_msg(Msg::Feed {
+            tab: app.tabs[0].id,
+            generation: app.tabs[0].feed.generation,
+            append: false,
+            result: Ok(listing("rust", &["existing"], None)),
+        });
+        app.all_subs.loading = true;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(app.loading_since.is_some());
+        app.loading_since = Some(Instant::now() - Duration::from_millis(100));
+        app.tick();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.loading_frame, 1);
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(120)
+                .flat_map(|row| row.iter().take(usize::from(app.sidebar_width())))
+                .filter(|cell| cell.symbol() == "⠙")
+                .count(),
+            2
+        );
+
+        app.show_sidebar = false;
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(app.loading_since.is_none());
+        app.tick();
+        assert_eq!(app.loading_frame, 1);
+
+        app.show_sidebar = true;
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.loading_since = Some(Instant::now() - Duration::from_millis(100));
+        app.on_msg(Msg::Subscriptions {
+            generation: app.all_subs.generation,
+            result: Err("offline".into()),
+        });
+        app.tick();
+        assert_eq!(app.loading_frame, 1);
     }
 
     #[test]

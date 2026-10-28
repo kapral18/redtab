@@ -748,7 +748,7 @@ fn image_protocol_choice(
 
 /// In tmux the probe may get no kitty reply even when the outer terminal supports it.
 /// Use kitty only if redtab draws straight into its pane (a nested terminal drops
-/// passthrough) and every client of every session showing the window is Ghostty or kitty.
+/// passthrough). Unattached windows require agreement across all attached clients.
 fn tmux_graphics() -> (bool, Option<ratatui_image::FontSize>) {
     use std::os::unix::fs::MetadataExt;
     use std::process::{Command, Stdio};
@@ -811,15 +811,21 @@ fn tmux_client_graphics(
     clients: &str,
     sessions: &[&str],
 ) -> (bool, Option<ratatui_image::FontSize>) {
-    let clients: Vec<_> = clients
+    if sessions.is_empty() {
+        return (false, None);
+    }
+    let mut clients: Vec<_> = clients
         .lines()
         .map(|line| line.split_whitespace().collect::<Vec<_>>())
-        .filter(|fields| {
-            fields
-                .first()
-                .is_some_and(|session| sessions.contains(session))
-        })
         .collect();
+    let on_window = |fields: &Vec<&str>| {
+        fields
+            .first()
+            .is_some_and(|session| sessions.contains(session))
+    };
+    if clients.iter().any(on_window) {
+        clients.retain(on_window);
+    }
     if clients.is_empty()
         || !clients.iter().all(|fields| {
             fields
@@ -1149,6 +1155,28 @@ mod event_loop_tests {
                 "{clients}"
             );
         }
+    }
+
+    #[test]
+    fn when_a_tmux_window_is_unattached_it_should_keep_native_pixels_for_matching_clients() {
+        use ratatui_image::picker::ProtocolType;
+        let (native, font) = tmux_client_graphics("$1 xterm-ghostty 8 18\n", &["$12"]);
+
+        let actual = image_protocol_choice(None, native, font);
+
+        assert_eq!(
+            actual.map(|(protocol, font)| (protocol, font.width, font.height)),
+            Some((ProtocolType::Kitty, 8, 18))
+        );
+        for clients in [
+            "$1 xterm-ghostty 8 18\n$2 xterm-256color 8 18\n",
+            "$1 xterm-ghostty 8 18\n$2 xterm-kitty 10 20\n",
+        ] {
+            let (native, font) = tmux_client_graphics(clients, &["$12"]);
+            assert!(image_protocol_choice(None, native, font).is_none());
+        }
+        let (native, font) = tmux_client_graphics("$1 xterm-ghostty 8 18\n", &[]);
+        assert!(image_protocol_choice(None, native, font).is_none());
     }
 
     #[test]

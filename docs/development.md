@@ -24,8 +24,9 @@ and generated comments use the [settings schema](../src/config/schema.rs).
 Startup graphics negotiation collects replies for at most one second, even when the
 status reply arrives before graphics or cell measurements. A separate child owns
 stdin and is killed/reaped after two seconds. The tmux fallback requires the actual
-pane tty, compatible clients and matching measured client cell sizes; window pixel
-defaults cannot establish native graphics support.
+pane tty, compatible clients and matching measured client cell sizes. If no client
+shows that window, all attached server clients must agree. Window pixel defaults
+cannot establish native graphics support.
 
 ## Request scheduling
 
@@ -113,6 +114,8 @@ analysis before the first picture. Other media keeps its existing probing.
 One background extraction runs at a time. Player disposal cancels it; the worker
 kills and reaps its process group on cancellation, a 20-second deadline or oversized
 output. `yt-dlp` runs without user config, plugins, cookie import or filesystem cache.
+It prints only selected streams and access-validation fields; full metadata such
+as captions and unselected formats cannot consume the inline output budget.
 Only public, non-live metadata and HTTPS Google video streams are accepted. Only
 User-Agent, YouTube Referer and Origin headers reach ffmpeg. This path never
 uses the authenticated Reddit transport.

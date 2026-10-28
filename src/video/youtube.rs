@@ -15,9 +15,11 @@ use super::Sources;
 
 const LIMIT: usize = 4 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(20);
-const UNAVAILABLE: &str = "YouTube unavailable; update yt-dlp or press m for browser";
+const UNAVAILABLE: &str = "YouTube unavailable; P retries or m opens browser";
+const OUTPUT_TOO_LARGE: &str = "YouTube metadata exceeds the inline limit; m opens browser";
 const CANCELLED: &str = "YouTube resolution cancelled";
 const FORMAT: &str = "bestvideo[protocol=https][width<=1920][height<=1920][fps<=30]+bestaudio[protocol=https]/best[protocol=https][width<=1920][height<=1920][fps<=30]";
+const PLAYBACK_METADATA: &str = "%(.{id,_type,availability,is_live,live_status,requested_formats,url,protocol,vcodec,acodec,http_headers})j";
 static RESOLVER: LazyLock<Resolver> = LazyLock::new(Resolver::default);
 
 #[derive(Default)]
@@ -140,7 +142,8 @@ fn command(program: &OsStr, page: &str) -> Command {
             "node",
             "--no-playlist",
             "--skip-download",
-            "--dump-single-json",
+            "--print",
+            PLAYBACK_METADATA,
             "--no-warnings",
             "--no-progress",
             "--socket-timeout",
@@ -251,7 +254,7 @@ fn drain(reader: &mut impl Read, bytes: &mut Vec<u8>) -> Result<(), String> {
             Ok(0) => return Ok(()),
             Ok(count) => {
                 if bytes.len() + count > LIMIT {
-                    return Err(UNAVAILABLE.into());
+                    return Err(OUTPUT_TOO_LARGE.into());
                 }
                 bytes.extend_from_slice(&buffer[..count]);
             }
@@ -465,7 +468,6 @@ mod tests {
             "--no-cookies-from-browser",
             "--no-cache-dir",
             "--no-playlist",
-            "--dump-single-json",
         ] {
             assert!(
                 args.lines().any(|arg| arg == flag),
@@ -475,11 +477,24 @@ mod tests {
     }
 
     #[test]
-    fn when_extracting_direct_streams_it_should_select_the_playable_client_and_skip_hls() {
-        let fake = Fake::new("/bin/cat info.json");
+    fn when_unneeded_metadata_is_large_it_should_still_resolve_selected_streams() {
+        let fake = Fake::new(
+            "case \" $* \" in *\" --dump-single-json \"*) /bin/cat full.json ;; *\" --print \"*) /bin/cat info.json ;; *) exit 2 ;; esac",
+        );
+        let mut full = metadata();
+        full["description"] = json!("x".repeat(LIMIT));
+        std::fs::write(fake.dir.path().join("full.json"), full.to_string()).unwrap();
 
-        fake.resolve(&Resolver::default()).unwrap();
+        let actual = fake.resolve(&Resolver::default()).unwrap();
 
+        assert_eq!(
+            actual.video,
+            "https://rr1.googlevideo.com/video?signature=SECRET"
+        );
+        assert_eq!(
+            actual.audio.as_deref(),
+            Some("https://rr2.googlevideo.com/audio?signature=SECRET")
+        );
         let args = std::fs::read_to_string(fake.dir.path().join("args")).unwrap();
         let args: Vec<_> = args.lines().collect();
         let options = &args[..args.iter().position(|arg| *arg == "--").unwrap()];
@@ -487,6 +502,12 @@ mod tests {
             pair == [
                 "--extractor-args",
                 "youtube:skip=hls;player_client=visionos",
+            ]
+        }));
+        assert!(options.windows(2).any(|pair| {
+            pair == [
+                "--print",
+                "%(.{id,_type,availability,is_live,live_status,requested_formats,url,protocol,vcodec,acodec,http_headers})j",
             ]
         }));
     }
@@ -754,7 +775,10 @@ mod tests {
 
         let actual = fake.resolve(&Resolver::default());
 
-        assert_eq!(actual.unwrap_err(), UNAVAILABLE);
+        assert_eq!(
+            actual.unwrap_err(),
+            "YouTube metadata exceeds the inline limit; m opens browser"
+        );
     }
 
     #[test]

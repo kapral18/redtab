@@ -23,7 +23,8 @@ impl Experience {
         let keep = |screen: &Screen| match screen {
             Screen::Input(form) => match &form.kind {
                 FormKind::Find => has_post,
-                FormKind::Search(_)
+                FormKind::OpenLink
+                | FormKind::Search(_)
                 | FormKind::Profile
                 | FormKind::Reply(_)
                 | FormKind::Edit(_)
@@ -126,6 +127,7 @@ pub struct Form {
 
 #[derive(Clone)]
 enum FormKind {
+    OpenLink,
     Search(SearchKind),
     Profile,
     Reply(Target),
@@ -177,7 +179,7 @@ impl Form {
     pub fn submit_label(&self) -> &'static str {
         match self.kind {
             FormKind::Search(_) | FormKind::Find => "search",
-            FormKind::Profile | FormKind::Wiki(_) => "open",
+            FormKind::OpenLink | FormKind::Profile | FormKind::Wiki(_) => "open",
             FormKind::Reply(_) => "reply",
             FormKind::Edit(_) => "save",
             FormKind::Report(_) => "report",
@@ -275,6 +277,80 @@ fn ordered_choices(choices: Vec<Choice>, scope: MenuScope) -> Vec<Choice> {
 fn read(label: &str, query: Query) -> Choice {
     choice(label, Command::Read(query))
 }
+
+fn link_command(input: &str) -> anyhow::Result<Command> {
+    let base = url::Url::parse("https://www.reddit.com/").unwrap();
+    let input = input.trim();
+    let url = if input.starts_with('/') {
+        base.join(input)
+    } else {
+        url::Url::parse(input)
+    }
+    .map_err(|_| {
+        anyhow::anyhow!("Enter a full Reddit URL or /r/name, /user/name or /comments/id")
+    })?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        anyhow::bail!("Enter an http or https Reddit link without credentials or a custom port");
+    }
+    let path = url.path();
+    let parts: Vec<_> = path.trim_matches('/').split('/').collect();
+    match url.host_str() {
+        Some("redd.it" | "www.redd.it") => {
+            if let [id] = parts.as_slice() {
+                let path = format!("/comments/{id}/");
+                if crate::reddit::parse::post_id(&path).is_some() {
+                    return Ok(Command::Read(Query::Thread(path)));
+                }
+            }
+        }
+        Some(
+            "reddit.com" | "www.reddit.com" | "old.reddit.com" | "new.reddit.com" | "np.reddit.com"
+            | "m.reddit.com" | "sh.reddit.com",
+        ) => {
+            if crate::reddit::parse::post_id(path).is_some() {
+                return Ok(Command::Read(Query::Thread(path.into())));
+            }
+            match parts.as_slice() {
+                ["r", sub] if is_subreddit_name(sub) => {
+                    return Ok(Command::Subreddit((*sub).into()));
+                }
+                ["u" | "user", user] if name(user).is_ok() => {
+                    return Ok(Command::User((*user).into()));
+                }
+                _ => {}
+            }
+        }
+        _ => anyhow::bail!("This link is not on reddit.com or redd.it"),
+    }
+    anyhow::bail!(
+        "Use a full post, comment, community or profile link; shortened /s/ share links are not supported"
+    )
+}
+
+fn search_choices() -> Vec<Choice> {
+    [
+        ("Search posts across Reddit", SearchKind::Posts),
+        ("Search communities", SearchKind::Communities),
+        ("Search people", SearchKind::People),
+    ]
+    .into_iter()
+    .map(|(label, kind)| {
+        choice(
+            label,
+            Command::Input(form(
+                label,
+                FormKind::Search(kind),
+                vec![field("Query", "", false)],
+                "/search/",
+            )),
+        )
+    })
+    .collect()
+}
 fn native(label: &str, path: &str) -> Choice {
     choice(
         &format!("{label} · open Reddit ↗"),
@@ -283,6 +359,34 @@ fn native(label: &str, path: &str) -> Choice {
 }
 
 impl App {
+    pub fn show_open_link(&mut self) {
+        if self.experience.writing() {
+            return;
+        }
+        self.experience = Experience::default();
+        self.experience.screens.push(Screen::Input(form(
+            "Open Reddit URL",
+            FormKind::OpenLink,
+            vec![field("Reddit URL", "", false)],
+            "/",
+        )));
+        self.overlay = Some(Overlay::Experience);
+    }
+
+    pub fn search_explore(&mut self) {
+        if self.experience.writing() {
+            return;
+        }
+        self.experience = Experience::default();
+        let mut choices = search_choices();
+        choices.extend([
+            read("Discover communities", Query::Communities),
+            choice("Popular posts", Command::Subreddit("popular".into())),
+            choice("All Reddit", Command::Subreddit("all".into())),
+        ]);
+        self.push_menu("Search and explore", choices, MenuScope::Reddit);
+    }
+
     pub fn open_reddit_link(&mut self, path: &str) {
         match reddit_url(path)
             .and_then(|url| media::spawn_detached(&self.config.commands.browser, &[url]))
@@ -415,21 +519,7 @@ impl App {
             choice("Popular posts", Command::Subreddit("popular".into())),
             choice("All Reddit", Command::Subreddit("all".into())),
         ]);
-        for (label, kind) in [
-            ("Search posts across Reddit", SearchKind::Posts),
-            ("Search communities", SearchKind::Communities),
-            ("Search people", SearchKind::People),
-        ] {
-            choices.push(choice(
-                label,
-                Command::Input(form(
-                    label,
-                    FormKind::Search(kind),
-                    vec![field("Query", "", false)],
-                    "/search/",
-                )),
-            ));
-        }
+        choices.extend(search_choices());
         choices.extend([
             native("Search comments", "/search/?type=comment"),
             native("Search media", "/search/?type=media"),
@@ -1004,6 +1094,12 @@ impl App {
                 let post = page.post.clone();
                 let link = post.permalink.clone();
                 self.overlay = None;
+                self.focus_main();
+                if let Some(user) = post.profile_user() {
+                    self.open_user(user);
+                } else {
+                    self.open_subreddit(&post.subreddit);
+                }
                 if let Some(generation) = self.show_post(post, &link) {
                     self.focus = Focus::Post;
                     self.on_msg(Msg::Post {
@@ -1326,12 +1422,20 @@ impl App {
                 }
                 KeyCode::Enter => {
                     command = page.entries.get(*selected).and_then(|entry| {
-                        entry.query.clone().map(Command::Read).or_else(|| {
-                            entry
-                                .target
-                                .clone()
-                                .map(|target| Command::Target(target, entry.post.clone()))
-                        })
+                        entry
+                            .query
+                            .clone()
+                            .map(|query| match query {
+                                Query::Community(sub) => Command::Subreddit(sub),
+                                Query::Profile(user) => Command::User(user),
+                                query => Command::Read(query),
+                            })
+                            .or_else(|| {
+                                entry
+                                    .target
+                                    .clone()
+                                    .map(|target| Command::Target(target, entry.post.clone()))
+                            })
                     })
                 }
                 KeyCode::Char('L') => {
@@ -1468,6 +1572,13 @@ impl App {
         }
         let v = |index: usize| form.fields[index].value.clone();
         let action = match form.kind {
+            FormKind::OpenLink => {
+                match link_command(&v(0)) {
+                    Ok(command) => self.execute_experience(command),
+                    Err(error) => self.experience.error = Some(error.to_string()),
+                }
+                return;
+            }
             FormKind::Search(kind) => {
                 self.read_experience(
                     Query::Search {
@@ -1767,6 +1878,154 @@ mod tests {
 
     fn key(app: &mut App, code: KeyCode) {
         crate::keys::handle(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn when_a_reddit_url_is_pasted_it_should_open_its_thread_or_feed_and_retain_invalid_input() {
+        for (link, expected) in [
+            (
+                "https://old.reddit.com/r/rust/comments/abc/title/def/?context=3",
+                "thread",
+            ),
+            ("https://redd.it/abc", "thread"),
+            ("https://reddit.com/r/rust/?share_id=ignored", "rust"),
+            ("https://www.reddit.com/r/popular/", "popular"),
+            ("https://www.reddit.com/user/spez/", "user"),
+            ("https://example.com/r/rust/", "error"),
+        ] {
+            let (mut app, _dir, _fixture) = app();
+            crate::keys::handle(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            );
+            crate::keys::paste(&mut app, link);
+            key(&mut app, KeyCode::Enter);
+
+            match expected {
+                "thread" => assert!(matches!(&app.experience.pending,
+                    Some((_, Request::Read { query: Query::Thread(path), .. }))
+                    if path == "/r/rust/comments/abc/title/def/" || path == "/comments/abc/")),
+                "rust" | "popular" => assert!(
+                    matches!(&app.active_tab().kind, TabKind::Subreddit { name, .. } if name == expected)
+                ),
+                "user" => assert!(
+                    matches!(&app.active_tab().kind, TabKind::User { name, .. } if name == "spez")
+                ),
+                _ => {
+                    assert!(app.experience.error.is_some());
+                    assert_eq!(app.experience.input().unwrap().fields[0].value, link);
+                    assert!(app.experience.pending.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn when_a_pasted_thread_loads_navigation_should_follow_its_source_and_keep_comment_focus() {
+        for profile in [false, true] {
+            let (mut app, _dir, _fixture) = app();
+            let mut page = post_page();
+            let existing = if profile {
+                page.post.permalink = "/user/writer/comments/1x4v4sn/title/".into();
+                page.post.subreddit = "u_writer".into();
+                None
+            } else {
+                app.open_subreddit("Neovim");
+                Some(app.active_tab().id)
+            };
+            app.switch_tab(0);
+            if profile {
+                app.show_sidebar = false;
+                app.focus_sidebar();
+            }
+            crate::keys::handle(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            );
+            crate::keys::paste(
+                &mut app,
+                "https://reddit.com/r/wrong/comments/1x4v4sn/title/c1/",
+            );
+            key(&mut app, KeyCode::Enter);
+            let generation = app.experience.pending.as_ref().unwrap().0;
+            assert!(matches!(app.active_tab().kind, TabKind::Home));
+
+            app.on_experience(generation, Err("Unavailable".into()));
+            assert!(matches!(app.active_tab().kind, TabKind::Home));
+            key(&mut app, KeyCode::Char('r'));
+            let generation = app.experience.pending.as_ref().unwrap().0;
+            app.on_experience(generation, Ok(Response::Thread(Box::new(page))));
+
+            if profile {
+                assert!(
+                    matches!(&app.active_tab().kind, TabKind::User { name, .. } if name == "writer")
+                );
+                assert!(!app.sidebar_peek);
+                assert!(!app.show_sidebar);
+            } else {
+                assert_eq!(app.active_tab().id, existing.unwrap());
+                assert_eq!(app.active_tab().subreddit(), Some("Neovim"));
+            }
+            assert_eq!(app.tabs.len(), 4);
+            assert_eq!(app.focus, Focus::Post);
+            assert!(app.overlay.is_none());
+            assert_eq!(app.post_view.as_ref().unwrap().shown_post().id, "1x4v4sn");
+            assert_eq!(app.comment_target().unwrap().id, "t1_c1");
+        }
+    }
+
+    #[test]
+    fn when_exploring_search_should_open_community_and_people_feeds_directly() {
+        let (mut app, _dir, _fixture) = app();
+        key(&mut app, KeyCode::F(3));
+        let Some(Screen::Menu { choices, .. }) = app.experience.screens.last() else {
+            panic!("search and explore missing")
+        };
+        assert!(
+            choices
+                .iter()
+                .any(|choice| matches!(choice.command, Command::Read(Query::Communities)))
+        );
+        key(&mut app, KeyCode::Enter);
+        crate::keys::paste(&mut app, "rust");
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(&app.experience.pending,
+            Some((_, Request::Read { query: Query::Search { text, kind: SearchKind::Posts, .. }, .. })) if text == "rust"));
+        app.experience.pending = None;
+        for query in [
+            Query::Community("rust".into()),
+            Query::Profile("spez".into()),
+        ] {
+            app.overlay = Some(Overlay::Experience);
+            app.experience.screens = vec![Screen::Browse {
+                query: Query::Communities,
+                page: Page {
+                    title: "Results".into(),
+                    text: String::new(),
+                    entries: vec![Entry {
+                        title: "Result".into(),
+                        body: String::new(),
+                        query: Some(query.clone()),
+                        target: None,
+                        post: None,
+                    }],
+                    after: None,
+                    url: "/".into(),
+                },
+                selected: 0,
+                scroll: 0,
+            }];
+            key(&mut app, KeyCode::Enter);
+            assert!(app.overlay.is_none());
+            match query {
+                Query::Community(_) => assert!(
+                    matches!(&app.active_tab().kind, TabKind::Subreddit { name, .. } if name == "rust")
+                ),
+                _ => assert!(
+                    matches!(&app.active_tab().kind, TabKind::User { name, .. } if name == "spez")
+                ),
+            }
+        }
     }
 
     #[test]

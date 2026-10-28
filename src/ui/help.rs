@@ -78,6 +78,9 @@ const REDDIT: &[(&str, &str)] = &[
     ("A", "saved accounts: switch, add or reconnect"),
 ];
 const GLOBAL: &[(&str, &str)] = &[
+    ("C-l", "paste a Reddit URL and open it in redtab"),
+    ("F3", "search posts, communities, people; explore Reddit"),
+    ("/", "search this community; elsewhere search and explore"),
     ("o · y", "open on reddit.com · copy link"),
     ("b", "bookmark / remove bookmark"),
     ("r", "reload"),

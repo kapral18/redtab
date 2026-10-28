@@ -8,6 +8,18 @@ The sidebar contains Home, Bookmarks, All subs, Subscriptions, Following and ope
 tabs. Subscriptions are communities; Following contains people you follow. Number
 keys switch tabs; `p` finds a tab or opens a subreddit or `u/name`. `\` hides the sidebar.
 
+`Ctrl+L` opens a Reddit URL inside redtab. Paste a post, comment, community or
+profile link, then press `Enter`. Reddit host variants and `redd.it` post links
+work; `/s/` share links need the full post URL. Invalid links keep the input for editing.
+Post and comment links select their community or profile tab once loaded and keep
+the linked comment selected.
+
+`F3` opens Search and explore: search posts across Reddit, communities or people,
+discover communities, or browse Popular and All. `Enter` opens a result's post or
+feed; `B` shows community/profile tools. Post searches support `s` sort, `t` time
+and `L` next page. `Esc` returns to the query to edit it. `/` also opens Search and
+explore outside community tabs; inside one it searches that community.
+
 Home uses Reddit's personalized Best feed, including recommendations. All subs
 groups the top non-stickied posts from each joined community. Press `r` there to
 refresh subscriptions and posts. A failed refresh keeps the last known community list.
@@ -146,4 +158,6 @@ Help scrolls with `j`/`k`; `Esc` returns to the view beneath it.
 | Content | `o`, `y`, `m`, `b` | Open on Reddit, copy link, open media, local bookmark |
 | Tools | `:`, `;`, `B`, `A`, `F2` | Reddit tools, content actions, community, accounts, settings |
 | General | `i`, `r` | Toggle previews (saved when writable; F2 reviews managed saves), reload |
+| General | `Ctrl+L`, `F3` | Open Reddit URL, search and explore |
+| Other views | `/` | Search and explore |
 | General | `q`, `Ctrl+c` | Quit; `q` closes an open post first |

@@ -13,6 +13,7 @@ pub struct Writer<W, B> {
     output: W,
     frame: Vec<u8>,
     acknowledge: B,
+    barrier_enabled: bool,
 }
 
 impl<W: Write, B: FnMut() -> io::Result<()>> Writer<W, B> {
@@ -21,6 +22,7 @@ impl<W: Write, B: FnMut() -> io::Result<()>> Writer<W, B> {
             output,
             frame: Vec::new(),
             acknowledge,
+            barrier_enabled: true,
         }
     }
 
@@ -41,14 +43,26 @@ impl<W: Write, B: FnMut() -> io::Result<()>> Writer<W, B> {
         self.output.flush()?;
         // A same-pane DSR reply orders the next input after tmux's cursor restoration.
         // Starting the grid hold earlier would preserve the last raw reset's visible cursor.
-        (self.acknowledge)()?;
+        if self.barrier_enabled {
+            match (self.acknowledge)() {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                    self.barrier_enabled = false;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         // Virtual images have no screen position until their placeholder cells arrive.
         let mut start = 0;
         for range in uploads {
             self.output.write_all(&self.frame[start..range.start])?;
             start = range.end;
         }
-        self.output.write_all(&self.frame[start..])
+        self.output.write_all(&self.frame[start..])?;
+        if !self.barrier_enabled {
+            self.output.write_all(TMUX_END.as_bytes())?;
+        }
+        Ok(())
     }
 }
 
@@ -269,16 +283,22 @@ mod tests {
         assert!(writer.flush().is_err());
     }
     #[test]
-    fn failed_acknowledgment_should_not_expose_the_new_grid() {
+    fn when_acknowledgment_times_out_frames_should_remain_drawable_without_more_queries() {
         let upload = b"\x1bPtmux;\x1b\x1b_Ga=T,U=1,m=0;AAAA\x1b\x1b\\\x1b\\";
+        let mut queries = 0;
         let mut writer = Writer::new(Vec::new(), || {
+            queries += 1;
             Err(io::Error::new(io::ErrorKind::TimedOut, "no reply"))
         });
-        writer
-            .write_all(&[BEGIN, upload, b"new grid", END].concat())
-            .unwrap();
-        assert_eq!(writer.flush().unwrap_err().kind(), io::ErrorKind::TimedOut);
-        assert!(!writer.output.windows(8).any(|bytes| bytes == b"new grid"));
-        assert!(!writer.output.ends_with(END));
+        for grid in [b"new grid".as_slice(), b"next grid"] {
+            writer
+                .write_all(&[BEGIN, upload, grid, END].concat())
+                .unwrap();
+            writer.flush().unwrap();
+            assert!(writer.output.windows(grid.len()).any(|bytes| bytes == grid));
+            assert!(writer.output.ends_with(TMUX_END.as_bytes()));
+        }
+        drop(writer);
+        assert_eq!(queries, 1);
     }
 }

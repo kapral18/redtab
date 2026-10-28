@@ -49,7 +49,10 @@ the work. Use compact variants when the surrounding layout has only one row.
 | Media preparation | Centered spinner within the reserved image/video slot; inline for embedded pictures and playback status |
 | Account or write action | Warm spinner with the specific action and its existing controls; pending writes retain drafts and block duplicate submission |
 
-Animation advances at most every 100 ms while the active view is busy. Help and
+Subscriptions and Following each show a loading row while the account list loads,
+including before any entries arrive. Refresh keeps existing rows visible.
+
+Animation advances at most every 100 ms while the active view or sidebar is busy. Help and
 static overlays pause it; busy dialogs animate their own progress. Completion or
 failure stops it. Redraws reuse cached media.
 
@@ -124,6 +127,7 @@ Required fields below describe client validation.
 
 | Form | Fields and defaults | Submission |
 | --- | --- | --- |
+| Open Reddit URL (`Ctrl+L`) | Reddit URL; required, empty, single line | Open post/comment, community or user feed; invalid links retain input |
 | Search posts | Query; required, empty, single line | Search |
 | Search communities | Query; required, empty, single line | Search |
 | Search people | Query; required, empty, single line | Search |
@@ -153,6 +157,7 @@ Presentation: [menu renderer](../src/ui/experience.rs).
 
 | Menu/group | Choices |
 | --- | --- |
+| Search and explore (`F3`; `/` outside community tabs) | Search posts, communities, people; discover communities; Popular; All Reddit. Results open posts or feeds directly. |
 | Reddit / Notifications | Unread, comment replies, post replies, mentions, inbox, native notifications |
 | Reddit / Messages | Chat on Reddit |
 | Reddit / Your account | Profile, saved, hidden, upvoted, downvoted; connected accounts only |

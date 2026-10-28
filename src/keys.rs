@@ -56,6 +56,16 @@ pub fn handle(app: &mut App, mut key: KeyEvent) {
         app.show_settings();
         return;
     }
+    if app.overlay.is_none() {
+        if ctrl && key.code == KeyCode::Char('l') {
+            app.show_open_link();
+            return;
+        }
+        if key.code == KeyCode::F(3) {
+            app.search_explore();
+            return;
+        }
+    }
     if matches!(app.overlay, Some(Overlay::Settings)) {
         app.settings_key(key);
         return;
@@ -394,6 +404,7 @@ fn handle_global(app: &mut App, key: KeyEvent) {
         KeyCode::Char('b') => app.toggle_bookmark(),
         KeyCode::Char('\\') => app.toggle_sidebar(),
         KeyCode::Char('S') => app.show_membership(),
+        KeyCode::Char('/') if !on_sub => app.search_explore(),
         _ if in_post => {}
         KeyCode::Char('j') | KeyCode::Down => app.move_selection(1),
         KeyCode::Char('k') | KeyCode::Up => app.move_selection(-1),
