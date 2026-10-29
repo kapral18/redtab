@@ -494,6 +494,13 @@ pub struct AllSubs {
     pub offset: usize,
 }
 
+#[derive(Clone)]
+struct AncestorFollow {
+    tab: u64,
+    group: Option<String>,
+    waiting: bool,
+}
+
 #[derive(Debug)]
 pub struct PostView {
     pub post: Post,
@@ -521,7 +528,7 @@ pub struct PostView {
     keep_reading: Option<(RowKey, isize, usize)>,
     /// The selected row the last draw placed on screen; None while reading.
     pub drawn_cursor: Option<usize>,
-    /// `v` while reading: spoiler state and scroll of the last draw, to find the top line
+    /// Spoiler changes while reading: spoiler state and scroll of the last draw, to find the top line
     /// in the new wrap.
     pub rewrapped: Option<(bool, usize)>,
     /// Last rendered document, moved here after drawing.
@@ -543,7 +550,7 @@ pub struct PostView {
     pub row_starts: Vec<usize>,
     /// Document lines visible in the last draw; pages are this tall.
     pub page_height: usize,
-    /// `v` shows spoilers: a spoiler-tagged post's body and image, and `>!…!<` text.
+    /// Reveal spoilers: a spoiler-tagged post's body and image, and `>!…!<` text.
     pub reveal_spoilers: bool,
     pub gallery_index: usize,
     pub comment_sort: String,
@@ -573,13 +580,13 @@ impl PostView {
         self.page.as_ref().map_or(&self.post, |page| &page.post)
     }
 
-    /// A spoiler-tagged post whose body and image stay hidden until `v`.
+    /// A spoiler-tagged post whose body and image stay hidden until revealed.
     pub fn spoiler_hidden(&self) -> bool {
         !self.reveal_spoilers
             && (self.post.spoiler || self.page.as_ref().is_some_and(|p| p.post.spoiler))
     }
 
-    /// Anything `v` would reveal: a spoiler tag or `>!…!<` text in the body or comments.
+    /// Anything revealing spoilers would show: a spoiler tag or `>!…!<` text in the body or comments.
     pub fn has_spoilers(&self) -> bool {
         fn marked(comments: &[Comment]) -> bool {
             comments
@@ -774,7 +781,7 @@ impl PostView {
     }
 
     /// For the draw: where to put the top line back after the document changed above it,
-    /// once. Keys that scrolled since move on from it; `g` stays at the top.
+    /// once. Keys that scrolled since move on from it; a top jump stays at the top.
     pub fn take_reading_anchor(&mut self) -> Option<(usize, isize)> {
         let (key, offset, pinned) = self.keep_reading.take()?;
         if self.scroll == 0 && pinned != 0 {
@@ -848,11 +855,11 @@ impl RowKey {
 /// Which comment a key pressed while reading the post selects.
 #[derive(Clone, Copy)]
 enum Anchor {
-    /// `k` `N`: the comment holding the top line.
+    /// Upward movement: the comment holding the top line.
     Up,
-    /// `j` `n`: the first comment from the top line down.
+    /// Downward movement: the first comment from the top line down.
     Down,
-    /// `l` `c` Enter: the comment `h` left if on screen, else the one being read (first
+    /// Selecting a comment: the comment `h` left if on screen, else the one being read (first
     /// starting on screen, else holding the top line, else the next below).
     Select,
 }
@@ -1014,6 +1021,7 @@ struct IconMetadata {
 }
 
 pub struct App {
+    pub keymap: crate::keys::State,
     pub experience: experience::Experience,
     pub config: Config,
     pub settings: settings::Settings,
@@ -1033,6 +1041,7 @@ pub struct App {
     read_redraw: bool,
     membership: Option<MembershipChange>,
     pub post_view: Option<PostView>,
+    ancestor_follow: Option<AncestorFollow>,
     pub overlay: Option<Overlay>,
     /// Help covers the current dialog without replacing its state.
     pub help_scroll: Option<usize>,
@@ -1114,6 +1123,7 @@ impl App {
         let (state, warning) = State::load(&state_path);
         let show_images = config.media.image_preview;
         let mut app = Self {
+            keymap: crate::keys::State::default(),
             experience: experience::Experience::default(),
             settings: settings::Settings::new(crate::config::store::Store::memory(config.clone())),
             config,
@@ -1172,6 +1182,7 @@ impl App {
             video_area: None,
             video_resize: None,
             post_settle: Settle::default(),
+            ancestor_follow: None,
             membership: None,
             feed_settle: Settle::default(),
             picture_settle: Settle::default(),
@@ -1279,6 +1290,7 @@ impl App {
     }
 
     fn install_connection(&mut self, reddit: Reddit) {
+        self.ancestor_follow = None;
         let disconnected = reddit.needs_sign_in();
         let same_account = !disconnected
             && match self.reddit.account().zip(reddit.account()) {
@@ -1407,7 +1419,7 @@ impl App {
             if let Some(warning) = state_warning {
                 self.error(format!("Disconnected from Reddit; {warning}"));
             } else {
-                self.info("Disconnected from Reddit. Press A to connect.");
+                self.info("Disconnected from Reddit. Press SPC p a to connect.");
             }
             return;
         }
@@ -1798,8 +1810,15 @@ impl App {
     /// Timers: held-back navigation loads, status expiry, Reddit health, saves, video
     /// frames. True when something visible changed.
     pub fn tick(&mut self) -> bool {
-        let now = Instant::now();
+        self.tick_at(Instant::now())
+    }
+
+    fn tick_at(&mut self, now: Instant) -> bool {
+        let was_visible = self.keymap.hint_visible();
+        crate::keys::map::sync(self);
         let mut changed = std::mem::take(&mut self.read_redraw);
+        changed |= was_visible && !self.keymap.hint_visible();
+        changed |= self.keymap.tick(now);
         changed |= self.poll_settings(now);
         if let Some(since) = self.loading_since
             && self.loading_active()
@@ -1810,6 +1829,7 @@ impl App {
             changed = true;
         }
         changed |= self.load_settled(now);
+        changed |= self.follow_ancestor();
         changed |= self.card_renderer.poll();
         // Pictures a quick run of moves held back: the redraw fetches what it shows.
         changed |= self.picture_settle.due(now).is_some();
@@ -1979,6 +1999,7 @@ impl App {
             .chain(self.post_settle.wake_in(now))
             .chain(self.feed_settle.wake_in(now))
             .chain(self.picture_settle.wake_in(now))
+            .chain(self.keymap.wake_in(now))
             .chain(self.card_video.as_ref().and_then(|card| {
                 let left = NAV_SETTLE.saturating_sub(now.saturating_duration_since(card.since));
                 (!left.is_zero()).then_some(left)
@@ -2343,7 +2364,7 @@ impl App {
         }
     }
 
-    /// `a` toggles this video's sound; fresh cards start muted.
+    /// The mute action toggles this video's sound; fresh cards start muted.
     pub fn toggle_video_sound(&mut self) {
         if !self.video_matches_selection() {
             self.info("No video plays here");
@@ -2368,7 +2389,7 @@ impl App {
         }
     }
 
-    /// Whether videos start with sound (`a`).
+    /// Whether videos start with sound.
     pub fn video_sound_wanted(&self) -> bool {
         self.video_sound_on
     }
@@ -2474,13 +2495,15 @@ impl App {
         if index >= self.tabs.len() || index == self.active {
             return;
         }
-        self.enter_tab(index);
+        self.enter_tab(index, false);
     }
 
-    fn enter_tab(&mut self, index: usize) {
+    fn enter_tab(&mut self, index: usize, keep_post: bool) {
         self.active = index;
         self.sync_feed_demand();
-        self.close_post();
+        if !keep_post {
+            self.close_post();
+        }
         let now = Instant::now();
         if self.focus == Focus::Sidebar {
             self.feed_settle.defer(self.tabs[index].id, now);
@@ -2493,14 +2516,22 @@ impl App {
         }
     }
 
-    pub fn cycle_tab(&mut self, forward: bool) {
+    pub fn cycle_tab(&mut self, forward: bool, preserve_depth: bool) {
+        let follow = preserve_depth && (self.post_focused() || self.ancestor_follow.is_some());
         let n = self.tabs.len();
         let next = if forward {
             (self.active + 1) % n
         } else {
             (self.active + n - 1) % n
         };
-        self.switch_tab(next);
+        if next == self.active {
+            return;
+        }
+        if follow {
+            self.switch_ancestor_tab(next);
+        } else {
+            self.switch_tab(next);
+        }
     }
 
     pub fn open_user(&mut self, name: &str) {
@@ -2555,13 +2586,13 @@ impl App {
                 followed: false, ..
             } => {
                 self.tabs.remove(self.active);
-                self.enter_tab(self.active.min(self.tabs.len() - 1));
+                self.enter_tab(self.active.min(self.tabs.len() - 1), false);
             }
             TabKind::User { followed: true, .. } => {
-                self.info("Following this user — press S to unfollow")
+                self.info("Following this user — press SPC a m to unfollow")
             }
             TabKind::Subreddit { pinned: true, .. } => {
-                self.info("Joined this community — press S to leave")
+                self.info("Joined this community — press SPC a m to leave")
             }
             _ => self.info("Home, Bookmarks and All subs stay open"),
         }
@@ -2786,6 +2817,14 @@ impl App {
             TabKind::Bookmarks => {}
             TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. } => {
                 let feed = &self.tabs[self.active].feed;
+                if feed.loading_more() {
+                    return;
+                }
+                if feed.page_failed() {
+                    let after = feed.after.clone();
+                    self.fetch_feed(self.active, after, true);
+                    return;
+                }
                 let failed_pages: Vec<_> = feed
                     .pages
                     .iter()
@@ -2957,7 +2996,7 @@ impl App {
     pub fn cycle_time(&mut self) {
         let feed = &mut self.tabs[self.active].feed;
         if !feed.sort.takes_time() || feed.search.is_some() {
-            self.info("Time range applies to Top and Controversial (press s)");
+            self.info("Time range applies to Top and Controversial (press SPC f s)");
             return;
         }
         feed.time = feed.time.next();
@@ -3036,6 +3075,9 @@ impl App {
     }
 
     pub fn scroll_card(&mut self, delta: isize) {
+        if delta > 0 && self.current_post().is_none() {
+            self.prefetch_list(self.active_tab().feed.selected);
+        }
         if self.state.list_view() != ListView::Card
             || matches!(self.active_tab().kind, TabKind::AllSubs)
             || self.current_post().is_none()
@@ -3058,10 +3100,13 @@ impl App {
         }
         let feed = &tab.feed;
         let len = self.config.visible(&feed.posts).count();
-        // Failed pages wait for L or r.
         if last_visible.saturating_add(PREFETCH_MARGIN) >= len
             && feed.after.is_some()
             && !feed.loading()
+            && !feed.loading_more()
+            && !feed.receiving()
+            && feed.shows_current_query()
+            && !feed.pages.iter().any(|page| page.cursor == feed.after)
             && !feed.page_failed()
         {
             self.load_feed(self.active, true);
@@ -3153,10 +3198,185 @@ impl App {
     }
 
     pub fn move_all_subs_group(&mut self, delta: isize) {
-        self.all_subs.group = step(self.all_subs.group, delta, self.all_subs.groups.len());
+        let group = step(self.all_subs.group, delta, self.all_subs.groups.len());
+        if group == self.all_subs.group {
+            return;
+        }
+        self.all_subs.group = group;
         self.all_subs.post = 0;
         self.moving();
         self.preview_selection();
+    }
+
+    pub fn move_community(&mut self, forward: bool) {
+        let follow = self.post_focused() || self.ancestor_follow.is_some();
+        if matches!(self.active_tab().kind, TabKind::AllSubs) {
+            if self.post_focused()
+                && let Some(view) = &self.post_view
+            {
+                let anchor = self
+                    .all_subs
+                    .groups
+                    .iter()
+                    .enumerate()
+                    .find_map(|(group, entry)| {
+                        self.group_posts(entry)
+                            .position(|post| post.id == view.post.id)
+                            .map(|post| (group, post))
+                    })
+                    .or_else(|| {
+                        self.all_subs
+                            .groups
+                            .iter()
+                            .position(|group| {
+                                group.subreddit.eq_ignore_ascii_case(&view.post.subreddit)
+                            })
+                            .map(|group| (group, 0))
+                    });
+                if let Some((group, post)) = anchor {
+                    self.all_subs.group = group;
+                    self.all_subs.post = post;
+                }
+            }
+            let before = self.all_subs.group;
+            self.move_all_subs_group(if forward { 1 } else { -1 });
+            if follow && self.all_subs.group != before {
+                self.start_ancestor_follow();
+            }
+            return;
+        }
+        let order = self.sidebar_order();
+        let at = order
+            .iter()
+            .position(|&index| index == self.active)
+            .unwrap_or(0);
+        let is_community = |&&index: &&usize| self.tabs[index].subreddit().is_some();
+        let next = if forward {
+            order.iter().skip(at + 1).find(is_community)
+        } else {
+            order[..at].iter().rev().find(is_community)
+        };
+        if let Some(&index) = next {
+            if follow {
+                self.switch_ancestor_tab(index);
+            } else {
+                self.switch_tab(index);
+            }
+        }
+    }
+
+    pub(crate) fn ancestor_following(&self) -> bool {
+        self.ancestor_follow.is_some()
+    }
+
+    pub(crate) fn cancel_ancestor_follow(&mut self) {
+        self.ancestor_follow = None;
+    }
+
+    fn showing_list_post(&self, index: usize) -> bool {
+        self.post_focused()
+            && self.list_post(index).is_some_and(|post| {
+                self.post_view
+                    .as_ref()
+                    .is_some_and(|view| view.post.id == post.id)
+            })
+    }
+
+    fn switch_ancestor_tab(&mut self, index: usize) {
+        if self.showing_list_post(index) {
+            self.enter_tab(index, true);
+        } else {
+            self.switch_tab(index);
+            self.start_ancestor_follow();
+        }
+    }
+
+    fn start_ancestor_follow(&mut self) {
+        if self.showing_list_post(self.active) {
+            return;
+        }
+        self.close_post();
+        let group = if matches!(self.active_tab().kind, TabKind::AllSubs) {
+            self.all_subs
+                .groups
+                .get(self.all_subs.group)
+                .map(|group| group.subreddit.clone())
+        } else {
+            None
+        };
+        self.ancestor_follow = Some(AncestorFollow {
+            tab: self.active_tab().id,
+            group,
+            waiting: true,
+        });
+        self.follow_ancestor();
+    }
+
+    fn follow_ancestor(&mut self) -> bool {
+        let Some(target) = &self.ancestor_follow else {
+            return false;
+        };
+        let group = matches!(self.active_tab().kind, TabKind::AllSubs)
+            .then(|| self.all_subs.groups.get(self.all_subs.group))
+            .flatten();
+        if self.active_tab().id != target.tab
+            || target
+                .group
+                .as_ref()
+                .is_some_and(|name| group.is_none_or(|group| &group.subreddit != name))
+            || self.overlay.is_some()
+            || self.help_scroll.is_some()
+            || self.focus != Focus::List
+            || self.post_view.is_some()
+        {
+            self.ancestor_follow = None;
+            return false;
+        }
+        if !target.waiting || !self.keymap.prefix.is_empty() {
+            return false;
+        }
+        if let Some(post) = self.current_post() {
+            self.ancestor_follow = None;
+            let permalink = post.permalink.clone();
+            self.moving();
+            if let Some(generation) = self.show_post(post, &permalink) {
+                self.focus = Focus::Post;
+                if self.post_settle.arrive(generation, Instant::now()) {
+                    self.load_post(permalink);
+                }
+            }
+            return true;
+        }
+        let finished = match self.active_tab().kind {
+            TabKind::Bookmarks => true,
+            TabKind::AllSubs => {
+                group.is_some_and(|group| {
+                    !group.loading
+                        && !group.needs_refresh
+                        && (group.error.is_some()
+                            || group.freshness.is_some_and(|freshness| {
+                                now().saturating_sub(freshness.fetched_at)
+                                    < crate::cache::CONTENT_TTL
+                            }))
+                }) || (group.is_none() && !self.all_subs.loading)
+            }
+            _ => {
+                let feed = &self.active_tab().feed;
+                let stale = feed.freshness.is_some_and(|freshness| {
+                    now().saturating_sub(freshness.fetched_at) >= crate::cache::CONTENT_TTL
+                });
+                !feed.loading()
+                    && !feed.refreshing()
+                    && (feed.error().is_some() && !self.feed_settle.holding(Instant::now())
+                        || feed.loaded && !stale && feed.deferred.is_empty())
+            }
+        };
+        if (finished || self.reddit.needs_sign_in())
+            && let Some(target) = &mut self.ancestor_follow
+        {
+            target.waiting = false;
+        }
+        false
     }
 
     pub fn community(&self) -> Option<String> {
@@ -3183,10 +3403,16 @@ impl App {
     }
 
     pub fn open_current_community(&mut self) {
-        if let Some(name) = self.community().filter(|name| is_community(name)) {
-            self.open_subreddit(&name);
-        } else if let Some(user) = self.profile_context() {
-            self.open_user(&user);
+        let target = self.membership_target();
+        if matches!(self.overlay, Some(Overlay::Experience)) {
+            self.experience = experience::Experience::default();
+            self.overlay = None;
+        }
+        self.focus_main();
+        match target {
+            Some(MembershipTarget::Community(name)) => self.open_subreddit(&name),
+            Some(MembershipTarget::User(name)) => self.open_user(&name),
+            None => {}
         }
     }
 
@@ -3201,17 +3427,12 @@ impl App {
     }
 
     pub fn open_source_in_browser(&mut self) {
-        if let Some(user) = self.profile_context() {
-            self.open_reddit_link(&format!("/user/{user}/"));
-            return;
-        }
-        let name = self
-            .community()
-            .or_else(|| self.active_tab().subreddit().map(str::to_string));
-        if let Some(name) = name.filter(|name| crate::config::is_subreddit_name(name)) {
-            self.open_reddit_link(&format!("/r/{name}/"));
-        } else {
-            self.info("No community selected");
+        match self.membership_target() {
+            Some(MembershipTarget::User(name)) => self.open_reddit_link(&format!("/user/{name}/")),
+            Some(MembershipTarget::Community(name)) => {
+                self.open_reddit_link(&format!("/r/{name}/"))
+            }
+            None => self.info("No community or profile selected"),
         }
     }
 
@@ -3284,7 +3505,7 @@ impl App {
         }
         let Some(joined) = self.subscribed(&target) else {
             self.load_subscriptions(true);
-            self.info("Loading account subscriptions; press S again when ready");
+            self.info("Loading account subscriptions; press SPC a m again when ready");
             return;
         };
         self.overlay = Some(Overlay::Membership {
@@ -3327,7 +3548,11 @@ impl App {
         {
             return Some(view.shown_post().clone());
         }
-        let tab = self.active_tab();
+        self.list_post(self.active)
+    }
+
+    fn list_post(&self, index: usize) -> Option<Post> {
+        let tab = self.tabs.get(index)?;
         if matches!(tab.kind, TabKind::Subreddit { .. }) && tab.feed.access_denied().is_some() {
             return None;
         }
@@ -3349,6 +3574,69 @@ impl App {
     }
 
     // ----- post view --------------------------------------------------------
+
+    pub fn move_post(&mut self, forward: bool) {
+        if self.focus != Focus::Post
+            || (self.active_tab().subreddit().is_some()
+                && self.active_tab().feed.access_denied().is_some())
+        {
+            return;
+        }
+        let Some(view) = &self.post_view else {
+            return;
+        };
+        let posts: Vec<_> = match self.active_tab().kind {
+            TabKind::AllSubs => self
+                .all_subs
+                .groups
+                .iter()
+                .enumerate()
+                .flat_map(|(group, entry)| {
+                    self.group_posts(entry)
+                        .enumerate()
+                        .map(move |(index, post)| ((group, index), post))
+                })
+                .collect(),
+            TabKind::Bookmarks => self
+                .visible_bookmarks()
+                .enumerate()
+                .map(|(index, bookmark)| ((0, index), &bookmark.post))
+                .collect(),
+            _ => self
+                .config
+                .visible(&self.active_tab().feed.posts)
+                .enumerate()
+                .map(|(index, post)| ((0, index), post))
+                .collect(),
+        };
+        let Some(at) = posts.iter().position(|(_, post)| post.id == view.post.id) else {
+            return;
+        };
+        let next = step(at, if forward { 1 } else { -1 }, posts.len());
+        let ((group, index), post) = posts[next];
+        if next == at {
+            self.prefetch_list(index);
+            return;
+        }
+        let post = post.clone();
+        if matches!(self.active_tab().kind, TabKind::AllSubs) {
+            self.all_subs.group = group;
+            self.all_subs.post = index;
+        } else {
+            let feed = &mut self.tabs[self.active].feed;
+            feed.selected = index;
+            feed.cards = CardScroll::default();
+        }
+        self.prefetch_list(index);
+        self.moving();
+        let permalink = post.permalink.clone();
+        if let Some(generation) = self.show_post(post, &permalink) {
+            self.focus = Focus::Post;
+            if self.post_settle.arrive(generation, Instant::now()) {
+                self.load_post(permalink);
+            }
+        }
+    }
 
     pub fn open_current_post(&mut self) {
         if let Some(post) = self.current_post() {
@@ -3504,6 +3792,7 @@ impl App {
     }
 
     pub fn close_post(&mut self) {
+        self.ancestor_follow = None;
         self.post_view = None;
         if self.focus == Focus::Post {
             self.focus = Focus::List;
@@ -3816,7 +4105,7 @@ impl App {
     }
 
     pub fn popup_open(&self) -> bool {
-        self.overlay.is_some() || self.help_scroll.is_some()
+        self.overlay.is_some() || self.help_scroll.is_some() || self.keymap.hint_visible()
     }
 
     pub fn sidebar_width(&self) -> u16 {
@@ -3888,15 +4177,19 @@ impl App {
 
     /// Switch to the tab `delta` rows away in the sidebar, stopping at the ends.
     pub fn move_sidebar(&mut self, delta: isize) {
+        let order = self.sidebar_order();
+        let at = order.iter().position(|&i| i == self.active).unwrap_or(0);
+        self.switch_tab(order[step(at, delta, order.len())]);
+    }
+
+    fn sidebar_order(&self) -> Vec<usize> {
         let (pinned, following, opened) = self.sidebar_tabs();
-        let order: Vec<usize> = [0, BOOKMARKS_TAB, ALL_SUBS_TAB]
+        [0, BOOKMARKS_TAB, ALL_SUBS_TAB]
             .into_iter()
             .chain(pinned)
             .chain(following)
             .chain(opened)
-            .collect();
-        let at = order.iter().position(|&i| i == self.active).unwrap_or(0);
-        self.switch_tab(order[step(at, delta, order.len())]);
+            .collect()
     }
 
     pub fn sidebar_edge(&mut self, last: bool) {
@@ -4347,7 +4640,7 @@ impl App {
         }
     }
 
-    /// One image download per post at a time, so a second `m` while it runs can't open
+    /// One image download per post at a time, so a second media-open action while it runs can't open
     /// the viewer twice.
     fn download_images(&mut self, permalink: &str, urls: Vec<String>) {
         if !self.pending_media.insert(permalink.to_string()) {
@@ -4504,6 +4797,7 @@ impl App {
             self.prefetch_short_home();
             self.preview_selection();
             self.sync_feed_demand();
+            self.follow_ancestor();
         }
     }
 
@@ -5493,7 +5787,7 @@ impl App {
                     );
                 }
                 // A failed load of a new query must not leave the old query's posts and cursor
-                // (`L` would append to them); a failed reload of the same query keeps them.
+                // (a continuation would append to them); a failed reload of the same query keeps them.
                 if !append && feed.shown_query.as_ref() != Some(&feed.query()) {
                     feed.posts.clear();
                     feed.after = None;
@@ -5966,6 +6260,25 @@ fn step(current: usize, delta: isize, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_waiting_prefix_should_wake_and_redraw_once_then_cancel_on_context_change() {
+        let mut app = app_with(&["rust", "vim"]);
+        let before = Instant::now();
+        press(&mut app, crossterm::event::KeyCode::Char(']'));
+        let _ = app.tick_at(before + crate::keys::map::HINT_DELAY - Duration::from_millis(1));
+        assert!(!app.popup_open());
+        let due = Instant::now() + crate::keys::map::HINT_DELAY;
+        assert!(app.keymap.wake_in(due).is_some_and(|wait| wait.is_zero()));
+        assert!(app.tick_at(due));
+        assert!(app.popup_open());
+        assert!(app.keymap.wake_in(due).is_none());
+
+        app.switch_tab(0);
+        let _ = app.tick_at(due + Duration::from_secs(1));
+        assert!(!app.popup_open());
+        assert!(app.keymap.prefix.is_empty());
+    }
 
     #[test]
     fn when_offscreen_work_is_cancelled_the_group_should_keep_content_and_resume_on_return() {
@@ -6839,7 +7152,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert_eq!(
-            actual.matches("unavailable · m opens media").count(),
+            actual.matches("unavailable · SPC o m opens media").count(),
             1,
             "{actual}"
         );
@@ -6861,7 +7174,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(actual.contains("P retry"), "{actual}");
+        assert!(actual.contains("SPC m p retry"), "{actual}");
         assert!(actual.contains("fixture decoder unavailable"), "{actual}");
         assert!(matches!(
             app.card_images.get("https://i.redd.it/poster.jpg"),
@@ -6889,7 +7202,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(!actual.contains("P play/pause"), "{actual}");
+        assert!(!actual.contains("SPC m p play/pause"), "{actual}");
         assert!(!app.video_controls_available());
     }
 
@@ -6906,8 +7219,8 @@ mod tests {
             .map(|x| terminal.backend().buffer()[(x, 19)].symbol())
             .collect::<String>();
         let words = footer.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(words.contains("l/⏎ list"), "{footer}");
-        assert!(!footer.contains("P retry"), "{footer}");
+        assert!(words.contains("l list"), "{footer}");
+        assert!(!footer.contains("SPC m p retry"), "{footer}");
     }
 
     #[test]
@@ -6926,7 +7239,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(actual.contains("P retry"), "{actual}");
+        assert!(actual.contains("SPC m p retry"), "{actual}");
         assert!(actual.contains("F1"), "{actual}");
     }
 
@@ -9811,7 +10124,7 @@ mod tests {
     }
 
     #[test]
-    fn when_community_space_is_pressed_on_home_it_should_open_the_selected_subreddit() {
+    fn when_source_feed_keys_are_pressed_on_home_it_should_open_the_selected_subreddit() {
         let mut app = app_with(&[]);
         app.switch_tab(0);
         app.on_msg(Msg::Feed {
@@ -9821,13 +10134,7 @@ mod tests {
             result: Ok(listing("armenia", &["a"], None)),
         });
 
-        crate::keys::handle(
-            &mut app,
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char(' '),
-                crossterm::event::KeyModifiers::NONE,
-            ),
-        );
+        sequence(&mut app, " gc");
 
         assert_eq!(app.active_tab().subreddit(), Some("armenia"));
         assert!(matches!(
@@ -9937,6 +10244,12 @@ mod tests {
         );
     }
 
+    fn sequence(app: &mut App, keys: &str) {
+        for c in keys.chars() {
+            press(app, crossterm::event::KeyCode::Char(c));
+        }
+    }
+
     #[test]
     fn following_unfollowing_and_refollowing_should_preserve_the_same_reading_tab() {
         use crate::reddit::tests::{Fixture, Reply};
@@ -10018,7 +10331,7 @@ mod tests {
         let tab = app.active_tab().id;
 
         for (expected_writes, join) in [(1, true), (2, false), (3, true)] {
-            press(&mut app, KeyCode::Char('S'));
+            sequence(&mut app, " am");
             assert!(
                 matches!(&app.overlay, Some(Overlay::Membership { target: MembershipTarget::User(name), join: action }) if name == "blackvault" && *action == join)
             );
@@ -10164,7 +10477,7 @@ mod tests {
         app.tabs[app.active].feed.offset = 2;
         let tab = app.active_tab().id;
         for (expected_count, join) in [(1, true), (2, false), (3, true)] {
-            press(&mut app, KeyCode::Char('S'));
+            sequence(&mut app, " am");
             assert!(
                 matches!(&app.overlay, Some(Overlay::Membership { target: MembershipTarget::Community(subreddit), join: action }) if subreddit == "armenia" && *action == join)
             );
@@ -10336,7 +10649,7 @@ mod tests {
             Some("rust"),
             "empty All subs island"
         );
-        press(&mut app, KeyCode::Char('S'));
+        sequence(&mut app, " am");
         assert!(
             matches!(&app.overlay, Some(Overlay::Membership { target: MembershipTarget::Community(subreddit), join: false }) if subreddit == "rust")
         );
@@ -10345,11 +10658,11 @@ mod tests {
         app.open_subreddit("armenia");
         assert_eq!(app.community().as_deref(), Some("armenia"));
         app.focus = Focus::Sidebar;
-        press(&mut app, KeyCode::Char('S'));
+        sequence(&mut app, " am");
         assert!(
             matches!(&app.overlay, Some(Overlay::Membership { target: MembershipTarget::Community(subreddit), join: true }) if subreddit == "armenia")
         );
-        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('o'));
         assert!(app.membership.is_none());
         assert!(app.overlay.is_none());
         crate::keys::handle(
@@ -10360,8 +10673,8 @@ mod tests {
         app.overlay = Some(Overlay::Search {
             input: String::new(),
         });
-        press(&mut app, KeyCode::Char('S'));
-        assert!(matches!(&app.overlay, Some(Overlay::Search { input }) if input == "S"));
+        sequence(&mut app, " am");
+        assert!(matches!(&app.overlay, Some(Overlay::Search { input }) if input == " am"));
     }
 
     #[test]
@@ -11761,6 +12074,569 @@ mod tests {
     }
 
     #[test]
+    fn ancestor_navigation_from_deep_comments_should_follow_loaded_feeds() {
+        for width in [80, 200] {
+            let mut app = app_with(&["a", "b", "c"]);
+            app.config.show_nsfw = false;
+            for (name, ids) in [
+                ("a", vec!["a1", "a2"]),
+                ("b", vec!["b1"]),
+                ("c", vec!["c1"]),
+            ] {
+                let index = tab_index(&app, name);
+                let feed = &mut app.tabs[index].feed;
+                feed.posts = ids.iter().map(|id| post(id, name)).collect();
+                if name == "b" {
+                    let mut hidden = post("hidden", "b");
+                    hidden.nsfw = true;
+                    feed.posts.insert(0, hidden);
+                }
+                feed.loaded = true;
+                feed.shown_query = Some(feed.query());
+            }
+            app.active = tab_index(&app, "a");
+            app.resize(width);
+            app.open_current_post();
+            let generation = app.post_view.as_ref().unwrap().generation;
+            app.on_msg(Msg::Post {
+                generation,
+                result: Ok(Box::new(PostPage {
+                    post: post("a1", "a"),
+                    body: String::new(),
+                    comments: vec![
+                        comment("root", vec![comment("deep", vec![], None)], None),
+                        comment("next", vec![], None),
+                    ],
+                })),
+            });
+            let view = app.post_view.as_mut().unwrap();
+            view.free_scroll = false;
+            view.cursor = 1;
+            for key in "]]".chars() {
+                press(&mut app, crossterm::event::KeyCode::Char(key));
+            }
+            assert_eq!(app.post_view.as_ref().unwrap().cursor, 2);
+            for key in "]p".chars() {
+                press(&mut app, crossterm::event::KeyCode::Char(key));
+            }
+            assert_eq!(app.current_post().unwrap().id, "a2");
+            for key in "]s".chars() {
+                press(&mut app, crossterm::event::KeyCode::Char(key));
+            }
+            assert_eq!(app.active_tab().subreddit(), Some("b"));
+            assert_eq!(app.current_post().unwrap().id, "b1");
+            assert_eq!(app.focus, Focus::Post, "width={width}");
+            for key in "[s".chars() {
+                press(&mut app, crossterm::event::KeyCode::Char(key));
+            }
+            assert_eq!(app.current_post().unwrap().id, "a2");
+            for key in "gt".chars() {
+                press(&mut app, crossterm::event::KeyCode::Char(key));
+            }
+            assert_eq!(app.current_post().unwrap().id, "b1");
+            for key in "gT".chars() {
+                press(&mut app, crossterm::event::KeyCode::Char(key));
+            }
+            assert_eq!(app.current_post().unwrap().id, "a2");
+            assert_eq!(app.focus, Focus::Post);
+            press(&mut app, crossterm::event::KeyCode::Tab);
+            assert_eq!(app.current_post().unwrap().id, "b1");
+            press(&mut app, crossterm::event::KeyCode::BackTab);
+            assert_eq!(app.current_post().unwrap().id, "a2");
+            app.all_subs.groups[0].posts = vec![post("a1", "a")];
+            for key in "gT".chars() {
+                press(&mut app, crossterm::event::KeyCode::Char(key));
+            }
+            assert_eq!(app.current_post().unwrap().id, "a1");
+            for key in "gT".chars() {
+                press(&mut app, crossterm::event::KeyCode::Char(key));
+            }
+            assert_eq!(app.active, BOOKMARKS_TAB);
+            assert!(app.post_view.is_none());
+            for key in "gt".chars() {
+                press(&mut app, crossterm::event::KeyCode::Char(key));
+            }
+            assert_eq!(app.current_post().unwrap().id, "a1");
+            assert_eq!(app.focus, Focus::Post);
+        }
+
+        let mut app = app_with(&["a"]);
+        let a = tab_index(&app, "a");
+        for index in [0, a] {
+            app.tabs[index].feed.posts = vec![post("same", "a")];
+            app.tabs[index].feed.loaded = true;
+        }
+        app.active = 0;
+        app.open_current_post();
+        let view = app.post_view.as_mut().unwrap();
+        view.scroll = 31;
+        let generation = view.generation;
+        for key in "]s".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        assert_eq!(app.active, a);
+        let view = app.post_view.as_ref().unwrap();
+        assert_eq!((view.generation, view.scroll), (generation, 31));
+        for key in "gt".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        assert_eq!(app.active, 0);
+        let view = app.post_view.as_ref().unwrap();
+        assert_eq!((view.generation, view.scroll), (generation, 31));
+    }
+
+    #[test]
+    fn ancestor_navigation_should_follow_only_the_latest_uninterrupted_cold_feed() {
+        let mut app = app_with(&["a", "b", "c", "d"]);
+        let a = tab_index(&app, "a");
+        app.active = a;
+        app.tabs[a].feed.posts = vec![post("a1", "a")];
+        app.tabs[a].feed.loaded = true;
+        let c = tab_index(&app, "c");
+        app.tabs[c].feed.loaded = true;
+        app.tabs[c].feed.freshness = Some(Freshness {
+            fetched_at: now() - crate::cache::CONTENT_TTL - 1,
+            source: Source::default(),
+        });
+        app.open_current_post();
+        for key in "]s".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        let b = tab_index(&app, "b");
+        assert_eq!(app.active, b);
+        assert!(app.post_view.is_none());
+        let b_generation = app.tabs[b].feed.generation;
+        press(&mut app, crossterm::event::KeyCode::Char('g'));
+        app.on_msg(Msg::FeedProgress {
+            tab: app.tabs[b].id,
+            generation: b_generation,
+            post: Box::new(post("b1", "b")),
+            source: Source::default(),
+        });
+        assert!(
+            app.post_view.is_none(),
+            "a partial key must not be interrupted"
+        );
+        app.feed_settle.arrive(
+            app.active_tab().id,
+            Instant::now() + Duration::from_secs(60),
+        );
+        press(&mut app, crossterm::event::KeyCode::Char('t'));
+        assert_eq!(app.active, c);
+        app.on_msg(Msg::Feed {
+            tab: app.tabs[b].id,
+            generation: b_generation,
+            append: false,
+            result: Ok(listing("b", &["b1"], None)),
+        });
+        assert!(app.post_view.is_none(), "an older feed must not take focus");
+        app.load_settled(Instant::now() + NAV_SETTLE);
+        let c_generation = app.tabs[c].feed.generation;
+        app.on_msg(Msg::FeedProgress {
+            tab: app.tabs[c].id,
+            generation: c_generation,
+            post: Box::new(post("c1", "c")),
+            source: Source::default(),
+        });
+        assert_eq!(app.current_post().unwrap().id, "c1");
+        assert_eq!(app.focus, Focus::Post);
+        for key in "]s".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        let d = tab_index(&app, "d");
+        assert_eq!(app.active, d);
+        app.load_settled(Instant::now() + NAV_SETTLE);
+        let d_generation = app.tabs[d].feed.generation;
+        press(&mut app, crossterm::event::KeyCode::Char('j'));
+        app.on_msg(Msg::Feed {
+            tab: app.tabs[d].id,
+            generation: d_generation,
+            append: false,
+            result: Ok(listing("d", &["d1"], None)),
+        });
+        assert!(
+            app.post_view.is_none(),
+            "user navigation cancels automatic detail follow"
+        );
+        assert_eq!(app.focus, Focus::List);
+
+        let mut app = app_with(&["x", "y", "z"]);
+        let x = tab_index(&app, "x");
+        app.active = x;
+        app.tabs[x].feed.posts = vec![post("x1", "x")];
+        app.tabs[x].feed.loaded = true;
+        app.open_current_post();
+        for key in "]s".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        let y = tab_index(&app, "y");
+        let y_generation = app.tabs[y].feed.generation;
+        app.on_msg(Msg::Feed {
+            tab: app.tabs[y].id,
+            generation: y_generation,
+            append: false,
+            result: Err("offline".into()),
+        });
+        assert_eq!(app.active, y);
+        assert!(app.post_view.is_none());
+        for key in "gt".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        let z = tab_index(&app, "z");
+        assert_eq!(app.active, z);
+        app.load_settled(Instant::now() + NAV_SETTLE);
+        let generation = app.tabs[z].feed.generation;
+        app.show_auth();
+        app.on_msg(Msg::Feed {
+            tab: app.tabs[z].id,
+            generation,
+            append: false,
+            result: Ok(listing("z", &["z1"], None)),
+        });
+        assert!(matches!(app.overlay, Some(Overlay::Auth)));
+        app.overlay = None;
+        app.tick();
+        assert!(
+            app.post_view.is_none(),
+            "a covered view must not reopen later"
+        );
+
+        let mut app = app_with(&["m", "n"]);
+        let m = tab_index(&app, "m");
+        app.active = m;
+        app.tabs[m].feed.posts = vec![post("m1", "m")];
+        app.tabs[m].feed.loaded = true;
+        app.open_current_post();
+        for key in "]s".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        let n = tab_index(&app, "n");
+        let generation = app.tabs[n].feed.generation;
+        press(&mut app, crossterm::event::KeyCode::Char('g'));
+        app.on_msg(Msg::Feed {
+            tab: app.tabs[n].id,
+            generation,
+            append: false,
+            result: Ok(listing("n", &["n1"], None)),
+        });
+        assert!(app.post_view.is_none());
+        press(&mut app, crossterm::event::KeyCode::Esc);
+        app.tick();
+        assert_eq!(app.current_post().unwrap().id, "n1");
+        assert_eq!(app.focus, Focus::Post, "Esc cancels only the prefix");
+
+        let mut app = app_with(&["v", "w"]);
+        let v = tab_index(&app, "v");
+        app.active = v;
+        app.tabs[v].feed.posts = vec![post("v1", "v")];
+        app.tabs[v].feed.loaded = true;
+        app.open_current_post();
+        for key in "]s".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        let w = tab_index(&app, "w");
+        let generation = app.tabs[w].feed.generation;
+        press(&mut app, crossterm::event::KeyCode::Char('g'));
+        app.on_msg(Msg::Feed {
+            tab: app.tabs[w].id,
+            generation,
+            append: false,
+            result: Ok(listing("w", &["w1"], None)),
+        });
+        crate::keys::paste(&mut app, "]s");
+        app.tick();
+        assert!(app.post_view.is_none(), "paste cancels the deferred follow");
+
+        let mut app = app_with(&["q", "r"]);
+        let q = tab_index(&app, "q");
+        app.active = q;
+        app.tabs[q].feed.posts = vec![post("q1", "q")];
+        app.tabs[q].feed.loaded = true;
+        app.open_current_post();
+        for key in "]s".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        let r = tab_index(&app, "r");
+        let generation = app.tabs[r].feed.generation;
+        press(&mut app, crossterm::event::KeyCode::Char('q'));
+        assert!(!app.quit, "q returns to the list while a post is pending");
+        app.on_msg(Msg::Feed {
+            tab: app.tabs[r].id,
+            generation,
+            append: false,
+            result: Ok(listing("r", &["r1"], None)),
+        });
+        assert!(app.post_view.is_none());
+    }
+
+    #[test]
+    fn ancestor_navigation_should_follow_all_subs_groups_and_leave_empty_destinations_usable() {
+        let mut app = app_with(&["a", "b", "c"]);
+        app.resize(80);
+        app.all_subs.groups[0].posts = vec![post("a1", "a")];
+        app.all_subs.groups[2].posts = vec![post("c1", "c")];
+        app.open_current_post();
+        for key in "]s".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        assert_eq!(app.all_subs.group, 1);
+        assert!(app.post_view.is_none());
+        app.picture_settle.due(Instant::now() + NAV_SETTLE);
+        app.groups_drawn(&[1], &[]);
+        let generation = app.all_subs.groups[1].generation;
+        app.on_msg(Msg::Group {
+            subreddit: "b".into(),
+            generation,
+            result: Ok(listing("b", &["b1"], None)),
+        });
+        assert_eq!(app.current_post().unwrap().id, "b1");
+        assert_eq!(app.focus, Focus::Post);
+        for key in "]s".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        assert_eq!(app.current_post().unwrap().id, "c1");
+        assert_eq!(app.focus, Focus::Post);
+        let generation = app.post_view.as_ref().unwrap().generation;
+        for key in "]s".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        assert_eq!(app.post_view.as_ref().unwrap().generation, generation);
+        for key in "[s".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        assert_eq!(app.current_post().unwrap().id, "b1");
+        app.all_subs.groups[0].posts.clear();
+        app.all_subs.groups[0].freshness = Some(Freshness {
+            fetched_at: now(),
+            source: Source::default(),
+        });
+        for key in "[s".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        assert_eq!(app.all_subs.group, 0);
+        assert!(app.post_view.is_none());
+        assert_eq!(app.focus, Focus::List);
+        for key in "]s".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        assert_eq!(app.current_post().unwrap().id, "b1");
+        assert_eq!(app.focus, Focus::Post);
+        app.resize(200);
+        app.focus_main();
+        app.all_subs.groups[2].posts.clear();
+        app.all_subs.groups[2].freshness = Some(Freshness {
+            fetched_at: now(),
+            source: Source::default(),
+        });
+        app.move_all_subs_group(1);
+        assert_eq!(app.all_subs.group, 2);
+        app.open_current_post();
+        assert_eq!(app.current_post().unwrap().id, "b1");
+        for key in "]s".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        assert_eq!(app.all_subs.group, 2);
+        assert!(
+            app.post_view.is_none(),
+            "the selected post's community owns the move"
+        );
+        for key in "[s".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        assert_eq!(app.current_post().unwrap().id, "b1");
+        app.all_subs.groups[2].freshness = Some(Freshness {
+            fetched_at: now() - crate::cache::CONTENT_TTL - 1,
+            source: Source::default(),
+        });
+        for key in "]s".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        assert!(app.post_view.is_none());
+        app.picture_settle.due(Instant::now() + NAV_SETTLE);
+        app.groups_drawn(&[2], &[]);
+        let generation = app.all_subs.groups[2].generation;
+        app.on_msg(Msg::Group {
+            subreddit: "c".into(),
+            generation,
+            result: Ok(listing("c", &["fresh"], None)),
+        });
+        assert_eq!(app.current_post().unwrap().id, "fresh");
+        assert_eq!(app.focus, Focus::Post);
+    }
+
+    #[test]
+    fn ancestor_motions_should_jump_root_threads_without_changing_local_navigation() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(thread_message(
+            generation,
+            vec![
+                comment(
+                    "root",
+                    vec![comment("child", vec![comment("deep", vec![], None)], None)],
+                    None,
+                ),
+                comment("next", vec![], None),
+            ],
+        ));
+        let view = app.post_view.as_mut().unwrap();
+        view.free_scroll = false;
+        view.cursor = 2;
+
+        for key in "]]".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        assert_eq!(app.post_view.as_ref().unwrap().cursor, 3);
+        for key in "[[".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        assert_eq!(app.post_view.as_ref().unwrap().cursor, 0);
+        press(&mut app, crossterm::event::KeyCode::Char('j'));
+        assert_eq!(app.post_view.as_ref().unwrap().cursor, 1);
+        for key in "[c".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        assert_eq!(app.post_view.as_ref().unwrap().cursor, 1);
+        press(&mut app, crossterm::event::KeyCode::Char('k'));
+        assert_eq!(app.post_view.as_ref().unwrap().cursor, 0);
+    }
+
+    #[test]
+    fn ancestor_post_motions_should_follow_the_shown_post_and_keep_details_at_boundaries() {
+        for width in [80, 200] {
+            for source in 0..3 {
+                let mut app = app_with(&["a", "b", "c"]);
+                app.config.show_nsfw = false;
+                let first = post("first", "a");
+                let mut hidden = post("hidden", "a");
+                hidden.nsfw = true;
+                let second = post("second", "c");
+                let third = post("third", "c");
+                let posts = vec![first.clone(), hidden, second, third];
+                match source {
+                    0 => {
+                        app.active = tab_index(&app, "a");
+                        app.tabs[app.active].feed.posts = posts;
+                        app.tabs[app.active].feed.selected = 2;
+                    }
+                    1 => {
+                        for post in posts.iter().rev() {
+                            app.state.toggle_bookmark(post, 0);
+                        }
+                        app.active = BOOKMARKS_TAB;
+                        app.tabs[app.active].feed.selected = 2;
+                    }
+                    _ => {
+                        app.active = ALL_SUBS_TAB;
+                        app.config.all_subs_posts_per_group = 3;
+                        app.all_subs.groups[0].posts = posts[..2].to_vec();
+                        app.all_subs.groups[2].posts = posts[2..].to_vec();
+                        app.all_subs.group = 2;
+                        app.all_subs.post = 1;
+                    }
+                }
+                app.resize(width);
+                app.open_post_permalink(first.clone(), first.permalink.clone());
+                let old = app.post_view.as_ref().unwrap().generation;
+
+                for key in "]p".chars() {
+                    press(&mut app, crossterm::event::KeyCode::Char(key));
+                }
+
+                assert_eq!(app.focus, Focus::Post, "width={width}, source={source}");
+                assert_eq!(app.post_view.as_ref().unwrap().post.id, "second");
+                app.on_msg(Msg::Post {
+                    generation: old,
+                    result: Ok(Box::new(PostPage {
+                        post: first,
+                        body: "obsolete".into(),
+                        comments: vec![],
+                    })),
+                });
+                assert_eq!(app.current_post().unwrap().id, "second");
+                for key in "]p".chars() {
+                    press(&mut app, crossterm::event::KeyCode::Char(key));
+                }
+                assert_eq!(app.post_view.as_ref().unwrap().post.id, "third");
+                let view = app.post_view.as_mut().unwrap();
+                view.scroll = 31;
+                let generation = view.generation;
+                for key in "]p".chars() {
+                    press(&mut app, crossterm::event::KeyCode::Char(key));
+                }
+                let view = app.post_view.as_ref().unwrap();
+                assert_eq!((view.generation, view.scroll), (generation, 31));
+                for key in "[p".chars() {
+                    press(&mut app, crossterm::event::KeyCode::Char(key));
+                }
+                assert_eq!(app.post_view.as_ref().unwrap().post.id, "second");
+                assert_eq!(app.focus, Focus::Post);
+                press(&mut app, crossterm::event::KeyCode::Char('q'));
+                assert_eq!(app.current_post().unwrap().id, "second");
+                assert_eq!(app.focus, Focus::List);
+                let detached = post("detached", "a");
+                app.open_post_permalink(detached.clone(), detached.permalink);
+                let generation = app.post_view.as_ref().unwrap().generation;
+                for key in "]p".chars() {
+                    press(&mut app, crossterm::event::KeyCode::Char(key));
+                }
+                assert_eq!(app.post_view.as_ref().unwrap().generation, generation);
+            }
+        }
+    }
+
+    #[test]
+    fn ancestor_community_motions_should_skip_other_tabs_and_preserve_list_focus() {
+        let mut app = app_with(&["a", "c"]);
+        app.push_tab(TabKind::User {
+            name: "following".into(),
+            followed: true,
+            icon: None,
+        });
+        app.push_tab(TabKind::Subreddit {
+            name: "b".into(),
+            pinned: false,
+        });
+        app.push_tab(TabKind::User {
+            name: "opened".into(),
+            followed: false,
+            icon: None,
+        });
+        app.push_tab(TabKind::Subreddit {
+            name: "d".into(),
+            pinned: false,
+        });
+        app.active = 0;
+        app.focus_main();
+        for expected in ["a", "c", "b", "d", "d"] {
+            for key in "]s".chars() {
+                press(&mut app, crossterm::event::KeyCode::Char(key));
+            }
+            assert_eq!(app.active_tab().subreddit(), Some(expected));
+            assert_eq!(app.focus, Focus::List);
+        }
+        for expected in ["b", "c", "a", "a"] {
+            for key in "[s".chars() {
+                press(&mut app, crossterm::event::KeyCode::Char(key));
+            }
+            assert_eq!(app.active_tab().subreddit(), Some(expected));
+        }
+        app.switch_tab(ALL_SUBS_TAB);
+        app.all_subs.group = 1;
+        app.all_subs.groups[1].posts = vec![post("one", "c"), post("two", "c")];
+        app.all_subs.post = 1;
+        for key in "]s".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        assert_eq!((app.all_subs.group, app.all_subs.post), (1, 1));
+        for key in "[s".chars() {
+            press(&mut app, crossterm::event::KeyCode::Char(key));
+        }
+        assert_eq!((app.all_subs.group, app.all_subs.post), (0, 0));
+    }
+
+    #[test]
     fn next_top_level_from_the_top_of_a_post_selects_the_first_comment() {
         let mut app = app_with(&[]);
         app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
@@ -11792,7 +12668,7 @@ mod tests {
             view.free_scroll && view.scroll == 0
         };
 
-        // On the first comment, `k` goes up to the post; more `k` and `N` stay there
+        // On the first comment, `k` goes up to the post; more `k` and `[[` stay there
         // instead of flipping back down to the first comment.
         app.move_comment_cursor(1);
         assert!(!at_top(&app));
@@ -11810,7 +12686,7 @@ mod tests {
         let view = app.post_view.as_ref().unwrap();
         assert!(!view.free_scroll);
         assert_eq!(view.cursor, 0);
-        // `N` on the selected first thread goes up to the post, as `k` does.
+        // `[[` on the selected first thread goes up to the post, as `k` does.
         app.post_view.as_mut().unwrap().scroll = 4;
         app.jump_top_level(false);
         assert!(at_top(&app));
@@ -11852,13 +12728,13 @@ mod tests {
         // Inside the tall first comment: up keys select it, down keys the next one.
         assert_eq!(press_at(&mut app, 110, k), (false, 0, 110));
         assert_eq!(press_at(&mut app, 110, up), (false, 0, 110));
-        // A thread header exactly on the top line: `N` goes to the thread before.
+        // A thread header exactly on the top line: `[[` goes to the thread before.
         assert_eq!(press_at(&mut app, 140, up), (false, 0, 140));
         assert_eq!(press_at(&mut app, 110, j), (false, 1, 110));
         assert_eq!(press_at(&mut app, 110, down), (false, 1, 110));
-        // Inside a later thread, `N` selects that thread, not the one before.
+        // Inside a later thread, `[[` selects that thread, not the one before.
         assert_eq!(press_at(&mut app, 145, up), (false, 1, 145));
-        // Inside the last comment: `j` reads on by a line, `n` stays.
+        // Inside the last comment: `j` reads on by a line, `]]` stays.
         assert!(matches!(press_at(&mut app, 155, j), (true, _, 156)));
         assert!(matches!(press_at(&mut app, 155, down), (true, _, 155)));
 
@@ -11912,7 +12788,7 @@ mod tests {
         assert_eq!(
             after_n,
             (true, 120),
-            "`n` selects no reply: no thread follows"
+            "`]]` selects no reply: no thread follows"
         );
         assert_eq!(after_l, 2, "and `l` still returns to the comment `h` left");
     }
@@ -11965,7 +12841,7 @@ mod tests {
         view.row_starts = vec![10, 14, 18, 22, 26, 30];
         view.page_height = 20;
         view.free_scroll = false;
-        // Fold `a`, `h`, then `j`, `n`, `N` and `l`, all before the next draw.
+        // Fold `a`, `h`, then `j`, `]]`, `[[` and `l`, all before the next draw.
         app.activate_comment();
         app.leave_comment();
         app.post_view.as_mut().unwrap().scroll = 23;
@@ -12823,7 +13699,41 @@ mod tests {
     }
 
     #[test]
-    fn a_first_page_refresh_does_not_retry_a_failed_next_page() {
+    fn pagination_prefetch_should_reject_stale_queries_and_completed_cursors() {
+        for stale_query in [true, false] {
+            let mut app = app_with(&["vim"]);
+            let index = tab_index(&app, "vim");
+            app.switch_tab(index);
+            app.load_feed(index, false);
+            app.on_msg(Msg::Feed {
+                tab: app.tabs[index].id,
+                generation: app.tabs[index].feed.generation,
+                append: false,
+                result: Ok(listing("vim", &["a"], Some("a"))),
+            });
+            if stale_query {
+                app.tabs[index].feed.sort = Sort::New;
+            } else {
+                app.load_feed(index, true);
+                app.on_msg(Msg::Feed {
+                    tab: app.tabs[index].id,
+                    generation: app.tabs[index].feed.generation,
+                    append: true,
+                    result: Ok(listing("vim", &["b"], Some("a"))),
+                });
+            }
+
+            press(&mut app, crossterm::event::KeyCode::PageDown);
+
+            assert!(
+                !app.tabs[index].feed.loading_more(),
+                "stale_query={stale_query}: scrolling must not request an invalid continuation"
+            );
+        }
+    }
+
+    #[test]
+    fn pagination_reload_should_retry_a_failed_unseen_page_without_an_automatic_retry() {
         let mut app = app_with(&["vim"]);
         let i = tab_index(&app, "vim");
         app.switch_tab(i);
@@ -12865,8 +13775,18 @@ mod tests {
             !app.tabs[i].feed.loading(),
             "navigation must not retry the failed cursor"
         );
-        app.load_feed(i, true);
-        assert!(app.tabs[i].feed.loading(), "L still explicitly retries");
+        press(&mut app, crossterm::event::KeyCode::Char('r'));
+        assert!(
+            app.tabs[i].feed.loading_more(),
+            "r must resume the failed continuation"
+        );
+        assert_eq!(app.tabs[i].feed.posts[0].id, "a");
+        let generation = app.tabs[i].feed.generation;
+        press(&mut app, crossterm::event::KeyCode::Char('r'));
+        assert_eq!(
+            app.tabs[i].feed.generation, generation,
+            "r must not duplicate an active continuation"
+        );
     }
 
     fn thread_message(generation: u64, comments: Vec<Comment>) -> Msg {
@@ -15198,6 +16118,13 @@ mod tests {
         assert!(!app.state.is_read("p"));
         app.post_view.as_mut().unwrap().reveal_spoilers = true;
 
+        press(&mut app, crossterm::event::KeyCode::Char(' '));
+        app.keymap
+            .tick(Instant::now() + crate::keys::map::HINT_DELAY);
+        app.post_drawn(true);
+        assert!(!app.state.is_read("p"));
+        press(&mut app, crossterm::event::KeyCode::Esc);
+        press(&mut app, crossterm::event::KeyCode::Char(' '));
         app.post_drawn(true);
 
         assert!(app.state.is_read("p"));

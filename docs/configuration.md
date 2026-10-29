@@ -2,7 +2,7 @@
 
 [User guide](guide.md)
 
-Press `F2` to browse all settings. `Enter` toggles a boolean or opens an editor;
+Press `SPC p s` or `F2` to browse all settings. `Enter` toggles a boolean or opens an editor;
 `Enter` or `Ctrl+s` applies an edited value, and `Esc` cancels the draft.
 The screen separates **Reddit settings — u/name**, **Reader settings — u/name**,
 and **This device — all accounts**. Reddit preferences save to that account;
@@ -36,7 +36,7 @@ browser and image viewer.
 all_subs_posts_per_group = 3
 
 [media]
-image_preview = true       # also controlled by i
+image_preview = true       # also controlled by SPC v i
 
 [accounts.example_user.filters]
 keywords = ["giveaway"]    # case-insensitive title matches
@@ -60,7 +60,7 @@ arrive. Ordinary listings request 25 posts per page; filters can reduce the numb
 Replace `example_user` with your Reddit username without `u/`. Account names match
 without regard to case; saves retain the existing table spelling. Duplicate tables
 for the same username are rejected. An unidentified connection must reconnect with
-`A` before editing reader rules; it does not use signed-out rules. F2 creates the
+`SPC p a` before editing reader rules; it does not use signed-out rules. F2 creates the
 account tables when you edit reader rules.
 Use `[signed_out.filters]` and `[signed_out.highlight]` for signed-out browsing.
 There is no global filter inheritance. Removing an account section restores empty
@@ -100,7 +100,7 @@ the confirmation or save is active. An approved save finishes before redtab exit
 If apply fails, the source may already contain the edit; `r` prepares a fresh
 confirmation and retries. Source or target changes while confirming require
 another review. Templates, generated/encrypted sources, symlink targets and
-read-only sources remain session-only with an explanation. The `i` shortcut keeps
+read-only sources remain session-only with an explanation. The `SPC v i` shortcut keeps
 session changes until you open F2 to review saving them.
 
 ## Mature content and autoplay
@@ -109,7 +109,7 @@ F2 reads these preferences from Reddit. **Show NSFW** updates Reddit's native
 mature-content setting for feeds and search. Reddit
 may require completing a setting in its native interface; redtab reports that
 restriction. Content reloads after a confirmed change. **Autoplay videos** controls
-selected videos and GIFs; when off, press `P` to play manually.
+selected videos and GIFs; when off, press `SPC m p` to play manually.
 
 Preference failures leave the confirmed runtime policy intact and show an error.
 Refresh with `r` before another change if a save cannot be confirmed. Local reader

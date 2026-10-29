@@ -3,6 +3,7 @@
 
 mod experience;
 mod help;
+mod keymap;
 mod loading;
 mod rich_text;
 mod settings;
@@ -252,8 +253,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_overlay(f: &mut Frame, app: &mut App) -> Option<Rect> {
+    crate::keys::map::sync(app);
     if app.help_scroll.is_some() {
         return help::draw(f, app);
+    }
+    if app.keymap.hint_visible() {
+        return keymap::draw(f, app);
     }
     match &app.overlay {
         Some(Overlay::Settings) => Some(settings::draw(f, app)),
@@ -639,8 +644,8 @@ fn draw_sidebar(f: &mut Frame, app: &App, layout: &SidebarLayout, spots: &mut Ve
             Line::from(vec![
                 key_chip("F3"),
                 Span::styled(" search ", Style::new().fg(SUBTEXT)),
-                key_chip("C-l"),
-                Span::styled(" URL", Style::new().fg(SUBTEXT)),
+                key_chip("SPC"),
+                Span::styled(" keys", Style::new().fg(SUBTEXT)),
             ]),
         ])
         .style(panel),
@@ -681,7 +686,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, layout: &SidebarLayout, spots: &mut Ve
     f.render_widget(Paragraph::new(lines).style(panel), list);
 
     let (dot, color, label) = match app.health {
-        Health::SignedOut => ("○", YELLOW, "connect · A"),
+        Health::SignedOut => ("○", YELLOW, "connect: SPC p a"),
         Health::Unknown => ("○", OVERLAY, "reddit"),
         Health::Up => ("●", GREEN, "reddit"),
         Health::Paused => ("◐", YELLOW, "reddit paused"),
@@ -833,7 +838,7 @@ fn sort_chip(sort: Sort) -> Span<'static> {
 
 fn list_view_chip(app: &App) -> Span<'static> {
     chip(
-        format!("V {}", app.state.list_view().label()),
+        format!("SPC v c {}", app.state.list_view().label()),
         TEXT,
         SURFACE0,
     )
@@ -1549,7 +1554,7 @@ fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture], cover
                 .selected_video()
                 .is_some_and(|player| player.error().is_some())
             {
-                spot.status("unavailable · m opens media")
+                spot.status("unavailable · SPC o m opens media")
             } else if app.config.media.video_autoplay || app.selected_video().is_some() {
                 draw_visible_loading(
                     f,
@@ -1560,7 +1565,7 @@ fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture], cover
                 );
                 continue;
             } else {
-                spot.status("P play/pause")
+                spot.status("SPC m p play/pause")
             };
             draw_visible_status(f, spot.area, covered, &label);
             continue;
@@ -2044,7 +2049,7 @@ fn draw_all_subs(
             body,
             "○",
             "Connect Reddit",
-            "Press A to connect your account",
+            "Press SPC p a to connect your account",
         );
         return None;
     }
@@ -2065,7 +2070,7 @@ fn draw_all_subs(
         } else {
             (
                 "No joined communities",
-                "join communities on Reddit, then press r; p opens any subreddit".to_string(),
+                "join communities on Reddit, then press r; SPC b b opens any subreddit".to_string(),
             )
         };
         empty_state(f, body, "▦", title, &hint);
@@ -2357,7 +2362,7 @@ fn membership_chip(app: &App, target: &crate::model::MembershipTarget) -> Span<'
         status.into()
     } else {
         format!(
-            "{status} · S {}",
+            "{status} · SPC a m {}",
             membership.map_or_else(
                 || "check".into(),
                 |joined| target.action(!joined).to_ascii_lowercase()
@@ -2423,7 +2428,7 @@ fn draw_feed(
     }
     if access.is_none() && feed.error().is_some() && !feed.posts.is_empty() {
         let (label, retry) = if feed.page_failed() {
-            ("✗ next page failed", "L retry")
+            ("✗ next page failed", "r retry")
         } else {
             ("✗ reload failed", "r retry")
         };
@@ -2459,27 +2464,27 @@ fn draw_feed(
             body,
             "○",
             "Connect Reddit",
-            "Press A to connect your account",
+            "Press SPC p a to connect your account",
         );
         return None;
     }
     if let Some(access) = access {
         let compact = body.width < 36 || body.height < 8;
         let guidance = if compact && access == AccessDenied::PrivateCommunity {
-            "Approved members only · o Reddit"
+            "Approved members only · SPC o r Reddit"
         } else if compact {
-            "Check access · o Reddit"
+            "Check access · SPC o r Reddit"
         } else if access == AccessDenied::PrivateCommunity {
-            "Only approved members can view this community. Press o to open Reddit and check access."
+            "Only approved members can view this community. Press SPC o r to open Reddit and check access."
         } else {
-            "Reddit denied access to this community. Press o to open Reddit and check access or sign in."
+            "Reddit denied access to this community. Press SPC o r to open Reddit and check access or sign in."
         };
         empty_state(f, body, "🔒", access_title(access), guidance);
         return None;
     }
     if let Some(e) = error.filter(|_| posts.is_empty()) {
         let (title, retry) = if feed.page_failed() {
-            ("Could not load more posts", "L")
+            ("Could not load more posts", "r")
         } else {
             ("Could not load posts", "r")
         };
@@ -2526,9 +2531,9 @@ fn draw_feed(
                 "∅",
                 "No posts here",
                 if matches!(tab.kind, TabKind::User { .. }) {
-                    "s changes sort · O opens this profile in browser"
+                    "SPC f s sorts · SPC o c opens this profile"
                 } else {
-                    "try another sort with s, or a different subreddit with p"
+                    "SPC f s changes sort; SPC b b opens a subreddit"
                 },
             );
         }
@@ -2560,7 +2565,7 @@ fn draw_feed(
         )
     } else {
         let label = if feed.page_failed() {
-            Some("✗ Next page failed · L retries")
+            Some("✗ Next page failed · r retries")
         } else {
             feed_activity(feed, !app.reddit.needs_sign_in()).map(|(label, _)| label)
         };
@@ -2611,7 +2616,7 @@ fn draw_bookmarks(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListP
             if count == 0 && !app.state.bookmarks().is_empty() {
                 NSFW_EMPTY_HINT
             } else {
-                "press b on any post to keep it here"
+                "press SPC a b on any post to keep it here"
             },
         );
         return;
@@ -2919,7 +2924,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
         Media::Gallery { images, .. } if !images.is_empty() => {
             stats.push(Span::styled(
                 format!(
-                    "   image {}/{} · {{ }} browse",
+                    "   image {}/{} · [i ]i browse",
                     view.gallery_index % images.len() + 1,
                     images.len()
                 ),
@@ -2937,7 +2942,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
             if let Some(tag) = m.tag() {
                 stats.push(Span::raw("   "));
                 stats.push(chip(media_label(m, &tag), TEAL, SURFACE1));
-                stats.push(Span::styled("  m opens", Style::new().fg(OVERLAY)));
+                stats.push(Span::styled("  SPC o m opens", Style::new().fg(OVERLAY)));
             }
         }
     }
@@ -3550,7 +3555,7 @@ fn post_document(
             n => format!(" and its {} comments", format_count(n as i64)),
         };
         lines.push(Line::styled(
-            format!("⚠ Spoiler · v reveals the post{comments}"),
+            format!("⚠ Spoiler · SPC v s reveals the post{comments}"),
             Style::new().fg(YELLOW).add_modifier(Modifier::BOLD),
         ));
         return PostDocument {
@@ -3771,7 +3776,7 @@ fn video_status(app: &App) -> Line<'static> {
             Style::new().fg(RED),
         )),
         (None, _) if !app.config.media.video_autoplay && controls => {
-            spans.push(key_chip("P"));
+            spans.push(key_chip("SPC m p"));
             spans.push(Span::styled(" play · autoplay off", dim));
         }
         (None, _) if !app.config.media.video_autoplay => {
@@ -3801,7 +3806,6 @@ fn video_status(app: &App) -> Line<'static> {
                     Style::new().fg(TEXT),
                 ));
             }
-            // `a` turns the preference over; a video without sound says so.
             let wanted = app.video_sound_wanted();
             spans.push(Span::styled(
                 match (player.sound(), wanted) {
@@ -3813,9 +3817,13 @@ fn video_status(app: &App) -> Line<'static> {
             ));
             let pause = if player.paused() { "play" } else { "pause" };
             let sound = if wanted { "mute" } else { "sound" };
-            for (key, label) in [("P", pause), ("a", sound), (",/.", "seek")]
-                .into_iter()
-                .filter(|_| controls)
+            for (key, label) in [
+                ("SPC m p", pause),
+                ("SPC m m", sound),
+                ("SPC m h/l", "seek"),
+            ]
+            .into_iter()
+            .filter(|_| controls)
             {
                 spans.push(Span::raw("   "));
                 spans.push(key_chip(key));
@@ -3975,7 +3983,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, loaders: &VisibleLoaders) {
             app.health,
             Health::SignedOut | Health::Down | Health::Paused
         );
-    let help_width = if area.width >= 180
+    let help_width = if playback_error.is_some() && area.width < 40 {
+        area.width.min(2)
+    } else if area.width >= 180
         || (area.width >= 64
             && app.settings.store.persistence == crate::config::store::Persistence::Unsaved)
     {
@@ -4031,19 +4041,19 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, loaders: &VisibleLoaders) {
             .current_post()
             .is_some_and(|post| post.media.youtube_url().is_some())
         {
-            "m browser"
+            "SPC o m browser"
         } else {
-            "m media"
+            "SPC o m media"
         };
         let label = if content_width < 28 {
-            "✗ P retry".into()
+            "✗ SPC m p retry".into()
         } else {
-            format!("✗ P retry · {handoff} · {error}")
+            format!("✗ SPC m p retry · {error} · {handoff}")
         };
         Line::from(Span::styled(label, Style::new().fg(RED)))
     } else if app.health == Health::SignedOut {
         Line::from(Span::styled(
-            " Reddit sign-in required · A connect",
+            " Reddit sign-in required · SPC p a connect",
             Style::new().fg(YELLOW),
         ))
     } else if app.health == Health::Down {
@@ -4060,225 +4070,15 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, loaders: &VisibleLoaders) {
             ),
         ])
     } else {
-        // `x` closes only a tab opened with `p`.
-        let closable = matches!(
-            app.active_tab().kind,
-            TabKind::Subreddit { pinned: false, .. }
-                | TabKind::User {
-                    followed: false,
-                    ..
-                }
-        );
-        let dynamic;
-        let hints: &[(&str, &str)] = if app.post_focused() {
-            let playback = (app.video_controls_available()
-                && app.post_view.as_ref().is_some_and(|view| view.image_shown))
-            .then(|| {
-                [
-                    (
-                        "P",
-                        if app.selected_video().is_some_and(|p| !p.paused()) {
-                            "pause"
-                        } else {
-                            "play"
-                        },
-                    ),
-                    ("a", "sound"),
-                    (",/.", "seek"),
-                ]
-            });
-            let spoilers = app.post_view.as_ref().is_some_and(PostView::has_spoilers);
-            // `c` selects the comment being read, or acts on the selected row.
-            let c = app.post_view.as_ref().and_then(|v| {
-                let rows = v.rows();
-                if v.free_scroll {
-                    return (!rows.is_empty()).then_some(("c", "select"));
-                }
-                match &rows.get(v.cursor)?.kind {
-                    RowKind::More { parent, .. } if v.loading_more.contains(*parent) => None,
-                    RowKind::More { .. } => Some(("c", "load")),
-                    RowKind::Comment { comment, .. } if v.collapsed.contains(&comment.id) => {
-                        Some(("c", "unfold"))
-                    }
-                    RowKind::Comment { comment, .. }
-                        if !comment.replies.is_empty() || comment.more.is_some() =>
-                    {
-                        Some(("c", "fold"))
-                    }
-                    RowKind::Comment { .. } => None,
-                }
-            });
-            let shown_post = app.post_view.as_ref().map(PostView::shown_post);
-            let media = shown_post
-                .is_some_and(|p| !matches!(p.media, Media::None))
-                .then_some(("m", "media"));
-            let save = if shown_post.is_some_and(|p| app.state.is_bookmarked(&p.id)) {
-                ("b", "unbookmark")
-            } else {
-                ("b", "bookmark")
-            };
-            dynamic = playback
-                .into_iter()
-                .flatten()
-                .chain([("j/k", "comments"), ("B", "community")])
-                .chain(spoilers.then_some(("v", "spoilers")))
-                .chain(c)
-                .chain([("space", "page")])
-                .chain([("S", "join/leave")])
-                .chain(media)
-                .chain([
-                    ("o", "browser"),
-                    save,
-                    ("h", if app.detail_fits() { "list" } else { "back" }),
-                ])
-                .collect::<Vec<_>>();
-            &dynamic
-        } else if app.focus == Focus::Sidebar {
-            dynamic = [
-                ("j/k", "tabs"),
-                ("l/⏎", "list"),
-                ("S", "join/leave"),
-                (
-                    "B",
-                    if matches!(app.active_tab().kind, TabKind::User { .. }) {
-                        "profile"
-                    } else {
-                        "community"
-                    },
-                ),
-                ("o", "browser"),
-                ("g/G", "first/last"),
-                ("p", "jump"),
-            ]
-            .into_iter()
-            .chain(closable.then_some(("x", "close")))
+        let owned = crate::keys::footer_hints(app);
+        let hints: Vec<_> = owned
+            .iter()
+            .map(|(key, label)| (key.as_str(), label.as_str()))
             .collect();
-            &dynamic
-        } else if app.restricted_community().is_some() {
-            dynamic = vec![
-                (
-                    "o",
-                    if content_width < 20 {
-                        "Reddit"
-                    } else {
-                        "open Reddit"
-                    },
-                ),
-                ("r", "check access"),
-                ("p", "jump"),
-                ("B", "community"),
-            ];
-            &dynamic
-        } else if app.video_controls_available() {
-            dynamic = vec![
-                ("j/k", "move"),
-                ("⏎", "open"),
-                (
-                    "P",
-                    if app
-                        .video
-                        .as_ref()
-                        .is_some_and(|player| !player.paused() && player.error().is_none())
-                    {
-                        "pause"
-                    } else {
-                        "play"
-                    },
-                ),
-                ("a", "sound"),
-                (",/.", "seek"),
-                ("PgUp/Dn", "page"),
-                ("m", "media"),
-                ("V", "view"),
-            ];
-            &dynamic
-        } else {
-            match app.active_tab().kind {
-                TabKind::AllSubs => &[
-                    ("j/k", "posts"),
-                    ("J/K", "communities"),
-                    ("⏎", "open"),
-                    ("B", "community"),
-                    ("space", "subreddit"),
-                    ("S", "join/leave"),
-                    ("tab", "next"),
-                    ("p", "jump"),
-                ],
-                TabKind::Bookmarks => &[
-                    ("j/k", "move"),
-                    ("⏎", "open"),
-                    ("B", "community"),
-                    ("V", "view"),
-                    ("PgUp/Dn", "page"),
-                    ("space", "sub"),
-                    ("S", "join/leave"),
-                    ("b", "remove"),
-                    ("o", "browser"),
-                    ("p", "jump"),
-                ],
-                TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. } => {
-                    let feed = &app.active_tab().feed;
-                    let time =
-                        (feed.sort.takes_time() && feed.search.is_none()).then_some(("t", "time"));
-                    dynamic = [("j/k", "move"), ("⏎", "open")]
-                        .into_iter()
-                        .chain(
-                            matches!(app.active_tab().kind, TabKind::User { .. })
-                                .then_some(("S", "follow/unfollow")),
-                        )
-                        .chain([
-                            ("B", "community"),
-                            ("V", "view"),
-                            ("PgUp/Dn", "page"),
-                            ("space", "sub"),
-                            ("s", "sort"),
-                        ])
-                        .chain(time)
-                        .chain(app.active_tab().subreddit().map(|_| ("/", "search")))
-                        .chain([("p", "jump")])
-                        .chain(closable.then_some(("x", "close")))
-                        .collect();
-                    &dynamic
-                }
-            }
-        };
         // Keep whole key + label pairs; do not build pairs past the available width.
         let mut fitted = vec![Span::raw(" ")];
         let mut used = 1;
-        let target = app.membership_target();
-        let action = target.as_ref().map(|target| {
-            app.subscribed(target).map_or_else(
-                || "check".into(),
-                |joined| target.action(!joined).to_ascii_lowercase(),
-            )
-        });
-        for (key, label) in hints
-            .iter()
-            .chain([("F3", "explore"), ("C-l", "URL")].iter())
-        {
-            if *key == "S" && target.is_none() {
-                continue;
-            }
-            if *key == "space"
-                && app
-                    .community()
-                    .filter(|name| crate::reddit::is_community(name))
-                    .is_none()
-                && app.profile_context().is_none()
-            {
-                continue;
-            }
-            let label = if *key == "S" {
-                action.as_deref().unwrap_or("check")
-            } else if *key == "B" && matches!(target, Some(crate::model::MembershipTarget::User(_)))
-            {
-                "profile"
-            } else {
-                label
-            };
-            if *key == "PgUp/Dn" && app.state.list_view() != ListView::Card {
-                continue;
-            }
+        for (key, label) in &hints {
             let pair = [
                 key_chip(key),
                 Span::styled(format!(" {label}  "), Style::new().fg(OVERLAY)),
@@ -4389,7 +4189,7 @@ fn wrapped_rows(text: &str, width: u16) -> usize {
         .sum()
 }
 
-fn fitting_label(labels: &[&'static str], width: usize) -> &'static str {
+fn fitting_label<'a>(labels: &[&'a str], width: usize) -> &'a str {
     labels
         .iter()
         .copied()
@@ -4593,7 +4393,7 @@ fn draw_sort(f: &mut Frame, app: &App, selected: usize) -> Rect {
             let mut spans = vec![
                 Span::styled(if i == selected { "▌" } else { " " }, bg.fg(ACCENT)),
                 Span::styled(
-                    format!(" {} ", &name[..1]),
+                    format!(" {} ", if *s == Sort::Hot { "H" } else { &name[..1] }),
                     bg.fg(LAVENDER).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
@@ -4629,11 +4429,11 @@ fn draw_membership(f: &mut Frame, target: &crate::model::MembershipTarget, join:
     let hint = fitting_label(
         &[
             if matches!(target, crate::model::MembershipTarget::User(_)) {
-                "Space open profile"
+                "o open profile"
             } else {
-                "Space open subreddit"
+                "o open subreddit"
             },
-            "Space open",
+            "o open",
         ],
         width,
     );
@@ -5228,7 +5028,7 @@ pub(crate) mod tests {
         let actual = screen(&mut app, 90, 24);
         assert!(actual.contains("Connect Reddit"), "{actual}");
         assert!(
-            actual.contains("Press A to connect your account"),
+            actual.contains("Press SPC p a to connect your account"),
             "{actual}"
         );
         assert!(!actual.contains("Loading"), "{actual}");
@@ -5503,6 +5303,7 @@ pub(crate) mod tests {
             Query::Thread("post".into()),
         ] {
             app.experience.screens = vec![Screen::Browse {
+                pagination: Default::default(),
                 query,
                 page: Page {
                     title: "u/reader · Overview".into(),
@@ -5674,6 +5475,7 @@ pub(crate) mod tests {
         let mut app = app(&[]);
         app.overlay = Some(Overlay::Experience);
         app.experience.screens = vec![Screen::Browse {
+            pagination: Default::default(),
             query,
             page: Page {
                 title: "Collection".into(),
@@ -5810,17 +5612,13 @@ pub(crate) mod tests {
         let mut app = description_popup(query.clone(), "", &["Description"]);
         key(&mut app, KeyCode::F(1), KeyModifiers::NONE);
         let sections = help::entries(&app);
-        assert!(sections.iter().any(
-            |(keys, action)| keys.contains("C-d/u") && action == "scroll the selected content"
-        ));
+        assert!(
+            sections
+                .iter()
+                .any(|(keys, action)| keys == "C-d" && action == "Half page down")
+        );
         key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        app.experience.pending = Some((
-            1,
-            Request::Read {
-                query,
-                after: Some("next".into()),
-            },
-        ));
+        app.experience.pending = Some((1, Request::Read { query, after: None }));
 
         key(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
         assert!(matches!(
@@ -5974,7 +5772,7 @@ pub(crate) mod tests {
                 assert!(
                     shown.contains("Enter")
                         && shown.contains("Esc cancel")
-                        && shown.contains("Space open subreddit"),
+                        && shown.contains("o open subreddit"),
                     "{shown}"
                 );
             }
@@ -5987,7 +5785,7 @@ pub(crate) mod tests {
         app.open_subreddit("rust");
         let shown = screen(&mut app, 120, 24);
         assert!(
-            shown.contains("Joined") && shown.contains("S leave"),
+            shown.contains("Joined") && shown.contains("SPC a m leave"),
             "{shown}"
         );
         app.open_subreddit("armenia");
@@ -6032,7 +5830,7 @@ pub(crate) mod tests {
             home.contains("best") && home.contains("r/rust") && home.contains("personalized"),
             "{home}"
         );
-        assert!(!home.contains("J/K"), "{home}");
+        assert!(home.contains("]s"), "{home}");
 
         app.switch_tab(crate::app::ALL_SUBS_TAB);
         app.on_msg(Msg::Group {
@@ -6048,7 +5846,7 @@ pub(crate) mod tests {
             islands.contains("▦ All subs") && islands.contains("personalized"),
             "{islands}"
         );
-        assert!(islands.contains("J/K"), "{islands}");
+        assert!(islands.contains("]s"), "{islands}");
     }
 
     #[test]
@@ -6070,12 +5868,12 @@ pub(crate) mod tests {
     fn when_home_sorts_change_best_should_be_available_only_on_home() {
         let mut app = app(&["rust"]);
         app.switch_tab(0);
-        press(&mut app, 's');
+        press_keys(&mut app, " fs");
         assert!(screen(&mut app, 80, 24).contains("best"));
         press(&mut app, 'n');
         assert_eq!(app.active_tab().feed.sort, Sort::New);
         app.open_subreddit("rust");
-        press(&mut app, 's');
+        press_keys(&mut app, " fs");
         assert!(!screen(&mut app, 80, 24).contains("best"));
     }
 
@@ -6346,7 +6144,7 @@ pub(crate) mod tests {
         page.body.clear();
         page.comments[0].body = format!("{PICTURE}{url}\n\n{}", paragraphs("line", 1..=60));
         screen(&mut app, 100, 30);
-        press(&mut app, ' ');
+        key(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
         let top = |s: &str| {
             s.lines().find_map(|l| {
                 let rest = l.split("line ").nth(1)?;
@@ -6502,8 +6300,8 @@ pub(crate) mod tests {
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         page.comments[0].body = format!("intro\n{PICTURE}{url}\n\n{}", paragraphs("line", 1..=60));
         screen(&mut app, 100, 30);
-        for key in [' ', ' ', ' ', 'l'] {
-            press(&mut app, key);
+        for keys in ["\u{6}", "\u{6}", "\u{6}", "l"] {
+            press_keys(&mut app, keys);
         }
         let before = first_numbered_line(&screen(&mut app, 100, 30));
 
@@ -6768,7 +6566,7 @@ pub(crate) mod tests {
             let words = actual.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(words.contains("Private community"), "{actual}");
             assert!(
-                words.contains("o Reddit") || words.contains("o open Reddit"),
+                words.contains("SPC o r Reddit") || words.contains("SPC o r to open Reddit"),
                 "{actual}"
             );
             assert!(
@@ -6866,9 +6664,12 @@ pub(crate) mod tests {
         let mut app = denied_community(AccessDenied::PrivateCommunity);
         press(&mut app, '?');
         let actual = screen(&mut app, 100, 14);
-        assert!(actual.contains("Private community"), "{actual}");
-        assert!(actual.contains("open this community on Reddit"), "{actual}");
-        assert!(actual.contains("check access again"), "{actual}");
+        assert!(actual.contains("Feed"), "{actual}");
+        assert!(
+            actual.contains("Open the current item on Reddit"),
+            "{actual}"
+        );
+        assert!(actual.contains("Reload / retry"), "{actual}");
     }
 
     #[cfg(unix)]
@@ -6886,7 +6687,7 @@ pub(crate) mod tests {
             "printf '%s' \"$1\" > \"$0\"".into(),
             file.to_string_lossy().into_owned(),
         ];
-        press(&mut app, 'o');
+        press_keys(&mut app, " or");
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         let actual = loop {
             if let Ok(text) = std::fs::read_to_string(&file)
@@ -7128,8 +6929,8 @@ pub(crate) mod tests {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(footer.contains("P play"), "{actual}");
-        assert!(footer.contains("a sound"), "{actual}");
+        assert!(footer.contains("SPC m p play"), "{actual}");
+        assert!(footer.contains("SPC m m sound"), "{actual}");
     }
 
     #[test]
@@ -7149,7 +6950,7 @@ pub(crate) mod tests {
         let actual = screen(&mut app, 100, 20);
 
         assert!(
-            actual.lines().last().unwrap().contains("P retry"),
+            actual.lines().last().unwrap().contains("SPC m p retry"),
             "{actual}"
         );
     }
@@ -7165,7 +6966,7 @@ pub(crate) mod tests {
         assert!(app.video_area.is_none());
         let actual = screen(&mut app, 100, 50);
         assert!(
-            actual.lines().last().unwrap().contains("P retry"),
+            actual.lines().last().unwrap().contains("SPC m p retry"),
             "{actual}"
         );
     }
@@ -7432,7 +7233,7 @@ pub(crate) mod tests {
         );
         assert!(view.row_starts[view.cursor] > view.rendered_pictures[0].2);
         assert!(view.row_starts[view.cursor] < view.scroll + view.page_height);
-        press(&mut app, 'g');
+        press_keys(&mut app, "gg");
         let top = detail_pictures(&mut app, 80, 30);
         assert_eq!(top[0].skipped, 0);
     }
@@ -7493,7 +7294,7 @@ pub(crate) mod tests {
     fn a_short_detail_image_should_stay_when_page_scrolling_clamps_at_the_top() {
         let mut app = image_post("short");
         let at_top = screen(&mut app, 100, 40);
-        press(&mut app, ' ');
+        key(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
         let paged = screen(&mut app, 100, 40);
         let redrawn = screen(&mut app, 100, 40);
 
@@ -7657,10 +7458,10 @@ pub(crate) mod tests {
         press(&mut app, 'j');
         let on_more = footer(&mut app);
         // Asked for: the row says "loading replies", and `c` does nothing more.
-        press(&mut app, 'c');
+        press_keys(&mut app, "za");
         let loading = footer(&mut app);
         press(&mut app, 'k');
-        press(&mut app, 'c');
+        press_keys(&mut app, "za");
         let folded = footer(&mut app);
         // A comment without replies: `c` does nothing there, so no hint.
         let (mut leaf, _) = open_long_post(|_| {});
@@ -7767,7 +7568,7 @@ pub(crate) mod tests {
         });
         screen(&mut app, 100, 30);
         press(&mut app, 'j');
-        press(&mut app, 'c');
+        press_keys(&mut app, "za");
         let s = screen(&mut app, 100, 30);
 
         assert!(s.contains("+3 folded"), "{s}");
@@ -7822,15 +7623,15 @@ pub(crate) mod tests {
             .join("\n\n");
         screen(&mut app, 100, 60);
         // Reveal; select "marker 1" (row 2); `h`, `l` hold it at scroll 0.
-        for key in ['v', 'j', 'j', 'j', 'h', 'l'] {
-            press(&mut app, key);
+        for keys in [" vs", "j", "j", "j", "h", "l"] {
+            press_keys(&mut app, keys);
             screen(&mut app, 100, 60);
         }
         let view = app.post_view.as_ref().unwrap();
         let held = (view.cursor, view.hold_view.is_some(), view.scroll);
 
         // Hiding the spoilers again adds lines above the held comment.
-        press(&mut app, 'v');
+        press_keys(&mut app, " vs");
         let s = screen(&mut app, 100, 60);
 
         assert_eq!(held, (2, true, 0));
@@ -7898,7 +7699,7 @@ pub(crate) mod tests {
             .hold_view
             .is_some_and(|h| h.top);
         let row_of = |s: &str| s.lines().position(|l| l.contains("marker 1 "));
-        press(&mut app, 'i');
+        press_keys(&mut app, " vi");
         let before = row_of(&screen(&mut app, 100, 60));
 
         load_two_replies_above(&mut app);
@@ -7912,10 +7713,10 @@ pub(crate) mod tests {
     #[test]
     fn images_on_and_a_load_in_one_pass_show_the_image() {
         let mut app = marker_selected_under_the_image();
-        press(&mut app, 'i');
+        press_keys(&mut app, " vi");
         screen(&mut app, 100, 60);
 
-        press(&mut app, 'i');
+        press_keys(&mut app, " vi");
         load_two_replies_above(&mut app);
         let s = screen(&mut app, 100, 60);
 
@@ -7943,7 +7744,7 @@ pub(crate) mod tests {
         screen(&mut app, 100, 60);
 
         // A spoiler only below it is revealed.
-        press(&mut app, 'v');
+        press_keys(&mut app, " vs");
         let s = screen(&mut app, 100, 60);
 
         assert!(s.contains("loading image"), "{s}");
@@ -7959,7 +7760,7 @@ pub(crate) mod tests {
             let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
             page.comments[0].body = "first".into();
             screen(&mut app, 100, 60);
-            press(&mut app, ' ');
+            key(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
             if load {
                 let generation = app.post_view.as_ref().unwrap().generation;
                 app.on_msg(Msg::MoreReplies {
@@ -8007,7 +7808,7 @@ pub(crate) mod tests {
         assert_eq!(app.post_view.as_ref().unwrap().cursor, 2, "c2 selected");
 
         // Spoilers above it rewrap, then replies load above it.
-        press(&mut app, 'v');
+        press_keys(&mut app, " vs");
         let after_v = draw(&mut app);
         app.on_msg(Msg::MoreReplies {
             generation: app.post_view.as_ref().unwrap().generation,
@@ -8125,7 +7926,7 @@ pub(crate) mod tests {
         };
         let before = shown(&screen(&mut app, 100, 30));
 
-        press(&mut app, 'v');
+        press_keys(&mut app, " vs");
         let after = shown(&screen(&mut app, 100, 30));
         let revealed_start = app.post_view.as_ref().unwrap().row_starts[0];
 
@@ -8201,14 +8002,14 @@ pub(crate) mod tests {
     #[test]
     fn a_scroll_key_after_v_in_the_same_batch_still_scrolls() {
         // Each batch of keys is handled before one draw, as the main loop does.
-        let scroll_after = |batches: &[&[char]]| {
+        let scroll_after = |batches: &[&[&str]]| {
             let mut app = post_with_rewrapping_spoilers(0);
             let view = app.post_view.as_mut().unwrap();
             view.scroll = view.row_starts[0] + 10;
             screen(&mut app, 100, 30);
             for batch in batches {
                 for &key in *batch {
-                    press(&mut app, key);
+                    press_keys(&mut app, key);
                 }
                 screen(&mut app, 100, 30);
             }
@@ -8217,11 +8018,11 @@ pub(crate) mod tests {
 
         // Paging after `v` moves on from the kept text, drawn or not in between.
         assert_eq!(
-            scroll_after(&[&['v', ' ']]),
-            scroll_after(&[&['v'], &[' ']])
+            scroll_after(&[&[" vs", "\u{6}"]]),
+            scroll_after(&[&[" vs"], &["\u{6}"]])
         );
         // Hiding again adds lines above; `g` in the same batch still goes to the top.
-        assert_eq!(scroll_after(&[&['v'], &['v', 'g']]), 0);
+        assert_eq!(scroll_after(&[&[" vs"], &[" vs", "gg"]]), 0);
     }
 
     #[test]
@@ -8237,7 +8038,7 @@ pub(crate) mod tests {
         };
         let before = shown(&screen(&mut app, 100, 30));
 
-        press(&mut app, 'v');
+        press_keys(&mut app, " vs");
         let after = shown(&screen(&mut app, 100, 30));
 
         assert!(before.is_some());
@@ -8261,7 +8062,7 @@ pub(crate) mod tests {
             screen(&mut app, 100, 30);
             app.post_view.as_mut().unwrap().scroll = scroll;
             before.push(shown(&screen(&mut app, 100, 30)));
-            press(&mut app, 'v');
+            press_keys(&mut app, " vs");
             after.push(shown(&screen(&mut app, 100, 30)));
         }
 
@@ -8328,7 +8129,7 @@ pub(crate) mod tests {
     #[test]
     fn a_scroll_key_after_v_on_a_selected_comment_moves_on_from_its_text() {
         // Returns the first visible "line N" and the scroll.
-        let after = |batches: &[&[char]]| {
+        let after = |batches: &[&[&str]]| {
             let mut app = post_with_rewrapping_spoilers(0);
             let view = app.post_view.as_mut().unwrap();
             view.cursor = 0;
@@ -8337,7 +8138,7 @@ pub(crate) mod tests {
             screen(&mut app, 100, 30);
             for batch in batches {
                 for &key in *batch {
-                    press(&mut app, key);
+                    press_keys(&mut app, key);
                 }
                 screen(&mut app, 100, 30);
             }
@@ -8348,9 +8149,12 @@ pub(crate) mod tests {
             (first, app.post_view.as_ref().unwrap().scroll)
         };
 
-        assert_eq!(after(&[&['v', ' ']]).0, after(&[&['v'], &[' ']]).0);
+        assert_eq!(
+            after(&[&[" vs", "\u{6}"]]).0,
+            after(&[&[" vs"], &["\u{6}"]]).0
+        );
         // Hiding again adds lines above; `g` in the same batch still goes to the top.
-        assert_eq!(after(&[&['v'], &['v', 'g']]).1, 0);
+        assert_eq!(after(&[&[" vs"], &[" vs", "gg"]]).1, 0);
     }
 
     #[test]
@@ -8369,13 +8173,13 @@ pub(crate) mod tests {
         let hidden = screen(&mut app, 100, 30);
         // No comment can be selected or folded while unseen.
         let rows_hidden = app.post_view.as_ref().unwrap().rows().is_empty();
-        press(&mut app, 'v');
+        press_keys(&mut app, " vs");
         let shown = screen(&mut app, 100, 30);
 
         assert!(masked.contains("the butler did it"), "{masked}");
         assert!(masked.contains("so ▒▒▒▒▒▒▒ was the sled"), "{masked}");
         assert!(
-            hidden.contains("v reveals the post and its comment"),
+            hidden.contains("SPC v s reveals the post and its comment"),
             "{hidden}"
         );
         assert!(
@@ -8398,15 +8202,15 @@ pub(crate) mod tests {
         press(&mut app, 'G');
         let after_g = reading(&app);
         // Reveal and draw, then hide and press `j` before the next draw.
-        press(&mut app, 'v');
+        press_keys(&mut app, " vs");
         screen(&mut app, 100, 30);
-        press(&mut app, 'v');
+        press_keys(&mut app, " vs");
         press(&mut app, 'j');
         let after_hide_j = reading(&app);
         // Hidden (positions cleared), then reveal and `G` before the next draw:
         // `G` scrolls down to the last comment, it does not hold the view.
         screen(&mut app, 100, 30);
-        press(&mut app, 'v');
+        press_keys(&mut app, " vs");
         press(&mut app, 'G');
         let g_holds = app.post_view.as_ref().unwrap().hold_view.is_some();
 
@@ -8421,8 +8225,8 @@ pub(crate) mod tests {
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         page.comments[0].body = paragraphs("line", 1..=40);
         // Select the tall comment, then page down inside it: its header leaves.
-        for key in ['j', ' ', ' '] {
-            press(&mut app, key);
+        for keys in ["j", "\u{6}", "\u{6}"] {
+            press_keys(&mut app, keys);
             screen(&mut app, 100, 30);
         }
         let reading = app.post_view.as_ref().unwrap().scroll;
@@ -8441,7 +8245,7 @@ pub(crate) mod tests {
         let after_j = app.post_view.as_ref().unwrap().scroll;
         // `G` while reading inside the last comment stays too.
         press(&mut app, 'h');
-        press(&mut app, ' ');
+        key(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
         screen(&mut app, 100, 30);
         let paged = app.post_view.as_ref().unwrap().scroll;
         press(&mut app, 'G');
@@ -8470,7 +8274,7 @@ pub(crate) mod tests {
         // Read into a tall last comment below two "more replies" rows; then `keys`,
         // with a draw after each only when `draw_between`; then 20 replies load
         // under each comment in `loads`, all before one draw.
-        let run = |keys: &[char], draw_between: bool, loads: &[&str]| {
+        let run = |keys: &[&str], draw_between: bool, loads: &[&str]| {
             let (mut app, _) = open_long_post(|_| {});
             let generation = app.post_view.as_ref().unwrap().generation;
             let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
@@ -8487,13 +8291,13 @@ pub(crate) mod tests {
                 ..page.comments[0].clone()
             });
             page.comments.push(tall);
-            for key in ['G', ' '] {
-                press(&mut app, key);
+            for key in ["G", "\u{6}"] {
+                press_keys(&mut app, key);
                 screen(&mut app, 100, 30);
             }
             let before = first_line(&screen(&mut app, 100, 30));
             for &key in keys {
-                press(&mut app, key);
+                press_keys(&mut app, key);
                 if draw_between {
                     screen(&mut app, 100, 30);
                 }
@@ -8515,10 +8319,10 @@ pub(crate) mod tests {
         };
 
         let (before, reading) = run(&[], true, &["c"]);
-        let (_, selected) = run(&['l'], true, &["c"]);
+        let (_, selected) = run(&["l"], true, &["c"]);
         // The main loop handles keys, then messages, then draws: `l` and the
         // replies, or two loads, can land before one draw.
-        let (_, same_pass) = run(&['l'], false, &["c"]);
+        let (_, same_pass) = run(&["l"], false, &["c"]);
         let (_, two_loads) = run(&[], true, &["c", "c2"]);
 
         assert!(
@@ -8647,9 +8451,9 @@ pub(crate) mod tests {
 
         // Replace A's child with B's before a draw: the row count stays four,
         // but their positions change. Reselect only after the draw places them.
-        press(&mut app, 'c');
+        press_keys(&mut app, "za");
         press(&mut app, 'j');
-        press(&mut app, 'c');
+        press_keys(&mut app, "za");
         press(&mut app, 'h');
         press(&mut app, 'l');
 
@@ -8666,20 +8470,20 @@ pub(crate) mod tests {
     #[test]
     fn upward_keys_in_a_long_body_read_upward() {
         let (mut app, _) = open_long_post(|_| {});
-        press(&mut app, ' ');
+        key(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
         screen(&mut app, 100, 30);
         let paged = app.post_view.as_ref().unwrap().scroll;
 
         press(&mut app, 'k');
         screen(&mut app, 100, 30);
         let after_k = app.post_view.as_ref().unwrap().scroll;
-        press(&mut app, 'N');
+        press_keys(&mut app, "[[");
         screen(&mut app, 100, 30);
         let view = app.post_view.as_ref().unwrap();
 
         assert!(paged > 0);
         assert_eq!(after_k, paged - 1, "`k` scrolls up a line, not down");
-        assert_eq!(view.scroll, 0, "`N` from the body goes to the post's top");
+        assert_eq!(view.scroll, 0, "`[[` from the body goes to the post's top");
         assert!(view.free_scroll);
     }
 
@@ -8714,7 +8518,7 @@ pub(crate) mod tests {
         let mut app = feed_app(Picker::halfblocks());
         app.no_color = true;
 
-        press(&mut app, 'i');
+        press_keys(&mut app, " vi");
         let s = screen(&mut app, 100, 20);
 
         assert!(app.show_images, "i changes nothing it cannot show");
@@ -9478,6 +9282,7 @@ pub(crate) mod tests {
         let mut app = app(&[]);
         app.overlay = Some(Overlay::Experience);
         app.experience.screens.push(Screen::Browse {
+            pagination: Default::default(),
             query: Query::Multis,
             page: Page {
                 title: "Custom feeds".into(),
@@ -9518,6 +9323,16 @@ pub(crate) mod tests {
                 ..
             })
         ));
+        app.on_experience(91, Err("offline".into()));
+        for (width, height) in [(24, 10), (40, 12), (100, 30)] {
+            let actual = screen(&mut app, width, height);
+            assert!(actual.contains("Existing feed"), "{actual}");
+            assert!(actual.contains("r retry"), "{actual}");
+        }
+        press(&mut app, 'r');
+        assert!(
+            matches!(&app.experience.pending, Some((_, Request::Read { after: Some(cursor), .. })) if cursor == "next")
+        );
     }
 
     #[test]
@@ -9528,6 +9343,7 @@ pub(crate) mod tests {
             let mut app = app(&[]);
             app.overlay = Some(Overlay::Experience);
             app.experience.screens.push(Screen::Browse {
+                pagination: Default::default(),
                 query: Query::Multis,
                 page: Page {
                     title: "Custom feeds".into(),
@@ -9679,7 +9495,7 @@ pub(crate) mod tests {
         let actual = screen(&mut app, 100, 24);
 
         assert!(
-            actual.contains("Could not load more posts") && actual.contains("press L to retry"),
+            actual.contains("Could not load more posts") && actual.contains("press r to retry"),
             "{actual}"
         );
     }
@@ -10069,7 +9885,7 @@ pub(crate) mod tests {
 
         let actual = screen(&mut app, 80, 20);
 
-        assert!(actual.contains("Next page failed · L retries"), "{actual}");
+        assert!(actual.contains("Next page failed · r retries"), "{actual}");
         assert!(!actual.contains("more posts"), "{actual}");
         assert!(
             !actual.contains("Loading posts") && !actual.contains("━"),
@@ -10457,7 +10273,7 @@ pub(crate) mod tests {
 
         let actual = screen(&mut app, 70, 20);
 
-        assert!(actual.contains("V Card"), "{actual}");
+        assert!(actual.contains("SPC v c Card"), "{actual}");
         assert!(actual.contains("First line of the title"), "{actual}");
         assert!(actual.contains("ending in 東"), "{actual}");
         assert!(actual.contains('京'), "{actual}");
@@ -10475,19 +10291,19 @@ pub(crate) mod tests {
         ));
         let before = app.current_post().unwrap().id;
 
-        press(&mut app, 'V');
+        press_keys(&mut app, " vc");
         let compact = screen(&mut app, 100, 20);
         let (saved, warning) = crate::state::State::load(&state_path);
         assert!(warning.is_none());
         assert_eq!(saved.list_view(), ListView::Compact);
-        assert!(compact.contains("V Compact"), "{compact}");
+        assert!(compact.contains("SPC v c Compact"), "{compact}");
         assert_eq!(app.current_post().unwrap().id, before);
 
-        press(&mut app, 'V');
+        press_keys(&mut app, " vc");
         let cards = screen(&mut app, 100, 20);
         std::fs::remove_file(&state_path).unwrap();
         std::fs::remove_file(state_path.with_extension("json.lock")).unwrap();
-        assert!(cards.contains("V Card"), "{cards}");
+        assert!(cards.contains("SPC v c Card"), "{cards}");
         assert!(cards.contains("p5"), "{cards}");
         assert!(!cards.contains("……"), "{cards}");
         assert_eq!(app.current_post().unwrap().id, before);
@@ -10555,7 +10371,7 @@ pub(crate) mod tests {
         let words = actual.split_whitespace().collect::<Vec<_>>().join(" ");
 
         assert!(words.contains("l return"), "{actual}");
-        assert!(!words.contains("P play"), "{actual}");
+        assert!(!words.contains("SPC m p play"), "{actual}");
     }
 
     #[test]
@@ -10566,7 +10382,7 @@ pub(crate) mod tests {
         let actual = screen(&mut app, 100, 30);
         let words = actual.split_whitespace().collect::<Vec<_>>().join(" ");
 
-        assert!(words.contains("P play"), "{actual}");
+        assert!(words.contains("SPC m p play"), "{actual}");
         assert!(!actual.contains("loading video"), "{actual}");
     }
 
@@ -10637,7 +10453,7 @@ pub(crate) mod tests {
         let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 180));
         app.video = Some(video::Player::silent(VIDEO, Size::new(68, 17)));
 
-        press(&mut app, 'P');
+        press_keys(&mut app, " mp");
 
         assert!(app.video.as_ref().unwrap().paused());
     }
@@ -10655,7 +10471,7 @@ pub(crate) mod tests {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(footer.contains("P play"), "{actual}");
+        assert!(footer.contains("SPC m p play"), "{actual}");
     }
 
     #[test]
@@ -11714,7 +11530,7 @@ pub(crate) mod tests {
         screen(&mut app, 100, 20);
         app.scroll_card(5);
 
-        press(&mut app, 'g');
+        press_keys(&mut app, "gg");
         let actual = screen(&mut app, 100, 20);
 
         assert!(actual.contains("Full width image"), "{actual}");
@@ -11944,7 +11760,7 @@ pub(crate) mod tests {
         screen(&mut app, 100, 20);
         assert!(!app.card_images.is_empty());
 
-        press(&mut app, 'i');
+        press_keys(&mut app, " vi");
         screen(&mut app, 100, 20);
 
         assert!(app.card_images.is_empty());
@@ -11974,7 +11790,7 @@ pub(crate) mod tests {
 
         let actual = screen(&mut app, 100, 20);
 
-        assert!(actual.contains("V Card"), "{actual}");
+        assert!(actual.contains("SPC v c Card"), "{actual}");
         assert!(actual.contains("saved"), "{actual}");
         assert!(actual.contains("comments"), "{actual}");
     }
@@ -12136,6 +11952,7 @@ pub(crate) mod tests {
             app.config.show_nsfw = false;
             app.overlay = Some(Overlay::Experience);
             app.experience.screens = vec![Screen::Browse {
+                pagination: Default::default(),
                 query,
                 page: Page {
                     title: "Empty collection".into(),
@@ -12177,6 +11994,7 @@ pub(crate) mod tests {
             app.config.show_nsfw = show_nsfw;
             app.overlay = Some(Overlay::Experience);
             app.experience.screens = vec![Screen::Browse {
+                pagination: Default::default(),
                 query,
                 page: Page {
                     title: "Empty collection".into(),
@@ -12380,7 +12198,7 @@ pub(crate) mod tests {
     fn popup_media_jump_should_preserve_card_pixels_around_its_bounds() {
         let mut app = card_with_image(640, 320);
         let before = placeholder_cells(&mut app, 100, 40);
-        press(&mut app, 'p');
+        press_keys(&mut app, " bb");
 
         let actual = placeholder_cells(&mut app, 100, 40);
 
@@ -12420,7 +12238,7 @@ pub(crate) mod tests {
             |x, _| image::Rgb([if x < 320 { 0 } else { 255 }, 0, 0]),
         )));
         screen(&mut app, 100, 40);
-        press(&mut app, 'p');
+        press_keys(&mut app, " bb");
 
         let actual = screen(&mut app, 100, 40);
 
@@ -12453,7 +12271,7 @@ pub(crate) mod tests {
     fn popup_media_jump_should_preserve_sixel_card_fragments() {
         let mut app = card_with_image(320, 640);
         app.image_picker.set_protocol_type(ProtocolType::Sixel);
-        press(&mut app, 'p');
+        press_keys(&mut app, " bb");
 
         let actual = screen(&mut app, 100, 40);
 
@@ -12465,7 +12283,7 @@ pub(crate) mod tests {
     fn popup_media_jump_should_preserve_halfblock_pixels_outside_the_popup() {
         let mut app = card_with_image(320, 640);
         app.image_picker.set_protocol_type(ProtocolType::Halfblocks);
-        press(&mut app, 'p');
+        press_keys(&mut app, " bb");
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         while app.card_renderer.pending() {
@@ -12501,8 +12319,8 @@ pub(crate) mod tests {
         let mut player = video::Player::showing(&url, frame);
         player.area = app.video_area.unwrap().as_size();
         app.video = Some(player);
-        press(&mut app, 'P');
-        press(&mut app, 'p');
+        press_keys(&mut app, " mp");
+        press_keys(&mut app, " bb");
         app.tick();
 
         let actual = placeholder_cells(&mut app, 100, 40);
@@ -12774,6 +12592,20 @@ pub(crate) mod tests {
         crate::keys::handle(app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
     }
 
+    fn press_keys(app: &mut App, keys: &str) {
+        for c in keys.chars() {
+            if c.is_ascii_control() {
+                key(
+                    app,
+                    KeyCode::Char(char::from_u32(c as u32 + 96).unwrap()),
+                    KeyModifiers::CONTROL,
+                );
+            } else {
+                press(app, c);
+            }
+        }
+    }
+
     #[test]
     fn when_detail_is_split_h_should_focus_the_list_without_leaving_the_comment() {
         let (mut app, _) = open_long_post(|_| {});
@@ -12888,7 +12720,7 @@ pub(crate) mod tests {
         screen(&mut app, 180, 30);
 
         press(&mut app, 'l');
-        press(&mut app, ' ');
+        key(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
         screen(&mut app, 180, 30);
 
         let view = app
@@ -12946,7 +12778,7 @@ pub(crate) mod tests {
         }
         press(&mut app, 'k');
         let after_k = name(&app);
-        press(&mut app, 'g');
+        press_keys(&mut app, "gg");
         let first = name(&app);
 
         assert_eq!(
@@ -12993,21 +12825,156 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn esc_then_a_key_arriving_as_alt_key_does_both() {
+    fn prefix_hint_should_not_interrupt_a_fast_key_sequence() {
+        let mut app = app(&["rust", "vim"]);
+        let footer = crate::keys::footer_hints(&app);
+        press(&mut app, ']');
+
+        let shown = screen(&mut app, 100, 24);
+        assert!(!shown.contains("Next · ] · Esc cancel"), "{shown}");
+        assert!(!app.popup_open(), "a pending key is not yet a popup");
+        assert_eq!(crate::keys::footer_hints(&app), footer);
+
+        press(&mut app, 's');
+        assert_eq!(app.all_subs.group, 1);
+
+        app.reddit_menu();
+        let before = popup_snapshot(&mut app, 80, 24);
+        press(&mut app, 's');
+        let after = popup_snapshot(&mut app, 80, 24);
+        assert_eq!(
+            after, before,
+            "the menu stays visible while the hint is delayed"
+        );
+    }
+
+    #[test]
+    fn prefix_hint_should_wait_for_the_latest_key_and_stay_open_while_narrowing() {
+        use std::time::{Duration, Instant};
+        let mut app = app(&[]);
+        press(&mut app, ' ');
+        let before = Instant::now() - Duration::from_millis(400);
+        app.keymap.schedule_hint(before);
+        press(&mut app, 'p');
+        assert!(!app.keymap.tick(before + crate::keys::map::HINT_DELAY));
+        assert!(!app.popup_open());
+        assert!(
+            app.keymap
+                .tick(Instant::now() + crate::keys::map::HINT_DELAY)
+        );
+        assert!(screen(&mut app, 80, 24).contains("Preferences"));
+        press(&mut app, 's');
+        assert!(matches!(app.overlay, Some(Overlay::Settings)));
+
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, ' ');
+        assert!(
+            app.keymap
+                .tick(Instant::now() + crate::keys::map::HINT_DELAY)
+        );
+        press(&mut app, 'p');
+        assert!(app.popup_open());
+        assert!(screen(&mut app, 80, 24).contains("Preferences"));
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.popup_open());
+        assert!(
+            !app.keymap
+                .tick(Instant::now() + crate::keys::map::HINT_DELAY)
+        );
+    }
+
+    #[test]
+    fn vim_prefixes_should_wait_cancel_and_open_the_named_action() {
         use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app(&["rust", "vim"]);
+        app.focus_sidebar();
+        app.sidebar_edge(true);
+        let active = app.active;
+
+        press(&mut app, 'g');
+        assert_eq!(app.active, active, "a pending g must not move yet");
+        press(&mut app, 'g');
+        assert_eq!(app.active, 0);
+        press(&mut app, ' ');
+        app.keymap
+            .tick(std::time::Instant::now() + crate::keys::map::HINT_DELAY);
+        assert!(screen(&mut app, 80, 24).contains("Preferences"));
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.overlay.is_none());
+        for c in " ps".chars() {
+            press(&mut app, c);
+        }
+        assert!(matches!(app.overlay, Some(Overlay::Settings)));
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        app.overlay = Some(Overlay::Picker(crate::app::PickerState::default()));
+        for c in " ps".chars() {
+            press(&mut app, c);
+        }
+        assert!(matches!(&app.overlay, Some(Overlay::Picker(picker)) if picker.input == " ps"));
+        key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert!(matches!(&app.overlay, Some(Overlay::Picker(picker)) if picker.input == " "));
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, ' ');
+        press(&mut app, 'p');
+        app.switch_tab(3);
+        press(&mut app, 's');
+        assert!(
+            app.overlay.is_none(),
+            "a prefix must not survive switching contexts"
+        );
+    }
+
+    #[test]
+    fn leader_hints_should_page_without_skipping_choices_in_a_short_pane() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app(&[]);
+        press(&mut app, ' ');
+        app.keymap
+            .tick(std::time::Instant::now() + crate::keys::map::HINT_DELAY);
+        let mut saw_preferences = false;
+        for _ in 0..20 {
+            let actual = screen(&mut app, 30, 8);
+            saw_preferences |= actual.contains("Preferences");
+            key(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        }
+        assert!(saw_preferences);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.keymap.prefix.is_empty());
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn modified_keys_should_not_close_dialogs_or_confirm_account_actions() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app(&["rust"]);
+        app.show_settings();
+        key(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+        assert!(matches!(app.overlay, Some(Overlay::Settings)));
+        app.overlay = Some(Overlay::Sort { selected: 0 });
+        key(&mut app, KeyCode::Char('q'), KeyModifiers::ALT);
+        assert!(matches!(app.overlay, Some(Overlay::Sort { .. })));
+        assert!(!app.quit);
+        app.overlay = Some(Overlay::Membership {
+            target: crate::model::MembershipTarget::Community("rust".into()),
+            join: true,
+        });
+        key(&mut app, KeyCode::Enter, KeyModifiers::CONTROL);
+        assert!(matches!(app.overlay, Some(Overlay::Membership { .. })));
+    }
+
+    #[test]
+    fn alt_keys_should_preserve_the_current_view_and_dialog() {
         let (mut app, _) = open_long_post(|_| {});
-
         key(&mut app, KeyCode::Char('?'), KeyModifiers::ALT);
+        assert!(app.post_view.is_some());
+        assert!(app.help_scroll.is_none());
 
-        assert!(app.post_view.is_none(), "Esc closed the post");
-        assert!(app.help_scroll.is_some(), "then ? opened help");
-        // Esc then Tab arrives as Alt+Tab: the sort popup closes, then Tab moves on.
         let mut feed = feed_app(Picker::halfblocks());
         let active = feed.active;
-        press(&mut feed, 's');
+        press_keys(&mut feed, " fs");
         key(&mut feed, KeyCode::Tab, KeyModifiers::ALT);
-        assert!(feed.overlay.is_none(), "Esc closed the sort popup");
-        assert_ne!(feed.active, active, "then Tab switched tabs");
+        assert!(matches!(feed.overlay, Some(Overlay::Sort { .. })));
+        assert_eq!(feed.active, active);
     }
 
     #[test]
@@ -13062,7 +13029,7 @@ pub(crate) mod tests {
         let searched =
             app.overlay.is_none() && app.active_tab().feed.search.as_deref() == Some("rust");
         // The picker the same way.
-        press(&mut app, 'p');
+        press_keys(&mut app, " bb");
         for c in "fo".chars() {
             press(&mut app, c);
         }
@@ -13105,7 +13072,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn space_pages_a_post_by_its_visible_height_and_stops_at_the_end() {
+    fn ctrl_f_pages_a_post_by_its_visible_height_and_stops_at_the_end() {
         let (mut app, first) = open_long_post(|_| {});
         let paragraphs = |s: &str| -> Vec<usize> {
             s.lines()
@@ -13115,10 +13082,10 @@ pub(crate) mod tests {
         };
         let before = paragraphs(&first);
 
-        press(&mut app, ' ');
+        key(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
         let after = paragraphs(&screen(&mut app, 100, 30));
         for _ in 0..50 {
-            press(&mut app, ' ');
+            key(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
         }
         let end = screen(&mut app, 100, 30);
 
@@ -13140,7 +13107,14 @@ pub(crate) mod tests {
 
         let shown = screen(&mut app, 100, 24);
 
-        assert!(shown.contains("next / previous comment"));
+        assert!(shown.contains("Next comment"));
+        let entries = help::entries(&app);
+        for motion in ["]]", "]p", "]s", "gt"] {
+            assert!(
+                entries.iter().any(|(key, _)| key == motion),
+                "missing {motion}"
+            );
+        }
     }
 
     #[test]
@@ -13152,39 +13126,23 @@ pub(crate) mod tests {
 
         let shown = screen(&mut app, 160, 20);
 
-        assert!(shown.contains("All subs · community islands"));
-        assert!(!shown.contains("Post · reading"));
+        assert!(shown.contains("Feed"));
+        assert!(!shown.contains("Post and comments"));
     }
 
     #[test]
     fn help_should_prioritize_each_list_view() {
         for (tab, compact, title, expected_key) in [
-            (
-                0,
-                false,
-                "Home · Card view",
-                "cards: scroll a page / half page",
-            ),
-            (
-                1,
-                true,
-                "Bookmarks · Compact view",
-                "remove the selected bookmark",
-            ),
-            (
-                2,
-                false,
-                "All subs · community islands",
-                "next / previous community island",
-            ),
-            (
-                3,
-                false,
-                "Subreddit feed / search · Card view",
-                "subreddit: search",
-            ),
+            (0, false, "Feed", "Toggle Card / Compact"),
+            (1, true, "Feed", "Remove the local bookmark"),
+            (2, false, "Feed", "Next community group"),
+            (3, false, "Feed", "Search this community"),
         ] {
             let mut app = card_feed_app(Picker::halfblocks());
+            if tab == 1 {
+                let post = app.tabs[3].feed.posts[0].clone();
+                app.state.toggle_bookmark(&post, 0);
+            }
             app.active = tab;
             if compact {
                 app.state.toggle_list_view();
@@ -13206,8 +13164,8 @@ pub(crate) mod tests {
 
         let shown = screen(&mut app, 100, 12);
 
-        assert!(shown.contains("Sidebar and tabs"));
-        assert!(shown.contains("sidebar: next / previous tab"));
+        assert!(shown.contains("Sidebar and buffers"));
+        assert!(shown.contains("Next sidebar tab"));
         assert!(!shown.contains("Reddit: saved"));
     }
 
@@ -13219,7 +13177,7 @@ pub(crate) mod tests {
 
         let shown = screen(&mut app, 100, 12);
 
-        assert!(shown.contains("Home · Compact view"));
+        assert!(shown.contains("Feed"));
         assert!(shown.contains("Card / Compact view"));
         assert!(!shown.contains("cards: scroll down / up one line"));
     }
@@ -13232,9 +13190,9 @@ pub(crate) mod tests {
 
         let shown = screen(&mut app, 100, 12);
 
-        assert!(shown.contains("Post · comment selected"));
-        assert!(shown.contains("fold a thread · load more replies"));
-        assert!(shown.contains("actions for the selected post or comment"));
+        assert!(shown.contains("Post and comments"));
+        assert!(!help::entries(&app).iter().any(|(key, _)| key == "za"));
+        assert!(shown.contains("Reddit content actions"));
     }
 
     #[test]
@@ -13244,8 +13202,8 @@ pub(crate) mod tests {
 
         let shown = screen(&mut app, 100, 12);
 
-        assert!(shown.contains("Video / GIF"));
-        assert!(shown.contains("video: pause / play"));
+        assert!(shown.contains("Post and comments"));
+        assert!(shown.contains("Play / pause / retry video"));
         assert!(!shown.contains("Reddit: saved"));
     }
 
@@ -13259,8 +13217,8 @@ pub(crate) mod tests {
 
         let shown = screen(&mut app, 100, 12);
 
-        assert!(shown.contains("Post · reading"));
-        assert!(shown.contains("next / previous comment"));
+        assert!(shown.contains("Post and comments"));
+        assert!(shown.contains("Next comment"));
         assert!(!shown.contains("video: pause"));
     }
 
@@ -13283,8 +13241,8 @@ pub(crate) mod tests {
 
         let shown = screen(&mut app, 100, 12);
 
-        assert!(shown.contains("Gallery"));
-        assert!(shown.contains("previous / next gallery image"));
+        assert!(shown.contains("Post and comments"));
+        assert!(shown.contains("Next gallery image"));
         assert!(!shown.contains("Reddit: saved"));
     }
 
@@ -13303,9 +13261,16 @@ pub(crate) mod tests {
 
         let shown = screen(&mut app, 100, 10);
 
-        assert!(shown.contains("Post · spoiler hidden"));
-        assert!(shown.contains("show / hide spoilers"));
+        assert!(shown.contains("Post and comments"));
+        assert!(shown.contains("Reveal / hide spoilers"));
         assert!(!shown.contains("video: pause"));
+        assert!(!help::entries(&app).iter().any(|(key, _)| key == "/"));
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press_keys(&mut app, " vs");
+        press(&mut app, '/');
+        assert!(
+            matches!(app.experience.screens.last(), Some(crate::app::experience::Screen::Input(form)) if form.title == "Find in loaded comments")
+        );
     }
 
     #[test]
@@ -13362,34 +13327,30 @@ pub(crate) mod tests {
         for (overlay, title, description) in [
             (
                 Overlay::Picker(crate::app::PickerState::default()),
-                "Jump / open community or profile",
-                "open the selected result",
+                "Text entry",
+                "Accept a single-line",
             ),
             (
                 Overlay::Search {
                     input: "query".into(),
                 },
-                "Subreddit search",
-                "search this subreddit",
+                "Text entry",
+                "Accept a single-line",
             ),
             (
                 Overlay::Sort { selected: 0 },
-                "Choose feed sort",
-                "apply the selected sort",
+                "Choose sort",
+                "Open / focus right",
             ),
             (
                 Overlay::Membership {
                     target: crate::model::MembershipTarget::Community("rust".into()),
                     join: true,
                 },
-                "Confirm Join / Leave",
-                "confirm the membership change",
+                "Confirmation",
+                "Confirm the displayed action",
             ),
-            (
-                Overlay::Auth,
-                "Saved accounts / sign-in",
-                "select saved account / Add account",
-            ),
+            (Overlay::Auth, "Accounts", "Open / focus right"),
         ] {
             let mut app = app(&[]);
             app.auth.phase = crate::auth::Phase::Accounts;
@@ -13456,10 +13417,7 @@ pub(crate) mod tests {
         app.overlay = Some(Overlay::Auth);
         app.auth.phase = crate::auth::Phase::Confirm;
         let actual = help::entries(&app);
-        let context: Vec<_> = actual
-            .iter()
-            .take_while(|(key, _)| key != "All subs · community islands")
-            .collect();
+        let context: Vec<_> = actual.iter().take_while(|(key, _)| key != "Feed").collect();
         assert!(
             !context
                 .iter()
@@ -13571,8 +13529,9 @@ pub(crate) mod tests {
 
         assert!(shown.contains("Text entry"));
         assert!(shown.contains("post"));
-        assert!(app.help_scroll.is_none());
+        assert!(app.help_scroll.is_some());
         assert!(app.experience.pending.is_none());
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         let Some(Screen::Input(form)) = app.experience.screens.last() else {
             panic!("help lost the composer")
         };
@@ -13590,7 +13549,7 @@ pub(crate) mod tests {
         let shown = screen(&mut app, 100, 14);
         key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
-        assert!(shown.contains("Reddit menu / actions"));
+        assert!(shown.contains("Action menu"));
         assert!(matches!(
             app.experience.screens.last(),
             Some(Screen::Menu { selected: 1, .. })
@@ -13627,7 +13586,7 @@ pub(crate) mod tests {
         let shown = screen(&mut app, 100, 14);
         key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
-        assert!(shown.contains("Reddit collection"));
+        assert!(shown.contains("Reading dialog"));
         assert!(app.experience.pending.is_none());
         assert!(
             matches!(app.experience.screens.last(), Some(Screen::Browse { page, .. }) if page.title == "Loaded feeds")
@@ -13677,8 +13636,8 @@ pub(crate) mod tests {
 
         let shown = screen(&mut app, 32, 12);
 
-        assert!(shown.contains("quit"));
-        assert!(shown.contains("q closes an open"));
+        assert!(shown.contains("Quit"));
+        assert!(shown.contains("Quit redtab"));
         assert!(app.help_scroll.is_some_and(|s| s < usize::MAX));
     }
 
@@ -13693,7 +13652,7 @@ pub(crate) mod tests {
 
         let s = screen(&mut app, 80, 24);
 
-        assert!(s.contains("quit"), "{s}");
+        assert!(s.contains("Quit"), "{s}");
         assert!(
             app.help_scroll.is_some(),
             "j scrolls, it does not close help"
@@ -13717,10 +13676,15 @@ pub(crate) mod tests {
         }
 
         for (key, desc) in help::entries(&app).iter().filter(|(_, d)| !d.is_empty()) {
-            // The key, its padding and the whole description, on one line.
             assert!(
-                s.lines()
-                    .any(|l| l.contains(key) && l.contains(&format!("  {desc}"))),
+                s.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .contains(&key.split_whitespace().collect::<Vec<_>>().join(" "))
+                    && s.split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .contains(desc),
                 "{key:?} / {desc:?} is not shown whole:\n{s}"
             );
         }
@@ -13789,13 +13753,13 @@ pub(crate) mod tests {
         assert_eq!(step(&mut app), Some(true), "waits under the help");
         app.help_scroll = None;
         assert_eq!(step(&mut app), Some(false));
-        press(&mut app, ' ');
+        key(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
         assert_eq!(step(&mut app), Some(true), "waits while scrolled away");
-        press(&mut app, 'g');
+        press_keys(&mut app, "gg");
         assert_eq!(step(&mut app), Some(false));
-        press(&mut app, 'i');
+        press_keys(&mut app, " vi");
         assert_eq!(step(&mut app), None, "images off stops it");
-        press(&mut app, 'i');
+        press_keys(&mut app, " vi");
         assert_eq!(step(&mut app), Some(false));
         press(&mut app, 'q');
         assert_eq!(step(&mut app), None, "leaving the post stops it");
@@ -13851,14 +13815,14 @@ pub(crate) mod tests {
         app.video = Some(video::Player::silent(&url, area));
 
         // A video without sound: `a` still turns the setting over; this one stays silent.
-        press(&mut app, 'a');
+        press_keys(&mut app, " mm");
         assert!(app.video_sound_wanted());
         assert!(!app.video.as_ref().unwrap().sound());
-        press(&mut app, 'a');
+        press_keys(&mut app, " mm");
         assert!(!app.video_sound_wanted(), "and back off");
 
         // ffplay failing, even at a later frame, leaves later videos silent too.
-        press(&mut app, 'a');
+        press_keys(&mut app, " mm");
         app.video.as_mut().unwrap().fail_sound();
         app.tick();
         assert!(!app.video_sound_wanted());
@@ -13875,7 +13839,7 @@ pub(crate) mod tests {
         let first = app.video.as_ref().unwrap().area;
         let url = app.reddit.media_url(VIDEO).unwrap();
         app.video = Some(video::Player::silent(&url, first));
-        press(&mut app, 'P');
+        press_keys(&mut app, " mp");
 
         // Two draws at once at the new size: it has not held still yet.
         step(&mut app, 40);
@@ -14037,13 +14001,13 @@ pub(crate) mod tests {
 
     #[test]
     fn edited_selftext_anchor_respects_batched_spoiler_and_scroll_keys() {
-        let run = |edit_body: bool, draw_between: bool, before: &[char], after: &[char]| {
+        let run = |edit_body: bool, draw_between: bool, before: &[&str], after: &[&str]| {
             let mut app = post_with_rewrapping_spoilers(40);
             let view = app.post_view.as_mut().unwrap();
             view.scroll = view.row_starts[0] - 30;
             screen(&mut app, 100, 30);
             for &key in before {
-                press(&mut app, key);
+                press_keys(&mut app, key);
                 if draw_between {
                     screen(&mut app, 100, 30);
                 }
@@ -14062,7 +14026,7 @@ pub(crate) mod tests {
                 screen(&mut app, 100, 30);
             }
             for &key in after {
-                press(&mut app, key);
+                press_keys(&mut app, key);
             }
             let shown = screen(&mut app, 100, 30);
             let passage = shown.lines().enumerate().find_map(|(row, line)| {
@@ -14074,13 +14038,13 @@ pub(crate) mod tests {
             (app.post_view.as_ref().unwrap().scroll, passage)
         };
         for (before, after) in [
-            (&[][..], &['v', ' '][..]),
-            (&['v'][..], &[][..]),
-            (&[][..], &['g'][..]),
+            (&[][..], &[" vs", "\u{6}"][..]),
+            (&[" vs"][..], &[][..]),
+            (&[][..], &["gg"][..]),
         ] {
             let batched = run(true, false, before, after);
             assert_eq!(batched, run(true, true, before, after));
-            if after.contains(&'g') {
+            if after.contains(&"gg") {
                 assert_eq!(batched.0, 0);
             } else {
                 let unchanged = run(false, false, before, after);
@@ -14197,7 +14161,7 @@ pub(crate) mod tests {
             };
             let before = passage(screen(&mut app, 100, 30));
             assert!(before.is_some());
-            press(&mut app, 'v');
+            press_keys(&mut app, " vs");
             let view = app.post_view.as_ref().unwrap();
             let generation = view.generation;
             let mut page = view.page.as_ref().unwrap().clone();
@@ -14238,7 +14202,7 @@ pub(crate) mod tests {
         screen(&mut app, 100, 30);
         press(&mut app, 'l');
         screen(&mut app, 100, 30);
-        press(&mut app, 'g');
+        press_keys(&mut app, "gg");
         let view = app.post_view.as_ref().unwrap();
         let generation = view.generation;
         let mut page = view.page.as_ref().unwrap().clone();
@@ -14266,8 +14230,8 @@ pub(crate) mod tests {
             screen(&mut app, 100, 30);
             press(&mut app, 'j');
             screen(&mut app, 100, 30);
-            for key in ['h', ' ', 'l'] {
-                press(&mut app, key);
+            for keys in ["h", "\u{6}", "l"] {
+                press_keys(&mut app, keys);
             }
             if edited {
                 let view = app.post_view.as_ref().unwrap();
@@ -14364,7 +14328,7 @@ pub(crate) mod tests {
         };
         let before = passage(screen(&mut app, 100, 30));
         assert!(before.is_some());
-        press(&mut app, 'v');
+        press_keys(&mut app, " vs");
         let view = app.post_view.as_ref().unwrap();
         let generation = view.generation;
         let mut page = view.page.as_ref().unwrap().clone();
@@ -14399,8 +14363,8 @@ pub(crate) mod tests {
                 press(&mut app, 'l');
                 screen(&mut app, 100, 30);
             }
-            press(&mut app, 'v');
-            press(&mut app, ' ');
+            press_keys(&mut app, " vs");
+            key(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
             if edited {
                 let view = app.post_view.as_ref().unwrap();
                 let generation = view.generation;
@@ -14462,7 +14426,7 @@ pub(crate) mod tests {
             press(&mut app, 'h');
             screen(&mut app, 100, 30);
             if toggle {
-                press(&mut app, 'v');
+                press_keys(&mut app, " vs");
             }
             let view = app.post_view.as_ref().unwrap();
             let generation = view.generation;
@@ -14626,6 +14590,7 @@ pub(crate) mod tests {
             assert!(actual.contains("Esc"), "{actual}");
             app.experience.pending = None;
             app.experience.screens = vec![Screen::Browse {
+                pagination: Default::default(),
                 query,
                 page: Page {
                     title: "Rules".into(),
@@ -14825,8 +14790,7 @@ pub(crate) mod tests {
             let actual = screen(&mut feed, 24, 8);
             let header = actual.lines().take(3).collect::<Vec<_>>().join("\n");
             assert!(
-                header.contains("failed")
-                    && header.contains(if append { "L retry" } else { "r retry" }),
+                header.contains("failed") && header.contains("r retry"),
                 "{actual}"
             );
         }
@@ -14839,7 +14803,7 @@ pub(crate) mod tests {
                 let mut app = app(&["rust"]);
                 match kind {
                     "jump" => {
-                        press(&mut app, 'p');
+                        press_keys(&mut app, " bb");
                         crate::keys::paste(&mut app, "rust");
                     }
                     "search" => {
@@ -14949,7 +14913,7 @@ pub(crate) mod tests {
         key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
         assert_eq!(app.settings.editing.as_ref().unwrap().value, "[\"café \"]");
         key(&mut app, KeyCode::F(1), KeyModifiers::NONE);
-        assert!(screen(&mut app, 70, 20).contains("Edit setting"));
+        assert!(screen(&mut app, 70, 20).contains("Text entry"));
         key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(app.settings.editing.is_some());
         let actual = screen(&mut app, 70, 16);
@@ -15113,6 +15077,14 @@ pub(crate) mod tests {
         let (mut app, fixture) = managed_settings_app();
         app.settings.wait_managed();
         app.tick();
+        press(&mut app, 'l');
+        key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        key(&mut app, KeyCode::Enter, KeyModifiers::CONTROL);
+        assert!(matches!(
+            app.settings.managed,
+            Some(crate::app::settings::ManagedSave::Confirm(_))
+        ));
+        assert!(!fixture.directory.path().join("applied-args").exists());
         crate::keys::handle(
             &mut app,
             crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -15373,7 +15345,7 @@ pub(crate) mod tests {
             "printf '%s' \"$1\" > \"$0\"".into(),
             file.to_string_lossy().into_owned(),
         ];
-        press(&mut app, 'o');
+        press_keys(&mut app, " or");
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         let actual = loop {
             if let Ok(text) = std::fs::read_to_string(&file)
@@ -15390,7 +15362,7 @@ pub(crate) mod tests {
         assert_eq!(actual, "https://www.reddit.com/r/s/");
     }
     #[cfg(unix)]
-    fn opened_browser_url(app: &mut App, key: char) -> String {
+    fn opened_browser_url(app: &mut App, keys: &str) -> String {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("opened-url");
         app.config.commands.browser = vec![
@@ -15399,7 +15371,7 @@ pub(crate) mod tests {
             "printf '%s' \"$1\" > \"$0\"".into(),
             file.to_string_lossy().into_owned(),
         ];
-        press(app, key);
+        press_keys(app, keys);
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         loop {
             if let Ok(text) = std::fs::read_to_string(&file)
@@ -15421,7 +15393,7 @@ pub(crate) mod tests {
         let mut app = feed_with_next_page(ListView::Card);
         app.focus = Focus::Sidebar;
 
-        let actual = opened_browser_url(&mut app, 'o');
+        let actual = opened_browser_url(&mut app, " oc");
 
         assert_eq!(actual, "https://www.reddit.com/r/s/");
     }
@@ -15435,7 +15407,7 @@ pub(crate) mod tests {
         post.subreddit = "fromhome".into();
         app.tabs[0].feed.posts = vec![post];
 
-        let actual = opened_browser_url(&mut app, 'O');
+        let actual = opened_browser_url(&mut app, " oc");
 
         assert_eq!(actual, "https://www.reddit.com/r/fromhome/");
     }
@@ -15451,7 +15423,7 @@ pub(crate) mod tests {
         app.open_current_post();
         app.focus = Focus::Post;
 
-        let actual = opened_browser_url(&mut app, 'O');
+        let actual = opened_browser_url(&mut app, " oc");
 
         assert_eq!(actual, "https://www.reddit.com/r/detail/");
     }
@@ -15463,7 +15435,7 @@ pub(crate) mod tests {
         app.tabs[3].feed.posts[0].permalink = "/r/s/comments/existing/title/".into();
         app.focus = Focus::List;
 
-        let actual = opened_browser_url(&mut app, 'o');
+        let actual = opened_browser_url(&mut app, " or");
 
         assert_eq!(
             actual,
@@ -15538,7 +15510,7 @@ pub(crate) mod tests {
                 shown.contains(control) && shown.contains("Esc cancel"),
                 "{shown}"
             );
-            assert!(shown.contains("Space open profile"), "{shown}");
+            assert!(shown.contains("o open profile"), "{shown}");
         }
     }
 
@@ -15555,13 +15527,13 @@ pub(crate) mod tests {
         app.open_user("blackvault");
         let tab = app.active_tab().id;
 
-        press(&mut app, 'x');
+        press_keys(&mut app, " bd");
 
         assert_eq!(app.active_tab().id, tab);
         assert!(
             app.status
                 .as_ref()
-                .is_some_and(|status| status.text.contains("S to unfollow"))
+                .is_some_and(|status| status.text.contains("SPC a m to unfollow"))
         );
     }
 
@@ -15574,7 +15546,7 @@ pub(crate) mod tests {
         let shown = screen(&mut app, 120, 24);
 
         assert!(
-            shown.contains("Following unknown") && shown.contains("S check"),
+            shown.contains("Following unknown") && shown.contains("SPC a m check"),
             "{shown}"
         );
         assert!(!shown.contains("Not following"), "{shown}");
@@ -15595,7 +15567,7 @@ pub(crate) mod tests {
         let shown = screen(&mut app, 120, 24);
 
         assert!(
-            shown.contains("Following") && shown.contains("S unfollow"),
+            shown.contains("Following") && shown.contains("SPC a m unfollow"),
             "{shown}"
         );
         assert!(
@@ -15610,16 +15582,16 @@ pub(crate) mod tests {
         app.open_user("blackvault");
         app.focus = Focus::Sidebar;
         assert_eq!(
-            opened_browser_url(&mut app, 'o'),
+            opened_browser_url(&mut app, " or"),
             "https://www.reddit.com/user/blackvault/"
         );
         app.focus = Focus::List;
         assert_eq!(
-            opened_browser_url(&mut app, 'O'),
+            opened_browser_url(&mut app, " oc"),
             "https://www.reddit.com/user/blackvault/"
         );
         assert_eq!(
-            opened_browser_url(&mut app, 'o'),
+            opened_browser_url(&mut app, " or"),
             "https://www.reddit.com/user/blackvault/"
         );
     }
@@ -15629,7 +15601,7 @@ pub(crate) mod tests {
         let mut app = app(&[]);
         app.open_user("blackvault");
         app.focus = Focus::Sidebar;
-        press(&mut app, 'B');
+        press_keys(&mut app, " c");
 
         let actual = screen(&mut app, 120, 24);
 

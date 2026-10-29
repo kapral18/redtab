@@ -37,20 +37,25 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) -> Rect {
         "Reddit: Sign in to configure"
     };
     let editing = app.settings.editing.as_ref();
-    let controls = if editing.is_some() {
-        "Enter apply · Esc cancel · F1 help"
-    } else if field.scope == Scope::Reddit {
-        "Enter toggle · r refresh Reddit · Esc close · F1 help"
+    let action = if editing.is_some() {
+        "apply"
+    } else if field.kind == Kind::Boolean {
+        "toggle"
     } else {
-        "Enter edit · r retry file save · u revert file · Esc close · F1 help"
+        "edit"
     };
-    let controls = if controls.width() <= width {
-        controls
+    let controls = if editing.is_some() {
+        "Enter apply · Esc cancel · F1 help".into()
+    } else if field.scope == Scope::Reddit {
+        "Enter toggle · r refresh Reddit · Esc close · F1 help".into()
     } else {
-        fitting_label(
-            &["⏎ edit · r retry · Esc", "⏎ edit · Esc", "⏎ · Esc", "Esc"],
-            width,
-        )
+        format!("Enter {action} · r retry file save · u revert file · Esc close · F1 help")
+    };
+    let compact = format!("⏎ {action} · Esc");
+    let controls = if controls.width() <= width {
+        controls.as_str()
+    } else {
+        fitting_label(&[&compact, "⏎ · Esc", "Esc"], width)
     };
     let error = app.settings.message.as_ref().or_else(|| {
         if field.scope == Scope::Reddit {

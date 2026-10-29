@@ -37,7 +37,7 @@ pub const SETTINGS: &[Setting] = &[
         key: "media.video_autoplay",
         scope: Scope::Reddit,
         label: "Autoplay videos",
-        description: "Use Reddit account autoplay for selected videos and GIFs. Saves to Reddit; P still plays manually.",
+        description: "Use Reddit account autoplay for selected videos and GIFs. Saves to Reddit; SPC m p still plays manually.",
         kind: Kind::Boolean,
     },
     Setting {
@@ -111,7 +111,9 @@ impl Setting {
             return self.key.into();
         }
         match &config.active_account {
-            Some(name) if name.is_empty() => "Reconnect with A to identify this account".into(),
+            Some(name) if name.is_empty() => {
+                "Reconnect with SPC p a to identify this account".into()
+            }
             Some(name) => format!("accounts.{name}.{}", self.key),
             None => format!("signed_out.{}", self.key),
         }
@@ -157,7 +159,7 @@ impl Setting {
 
     pub fn set(&self, config: &Config, value: toml::Value) -> Result<Config> {
         if self.scope == Scope::Reader && config.active_account.as_deref() == Some("") {
-            bail!("Reconnect with A to identify this account before editing reader settings");
+            bail!("Reconnect with SPC p a to identify this account before editing reader settings");
         }
         self.validate_value(&value)?;
         let mut next = config.clone();

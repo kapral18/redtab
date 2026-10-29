@@ -27,7 +27,7 @@ cancellation. Browser challenges can still prevent sign-in.
 
 ## Manage saved accounts
 
-Press `A` to open **Accounts**. Use `j`/`k` or the arrows to select a row.
+Press `SPC p a` to open **Accounts**. Use `j`/`k` or the arrows to select a row.
 
 | Action | Control | Result |
 | --- | --- | --- |

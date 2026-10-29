@@ -26,7 +26,16 @@ fn menu_rows(
         let first_row = lines.len();
         let active = index == selected;
         let style = choice_style(active);
-        for (part, text) in textwrap::wrap(&clean(&choice.label), width.saturating_sub(2).max(1))
+        let label = if choice.shortcut.is_empty() {
+            choice.label.clone()
+        } else {
+            format!(
+                "[{}] {}",
+                crate::keys::map::label(choice.shortcut),
+                choice.label
+            )
+        };
+        for (part, text) in textwrap::wrap(&clean(&label), width.saturating_sub(2).max(1))
             .iter()
             .enumerate()
         {
@@ -130,29 +139,23 @@ fn body_rows(screen: &Screen, width: u16, show_nsfw: bool) -> usize {
     }
 }
 
-fn paginating(app: &App) -> bool {
-    matches!(
-        app.experience.pending.as_ref(),
-        Some((
-            _,
-            crate::reddit::experience::Request::Read { after: Some(_), .. }
-        ))
-    )
-}
-
 fn footer(app: &App, screen: &Screen, width: usize, loader_visible: bool) -> String {
+    let loading_more = app.experience.loading_more();
+    let failed_read = app.experience.error().is_some()
+        && matches!(screen, Screen::Browse { .. } | Screen::Loading(_));
     let scroll_controls = if let Screen::Browse {
         query,
         page,
         selected,
         ..
     } = screen
-        && (page.entries.is_empty()
+        && (loading_more
+            || page.entries.is_empty()
             || (!matches!(query, crate::reddit::experience::Query::Thread(_))
                 && !page.text.is_empty())
             || !preview_text(query, page, *selected).is_empty())
     {
-        Some(if page.entries.is_empty() {
+        Some(if page.entries.is_empty() || loading_more {
             fitting_label(
                 &[
                     "Ctrl+d/u scroll · Ctrl+e/y line · Esc back",
@@ -199,12 +202,17 @@ fn footer(app: &App, screen: &Screen, width: usize, loader_visible: bool) -> Str
     if width < 28 {
         let (hint, short) = if app.experience.writing() {
             ("Sending…".into(), "Sending…")
-        } else if app.experience.pending.is_some() && loader_visible {
+        } else if failed_read {
+            (
+                "r retry · Esc".into(),
+                fitting_label(&["r retry · Esc", "r · Esc", "r Esc", "⎋"], width),
+            )
+        } else if app.experience.pending.is_some() && !loading_more && loader_visible {
             (
                 "Esc back".into(),
                 fitting_label(&["Esc back", "Esc", "⎋"], width),
             )
-        } else if app.experience.pending.is_some() {
+        } else if app.experience.pending.is_some() && !loading_more {
             (
                 "Loading · Esc".into(),
                 fitting_label(&["… · Esc", "… Esc", "…⎋", "⎋"], width),
@@ -237,7 +245,9 @@ fn footer(app: &App, screen: &Screen, width: usize, loader_visible: bool) -> Str
     if app.experience.writing() {
         return "Sending… wait for confirmation".into();
     }
-    let mut parts: Vec<&str> = if app.experience.pending.is_some() {
+    let mut parts: Vec<&str> = if failed_read {
+        vec!["r retry", "Esc back"]
+    } else if app.experience.pending.is_some() && !loading_more {
         if loader_visible {
             vec!["Esc back"]
         } else {
@@ -270,16 +280,13 @@ fn footer(app: &App, screen: &Screen, width: usize, loader_visible: bool) -> Str
             page,
             selected,
             ..
-        } => {
+        } if !loading_more => {
             if page
                 .entries
                 .get(*selected)
                 .is_some_and(|entry| entry.target.is_some())
             {
-                extras.insert(0, "; actions");
-            }
-            if page.after.is_some() {
-                extras.push("L next");
+                extras.insert(0, "SPC a a actions");
             }
             if matches!(
                 query,
@@ -288,13 +295,13 @@ fn footer(app: &App, screen: &Screen, width: usize, loader_visible: bool) -> Str
                     ..
                 }
             ) {
-                extras.push("s sort");
+                extras.push("SPC f s sort");
             }
             if matches!(query, crate::reddit::experience::Query::Search { .. }) {
-                extras.push("t time");
+                extras.push("SPC f t time");
             }
             if matches!(query, crate::reddit::experience::Query::Multi { .. }) {
-                extras.extend(["a add", "d remove", "x delete"]);
+                extras.extend(["a add", "d remove", "D delete"]);
             }
         }
         _ => {}
@@ -309,7 +316,7 @@ fn footer(app: &App, screen: &Screen, width: usize, loader_visible: bool) -> Str
 
 pub(super) fn draw(f: &mut Frame, app: &App) -> Option<Rect> {
     let screen = app.experience.screens.last()?;
-    let loading_more = paginating(app);
+    let loading_more = app.experience.loading_more();
     let mut loader_visible = false;
     let title = match screen {
         Screen::Menu { title, .. } => title.as_str(),
@@ -349,8 +356,7 @@ pub(super) fn draw(f: &mut Frame, app: &App) -> Option<Rect> {
         .saturating_sub(4);
     let error_message = app
         .experience
-        .error
-        .as_deref()
+        .error()
         .map(|message| format!("✗ {}", clean(message)));
     let wanted_error_rows = error_message
         .as_deref()
@@ -464,6 +470,7 @@ pub(super) fn draw(f: &mut Frame, app: &App) -> Option<Rect> {
             page,
             selected,
             scroll,
+            ..
         } => {
             loader_visible = draw_browse(f, app, query, page, *selected, *scroll, body);
         }
@@ -528,7 +535,7 @@ fn draw_browse(
     scroll: usize,
     body: Rect,
 ) -> bool {
-    let loading_more = paginating(app);
+    let loading_more = app.experience.loading_more();
     let show_nsfw = app.config.show_nsfw;
     if loading_more && page.entries.is_empty() {
         return loading::draw(
@@ -800,6 +807,7 @@ mod tests {
             ratatui_image::picker::Picker::halfblocks(),
         );
         app.experience.screens.push(Screen::Browse {
+            pagination: Default::default(),
             query: Query::Profile("reader".into()),
             page: Page {
                 title: "u/reader".into(),
@@ -909,7 +917,7 @@ mod tests {
         assert!(actual.contains("r retry"));
         assert!(actual.contains("Esc back"));
         assert!(!actual.contains("submitting again"));
-        assert!(!actual.contains("s sort"));
+        assert!(!actual.contains("SPC f s sort"));
     }
 
     #[test]

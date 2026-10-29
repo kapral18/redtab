@@ -15,8 +15,8 @@ use super::Sources;
 
 const LIMIT: usize = 4 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(20);
-const UNAVAILABLE: &str = "YouTube unavailable; P retries or m opens browser";
-const OUTPUT_TOO_LARGE: &str = "YouTube metadata exceeds the inline limit; m opens browser";
+const UNAVAILABLE: &str = "YouTube unavailable; SPC m p retries or SPC o m opens browser";
+const OUTPUT_TOO_LARGE: &str = "YouTube metadata exceeds the inline limit; SPC o m opens browser";
 const CANCELLED: &str = "YouTube resolution cancelled";
 const FORMAT: &str = "bestvideo[protocol=https][width<=1920][height<=1920][fps<=30]+bestaudio[protocol=https]/best[protocol=https][width<=1920][height<=1920][fps<=30]";
 const PLAYBACK_METADATA: &str = "%(.{id,_type,availability,is_live,live_status,requested_formats,url,protocol,vcodec,acodec,http_headers})j";
@@ -90,7 +90,7 @@ impl Resolver {
             if cancelled.is_cancelled() {
                 Err(CANCELLED.to_owned())
             } else if started.elapsed() >= timeout {
-                Err("YouTube resolution timed out; m opens browser".to_owned())
+                Err("YouTube resolution timed out; SPC o m opens browser".to_owned())
             } else {
                 Ok(())
             }
@@ -196,7 +196,7 @@ fn extract(
 ) -> Result<Vec<u8>, String> {
     let child = command.spawn().map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
-            "Install yt-dlp for YouTube playback; m opens browser".into()
+            "Install yt-dlp for YouTube playback; SPC o m opens browser".into()
         } else {
             UNAVAILABLE.to_owned()
         }
@@ -277,7 +277,7 @@ fn parse(bytes: &[u8], id: &str) -> Result<Sources, String> {
             .as_str()
             .is_some_and(|access| !matches!(access, "public" | "unlisted"))
     {
-        return Err("This YouTube video needs the browser; press m".into());
+        return Err("This YouTube video needs the browser; press SPC o m".into());
     }
     let formats = info["requested_formats"].as_array();
     let video = formats
@@ -386,7 +386,7 @@ fn stream_ttl(sources: &Sources) -> Result<Duration, String> {
         }
     }
     if seconds == 0 {
-        return Err("YouTube stream expired; P retries or m opens browser".into());
+        return Err("YouTube stream expired; SPC m p retries or SPC o m opens browser".into());
     }
     Ok(Duration::from_secs(seconds))
 }
@@ -724,21 +724,47 @@ mod tests {
 
     #[test]
     fn when_the_tool_times_out_it_should_kill_and_reap_its_process() {
-        let fake = Fake::new("echo $$ > pid; sleep 10");
+        let fake = Fake::new("echo $$ > pid; sleep 30");
+        let program = fake.program.clone();
+        let cancelled = std::sync::Arc::new(Cancellation::default());
+        let registration = cancelled.process.lock();
+        let signal = cancelled.clone();
+        let worker = std::thread::spawn(move || {
+            Resolver::default().resolve_with(
+                PAGE,
+                &signal,
+                program.as_os_str(),
+                Duration::from_secs(2),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid: i32 = loop {
+            if let Ok(value) = std::fs::read_to_string(fake.dir.path().join("pid"))
+                && let Ok(pid) = value.trim().parse()
+            {
+                break pid;
+            }
+            assert!(
+                !worker.is_finished(),
+                "resolver exited before extractor started"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "extractor did not publish its PID"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        drop(registration);
 
-        let actual = Resolver::default().resolve_with(
-            PAGE,
-            &Cancellation::default(),
-            fake.program.as_os_str(),
-            Duration::from_millis(150),
-        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let finished = worker.is_finished();
+        let actual = worker.join().unwrap();
 
+        assert!(finished, "timed-out extractor was not terminated promptly");
         assert!(actual.unwrap_err().contains("timed out"));
-        let pid: i32 = std::fs::read_to_string(fake.dir.path().join("pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
         assert_eq!(
             unsafe { libc::kill(pid, 0) },
             -1,
@@ -777,7 +803,7 @@ mod tests {
 
         assert_eq!(
             actual.unwrap_err(),
-            "YouTube metadata exceeds the inline limit; m opens browser"
+            "YouTube metadata exceeds the inline limit; SPC o m opens browser"
         );
     }
 

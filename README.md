@@ -21,12 +21,12 @@ redtab
 ```
 
 On first launch, select your signed-in browser profile and confirm your account.
-Press `?` for help. Install `ffmpeg` for inline video.
+Press `Space` for action groups and `?` for help. Install `ffmpeg` for inline video.
 
 ## Documentation
 
 [User guide](docs/guide.md) · [Accounts](docs/accounts.md) ·
-[Settings](docs/configuration.md) · [Keyboard shortcuts](docs/usage.md#keyboard-shortcuts) ·
+[Settings](docs/configuration.md) · [Keyboard shortcuts](docs/keybindings.md) ·
 [Privacy](docs/accounts.md#data-and-privacy) · [Development](docs/development.md)
 
 ## License

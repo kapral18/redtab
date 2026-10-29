@@ -588,6 +588,9 @@ impl App {
             self.settings_edit_key(key);
             return;
         }
+        if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+            return;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::F(2) | KeyCode::Char('q') => {
                 self.overlay = self.settings.return_overlay.take()
@@ -598,9 +601,9 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.settings.selected = self.settings.selected.saturating_sub(1)
             }
-            KeyCode::Home | KeyCode::Char('g') => self.settings.selected = 0,
+            KeyCode::Home => self.settings.selected = 0,
             KeyCode::End | KeyCode::Char('G') => self.settings.selected = SETTINGS.len() - 1,
-            KeyCode::Enter | KeyCode::Char(' ') => {
+            KeyCode::Enter => {
                 let field = &SETTINGS[self.settings.selected];
                 let value = field.value(&self.config);
                 if field.kind == Kind::Boolean {

@@ -72,20 +72,21 @@ Rendering: [main UI](../src/ui.rs).
 | Sidebar identity | Name and version, separate from navigation |
 | Sidebar navigation | Home, Bookmarks, All subs, Subscriptions, Following, Opened; selected tab stays visible |
 | Sidebar tab | Number, community icon or user avatar/person glyph, name, community unread count (`?` when unknown), selection |
-| Sidebar status | Reddit up/unknown/paused/down/signed out; images on/off; signed out offers `A` |
+| Sidebar status | Reddit up/unknown/paused/down/signed out; images on/off; signed out offers `SPC p a` |
 | Home/community/user header | Title, Card/Compact, sort, eligible time range, search; stable title/state rows |
-| Membership | User feeds show Following/Not following/unknown beside `S unfollow`/`S follow`/`S check`; communities show Joined/Not joined/unknown and leave/join/check. Both use confirmation, progress and automatic sidebar reconciliation |
+| Membership | User feeds show Following/Not following/unknown beside `SPC a m unfollow`/`SPC a m follow`/`SPC a m check`; communities show Joined/Not joined/unknown and leave/join/check. Both use confirmation, progress and automatic sidebar reconciliation |
 | Feed activity | Unread count, loading, refresh/continuation error and freshness; refresh errors retain posts |
 | Compact post | Two rows: selection, thumbnail, score, unread/bookmark/pin, title; then comments, safety labels, community, author, age, flair and media/domain |
 | Expanded card | Metadata, wrapped title, media, score and comment count; stable loading geometry and continuous scrolling |
 | Media indicator | Centered play/link symbol, VIDEO/GIF badge, domain or gallery count; dark backing; play symbol hides during playback |
-| List boundary | Shared load-more loader in Card/Compact, outside real-post geometry; failures offer `L` retry |
+| List boundary | Shared load-more loader in Card/Compact, outside real-post geometry; failures offer `r` retry |
 | Scrollbar | Visible thumb and track, separate from text |
 | All subs header | Community/unread/unknown/loading counts, subscription sync, error and freshness |
 | Community island | Icon, name, unread badge, freshness, refresh error and focus border; 1–3 columns; lower-border retry |
 | Island post | Compact post fields; clipping keeps the selection visible |
 | Bookmarks | Count, view mode, stored posts, selection and removal; label as local bookmarks |
 | Detail header | Community, author, age, flair, bookmark, NSFW/spoiler, bounded title, score and comment count |
+| Structural navigation | `[[`/`]]` jumps root threads; `[p`/`]p` changes posts; `[s`/`]s` changes subreddit feeds or All subs groups; `gt`/`gT` changes tabs. A post follows the destination's selected post when available |
 | Detail media metadata | Gallery index/keys, URL or media/domain, open-media hint; freshness on border |
 | Post document | Selftext, quotes/code, polls, crossposts, gallery captions, main image and comment divider |
 | Comment identity | Selection, depth rails, author, OP/MOD, flair, score, known age and folded count; wrap metadata |
@@ -98,7 +99,7 @@ Rendering: [main UI](../src/ui.rs).
 Post bodies, comments, messages, search previews, community descriptions, rules,
 wiki pages and custom-feed descriptions share formatted text rendering. Bold,
 italic, strikethrough, headings, code, quotes, numbered/nested lists, tables and
-links retain their meaning when wrapped. Links show styled labels; `w` opens a
+links retain their meaning when wrapped. Links show styled labels; `SPC o l` opens a
 link picker for the selected comment, post body or dialog text. Select a label
 with `j`/`k` and `Enter`, then open its destination in the browser or copy its URL.
 Raw URLs remain visible. Superscript
@@ -120,13 +121,13 @@ Video/GIF state includes playback, loading/error, pause, position/duration and
 sound. One player serves the settled selected card, or detail when open. Keep
 geometry stable without a poster; retain pause within the same item. Show status
 beside the picture and controls in the footer. Failures keep the poster and
-retry/media guidance. Turning off **Autoplay videos** in F2 requires `P` to start.
+retry/media guidance. Turning off **Autoplay videos** in F2 requires `SPC m p` to start.
 
 Unread counts share local observation/read history across sidebar, Jump, feeds and
 islands. Only an accepted, revealed post document drawn outside overlays records a
 read; loading/error screens and sidebar focus do not. The sidebar updates in that
-frame; other list labels receive one follow-up redraw. `B` captures the relevant
-community or user for its tools; local bulk-read applies to communities. `O` opens
+frame; other list labels receive one follow-up redraw. `SPC c` captures the relevant
+community or user for its tools; local bulk-read applies to communities. `SPC o c` opens
 the source directly. Empty successful listings
 establish known zero; unfetched/failed listings remain unknown. See the
 [reading-history limits](usage.md#feeds-and-tabs).
@@ -139,7 +140,7 @@ Required fields below describe client validation.
 
 | Form | Fields and defaults | Submission |
 | --- | --- | --- |
-| Open Reddit URL (`Ctrl+L`) | Reddit URL; required, empty, single line | Open post/comment, community or user feed; invalid links retain input |
+| Open Reddit URL (`SPC o u`) | Reddit URL; required, empty, single line | Open post/comment, community or user feed; invalid links retain input |
 | Search posts | Query; required, empty, single line | Search |
 | Search communities | Query; required, empty, single line | Search |
 | Search people | Query; required, empty, single line | Search |
@@ -157,7 +158,7 @@ Required fields below describe client validation.
 | Jump | Single-line tab/subreddit query; empty lists tabs | Open selected result; show no matches explicitly |
 | Subreddit search | Single-line query for named community | Search; `Esc` cancels |
 
-Arrows, Home/End, Backspace/Delete, `Ctrl+u`, `Alt+Backspace` and paste edit text.
+Arrows, Home/End, Backspace/Delete, `Ctrl+u`, `Ctrl+w`, `Alt+Backspace` and paste edit text.
 `Tab`/`Shift+Tab` switch fields when there is more than one. Single-line `Enter`
 advances or submits; multiline `Enter` adds a newline. `Ctrl+s`/`Alt+Enter` submit.
 Pending writes keep the draft and prevent duplicate submission or cancellation.
@@ -169,7 +170,7 @@ Presentation: [menu renderer](../src/ui/experience.rs).
 
 | Menu/group | Choices |
 | --- | --- |
-| Search and explore (`F3`; `/` outside community tabs) | Search posts, communities, people; discover communities; Popular; All Reddit. Results open posts or feeds directly. |
+| Search and explore (`SPC s e` or `F3`) | Search posts, communities, people; discover communities; Popular; All Reddit. Results open posts or feeds directly. |
 | Reddit / Notifications | Unread, comment replies, post replies, mentions, inbox, native notifications |
 | Reddit / Messages | Chat on Reddit |
 | Reddit / Your account | Profile, saved, hidden, upvoted, downvoted; connected accounts only |
@@ -208,16 +209,16 @@ Presentation: [dialogs](../src/ui/experience.rs).
 | Surface | Contents and behavior |
 | --- | --- |
 | Jump/search | Query and caret, selected result with icon/badge, no-match state, Enter/Esc and movement |
-| Join/Leave / Follow/Unfollow | Captured community or user, confirm/cancel, `Space` to open its feed |
+| Join/Leave / Follow/Unfollow | Captured community or user, confirm/cancel, `o` to open its feed |
 | Content/feed deletion | Named target, irreversible Reddit consequence, confirm/cancel |
-| Loading read | Action/page, destination, pending state, cancel/back and native fallback |
+| Loading read | Action/page, destination, pending state, cancel/back and native fallback; continuation reads retain reading navigation while activation waits |
 | Failed first read | Error, `r` retry, `Esc` back, `Ctrl+o` native fallback |
-| Failed continuation | Retain entries/selection; `L` retries next page |
+| Failed continuation | Retain entries/selection and the failed continuation; `r` retries it |
 | Pending/successful write | Sending state blocks duplicate actions; update only after acknowledgment |
 | Profile | Username, karma/description, Overview/Posts/Comments |
-| User feed | Following tabs show submitted posts in Card/Compact with community metadata, sorting and pagination. `S` and the first profile tool follow/unfollow; unfollow moves the retained feed to Opened. Post details target the actual community/profile |
+| User feed | Following tabs show submitted posts in Card/Compact with community metadata, sorting and pagination. `SPC a m` and the first profile tool follow/unfollow; unfollow moves the retained feed to Opened. Post details target the actual community/profile |
 | Inbox | Category, entries, read/unread actions, preview and pagination |
-| Search | Posts/Communities/People, query, supported sort/time, results, preview and pagination |
+| Search | Posts/Communities/People, query, supported sort/time, results, preview and automatic loading near the end |
 | Community | Title, members, description/sidebar, Rules and Wiki |
 | Rules/wiki | Scrollable text; missing wiki says unavailable; no entry/action/paging hints |
 | Moderators | Usernames and profile links; no content-action hint without a target |
@@ -229,7 +230,7 @@ Presentation: [dialogs](../src/ui/experience.rs).
 Empty feeds distinguish sign-out, loading, read failure, private access, unknown
 restriction, filtering and no results/posts. Only an explicit private reason labels
 a community private; generic HTTP 403 does not imply a Reddit outage. Private
-access offers `o` to Reddit and `r` to recheck. Denied cached posts stay unselectable.
+access offers `SPC o r` to Reddit and `r` to recheck. Denied cached posts stay unselectable.
 Tabs and All subs share access observations; only a sufficiently newer success
 clears a denial. Successful empty lists with NSFW off suggest `F2` → **Show NSFW**
 without claiming it caused the empty result. Keep this guidance compact in islands

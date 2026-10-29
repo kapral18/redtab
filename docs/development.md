@@ -37,7 +37,7 @@ spoiler and superscript handling. Spoilers remain linear text markers across
 Markdown formatting boundaries. One styled-line wrapper serves post documents
 and collection dialogs; measurements use those same wrapped lines. Folded
 previews and comment search strip style markers and link-target metadata. Link
-destinations stay in the body separately from visible labels; the local `w` picker
+destinations stay in the body separately from visible labels; the local `SPC o l` picker
 omits links in hidden spoilers. Raw edit source stays separate. Post and reply
 cache keys are versioned to discard older flattened or URL-dump content.
 
@@ -79,6 +79,10 @@ this cancellation.
 Feed demand follows the active tab and current request generations. Retired reads
 resume their cursors and forced-refresh intent on a settled return. Fresh quota
 hints replace older pacing estimates; replies do not replenish burst credit.
+Ancestor moves from a post follow the destination's selected post. Cold destinations
+show their list while loading; a pending follow belongs to the active tab and group
+and is cancelled by unrelated input or a context change. Empty and failed results
+remain in the list.
 Each admission captures the older requests still outstanding. Its quota hint retains
 those reservations and deducts every newer start, regardless of completion order or
 missing headers. Failed/cancelled requests release their outstanding entry; existing
@@ -95,8 +99,13 @@ cache. Refreshes retain an existing page until its replacement completes. Best H
 streams complete cards from the browser's ranked HTML, including media and flags,
 without separate post lookups. An initial partial of up to three posts fetches one
 continuation. Cards from that continuation publish after its cursor is validated.
-Failed continuations keep existing content. Cold loads retain the starter with `L`
-retry; reloads retain the shown page with `r` retry. Failed combined loads are not cached.
+Failed continuations keep existing content. Cold loads retain the starter and reloads retain the shown page; `r` retries failed loading. Failed combined loads are not cached.
+
+Collection downward navigation prefetches near the last entry. Each gesture starts
+at most one continuation; empty/filtered pages advance on further navigation.
+Cursor history and continuation errors belong to their Browse screen. Failures
+wait for `r`; repeated cursors stop. Appends retain selection/description position
+and reject duplicate entries and abandoned generations.
 
 ## Media rendering
 
@@ -165,7 +174,7 @@ Returning to a detail video uses the current sound preference.
 Images above 16 million pixels use validated Reddit resolutions, preferring the
 smallest with a long edge of at least 1600 pixels, or the largest available below
 it. Original URLs stay separate for media handoff and downloads. Still decoding uses a 128 MiB
-allocation budget; oversized originals without a usable preview offer `o`.
+allocation budget; oversized originals without a usable preview offer `SPC o r`.
 
 Native video retains a 921,600-pixel budget, allocated proportionally for portrait
 frames. Fast lossless PNG carries the RGB pixels. Prepared strips publish together;
