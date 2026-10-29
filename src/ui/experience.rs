@@ -65,7 +65,11 @@ fn preview_rows(
 ) -> usize {
     let mut rows = 0;
     for index in 0..page.entries.len() {
-        rows = rows.max(wrapped_rows(preview_text(query, page, index), width).min(10));
+        rows = rows.max(
+            reading_lines(preview_text(query, page, index), width)
+                .len()
+                .min(10),
+        );
         if rows == 10 {
             break;
         }
@@ -80,7 +84,7 @@ fn empty_browse_text(
 ) -> String {
     use crate::reddit::experience::Query;
     if !page.text.is_empty() {
-        clean(&page.text)
+        page.text.clone()
     } else if !show_nsfw
         && matches!(
             query,
@@ -104,12 +108,14 @@ fn body_rows(screen: &Screen, width: u16, show_nsfw: bool) -> usize {
         Screen::Input(form) => form_layout(form, width as usize).lines.len().max(1),
         Screen::Browse { query, page, .. } => {
             if page.entries.is_empty() {
-                wrapped_rows(&empty_browse_text(query, page, show_nsfw), width).clamp(1, 18)
+                reading_lines(&empty_browse_text(query, page, show_nsfw), width)
+                    .len()
+                    .clamp(1, 18)
             } else {
                 let summary = if matches!(query, crate::reddit::experience::Query::Thread(_)) {
                     0
                 } else {
-                    wrapped_rows(&page.text, width).min(8)
+                    reading_lines(&page.text, width).len().min(8)
                 };
                 let preview = preview_rows(query, page, width);
                 summary
@@ -325,7 +331,11 @@ pub(super) fn draw(f: &mut Frame, app: &App) -> Option<Rect> {
             .entries
             .iter()
             .map(|e| e.title.width())
-            .chain(page.text.lines().map(UnicodeWidthStr::width))
+            .chain(
+                crate::model::unformatted(&spoiler_text(&page.text, false))
+                    .lines()
+                    .map(UnicodeWidthStr::width),
+            )
             .chain([title.width()])
             .max()
             .unwrap_or(40)
@@ -533,8 +543,7 @@ fn draw_browse(
     if page.entries.is_empty() {
         let text = empty_browse_text(query, page, show_nsfw);
         f.render_widget(
-            Paragraph::new(text)
-                .wrap(Wrap { trim: false })
+            Paragraph::new(reading_lines(&text, body.width))
                 .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
             body,
         );
@@ -553,7 +562,7 @@ fn draw_browse(
     };
     let available = body.height.saturating_sub(loader_rows);
     let has_preview = preview_rows(query, page, body.width) > 0;
-    let summary_rows = wrapped_rows(summary, body.width).min(8);
+    let summary_rows = reading_lines(summary, body.width).len().min(8);
     let text_reserve = if summary_rows > 0 {
         usize::from(available >= 2)
     } else if has_preview {
@@ -583,8 +592,7 @@ fn draw_browse(
     ])
     .areas(body);
     f.render_widget(
-        Paragraph::new(clean(summary))
-            .wrap(Wrap { trim: false })
+        Paragraph::new(reading_lines(summary, summary_area.width))
             .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         summary_area,
     );
@@ -615,8 +623,7 @@ fn draw_browse(
     f.render_widget(Paragraph::new(rows), list);
     if has_preview && !preview_area.is_empty() {
         f.render_widget(
-            Paragraph::new(clean(preview))
-                .wrap(Wrap { trim: false })
+            Paragraph::new(reading_lines(preview, preview_area.width))
                 .scroll((scroll.min(u16::MAX as usize) as u16, 0))
                 .block(
                     Block::default()
@@ -753,7 +760,16 @@ fn clean(text: &str) -> String {
         .chars()
         .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
         .filter(|c| *c != PICTURE)
+        .filter(|c| !crate::model::text_format(*c))
         .collect()
+}
+
+fn reading_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let text = spoiler_text(text, false).replace(PICTURE, "[image] ");
+    rich_text::wrap(&text, usize::from(width), Style::default())
 }
 
 #[cfg(test)]
@@ -787,7 +803,11 @@ mod tests {
             query: Query::Profile("reader".into()),
             page: Page {
                 title: "u/reader".into(),
-                text: "Post karma: 23499    Comment karma: 43077".into(),
+                text: format!(
+                    "Post karma: {}23499{}    Comment karma: 43077",
+                    crate::model::TEXT_BOLD,
+                    crate::model::TEXT_END
+                ),
                 entries: ["Overview", "Posts", "Comments"]
                     .map(|title| Entry {
                         title: title.into(),
@@ -809,6 +829,14 @@ mod tests {
                 super::draw(f, &app);
             })
             .unwrap();
+        let karma = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "2")
+            .unwrap();
+        assert!(karma.modifier.contains(Modifier::BOLD), "{karma:?}");
         let rows: Vec<String> = terminal
             .backend()
             .buffer()

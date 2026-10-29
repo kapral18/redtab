@@ -90,6 +90,7 @@ enum MenuScope {
     Comments,
     Message,
     User,
+    Links,
 }
 
 #[derive(Clone)]
@@ -99,6 +100,9 @@ enum Command {
     Write(Action),
     Confirm(String, Action),
     Native(String),
+    BodyLink(crate::model::BodyLink),
+    OpenUrl(String),
+    CopyUrl(String),
     Subreddit(String),
     User(String),
     Membership(MembershipTarget),
@@ -248,6 +252,7 @@ fn ordered_choices(choices: Vec<Choice>, scope: MenuScope) -> Vec<Choice> {
                     _ => (6, "On Reddit"),
                 },
                 MenuScope::User => (0, "Profile"),
+                MenuScope::Links => (0, "Links"),
                 MenuScope::Community => match &choice.command {
                     Command::Subreddit(_) | Command::MarkCommunityRead(_) => (0, "Community"),
                     Command::Native(path) if path.strip_prefix("/r/").is_some_and(is_community) => {
@@ -418,6 +423,64 @@ impl App {
             subreddit: post.subreddit.clone(),
             permalink: format!("/comments/{}/_/{}", post.id, comment.id),
         })
+    }
+
+    pub fn show_body_links(&mut self) {
+        let (text, reveal) = match self.experience.screens.last() {
+            Some(Screen::Browse {
+                query,
+                page,
+                selected,
+                ..
+            }) if matches!(self.overlay, Some(Overlay::Experience)) => {
+                let text = if !page.text.is_empty() && !matches!(query, Query::Thread(_)) {
+                    page.text.as_str()
+                } else {
+                    page.entries
+                        .get(*selected)
+                        .map_or(page.text.as_str(), |entry| entry.body.as_str())
+                };
+                (text, false)
+            }
+            _ if self.overlay.is_none() && self.post_focused() => {
+                let Some(view) = self
+                    .post_view
+                    .as_ref()
+                    .filter(|view| !view.spoiler_hidden())
+                else {
+                    self.info("Reveal spoilers with v first");
+                    return;
+                };
+                let text = if !view.free_scroll
+                    && let Some(Row {
+                        kind: RowKind::Comment { comment, .. },
+                        ..
+                    }) = view.rows().get(view.cursor)
+                    && !comment.id.starts_with(THREAD_ROOT)
+                {
+                    comment.body.as_str()
+                } else {
+                    view.page.as_ref().map_or("", |page| page.body.as_str())
+                };
+                (text, view.reveal_spoilers)
+            }
+            _ => return,
+        };
+        let choices: Vec<_> = crate::model::body_links(text, reveal)
+            .into_iter()
+            .map(|link| {
+                let label = link.label.clone();
+                choice(&label, Command::BodyLink(link))
+            })
+            .collect();
+        if choices.is_empty() {
+            self.info("No visible links in this text");
+            return;
+        }
+        if self.overlay.is_none() {
+            self.experience.screens.clear();
+        }
+        self.push_menu("Links in text", choices, MenuScope::Links);
     }
 
     fn action_target(&self) -> Option<Target> {
@@ -1220,6 +1283,27 @@ impl App {
                 });
             }
             Command::Native(path) => self.open_reddit_link(&path),
+            Command::BodyLink(link) => self.push_menu(
+                &link.label,
+                vec![
+                    choice(
+                        &format!("Open in browser ↗\n{}", link.url),
+                        Command::OpenUrl(link.url.clone()),
+                    ),
+                    choice("Copy URL", Command::CopyUrl(link.url)),
+                ],
+                MenuScope::Links,
+            ),
+            Command::OpenUrl(url) => {
+                match media::spawn_detached(&self.config.commands.browser, &[url]) {
+                    Ok(()) => self.info("Opened link in your browser"),
+                    Err(error) => self.error(format!("Could not open link: {error}")),
+                }
+            }
+            Command::CopyUrl(url) => match media::copy(&url) {
+                Ok(tool) => self.info(format!("Copied link ({tool})")),
+                Err(error) => self.error(format!("copy failed: {error:#}")),
+            },
             Command::Membership(target) => self.show_membership_for(target),
             Command::User(name) => {
                 self.experience = Experience::default();
@@ -1340,6 +1424,14 @@ impl App {
             return;
         }
         if self.experience.pending.is_some() {
+            return;
+        }
+        if key.code == KeyCode::Char('w')
+            && !ctrl
+            && !alt
+            && matches!(self.experience.screens.last(), Some(Screen::Browse { .. }))
+        {
+            self.show_body_links();
             return;
         }
         if key.code == KeyCode::Char('S') && !ctrl && !alt {
@@ -1826,7 +1918,9 @@ fn collect_invalidations(comments: &[Comment], entries: &mut Vec<crate::worker::
 fn collect_matches(comments: &[Comment], post: &Post, query: &str, entries: &mut Vec<Entry>) {
     for comment in comments {
         if !comment.id.starts_with(THREAD_ROOT)
-            && (comment.body.to_lowercase().contains(query)
+            && (crate::model::unformatted(&comment.body)
+                .to_lowercase()
+                .contains(query)
                 || comment.author.to_lowercase().contains(query))
         {
             entries.push(Entry {
@@ -2605,6 +2699,150 @@ mod tests {
     fn post_page() -> PostPage {
         crate::reddit::parse::parse_post_page(include_str!("../../tests/fixtures/post.json"))
             .unwrap()
+    }
+
+    #[test]
+    fn when_reading_links_it_should_follow_comment_selection_and_keep_spoilers_hidden() {
+        let (mut app, _dir, _fixture) = app();
+        let mut source: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/post.json")).unwrap();
+        source[0]["data"]["children"][0]["data"]["selftext_html"] =
+            json!("<p><a href='https://example.org/post?x=1&amp;y=2'>post guide</a></p>");
+        source[1]["data"]["children"][0]["data"]["body_html"] = json!(
+            "<p><a href='/r/rust/wiki/index'>comment guide</a> <span class='md-spoiler-text'><a href='https://example.org/secret'>secret</a></span></p>"
+        );
+        let page = crate::reddit::parse::parse_post_page(&source.to_string()).unwrap();
+        app.overlay = Some(Overlay::Experience);
+        app.experience.screens.push(Screen::Browse {
+            query: Query::Inbox(Inbox::All),
+            page: Page {
+                title: "Saved post".into(),
+                text: String::new(),
+                entries: vec![Entry {
+                    title: page.post.title.clone(),
+                    body: String::new(),
+                    target: Some(Target::from_post(&page.post)),
+                    query: None,
+                    post: Some(page.post.clone()),
+                }],
+                after: None,
+                url: "/saved".into(),
+            },
+            selected: 0,
+            scroll: 0,
+        });
+        key(&mut app, KeyCode::Enter);
+        assert!(app.overlay.is_none());
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(page)),
+        });
+        app.focus = Focus::Post;
+        app.post_view.as_mut().unwrap().free_scroll = true;
+
+        key(&mut app, KeyCode::Char('w'));
+        let Some(Screen::Menu { choices, .. }) = app.experience.screens.last() else {
+            panic!("missing post links")
+        };
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].label, "post guide");
+        key(&mut app, KeyCode::Enter);
+        let Some(Screen::Menu { choices, .. }) = app.experience.screens.last() else {
+            panic!("missing link actions")
+        };
+        assert!(
+            matches!(&choices[0].command, Command::OpenUrl(url) if url == "https://example.org/post?x=1&y=2")
+        );
+        assert!(
+            matches!(&choices[1].command, Command::CopyUrl(url) if url == "https://example.org/post?x=1&y=2")
+        );
+        app.config.commands.browser = vec!["/redtab-test-missing-browser".into()];
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|status| status.text.contains("Could not open link"))
+        );
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Esc);
+
+        let view = app.post_view.as_mut().unwrap();
+        view.free_scroll = false;
+        view.cursor = 0;
+        key(&mut app, KeyCode::Char('w'));
+        let Some(Screen::Menu { choices, .. }) = app.experience.screens.last() else {
+            panic!("missing comment links")
+        };
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].label, "comment guide");
+        assert!(
+            matches!(&choices[0].command, Command::BodyLink(link) if link.url == "https://www.reddit.com/r/rust/wiki/index")
+        );
+        assert!(app.experience.pending.is_none());
+        key(&mut app, KeyCode::Esc);
+        app.post_view.as_mut().unwrap().reveal_spoilers = true;
+        key(&mut app, KeyCode::Char('w'));
+        let Some(Screen::Menu { choices, .. }) = app.experience.screens.last() else {
+            panic!("missing revealed links")
+        };
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[1].label, "secret");
+        key(&mut app, KeyCode::Esc);
+        let view = app.post_view.as_mut().unwrap();
+        view.reveal_spoilers = false;
+        view.page.as_mut().unwrap().post.spoiler = true;
+        key(&mut app, KeyCode::Char('w'));
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn when_a_reading_dialog_has_links_it_should_use_the_visible_text_and_restore_the_dialog() {
+        let (mut app, _dir, _fixture) = app();
+        let mut source: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/post.json")).unwrap();
+        source[0]["data"]["children"][0]["data"]["selftext_html"] =
+            json!("<p><a href='https://example.org/about'>about guide</a></p>");
+        source[1]["data"]["children"][0]["data"]["body_html"] =
+            json!("<p><a href='https://example.org/comment'>comment guide</a></p>");
+        let page = crate::reddit::parse::parse_post_page(&source.to_string()).unwrap();
+        app.overlay = Some(Overlay::Experience);
+        app.experience.screens.push(Screen::Browse {
+            query: Query::Community("rust".into()),
+            page: Page {
+                title: "About".into(),
+                text: page.body,
+                entries: vec![Entry {
+                    title: "Comment".into(),
+                    body: page.comments[0].replies[0].body.clone(),
+                    query: None,
+                    target: None,
+                    post: None,
+                }],
+                after: None,
+                url: "/r/rust/about".into(),
+            },
+            selected: 0,
+            scroll: 3,
+        });
+
+        key(&mut app, KeyCode::Char('w'));
+        let Some(Screen::Menu { choices, .. }) = app.experience.screens.last() else {
+            panic!("missing dialog links")
+        };
+        assert_eq!(choices[0].label, "about guide");
+        key(&mut app, KeyCode::Esc);
+        let Some(Screen::Browse { query, scroll, .. }) = app.experience.screens.last_mut() else {
+            panic!("lost dialog")
+        };
+        assert_eq!(*scroll, 3);
+        *query = Query::Thread("/comments/post".into());
+        key(&mut app, KeyCode::Char('w'));
+        let Some(Screen::Menu { choices, .. }) = app.experience.screens.last() else {
+            panic!("missing selected entry links")
+        };
+        assert_eq!(choices[0].label, "comment guide");
+        assert!(app.experience.pending.is_none());
     }
 
     #[test]

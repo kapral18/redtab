@@ -42,6 +42,7 @@ const POST: &[(&str, &str)] = &[
     ("n N", "next / previous top-level comment"),
     (";", "actions for the selected post or comment"),
     ("o · y", "open or copy the selected comment/post link"),
+    ("w", "choose a text link to open or copy"),
     ("O", "open this post’s community or profile in browser"),
     ("B", "tools for this community or profile"),
     ("f", "comment sort and find in loaded comments"),
@@ -503,7 +504,13 @@ fn experience_section(app: &App) -> Section {
             page,
             selected,
             ..
-        }) => browse_section(query, page, *selected),
+        }) => {
+            let mut section = browse_section(query, page, *selected);
+            section
+                .keys
+                .push(("w", "choose a text link to open or copy"));
+            section
+        }
         _ => section(
             "Reddit menu / actions",
             &[

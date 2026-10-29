@@ -353,6 +353,7 @@ fn handle_post(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('G') | KeyCode::End => app.post_bottom(),
         KeyCode::Char('n') => app.jump_top_level(true),
         KeyCode::Char('v') => app.toggle_spoilers(),
+        KeyCode::Char('w') => app.show_body_links(),
         KeyCode::Char('N') => app.jump_top_level(false),
         KeyCode::Char('f') => app.comment_tools(),
         KeyCode::Char('{') => app.gallery_step(false),

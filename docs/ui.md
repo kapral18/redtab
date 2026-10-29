@@ -93,6 +93,18 @@ Rendering: [main UI](../src/ui.rs).
 | More replies | Optional count, singular/plural label, Enter and loading state; preserve expansion anchors |
 | Footer | Errors/success, membership and connection state before activity; rate-limit countdown with sanitized operation/status/quota; whole applicable key/action pairs; help stays visible |
 
+## Reddit text
+
+Post bodies, comments, messages, search previews, community descriptions, rules,
+wiki pages and custom-feed descriptions share formatted text rendering. Bold,
+italic, strikethrough, headings, code, quotes, numbered/nested lists, tables and
+links retain their meaning when wrapped. Links show styled labels; `w` opens a
+link picker for the selected comment, post body or dialog text. Select a label
+with `j`/`k` and `Enter`, then open its destination in the browser or copy its URL.
+Raw URLs remain visible. Superscript
+uses a caret because terminal cells have no smaller baseline. Spoilers remain
+masked until revealed. Titles and Markdown editing fields stay literal.
+
 ## Media states
 
 Images distinguish loading, preparing, ready, failed, disabled and unusable video

@@ -19,6 +19,7 @@ html5ever = "0.39"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 nucleo-matcher = "0.3"
 parking_lot = "0.12"
+pulldown-cmark = { version = "0.13.5", default-features = false, features = ["html"] }
 ratatui = "0.30"
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
 scraper = "0.27"

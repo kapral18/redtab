@@ -28,6 +28,19 @@ pane tty, compatible clients and matching measured client cell sizes. If no clie
 shows that window, all attached server clients must agree. Window pixel defaults
 cannot establish native graphics support.
 
+## Reddit text
+
+The HTML body parser preserves inline styles using internal noncharacter markers,
+alongside the existing spoiler and picture markers. Incoming text cannot inject
+these markers. Markdown-only content goes through pulldown-cmark with Reddit
+spoiler and superscript handling. Spoilers remain linear text markers across
+Markdown formatting boundaries. One styled-line wrapper serves post documents
+and collection dialogs; measurements use those same wrapped lines. Folded
+previews and comment search strip style markers and link-target metadata. Link
+destinations stay in the body separately from visible labels; the local `w` picker
+omits links in hidden spoilers. Raw edit source stays separate. Post and reply
+cache keys are versioned to discard older flattened or URL-dump content.
+
 ## Request scheduling
 
 Selected threads, active feeds and main images have separate worker capacity from

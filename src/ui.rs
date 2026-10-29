@@ -4,6 +4,7 @@
 mod experience;
 mod help;
 mod loading;
+mod rich_text;
 mod settings;
 
 use std::collections::{HashMap, hash_map::DefaultHasher};
@@ -2635,6 +2636,7 @@ fn draw_bookmarks(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListP
 /// Masks `>!…!<` spoilers as `▒`, one per column with spaces kept (same width, but break
 /// points still differ, e.g. at hyphens or between CJK), or strips the markers once revealed.
 fn spoiler_text(text: &str, reveal: bool) -> String {
+    let text = crate::model::without_link_targets(text);
     let mut out = String::with_capacity(text.len());
     let mut inside = false;
     let push = |segment: &str, masked: bool, out: &mut String| {
@@ -2652,16 +2654,26 @@ fn spoiler_text(text: &str, reveal: bool) -> String {
                 continue;
             }
             // Whole graphemes, so an emoji sequence masks to the columns it shows in.
-            for g in line.graphemes(true) {
-                if g.chars().all(char::is_whitespace) {
-                    out.push_str(g);
-                } else {
-                    out.extend(std::iter::repeat_n('▒', g.width()));
+            for part in line.split_inclusive(crate::model::text_format) {
+                let marker = part
+                    .chars()
+                    .last()
+                    .filter(|c| crate::model::text_format(*c));
+                let content = marker.map_or(part, |c| &part[..part.len() - c.len_utf8()]);
+                for g in content.graphemes(true) {
+                    if g.chars().all(char::is_whitespace) {
+                        out.push_str(g);
+                    } else {
+                        out.extend(std::iter::repeat_n('▒', g.width()));
+                    }
+                }
+                if let Some(marker) = marker {
+                    out.push(marker);
                 }
             }
         }
     };
-    let mut rest = text;
+    let mut rest = text.as_ref();
     while let Some(at) = rest.find([SPOILER_START, SPOILER_END]) {
         push(&rest[..at], inside, &mut out);
         let marker = rest[at..].chars().next().unwrap_or(SPOILER_END);
@@ -2679,26 +2691,9 @@ fn wrap_into(
     prefix: &[Span<'static>],
     style: Style,
 ) {
-    let width = width.max(1);
-    for para in text.split('\n') {
-        if para.trim().is_empty() {
-            lines.push(Line::from(prefix.to_vec()));
-            continue;
-        }
-        let quoted = para.starts_with("│ ");
-        let code = para.starts_with("    ");
-        let para_style = if quoted {
-            style.fg(SUBTEXT).add_modifier(Modifier::ITALIC)
-        } else if code {
-            style.fg(GREEN)
-        } else {
-            style
-        };
-        for piece in textwrap::wrap(para, width) {
-            let mut spans = prefix.to_vec();
-            spans.push(Span::styled(piece.into_owned(), para_style));
-            lines.push(Line::from(spans));
-        }
+    for mut line in rich_text::wrap(text, width, style) {
+        line.spans.splice(0..0, prefix.iter().cloned());
+        lines.push(line);
     }
 }
 
@@ -2752,10 +2747,12 @@ fn text_into(
         if start > 0 {
             wrap_into(lines, &rest[..start - 1], width, prefix, style);
         }
-        let url = picture_line(&rest[start..end]).unwrap_or_default();
+        let picture_text = crate::model::unformatted(&rest[start..end]);
+        let url = picture_line(&picture_text).unwrap_or_default();
         // What stands before it on its line, a bullet or quote bar, stays before it: quote
         // bars on every row, the rest (a bullet) on the first.
-        let lead = &rest[start..at];
+        let lead = crate::model::unformatted(&rest[start..at]);
+        let lead = lead.as_ref();
         let quoted = lead.starts_with('│');
         let lead_style = if quoted { style.fg(SUBTEXT) } else { style };
         let bars = lead.len() - lead.trim_start_matches(['│', ' ']).len();
@@ -3664,7 +3661,8 @@ fn post_document(
                 }];
                 body_prefix.extend(thread_prefix(row.depth, visible_depth));
                 if *hidden > 0 {
-                    let body = spoiler_text(&comment.body, reveal);
+                    let body = crate::model::unformatted(&spoiler_text(&comment.body, reveal))
+                        .into_owned();
                     let first = body
                         .lines()
                         .find(|l| !l.trim().is_empty())
@@ -6102,6 +6100,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn when_body_markup_wraps_it_should_style_visible_text_without_changing_column_width() {
+        use crate::model::{
+            LINK_TARGET, LINK_TARGET_END, TEXT_BOLD, TEXT_END, TEXT_ITALIC, TEXT_LINK,
+        };
+        let mut lines = Vec::new();
+        wrap_into(
+            &mut lines,
+            &format!(
+                "plain {TEXT_BOLD}bold {TEXT_ITALIC}both{TEXT_END} end{TEXT_END} {TEXT_LINK}{LINK_TARGET}https://example.org/a-long-destination{LINK_TARGET_END}link{TEXT_END}"
+            ),
+            12,
+            &[Span::raw("│ ")],
+            Style::new().fg(TEXT),
+        );
+        let actual: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect();
+        assert!(!actual.contains(crate::model::text_format), "{actual:?}");
+        assert!(!actual.contains("example.org"), "{actual:?}");
+        assert!(lines.iter().all(|line| line.width() <= 14), "{lines:?}");
+        let both = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.contains("both"))
+            .unwrap();
+        assert!(
+            both.style
+                .add_modifier
+                .contains(Modifier::BOLD | Modifier::ITALIC),
+            "{both:?}"
+        );
+        let link = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.contains("link"))
+            .unwrap();
+        assert!(
+            link.style.add_modifier.contains(Modifier::UNDERLINED),
+            "{link:?}"
+        );
+    }
+
+    #[test]
     fn when_account_lists_load_the_sidebar_should_show_progress_and_retain_refreshed_entries() {
         let mut app = app(&[]);
         app.active = 0;
@@ -6270,10 +6312,17 @@ pub(crate) mod tests {
         let url = "https://preview.redd.it/c.png";
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
         page.body.clear();
-        page.comments[0].body = format!("before\n{PICTURE}{url}\nafter");
+        let mut source: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/post.json")).unwrap();
+        source[1]["data"]["children"][0]["data"]["body_html"] = serde_json::json!(format!(
+            "before<a href='https://giphy.com/gifs/x'><img src='{url}'></a>after"
+        ));
+        let parsed = crate::reddit::parse::parse_post_page(&source.to_string()).unwrap();
+        page.comments[0].body = parsed.comments[0].replies[0].body.clone();
 
         let loading = screen(&mut app, 100, 40);
         assert!(loading.contains("⠋ loading image"), "{loading}");
+        assert!(!loading.contains("giphy.com"), "{loading}");
         assert!(matches!(app.images.get(url), Some(ImageSlot::Loading)));
 
         let slot = ready(&app, 400, 200);

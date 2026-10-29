@@ -265,14 +265,14 @@ impl Invalidation {
                 after,
             } => query.cache_request(target, after.as_deref()),
             Self::Post(link) => post_cache_request(link),
-            Self::Replies(cursor) => serde_json::to_string(&("replies", cursor)).ok(),
+            Self::Replies(cursor) => serde_json::to_string(&("replies-v3", cursor)).ok(),
         }
     }
 }
 
 fn post_cache_request(link: &str) -> Option<String> {
     let (path, _) = crate::reddit::experience::thread_location(link).ok()?;
-    serde_json::to_string(&("post-v2", crate::reddit::parse::post_id(&path)?)).ok()
+    serde_json::to_string(&("post-v4", crate::reddit::parse::post_id(&path)?)).ok()
 }
 
 impl Job {
@@ -1199,7 +1199,7 @@ impl Job {
                 (post_cache_request(permalink)?, CONTENT_TTL)
             }
             Job::MoreReplies { cursor, .. } => (
-                serde_json::to_string(&("replies", cursor)).ok()?,
+                serde_json::to_string(&("replies-v3", cursor)).ok()?,
                 CONTENT_TTL,
             ),
             Job::Image { url, .. } => (
@@ -3690,4 +3690,45 @@ fn when_home_uses_the_browser_feed_it_should_not_reuse_legacy_json_snapshots() {
             .unwrap(),
         r#"["feed","rust",{"Listing":{"sort":"Hot","time":"Day"}},null]"#
     );
+}
+
+#[test]
+fn when_bodies_retain_markup_they_should_not_reuse_flattened_cached_documents() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = Cache::new(directory.path().to_path_buf());
+    for (job, legacy, invalidation) in [
+        (
+            Job::Post {
+                generation: 1,
+                permalink: "/comments/post/title/".into(),
+            },
+            r#"["post-v3","post"]"#,
+            Invalidation::Post("/comments/post/title/".into()),
+        ),
+        (
+            Job::MoreReplies {
+                generation: 1,
+                comment_id: "comment".into(),
+                cursor: "cursor".into(),
+                minimum: None,
+            },
+            r#"["replies-v2","cursor"]"#,
+            Invalidation::Replies("cursor".into()),
+        ),
+    ] {
+        cache
+            .store(
+                &Cache::key("account", legacy),
+                b"flattened document",
+                crate::app::now(),
+                cache.reserve_request().unwrap(),
+            )
+            .unwrap();
+        let (actual, _) = job.cache_key("account").unwrap();
+        assert!(cache.load(&actual, crate::app::now()).is_none());
+        assert_eq!(
+            actual,
+            Cache::key("account", &invalidation.request().unwrap())
+        );
+    }
 }

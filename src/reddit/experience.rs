@@ -836,9 +836,12 @@ fn read_page(query: &Query, value: Value, show_nsfw: bool) -> Result<Page> {
                 "Post karma: {}    Comment karma: {}\n{}",
                 data["link_karma"].as_i64().unwrap_or(0),
                 data["comment_karma"].as_i64().unwrap_or(0),
-                data["subreddit"]["public_description"]
-                    .as_str()
-                    .unwrap_or_default()
+                text::body(
+                    "",
+                    data["subreddit"]["public_description"]
+                        .as_str()
+                        .unwrap_or_default()
+                )
             );
             page.entries = [UserFeed::Overview, UserFeed::Posts, UserFeed::Comments]
                 .into_iter()
@@ -865,9 +868,9 @@ fn read_page(query: &Query, value: Value, show_nsfw: bool) -> Result<Page> {
             page.title = format!("r/{sub}");
             page.text = format!(
                 "{}\n{} members\n\n{}\n\n{}",
-                data["title"].as_str().unwrap_or_default(),
+                text::without_markers(data["title"].as_str().unwrap_or_default()),
                 data["subscribers"].as_u64().unwrap_or(0),
-                data["public_description"].as_str().unwrap_or_default(),
+                text::body("", data["public_description"].as_str().unwrap_or_default()),
                 text::body(
                     data["description_html"].as_str().unwrap_or_default(),
                     data["description"].as_str().unwrap_or_default()
@@ -894,8 +897,11 @@ fn read_page(query: &Query, value: Value, show_nsfw: bool) -> Result<Page> {
                 .map(|r| {
                     format!(
                         "{}\n{}",
-                        r["short_name"].as_str().unwrap_or_default(),
-                        r["description"].as_str().unwrap_or_default()
+                        text::without_markers(r["short_name"].as_str().unwrap_or_default()),
+                        text::body(
+                            r["description_html"].as_str().unwrap_or_default(),
+                            r["description"].as_str().unwrap_or_default()
+                        )
                     )
                 })
                 .collect::<Vec<_>>()
@@ -943,7 +949,7 @@ fn read_page(query: &Query, value: Value, show_nsfw: bool) -> Result<Page> {
                 name(segments[3])?;
                 page.entries.push(Entry {
                     title: data["display_name"].as_str().unwrap_or(segments[3]).into(),
-                    body: data["description_md"].as_str().unwrap_or_default().into(),
+                    body: text::body("", data["description_md"].as_str().unwrap_or_default()),
                     target: None,
                     post: None,
                     query: Some(Query::Multi {
@@ -1069,10 +1075,7 @@ fn entry(thing: &Value) -> Result<Option<Entry>> {
                 .context("Community has no name")?;
             name(sub)?;
             entry.title = format!("r/{sub}");
-            entry.body = data["public_description"]
-                .as_str()
-                .unwrap_or_default()
-                .into();
+            entry.body = text::body("", data["public_description"].as_str().unwrap_or_default());
             entry.query = Some(Query::Community(sub.into()));
         }
         Some("t2") => {

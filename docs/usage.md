@@ -14,6 +14,11 @@ work; `/s/` share links need the full post URL. Invalid links keep the input for
 Post and comment links select their community or profile tab once loaded and keep
 the linked comment selected.
 
+In a post or reading dialog, `w` lists links in the selected comment, post body
+or dialog text. Choose a label with `j`/`k` and `Enter`, then open the link in your
+browser or copy its URL. Hidden spoiler links stay out of this list. `o` and `y`
+still open or copy the selected post/comment's Reddit permalink.
+
 `F3` opens Search and explore: search posts across Reddit, communities or people,
 discover communities, or browse Popular and All. `Enter` opens a result's post or
 feed; `B` shows community/profile tools. Post searches support `s` sort, `t` time
