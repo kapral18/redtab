@@ -176,11 +176,8 @@ impl Media {
 
     pub fn preview_image_at(&self, index: usize) -> Option<Cow<'_, str>> {
         let source = match self {
-            Media::Image { url, preview } => self
-                .video_url()
-                .is_none()
-                .then_some(preview.as_deref().unwrap_or(url)),
-            Media::Video { poster, .. } => poster.as_deref(),
+            Media::Image { url, preview } => Some(preview.as_deref().unwrap_or(url)),
+            Media::Video { poster, url, .. } => poster.as_deref().or(url.as_deref()),
             Media::Gallery {
                 images, previews, ..
             } => {
@@ -740,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn when_a_gif_post_lists_it_should_have_a_thumbnail_but_no_still_preview() {
+    fn when_a_gif_post_lists_it_should_use_its_first_frame_as_a_still_preview() {
         let media = Media::Image {
             url: "https://i.redd.it/a.gif".into(),
             preview: None,
@@ -750,7 +747,10 @@ mod tests {
             media.list_thumb().as_deref(),
             Some("https://i.redd.it/a.gif")
         );
-        assert_eq!(media.preview_image(), None, "it plays as video instead");
+        assert_eq!(
+            media.preview_image().as_deref(),
+            Some("https://i.redd.it/a.gif")
+        );
     }
 
     #[test]
@@ -791,7 +791,10 @@ mod tests {
         };
 
         assert_eq!(actual.video_url(), Some("https://i.redd.it/movie.gif"));
-        assert_eq!(actual.preview_image(), None);
+        assert_eq!(
+            actual.preview_image().as_deref(),
+            Some("https://preview.redd.it/movie.png")
+        );
         assert_eq!(
             actual.list_thumb().as_deref(),
             Some("https://preview.redd.it/movie.png")

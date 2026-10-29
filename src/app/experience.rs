@@ -1358,6 +1358,7 @@ impl App {
             tab.feed.refreshing.clear();
             tab.feed.forced.clear();
             tab.feed.deferred.clear();
+            tab.feed.updates.clear();
             tab.feed.loaded = false;
         }
         let target_post = thread_location(&self.experience_native_path())
@@ -1436,10 +1437,7 @@ impl App {
                     Err(error) => self.error(format!("Could not open link: {error}")),
                 }
             }
-            Command::CopyUrl(url) => match media::copy(&url) {
-                Ok(tool) => self.info(format!("Copied link ({tool})")),
-                Err(error) => self.error(format!("copy failed: {error:#}")),
-            },
+            Command::CopyUrl(url) => self.copy_url(&url, false),
             Command::Membership(target) => self.show_membership_for(target),
             Command::User(name) => {
                 self.experience = Experience::default();
@@ -1774,8 +1772,8 @@ impl App {
         let path = self
             .action_target()
             .map_or_else(|| self.experience_native_path(), |target| target.permalink);
-        match reddit_url(&path).and_then(|url| media::copy(&url)) {
-            Ok(tool) => self.info(format!("Copied link ({tool})")),
+        match reddit_url(&path) {
+            Ok(url) => self.copy_url(&url, false),
             Err(error) => self.error(format!("copy failed: {error:#}")),
         }
     }

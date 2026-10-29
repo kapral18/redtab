@@ -49,12 +49,29 @@ the work. Use compact variants when the surrounding layout has only one row.
 | Media preparation | Centered spinner within the reserved image/video slot; inline for embedded pictures and playback status |
 | Account or write action | Warm spinner with the specific action and its existing controls; pending writes retain drafts and block duplicate submission |
 
+Home, community, user and subreddit-search feeds buffer background replacements
+of loaded pages. The fixed header distinguishes **New posts** from **Feed details
+updated**, followed by **r refresh**. Detail updates include scores, comments,
+ordering or pagination changes among existing posts. `r` applies the latest buffered
+pages and shows the first visible post from the top, clearing the old scroll position.
+Home keeps Reddit's Best ranking; a refresh can still rank the same post first.
+Initial loads and new pagination pages appear immediately. With no buffered update,
+`r` fetches fresh content or retries a failed read.
+
 Subscriptions and Following each show a loading row while the account list loads,
 including before any entries arrive. Refresh keeps existing rows visible.
 
 Animation advances at most every 100 ms while the active view or sidebar is busy. Help and
 static overlays pause it; busy dialogs animate their own progress. Completion or
 failure stops it. Redraws reuse cached media.
+
+Visible videos load posters or first-frame stills independently of selection and
+autoplay. Selected playback supplies its own frame rather than starting a second
+preview decode. Large native video frames are paced by encoded size to limit
+terminal output; playback can skip frames while retaining pixel detail and media time.
+A background output owner commits one complete terminal frame at a time; input and
+application state continue updating while it writes. Exit and panic restoration wait
+for the outstanding frame before restoring terminal modes.
 
 Ordinary video-frame preparation does not show image-loading activity. Footer
 progress uses a reserved slot beside the key hints, so starting or finishing work

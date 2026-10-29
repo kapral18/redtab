@@ -225,6 +225,13 @@ pub enum Job {
         /// thread full of them never delays what the reader waits for.
         background: bool,
     },
+    VideoFrame {
+        url: String,
+        background: bool,
+    },
+    VideoThumb {
+        url: String,
+    },
     /// Small image for a list row or a subreddit icon.
     Thumb {
         url: String,
@@ -330,11 +337,11 @@ impl Job {
                 comment_id: comment_id.clone(),
                 result: Err(e),
             },
-            Job::Image { url, .. } => Msg::Image {
+            Job::Image { url, .. } | Job::VideoFrame { url, .. } => Msg::Image {
                 url: url.clone(),
                 result: Err(e),
             },
-            Job::Thumb { url } => Msg::Thumb {
+            Job::Thumb { url } | Job::VideoThumb { url } => Msg::Thumb {
                 url: url.clone(),
                 result: Err(e),
             },
@@ -479,7 +486,13 @@ struct Work {
 impl Queues {
     fn submit(&self, work: Work) {
         let queue = match work.job {
-            Job::Thumb { .. } => &self.thumbs,
+            Job::Thumb { .. } | Job::VideoThumb { .. } => &self.thumbs,
+            Job::VideoFrame {
+                background: true, ..
+            } => &self.images,
+            Job::VideoFrame {
+                background: false, ..
+            } => &self.foreground_images,
             Job::Icon { .. } => &self.icons,
             Job::Image {
                 background: true, ..
@@ -617,13 +630,15 @@ impl Pool {
 
     fn enqueue_policy(&self, job: Job, force: bool, cache_only: bool) {
         let image_ticket = match &job {
-            Job::Image { url, .. } => self.wanted.image_tickets.lock().ok().map(|mut tickets| {
-                Arc::clone(
-                    tickets
-                        .entry(url.clone())
-                        .or_insert_with(|| Arc::new(AtomicBool::new(false))),
-                )
-            }),
+            Job::Image { url, .. } | Job::VideoFrame { url, .. } => {
+                self.wanted.image_tickets.lock().ok().map(|mut tickets| {
+                    Arc::clone(
+                        tickets
+                            .entry(url.clone())
+                            .or_insert_with(|| Arc::new(AtomicBool::new(false))),
+                    )
+                })
+            }
             _ => None,
         };
         if !cache_only
@@ -774,7 +789,7 @@ fn cache_reader(
                     let mut claim = ImageClaim {
                         wanted: &wanted,
                         url: match job {
-                            Job::Image { url, .. } => Some(url),
+                            Job::Image { url, .. } | Job::VideoFrame { url, .. } => Some(url),
                             _ => None,
                         },
                         ticket: work.image_ticket.as_ref(),
@@ -843,7 +858,7 @@ fn spawn_worker(
                 let mut claim = ImageClaim {
                     wanted: &wanted,
                     url: match &job {
-                        Job::Image { url, .. } => Some(url),
+                        Job::Image { url, .. } | Job::VideoFrame { url, .. } => Some(url),
                         _ => None,
                     },
                     ticket: image_ticket.as_ref(),
@@ -906,7 +921,7 @@ fn spawn_worker(
                     };
                     let cancelled = Arc::clone(&wanted);
                     let image = match &job {
-                        Job::Image { url, .. } => Some(url.clone()),
+                        Job::Image { url, .. } | Job::VideoFrame { url, .. } => Some(url.clone()),
                         _ => None,
                     };
                     let feed = match &job {
@@ -929,6 +944,9 @@ fn spawn_worker(
                             | Job::SortedPost { .. }
                             | Job::MoreReplies { .. }
                             | Job::Image {
+                                background: false, ..
+                            }
+                            | Job::VideoFrame {
                                 background: false, ..
                             } => Priority::Selected,
                             Job::Icon { .. } => Priority::Background,
@@ -1007,7 +1025,9 @@ fn spawn_worker(
                         (msg, _) => msg,
                     };
                     let msg = match &job {
-                        Job::Image { url, .. } if scoped.read_aborted() => {
+                        Job::Image { url, .. } | Job::VideoFrame { url, .. }
+                            if scoped.read_aborted() =>
+                        {
                             Msg::ImageSkipped { url: url.clone() }
                         }
                         _ => msg,
@@ -1174,7 +1194,9 @@ impl Job {
                 | Job::ResolveMedia { .. }
                 | Job::MoreReplies { .. }
                 | Job::Image { .. }
+                | Job::VideoFrame { .. }
                 | Job::Thumb { .. }
+                | Job::VideoThumb { .. }
                 | Job::Icon { .. }
         )
     }
@@ -1202,11 +1224,13 @@ impl Job {
                 serde_json::to_string(&("replies-v3", cursor)).ok()?,
                 CONTENT_TTL,
             ),
-            Job::Image { url, .. } => (
+            Job::Image { url, .. } | Job::VideoFrame { url, .. } => (
                 serde_json::to_string(&("image", MAX_IMAGE_EDGE, url)).ok()?,
                 IMAGE_TTL,
             ),
-            Job::Thumb { url } => (serde_json::to_string(&("thumb", url)).ok()?, IMAGE_TTL),
+            Job::Thumb { url } | Job::VideoThumb { url } => {
+                (serde_json::to_string(&("thumb", url)).ok()?, IMAGE_TTL)
+            }
             Job::Icon { subreddit } => (
                 serde_json::to_string(&("icon", subreddit.to_ascii_lowercase())).ok()?,
                 IMAGE_TTL,
@@ -1258,11 +1282,11 @@ impl Job {
                 permalink: permalink.clone(),
                 result: Ok(serde_json::from_slice::<PostPage>(bytes).ok()?.post.media),
             },
-            Job::Thumb { url } => Msg::Thumb {
+            Job::Thumb { url } | Job::VideoThumb { url } => Msg::Thumb {
                 url: url.clone(),
                 result: Ok(image::load_from_memory(bytes).ok()?),
             },
-            Job::Image { url, .. } => Msg::Image {
+            Job::Image { url, .. } | Job::VideoFrame { url, .. } => Msg::Image {
                 url: url.clone(),
                 result: Ok(image::load_from_memory(bytes).ok()?.into()),
             },
@@ -1340,10 +1364,14 @@ fn icon_unwanted(name: &str, wanted: &Wanted) -> bool {
 
 fn skipped_image(job: &Job, wanted: &Wanted) -> Option<Msg> {
     match job {
-        Job::Thumb { url } if !wanted.thumbs.lock().is_ok_and(|set| set.contains(url)) => {
+        Job::Thumb { url } | Job::VideoThumb { url }
+            if !wanted.thumbs.lock().is_ok_and(|set| set.contains(url)) =>
+        {
             Some(Msg::ThumbSkipped { url: url.clone() })
         }
-        Job::Image { url, .. } if !wanted.images.lock().is_ok_and(|set| set.contains(url)) => {
+        Job::Image { url, .. } | Job::VideoFrame { url, .. }
+            if !wanted.images.lock().is_ok_and(|set| set.contains(url)) =>
+        {
             Some(Msg::ImageSkipped { url: url.clone() })
         }
         _ => None,
@@ -1559,8 +1587,12 @@ fn run(
             comment_id: comment_id.clone(),
             result: reddit.more_replies(cursor).map_err(err_string),
         },
-        Job::Image { url, .. } => {
-            let result = fetch_image(reddit, url, MAX_IMAGE_EDGE);
+        Job::Image { url, .. } | Job::VideoFrame { url, .. } => {
+            let result = if matches!(job, Job::VideoFrame { .. }) {
+                fetch_video_frame(reddit, url, job, wanted, MAX_IMAGE_EDGE)
+            } else {
+                fetch_image(reddit, url, MAX_IMAGE_EDGE)
+            };
             if result.is_err()
                 && let Some(skipped) = skipped_image(job, wanted)
             {
@@ -1571,10 +1603,22 @@ fn run(
                 result: result.map(LoadedImage::from),
             }
         }
-        Job::Thumb { url } => Msg::Thumb {
-            url: url.clone(),
-            result: fetch_image(reddit, url, MAX_THUMB_EDGE),
-        },
+        Job::Thumb { url } | Job::VideoThumb { url } => {
+            let result = if matches!(job, Job::VideoThumb { .. }) {
+                fetch_video_frame(reddit, url, job, wanted, MAX_THUMB_EDGE)
+            } else {
+                fetch_image(reddit, url, MAX_THUMB_EDGE)
+            };
+            if result.is_err()
+                && let Some(skipped) = skipped_image(job, wanted)
+            {
+                return skipped;
+            }
+            Msg::Thumb {
+                url: url.clone(),
+                result,
+            }
+        }
         Job::Icon { subreddit } => Msg::Icon {
             subreddit: subreddit.clone(),
             result: reddit.icon(subreddit).map_err(err_string),
@@ -1591,6 +1635,26 @@ fn run(
             result: download_images(reddit, urls).map_err(err_string),
         },
     }
+}
+
+fn fetch_video_frame(
+    reddit: &Reddit,
+    url: &str,
+    job: &Job,
+    wanted: &Wanted,
+    max_edge: u32,
+) -> Result<DynamicImage, String> {
+    let source = reddit.media_url(url).map_err(err_string)?;
+    crate::video::first_frame_preview(&source, || {
+        wanted.stopped.load(Ordering::Acquire) || skipped_image(job, wanted).is_some()
+    })
+    .map(|image| {
+        if image.width() > max_edge || image.height() > max_edge {
+            image.thumbnail(max_edge, max_edge)
+        } else {
+            image
+        }
+    })
 }
 
 /// Download and decode an image, shrunk to fit `max_edge`. A GIF gives its first frame
@@ -1797,6 +1861,58 @@ fn download_images(reddit: &Reddit, urls: &[String]) -> anyhow::Result<Vec<PathB
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_first_frame_job_cancels_when_its_video_leaves_the_viewport() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/", server.server_addr());
+        let (started, began) = std::sync::mpsc::sync_channel(1);
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        let serving = std::thread::spawn(move || {
+            loop {
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                if request.url() != "/slow.mp4" {
+                    let _ = request.respond(tiny_http::Response::empty(200));
+                    continue;
+                }
+                started.send(()).unwrap();
+                let _ = wait.recv_timeout(std::time::Duration::from_secs(2));
+                let _ = request.respond(tiny_http::Response::empty(200));
+                break;
+            }
+        });
+        let reddit = Reddit::test_at(&base, false);
+        let (pool, messages) = Pool::start(reddit, 1, None);
+        let url = format!("{base}slow.mp4");
+        pool.want_image(&url);
+        pool.submit(Job::VideoFrame {
+            url: url.clone(),
+            background: true,
+        });
+        began
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        pool.unwant_image(&url);
+        let result = messages.recv_timeout(std::time::Duration::from_secs(1));
+        let _ = release.send(());
+        serving.join().unwrap();
+
+        assert!(
+            matches!(result, Ok(Msg::ImageSkipped { .. })),
+            "decoder should retire before the stalled request completes"
+        );
+    }
+
     use super::*;
 
     #[test]

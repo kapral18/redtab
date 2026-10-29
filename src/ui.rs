@@ -1500,7 +1500,11 @@ fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture], cover
     );
     let urls: Vec<&str> = spots
         .iter()
-        .filter_map(|spot| spot.url.as_deref())
+        .filter_map(|spot| {
+            spot.url
+                .as_deref()
+                .filter(|url| !spot.selected || !app.video_uses_playback(url))
+        })
         .collect();
     app.card_pictures_drawn(&urls);
     app.card_renderer.begin();
@@ -1543,7 +1547,11 @@ fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture], cover
             }
             continue;
         }
-        let Some(url) = spot.url.as_deref() else {
+        let Some(url) = spot
+            .url
+            .as_deref()
+            .filter(|url| !spot.selected || !app.video_uses_playback(url))
+        else {
             let label = if !spot.selected {
                 spot.status("select to preview")
             } else if !spot.detail && app.post_view.is_some() {
@@ -2386,6 +2394,11 @@ fn draw_feed(
     let feed = &tab.feed;
     let access = tab.subreddit().and_then(|_| feed.access_denied());
     let mut chips = vec![list_view_chip(app)];
+    if access.is_none()
+        && let Some(summary) = feed.update_summary(&app.config)
+    {
+        chips.insert(0, chip(format!("{summary} · r refresh"), ACCENT, SURFACE0));
+    }
     match &feed.search {
         Some(q) => chips.push(chip(format!("🔍 {q}"), SKY, SURFACE0)),
         None => {
@@ -3024,7 +3037,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
         })
         .or_else(|| video.then_some((16, 9)));
     let failed_without_picture = video
-        && still_url.is_none()
+        && still_url.is_none_or(|url| app.video_uses_playback(url))
         && app.video_preview(false).is_none()
         && app.selected_video().is_some_and(|player| {
             player.error().is_some()
@@ -8861,6 +8874,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_unselected_video_without_autoplay_loads_and_displays_a_still_frame() {
+        let mut app = card_feed_app(kitty());
+        app.config.media.video_autoplay = false;
+        let mut first = post_with(
+            "video",
+            Media::Video {
+                gif: false,
+                url: Some(VIDEO.into()),
+                poster: None,
+            },
+        );
+        first.title = "Video preview".into();
+        first.preview_size = Some((160, 90));
+        let mut selected = post_with("selected", Media::None);
+        selected.title = "Selected text post".into();
+        app.tabs[3].feed.posts = vec![first, selected];
+        app.tabs[3].feed.selected = 1;
+        app.tabs[3].feed.offset = 0;
+        app.tabs[3].feed.cards = Default::default();
+        first_screen(&mut app, 100, 40);
+        assert!(
+            app.card_images.contains_key(VIDEO),
+            "visible unselected video must request a frame"
+        );
+
+        app.on_msg(Msg::Image {
+            url: VIDEO.into(),
+            result: Ok(image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                160,
+                90,
+                image::Rgb([180, 80, 50]),
+            ))
+            .into()),
+        });
+        let actual = screen(&mut app, 100, 40);
+
+        assert!(actual.contains('\u{10EEEE}'), "{actual}");
+        assert!(!actual.contains("select to preview"), "{actual}");
+        assert!(
+            app.video.is_none(),
+            "a still preview must not start playback"
+        );
+    }
+
+    #[test]
     fn when_a_youtube_card_waits_for_playback_it_should_show_the_provider_poster_and_play_overlay()
     {
         let mut app = card_feed_app(kitty());
@@ -10546,6 +10604,7 @@ pub(crate) mod tests {
     #[test]
     fn when_a_gif_card_has_a_flat_first_frame_it_should_keep_its_play_indicator() {
         let mut app = card_feed_app(kitty());
+        app.config.media.video_autoplay = false;
         app.tabs[3].feed.posts.truncate(1);
         app.tabs[3].feed.posts[0].media = Media::Image {
             url: "https://i.redd.it/animation.gif".into(),
@@ -11410,6 +11469,136 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn buffered_feed_notice_keeps_card_and_compact_rows_fixed_until_r() {
+        for (view, index) in [
+            (crate::state::ListView::Card, 0),
+            (crate::state::ListView::Compact, 0),
+            (crate::state::ListView::Card, 3),
+            (crate::state::ListView::Compact, 3),
+        ] {
+            for width in [40, 100] {
+                let mut app = app(&["rust"]);
+                if app.state.list_view() != view {
+                    app.state.toggle_list_view();
+                }
+                app.toggle_sidebar();
+                app.switch_tab(index);
+                let tab = app.active_tab().id;
+                let mut first = post_with("old", Media::None);
+                first.title = "Existing post".into();
+                let answer = |generation, posts| Msg::Feed {
+                    tab,
+                    generation,
+                    append: false,
+                    result: Ok(crate::model::Listing { posts, after: None }),
+                };
+                app.on_msg(answer(
+                    app.active_tab().feed.generation,
+                    vec![first.clone()],
+                ));
+                let before = screen(&mut app, width, 20);
+                let row = before
+                    .lines()
+                    .position(|line| line.contains(&first.title))
+                    .unwrap();
+                app.load_feed(index, false);
+                let mut next = post_with("new", Media::None);
+                next.title = "Incoming post".into();
+
+                app.on_msg(answer(
+                    app.active_tab().feed.generation,
+                    vec![next.clone(), first],
+                ));
+                let pending = screen(&mut app, width, 20);
+
+                assert!(pending.contains("New posts · r refresh"), "{pending}");
+                assert!(!pending.contains(&next.title), "{pending}");
+                assert_eq!(
+                    pending
+                        .lines()
+                        .position(|line| line.contains("Existing post")),
+                    Some(row)
+                );
+                crate::keys::handle(
+                    &mut app,
+                    crossterm::event::KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                );
+                let refreshed = screen(&mut app, width, 20);
+                assert!(!refreshed.contains("r refresh"), "{refreshed}");
+                assert_eq!(app.active_tab().feed.posts[0].id, "new");
+                assert_eq!(app.current_post().unwrap().id, "new");
+                assert_eq!(
+                    refreshed
+                        .lines()
+                        .position(|line| line.contains(&next.title)),
+                    Some(row)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn home_update_notices_distinguish_existing_post_updates_from_new_posts() {
+        let mut app = app(&[]);
+        app.toggle_sidebar();
+        app.switch_tab(0);
+        let tab = app.active_tab().id;
+        let answer = |generation, posts| Msg::Feed {
+            tab,
+            generation,
+            append: false,
+            result: Ok(crate::model::Listing { posts, after: None }),
+        };
+        let mut first = post_with("armenia", Media::None);
+        first.title = "Zakharova".into();
+        let mut second = post_with("other", Media::None);
+        second.title = "Other post".into();
+        app.on_msg(answer(
+            app.active_tab().feed.generation,
+            vec![first.clone(), second.clone()],
+        ));
+        first.score = Some(42);
+        first.comments = 12;
+        let mut new = post_with("new", Media::None);
+        new.title = "New post".into();
+        let mut hidden = post_with("hidden", Media::None);
+        hidden.author = "blocked".into();
+        app.config.filters.authors.push("blocked".into());
+
+        for (summary, posts, first_id) in [
+            (
+                "Feed details updated",
+                vec![first.clone(), second.clone(), hidden.clone()],
+                "armenia",
+            ),
+            (
+                "Feed details updated",
+                vec![second.clone(), first.clone(), hidden.clone()],
+                "other",
+            ),
+            ("New posts", vec![new, second, first, hidden], "new"),
+        ] {
+            screen(&mut app, 100, 20);
+            let previous = app.active_tab().feed.posts.clone();
+            app.load_feed(0, false);
+            app.on_msg(answer(app.active_tab().feed.generation, posts));
+            let pending = screen(&mut app, 100, 20);
+            assert!(
+                pending.contains(&format!("{summary} · r refresh")),
+                "{pending}"
+            );
+            assert_eq!(app.active_tab().feed.posts, previous);
+
+            press_keys(&mut app, "r");
+            let refreshed = screen(&mut app, 100, 20);
+            assert!(!refreshed.contains("r refresh"), "{refreshed}");
+            assert_eq!(app.current_post().unwrap().id, first_id);
+        }
+        assert_eq!(app.active_tab().feed.posts[2].score, Some(42));
+        assert_eq!(app.active_tab().feed.posts[2].comments, 12);
+    }
+
+    #[test]
     fn when_a_refresh_inserts_posts_above_the_viewport_its_post_and_row_should_stay_anchored() {
         let mut app = two_tall_media_cards();
         app.scroll_card(8);
@@ -11429,6 +11618,29 @@ pub(crate) mod tests {
         assert_eq!(app.active_tab().feed.cards.post.as_deref(), Some("p1"));
         assert_eq!(app.active_tab().feed.offset, 1);
         assert_eq!(app.active_tab().feed.cards.line, 8);
+
+        let mut posts = app.active_tab().feed.posts.clone();
+        let mut incoming = post_with("newer", Media::None);
+        incoming.title = "Newest post".into();
+        posts.insert(0, incoming);
+        app.load_feed(app.active, false);
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Ok(crate::model::Listing { posts, after: None }),
+        });
+        screen(&mut app, 100, 20);
+        assert_eq!(app.active_tab().feed.cards.post.as_deref(), Some("p1"));
+        assert_eq!(app.active_tab().feed.cards.line, 8);
+
+        press_keys(&mut app, "r");
+        let refreshed = screen(&mut app, 100, 20);
+
+        assert_eq!(app.current_post().unwrap().id, "newer");
+        assert_eq!(app.active_tab().feed.cards.post.as_deref(), Some("newer"));
+        assert_eq!(app.active_tab().feed.cards.line, 0);
+        assert!(refreshed.contains("Newest post"), "{refreshed}");
     }
 
     #[test]
@@ -11831,6 +12043,7 @@ pub(crate) mod tests {
             let mut app = feed_app(Picker::halfblocks());
             app.config.show_nsfw = false;
             app.show_sidebar = false;
+            app.reload();
             app.on_msg(Msg::Feed {
                 tab: app.active_tab().id,
                 generation: app.active_tab().feed.generation,
@@ -11885,6 +12098,7 @@ pub(crate) mod tests {
     fn empty_nsfw_enabled_feed_should_keep_the_normal_empty_message() {
         let mut app = feed_app(Picker::halfblocks());
         app.config.show_nsfw = true;
+        app.reload();
         app.on_msg(Msg::Feed {
             tab: app.active_tab().id,
             generation: app.active_tab().feed.generation,

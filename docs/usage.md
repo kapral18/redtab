@@ -87,7 +87,8 @@ thumbnails and community icons need Kitty, iTerm2 or Sixel graphics; Ghostty and
 Kitty also work in tmux. `SPC v i` toggles previews. `NO_COLOR` is supported.
 
 With `ffmpeg`, the selected card autoplays video/GIFs after navigation settles,
-initially muted, including while the sidebar has focus. An open detail pane takes
+initially muted, including while the sidebar has focus. Visible videos load a still
+preview even when unselected or autoplay is off. An open detail pane takes
 playback instead. Return to the list to use the playback controls. `SPC m p` plays/pauses,
 `SPC m m` toggles sound, and `SPC m h`/`SPC m l` seek five seconds. Scrolling within the same post
 keeps pause and position. Turn off **Autoplay videos** in F2 for manual playback; it saves to the current Reddit account.
@@ -107,6 +108,12 @@ videos use this browser fallback. Redtab does not import YouTube cookies.
 in your browser. Keep redtab open during external video playback. Use `SPC o r` to open the
 selected post/comment on Reddit, `yy` to copy its link, and `SPC a b` for a local bookmark.
 Feeds, posts and still previews reuse cached data and refresh in the background.
+The header distinguishes **New posts** from **Feed details updated**, each with
+**r refresh**. Press `r` to apply the buffered results and view the top of the updated
+list. Detail updates include scores, comments, ordering or pagination changes while
+the same posts remain; Home keeps Reddit's Best ranking. Initial loads and new
+pages appear immediately. With no buffered update, `r` fetches fresh content
+or retries a failed read.
 
 ## Reddit actions
 

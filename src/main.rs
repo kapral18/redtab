@@ -253,15 +253,19 @@ fn main() -> Result<()> {
     let queries = input_reader.queries.clone();
     crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
     // The input thread writes cursor queries through stdout, so keep it unlocked here.
-    let backend = ratatui::backend::CrosstermBackend::new(terminal_output::Writer::new(
+    let (output_writer, output) = terminal_output::AsyncWriter::new(terminal_output::Writer::new(
         std::io::stdout(),
         move || cursor_barrier(&queries),
     ));
+    terminal_output::install_output(output.clone());
+    let backend = ratatui::backend::CrosstermBackend::new(output_writer);
     let mut terminal = ratatui::Terminal::new(backend)?;
     // Restore quietly on main; worker panics become job errors.
     let default_hook = std::panic::take_hook();
+    let panic_output = output.clone();
     std::panic::set_hook(Box::new(move |info| {
         if std::thread::current().name() == Some("main") {
+            let _ = panic_output.wait();
             let _ = ratatui::try_restore();
             default_hook(info);
         } else {
@@ -322,7 +326,8 @@ fn main() -> Result<()> {
             if quit_signal.load(Ordering::Relaxed) {
                 break;
             }
-            if dirty {
+            let output_ready = output.ready()?;
+            if dirty && output_ready {
                 draw_synchronized(&mut terminal, |f| {
                     ui::draw(f, &mut app);
                     if no_color {
@@ -331,7 +336,12 @@ fn main() -> Result<()> {
                 })?;
                 dirty = false;
             }
-            match input.recv_timeout(app.wake_in()) {
+            let wait = if output_ready {
+                app.wake_in()
+            } else {
+                app.wake_in().min(Duration::from_millis(10))
+            };
+            match input.recv_timeout(wait) {
                 Ok(first) => {
                     for ev in std::iter::once(first).chain(input.try_iter()) {
                         // Keys after a quit key do nothing.
@@ -362,6 +372,7 @@ fn main() -> Result<()> {
     }));
     // Save first: it never touches the terminal, which may be gone. Runs after a panic too.
     app.save_state();
+    let output_result = output.wait();
     drop(guard);
     // The guard restored the terminal; Terminal's drop would only error on a dead tty.
     std::mem::forget(terminal);
@@ -370,7 +381,7 @@ fn main() -> Result<()> {
         let _ = writeln!(std::io::stderr(), "redtab: {}", status.text);
     }
     match run {
-        Ok(result) => result,
+        Ok(result) => result.and(output_result.map_err(Into::into)),
         Err(panic) => std::panic::resume_unwind(panic),
     }
 }

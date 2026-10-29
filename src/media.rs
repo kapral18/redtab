@@ -50,8 +50,12 @@ fn spawn(argv: &[String], extra: &[String], command: impl FnOnce(&str) -> Comman
     Ok(())
 }
 
-/// Copies with the platform clipboard tool, else OSC 52.
-pub fn copy(text: &str) -> Result<&'static str> {
+pub enum CopyStatus {
+    Copied(&'static str),
+    Queued,
+}
+
+pub fn copy(text: &str) -> Result<CopyStatus> {
     let candidates: &[(&str, &[&str])] = &[
         ("pbcopy", &[]),
         ("wl-copy", &[]),
@@ -60,11 +64,10 @@ pub fn copy(text: &str) -> Result<&'static str> {
     ];
     for (program, args) in candidates {
         if copy_with(program, args, text) {
-            return Ok(program);
+            return Ok(CopyStatus::Copied(program));
         }
     }
-    osc52(text)?;
-    Ok("OSC 52")
+    osc52(text)
 }
 
 /// Whether `program` took all of `text` and succeeded; always waited for.
@@ -85,18 +88,16 @@ fn copy_with(program: &str, args: &[&str], text: &str) -> bool {
     child.wait().is_ok_and(|status| status.success()) && wrote
 }
 
-fn osc52(text: &str) -> Result<()> {
+fn osc52(text: &str) -> Result<CopyStatus> {
     if text.len() > 74_994 {
         bail!("text too long for OSC 52");
     }
-    let mut out = std::io::stdout();
-    write!(
-        out,
+    let command = format!(
         "\x1b]52;c;{}\x07",
         base64::engine::general_purpose::STANDARD.encode(text)
-    )?;
-    out.flush()?;
-    Ok(())
+    );
+    crate::terminal_output::queue_command(command.as_bytes())?;
+    Ok(CopyStatus::Queued)
 }
 
 #[cfg(test)]

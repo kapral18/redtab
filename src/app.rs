@@ -176,6 +176,14 @@ pub struct Feed {
     refreshing: HashSet<u64>,
     forced: HashSet<u64>,
     deferred: HashMap<Option<String>, bool>,
+    updates: Vec<FeedUpdate>,
+}
+
+#[derive(Debug)]
+struct FeedUpdate {
+    cursor: Option<String>,
+    listing: Listing,
+    freshness: Freshness,
 }
 
 #[derive(Debug)]
@@ -217,6 +225,28 @@ impl Feed {
 
     pub fn refreshing(&self) -> bool {
         !self.refreshing.is_empty()
+    }
+
+    pub fn has_updates(&self) -> bool {
+        !self.updates.is_empty()
+    }
+
+    pub fn update_summary(&self, config: &Config) -> Option<&'static str> {
+        if !self.has_updates() {
+            return None;
+        }
+        let shown: HashSet<_> = config
+            .visible(&self.posts)
+            .map(|post| post.id.as_str())
+            .collect();
+        if self.updates.iter().any(|update| {
+            config
+                .visible(&update.listing.posts)
+                .any(|post| !shown.contains(post.id.as_str()))
+        }) {
+            return Some("New posts");
+        }
+        Some("Feed details updated")
     }
 
     /// `posts` answer the current sort, time range or search, not an earlier one still
@@ -1464,6 +1494,7 @@ impl App {
             tab.feed.requests.clear();
             tab.feed.forced.clear();
             tab.feed.deferred.clear();
+            tab.feed.updates.clear();
             tab.feed
                 .failures
                 .retain(|_, failure| community && failure.error.access().is_some());
@@ -2667,9 +2698,16 @@ impl App {
                     .iter()
                     .any(|(id, cursor)| cursor.is_none() && tab.feed.refreshing.contains(id)))
             && (!tab.feed.loaded
-                || tab.feed.freshness.is_some_and(|f| {
-                    now().saturating_sub(f.fetched_at) >= crate::cache::CONTENT_TTL
-                }))
+                || tab
+                    .feed
+                    .updates
+                    .iter()
+                    .find(|update| update.cursor.is_none())
+                    .map(|update| update.freshness)
+                    .or(tab.feed.freshness)
+                    .is_some_and(|f| {
+                        now().saturating_sub(f.fetched_at) >= crate::cache::CONTENT_TTL
+                    }))
         {
             self.load_feed(index, false);
         }
@@ -2729,6 +2767,7 @@ impl App {
             feed.refreshing.clear();
             feed.forced.clear();
             feed.deferred.clear();
+            feed.updates.clear();
             feed.failures
                 .retain(|_, failure| community && failure.error.access().is_some());
             feed.request_query = Some(query.clone());
@@ -2816,6 +2855,36 @@ impl App {
             }
             TabKind::Bookmarks => {}
             TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. } => {
+                let updates = std::mem::take(&mut self.tabs[self.active].feed.updates);
+                if !updates.is_empty() {
+                    let tab_id = self.tabs[self.active].id;
+                    for update in updates {
+                        let generation = self.generation();
+                        let feed = &mut self.tabs[self.active].feed;
+                        feed.requests.insert(generation, update.cursor.clone());
+                        feed.forced.insert(generation);
+                        self.on_feed(
+                            tab_id,
+                            generation,
+                            update.cursor.is_some(),
+                            Ok(update.listing),
+                            update.freshness,
+                            false,
+                        );
+                        self.tabs[self.active].feed.requests.remove(&generation);
+                    }
+                    let feed = &mut self.tabs[self.active].feed;
+                    feed.selected = 0;
+                    feed.offset = 0;
+                    feed.cards = CardScroll::default();
+                    self.prefetch_short_home();
+                    self.preview_selection();
+                    self.sync_feed_demand();
+                    self.follow_ancestor();
+                    if self.tabs[self.active].feed.error().is_none() {
+                        return;
+                    }
+                }
                 let feed = &self.tabs[self.active].feed;
                 if feed.loading_more() {
                     return;
@@ -4209,8 +4278,28 @@ impl App {
         })
     }
 
-    /// The open post's image or video poster, fetched ahead of everything else queued.
+    pub fn video_uses_playback(&self, url: &str) -> bool {
+        if matches!(
+            self.card_images.get(url),
+            Some(CardImageSlot::Ready { .. } | CardImageSlot::Cached { .. })
+        ) || matches!(self.images.get(url), Some(ImageSlot::Ready { .. }))
+        {
+            return false;
+        }
+        self.video_control_post().is_some_and(|post| {
+            post.media.video_url() == Some(url)
+                && (self.config.media.video_autoplay
+                    || self.video_requested.as_deref() == Some(post.id.as_str())
+                    || self
+                        .selected_video()
+                        .is_some_and(|player| player.frame().is_some()))
+        })
+    }
+
     fn request_image(&mut self, url: &str) {
+        if self.video_uses_playback(url) {
+            return;
+        }
         if !self.images.contains_key(url)
             && let Some(CardImageSlot::Ready { image, .. }) = self.card_images.get(url)
         {
@@ -4350,11 +4439,32 @@ impl App {
                     self.queued_images.entry(url.to_string())
                 {
                     entry.insert(true);
-                    self.pool.submit(Job::Image {
-                        url: url.to_string(),
-                        background: true,
-                    });
+                    self.pool.submit(self.image_job(url, true));
                 }
+            }
+        }
+    }
+
+    fn video_source(&self, url: &str) -> bool {
+        self.tabs
+            .iter()
+            .flat_map(|tab| &tab.feed.posts)
+            .chain(self.post_view.iter().map(|view| view.shown_post()))
+            .chain(self.state.bookmarks().iter().map(|bookmark| &bookmark.post))
+            .chain(self.all_subs.groups.iter().flat_map(|group| &group.posts))
+            .any(|post| post.media.video_url() == Some(url) && !video::plain_gif(url))
+    }
+
+    fn image_job(&self, url: &str, background: bool) -> Job {
+        if self.video_source(url) {
+            Job::VideoFrame {
+                url: url.into(),
+                background,
+            }
+        } else {
+            Job::Image {
+                url: url.into(),
+                background,
             }
         }
     }
@@ -4388,10 +4498,7 @@ impl App {
             // A fetch still queued for it runs now that it is wanted again.
             let queued = self.queued_images.insert(url.to_string(), background);
             if queued.is_none() || (!background && queued == Some(true)) {
-                self.pool.submit(Job::Image {
-                    url: url.to_string(),
-                    background,
-                });
+                self.pool.submit(self.image_job(url, background));
             }
         }
     }
@@ -4485,8 +4592,14 @@ impl App {
                     _ => false,
                 };
                 if submit {
-                    self.pool.submit(Job::Thumb {
-                        url: url.to_string(),
+                    self.pool.submit(if self.video_source(url) {
+                        Job::VideoThumb {
+                            url: url.to_string(),
+                        }
+                    } else {
+                        Job::Thumb {
+                            url: url.to_string(),
+                        }
                     });
                 }
             }
@@ -4552,20 +4665,23 @@ impl App {
         }
     }
 
+    fn copy_url(&mut self, url: &str, comment: bool) {
+        let label = if comment { "comment link" } else { "link" };
+        match media::copy(url) {
+            Ok(media::CopyStatus::Copied(tool)) => self.info(format!("Copied {label} ({tool})")),
+            Ok(media::CopyStatus::Queued) => self.info(format!("Copy queued: {label}")),
+            Err(error) => self.error(format!("copy failed: {error:#}")),
+        }
+    }
+
     pub fn copy_link(&mut self) {
         if let Some(target) = self.comment_target() {
-            match target.url().and_then(|url| media::copy(&url)) {
-                Ok(tool) => self.info(format!("Copied comment link ({tool})")),
-                Err(e) => self.error(format!("copy failed: {e:#}")),
+            match target.url() {
+                Ok(url) => self.copy_url(&url, true),
+                Err(error) => self.error(format!("copy failed: {error:#}")),
             }
-            return;
-        }
-        let Some(post) = self.current_post() else {
-            return;
-        };
-        match media::copy(&post.reddit_url()) {
-            Ok(tool) => self.info(format!("Copied link ({tool})")),
-            Err(e) => self.error(format!("copy failed: {e:#}")),
+        } else if let Some(post) = self.current_post() {
+            self.copy_url(&post.reddit_url(), false);
         }
     }
 
@@ -5251,7 +5367,7 @@ impl App {
                         )))
                 {
                     self.queued_images.insert(url.clone(), background);
-                    self.pool.submit(Job::Image { url, background });
+                    self.pool.submit(self.image_job(&url, background));
                 }
             }
             Msg::Thumb { url, result } => {
@@ -5675,6 +5791,42 @@ impl App {
         }
         match result {
             Ok(listing) => {
+                if feed.updates.iter().any(|update| {
+                    update.cursor == cursor
+                        && !freshness.source.may_replace(update.freshness.source)
+                }) {
+                    return;
+                }
+                feed.updates.retain(|update| update.cursor != cursor);
+                if feed.shows_current_query()
+                    && !forced
+                    && feed.access_denied().is_none()
+                    && let Some(index) = feed
+                        .pages
+                        .iter()
+                        .position(|page| page.cursor == cursor && page.complete)
+                {
+                    let page = &feed.pages[index];
+                    if !freshness.source.may_replace(page.source) {
+                        return;
+                    }
+                    let start: usize = feed.pages[..index].iter().map(|page| page.len).sum();
+                    if feed.posts[start..start + page.len] != listing.posts
+                        || page.after != listing.after
+                    {
+                        self.state
+                            .observe(name.as_deref(), &listing.posts, freshness, now());
+                        feed.updates.push(FeedUpdate {
+                            cursor,
+                            listing,
+                            freshness,
+                        });
+                        if let Some(name) = name {
+                            self.observe_community_access(&name, None, freshness.source);
+                        }
+                        return;
+                    }
+                }
                 let failed_next = feed.page_failed().then(|| feed.after.clone()).flatten();
                 let same_query = feed.shown_query.as_ref() == Some(&feed.query());
                 let selected = same_query
@@ -7156,7 +7308,7 @@ mod tests {
             1,
             "{actual}"
         );
-        assert!(actual.contains("select to preview"), "{actual}");
+        assert!(actual.contains("loading image"), "{actual}");
     }
 
     #[test]
@@ -8069,6 +8221,110 @@ mod tests {
             "the middle, not an edge"
         );
         assert_eq!((tall.width(), tall.height()), (100, 100));
+    }
+
+    #[test]
+    fn a_bookmark_only_video_loads_its_first_frame_with_autoplay_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frame.mp4");
+        let output = match std::process::Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=16x16:d=0.1",
+                "-frames:v",
+                "1",
+                "-c:v",
+                "mpeg4",
+                "-movflags",
+                "+faststart",
+                "-y",
+            ])
+            .arg(&path)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("{error}"),
+        };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = std::fs::read(path).unwrap();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/", server.server_addr());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let serving = std::thread::spawn(move || {
+            while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(request) = server.recv_timeout(Duration::from_millis(20)).unwrap() {
+                    let _ = request.respond(tiny_http::Response::from_data(bytes.clone()));
+                }
+            }
+        });
+        let mut results = Vec::new();
+        for converted_gif in [false, true] {
+            let (mut app, messages) = app_at(&base, &[]);
+            app.config.media.video_autoplay = false;
+            show_thumbnails(&mut app);
+            app.active = BOOKMARKS_TAB;
+            let url = if converted_gif {
+                format!("{base}frame.gif?format=mp4")
+            } else {
+                format!("{base}frame.mp4")
+            };
+            let mut saved = post("saved-video", "s");
+            saved.media = if converted_gif {
+                Media::Image {
+                    url: url.clone(),
+                    preview: None,
+                }
+            } else {
+                Media::Video {
+                    gif: false,
+                    url: Some(url.clone()),
+                    poster: None,
+                }
+            };
+            app.state.toggle_bookmark(&saved, 1);
+            app.card_pictures_drawn(&[&url]);
+            app.thumbs_drawn(&[&url]);
+            let replies = (0..2)
+                .map(|_| messages.recv_timeout(Duration::from_secs(5)))
+                .collect::<Vec<_>>();
+            results.push((app, url, replies));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        serving.join().unwrap();
+        for (mut app, url, replies) in results {
+            for reply in replies {
+                app.on_msg(reply.unwrap());
+            }
+            assert!(
+                matches!(app.thumbs.get(&url), Some(ImageSlot::Ready { .. })),
+                "video thumbnail must use first-frame decoding"
+            );
+
+            let Some(CardImageSlot::Ready { image, .. }) = app.card_images.get(&url) else {
+                if let Some(CardImageSlot::Failed(error)) = app.card_images.get(&url) {
+                    panic!("bookmark first frame failed: {error}");
+                }
+                panic!("bookmark first frame was not decoded");
+            };
+            let pixel = image.to_rgb8().get_pixel(0, 0).0;
+            assert!(
+                pixel[0] > 200 && pixel[1] < 40 && pixel[2] < 40,
+                "{pixel:?}"
+            );
+            assert!(app.video.is_none());
+        }
     }
 
     #[test]
@@ -12956,6 +13212,268 @@ mod tests {
     }
 
     #[test]
+    fn background_feed_updates_wait_for_reload_and_keep_the_latest_result() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        let answer = |generation, ids: &[&str], order| {
+            ordered_snapshot(
+                Msg::Feed {
+                    tab,
+                    generation,
+                    append: false,
+                    result: Ok(listing("vim", ids, Some("next"))),
+                },
+                order,
+                false,
+                false,
+            )
+        };
+        app.on_msg(answer(app.tabs[i].feed.generation, &["a", "b", "c"], 1));
+        app.tabs[i].feed.selected = 1;
+        app.tabs[i].feed.offset = 1;
+        app.fetch_feed(i, None, false);
+        let generation = app.tabs[i].feed.generation;
+
+        app.on_msg(answer(generation, &["new", "a", "b", "c"], 2));
+        app.on_msg(answer(generation, &["latest", "new", "a", "b", "c"], 3));
+        app.on_msg(answer(generation, &["older", "a", "b", "c"], 2));
+
+        assert_eq!(
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        app.reload();
+        assert_eq!(
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["latest", "new", "a", "b", "c"]
+        );
+        assert_eq!(app.current_post().unwrap().id, "latest");
+        assert_eq!(app.tabs[i].feed.offset, 0);
+        assert_eq!(app.tabs[i].feed.after.as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn applying_buffered_pages_reveals_the_top_and_retains_the_updated_suffix() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        let answer = |generation, append, ids: &[&str], after, order| {
+            ordered_snapshot(
+                Msg::Feed {
+                    tab,
+                    generation,
+                    append,
+                    result: Ok(listing("vim", ids, after)),
+                },
+                order,
+                false,
+                false,
+            )
+        };
+        app.on_msg(answer(
+            app.tabs[i].feed.generation,
+            false,
+            &["a", "b"],
+            Some("next"),
+            1,
+        ));
+        app.load_feed(i, true);
+        app.on_msg(answer(
+            app.tabs[i].feed.generation,
+            true,
+            &["c", "d"],
+            None,
+            1,
+        ));
+        app.tabs[i].feed.selected = 1;
+        app.tabs[i].feed.offset = 1;
+        app.load_feed(i, false);
+        app.on_msg(answer(
+            app.tabs[i].feed.generation,
+            false,
+            &["a", "x"],
+            Some("next"),
+            2,
+        ));
+        app.fetch_feed(i, Some("next".into()), false);
+        app.on_msg(answer(
+            app.tabs[i].feed.generation,
+            true,
+            &["b", "c", "d"],
+            None,
+            3,
+        ));
+
+        app.reload();
+
+        assert_eq!(app.current_post().unwrap().id, "a");
+        assert_eq!(app.tabs[i].feed.offset, 0);
+        assert_eq!(
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|post| post.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "x", "b", "c", "d"]
+        );
+    }
+
+    #[test]
+    fn page_boundary_updates_do_not_announce_new_posts() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        let answer = |generation, append, ids: &[&str], after, order| {
+            ordered_snapshot(
+                Msg::Feed {
+                    tab,
+                    generation,
+                    append,
+                    result: Ok(listing("vim", ids, after)),
+                },
+                order,
+                false,
+                false,
+            )
+        };
+        app.on_msg(answer(
+            app.tabs[i].feed.generation,
+            false,
+            &["a", "b"],
+            Some("next"),
+            1,
+        ));
+        app.load_feed(i, true);
+        app.on_msg(answer(
+            app.tabs[i].feed.generation,
+            true,
+            &["c", "d"],
+            None,
+            1,
+        ));
+        app.load_feed(i, false);
+
+        app.on_msg(answer(
+            app.tabs[i].feed.generation,
+            false,
+            &["a", "b", "c"],
+            Some("next"),
+            2,
+        ));
+
+        assert_eq!(
+            app.tabs[i].feed.update_summary(&app.config),
+            Some("Feed details updated")
+        );
+        app.reload();
+        assert_eq!(
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|post| post.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c", "d"]
+        );
+    }
+
+    #[test]
+    fn buffered_success_prevents_an_older_denial_from_hiding_the_feed() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Ok(listing("vim", &["old"], Some("next"))),
+            },
+            1,
+            false,
+            false,
+        ));
+        app.load_feed(i, true);
+        let earlier = app.tabs[i].feed.generation;
+        app.load_feed(i, false);
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Ok(listing("vim", &["new"], None)),
+            },
+            3,
+            false,
+            false,
+        ));
+
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation: earlier,
+                append: true,
+                result: Err(FeedError::Access(AccessDenied::PrivateCommunity)),
+            },
+            2,
+            false,
+            false,
+        ));
+
+        assert_eq!(app.tabs[i].feed.access_denied(), None);
+        assert_eq!(app.current_post().unwrap().id, "old");
+        assert!(app.tabs[i].feed.has_updates());
+        assert!(
+            app.all_subs
+                .groups
+                .iter()
+                .all(|group| group.error.is_none())
+        );
+    }
+
+    #[test]
+    fn changing_feed_query_discards_buffered_results() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        let answer = |generation, id| Msg::Feed {
+            tab,
+            generation,
+            append: false,
+            result: Ok(listing("vim", &[id], None)),
+        };
+        app.on_msg(answer(app.tabs[i].feed.generation, "old"));
+        app.load_feed(i, false);
+        app.on_msg(answer(app.tabs[i].feed.generation, "buffered"));
+        assert!(app.tabs[i].feed.has_updates());
+
+        app.set_sort(Sort::New);
+        app.on_msg(answer(app.tabs[i].feed.generation, "sorted"));
+        app.reload();
+
+        assert!(!app.tabs[i].feed.has_updates());
+        assert_eq!(app.current_post().unwrap().id, "sorted");
+        assert!(app.tabs[i].feed.loading());
+    }
+
+    #[test]
     fn cache_refresh_keeps_the_selected_post_and_screen_row() {
         let mut app = app_with(&["vim"]);
         let i = tab_index(&app, "vim");
@@ -13283,6 +13801,9 @@ mod tests {
             result: Ok(listing("vim", &["x", "c"], Some("t3_c"))),
         });
 
+        assert_eq!(app.tabs[i].feed.posts[2].id, "c");
+        assert_eq!(app.tabs[i].feed.posts[3].id, "d");
+        app.reload();
         assert_eq!(
             app.tabs[i]
                 .feed
@@ -13292,7 +13813,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["a", "b", "x", "c"]
         );
-        assert_eq!(app.current_post().unwrap().id, "c");
+        assert_eq!(app.current_post().unwrap().id, "a");
+        assert_eq!(app.tabs[i].feed.offset, 0);
         assert_eq!(app.tabs[i].feed.after.as_deref(), Some("t3_c"));
     }
 
@@ -13333,6 +13855,7 @@ mod tests {
             result: Ok(listing("vim", &["new", "a"], Some("t3_a"))),
         });
 
+        app.reload();
         assert_ne!(next, first);
         assert_eq!(
             app.tabs[i]
@@ -13454,6 +13977,7 @@ mod tests {
                 ..Source::default()
             },
         });
+        app.reload();
         assert_eq!(
             app.tabs[i]
                 .feed
@@ -13695,6 +14219,9 @@ mod tests {
             false,
         ));
 
+        assert_eq!(app.tabs[i].feed.posts[0].id, "cached");
+        app.switch_tab(i);
+        app.reload();
         assert_eq!(app.tabs[i].feed.posts[0].id, "new");
     }
 
@@ -14160,6 +14687,8 @@ mod tests {
             refreshing: false,
             source: ordered_source(2, false),
         });
+        assert_eq!(app.tabs[i].feed.posts[0].id, "old");
+        app.reload();
         assert_eq!(app.tabs[i].feed.posts[0].id, "home-newer");
         let before = app.tabs[i].feed.generation;
         app.load_feed(i, true);
@@ -14204,6 +14733,7 @@ mod tests {
             false,
             false,
         ));
+        app.reload();
         assert_eq!(app.tabs[i].feed.posts[0].id, "feed-newest");
     }
 
@@ -14597,6 +15127,7 @@ mod tests {
             source: ordered_source(3, false),
         });
 
+        app.reload();
         assert_eq!(app.tabs[i].feed.posts[0].id, "feed-later-start");
     }
 
@@ -15360,6 +15891,7 @@ mod tests {
                 cached: false,
             },
         });
+        app.reload();
         assert_eq!(app.tabs[i].feed.posts[0].id, "later-started-feed");
     }
 
@@ -15430,8 +15962,13 @@ mod tests {
             false,
             false,
         ));
-        assert_eq!(app.tabs[i].feed.posts[0].id, "useful-older-success");
         assert_eq!(app.tabs[i].feed.error(), Some("newer request failed"));
+        app.reload();
+        assert_eq!(app.tabs[i].feed.posts[0].id, "useful-older-success");
+        assert!(
+            app.tabs[i].feed.loading(),
+            "r retries the failed head after applying the buffered page"
+        );
     }
     #[test]
     fn an_interim_expansion_without_new_replies_keeps_its_target() {
@@ -16230,6 +16767,7 @@ mod tests {
             },
             false,
         );
+        app.reload();
         assert_ne!(app.tabs[i].feed.posts[0].title, "blocked");
         assert_eq!(app.badge(&app.tabs[i]), UnreadBadge::Count(1));
     }

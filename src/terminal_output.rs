@@ -9,6 +9,172 @@ const TMUX: &[u8] = b"\x1bPtmux;";
 const NATIVE_BEGIN: &[u8] = b"\x1b\x1b[?2026h";
 pub const TMUX_END: &str = "\x1bPtmux;\x1b\x1b[?2026l\x1b\\";
 
+#[derive(Default)]
+struct OutputState {
+    pending: usize,
+    command_pending: bool,
+    error: Option<io::Error>,
+}
+
+#[derive(Default)]
+struct SharedOutput {
+    state: parking_lot::Mutex<OutputState>,
+    changed: parking_lot::Condvar,
+}
+
+enum Output {
+    Frame(Vec<u8>),
+    Command(Vec<u8>),
+}
+
+#[derive(Clone)]
+pub struct OutputHandle {
+    shared: std::sync::Arc<SharedOutput>,
+    send: std::sync::mpsc::SyncSender<Output>,
+}
+
+static OUTPUT: std::sync::OnceLock<OutputHandle> = std::sync::OnceLock::new();
+
+pub fn install_output(output: OutputHandle) {
+    let _ = OUTPUT.set(output);
+}
+
+pub fn queue_command(bytes: &[u8]) -> io::Result<()> {
+    OUTPUT
+        .get()
+        .ok_or_else(|| io::Error::other("terminal output is not initialized"))?
+        .command(bytes)
+}
+
+impl OutputHandle {
+    pub fn command(&self, bytes: &[u8]) -> io::Result<()> {
+        let mut state = self.shared.state.lock();
+        if state.command_pending {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "terminal command still pending",
+            ));
+        }
+        if let Some(error) = state.error.take() {
+            return Err(error);
+        }
+        if self.send.try_send(Output::Command(bytes.to_vec())).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "terminal output stopped",
+            ));
+        }
+        state.pending += 1;
+        state.command_pending = true;
+        Ok(())
+    }
+
+    pub fn ready(&self) -> io::Result<bool> {
+        let mut state = self.shared.state.lock();
+        match state.error.take() {
+            Some(error) => Err(error),
+            None => Ok(state.pending == 0),
+        }
+    }
+
+    pub fn wait(&self) -> io::Result<()> {
+        let mut state = self.shared.state.lock();
+        while state.pending != 0 {
+            self.shared.changed.wait(&mut state);
+        }
+        match state.error.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+pub struct AsyncWriter {
+    frame: Vec<u8>,
+    send: std::sync::mpsc::SyncSender<Output>,
+    shared: std::sync::Arc<SharedOutput>,
+}
+
+impl AsyncWriter {
+    pub fn new(mut output: impl Write + Send + 'static) -> (Self, OutputHandle) {
+        let shared = std::sync::Arc::new(SharedOutput::default());
+        let worker = shared.clone();
+        let (send, receive) = std::sync::mpsc::sync_channel::<Output>(2);
+        std::thread::Builder::new()
+            .name("redtab-terminal-output".into())
+            .spawn(move || {
+                while let Ok(message) = receive.recv() {
+                    let command = matches!(message, Output::Command(_));
+                    let (Output::Frame(frame) | Output::Command(frame)) = message;
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        output.write_all(&frame).and_then(|()| output.flush())
+                    }))
+                    .unwrap_or_else(|_| Err(io::Error::other("terminal output worker panicked")));
+                    let failed = result.is_err();
+                    let mut state = worker.state.lock();
+                    state.pending -= 1;
+                    if command {
+                        state.command_pending = false;
+                    }
+                    state.error = result.err();
+                    if failed {
+                        state.pending = 0;
+                        state.command_pending = false;
+                    }
+                    worker.changed.notify_all();
+                    if failed {
+                        break;
+                    }
+                }
+            })
+            .expect("cannot start terminal output");
+        (
+            Self {
+                frame: Vec::new(),
+                send: send.clone(),
+                shared: shared.clone(),
+            },
+            OutputHandle { shared, send },
+        )
+    }
+}
+
+impl Write for AsyncWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.frame.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.frame.is_empty() || (self.frame.starts_with(BEGIN) && !self.frame.ends_with(END)) {
+            return Ok(());
+        }
+        let mut state = self.shared.state.lock();
+        if let Some(error) = state.error.take() {
+            return Err(error);
+        }
+        if state.pending != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "terminal frame still pending",
+            ));
+        }
+        state.pending = 1;
+        if self
+            .send
+            .try_send(Output::Frame(std::mem::take(&mut self.frame)))
+            .is_err()
+        {
+            state.pending = 0;
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "terminal output stopped",
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub struct Writer<W, B> {
     output: W,
     frame: Vec<u8>,
@@ -35,10 +201,14 @@ impl<W: Write, B: FnMut() -> io::Result<()>> Writer<W, B> {
         // The native hold covers its raw-passthrough cursor resets during pixel uploads.
         self.output.write_all(b"\x1b[?25l")?;
         for range in &uploads {
-            self.output.write_all(TMUX)?;
-            self.output.write_all(NATIVE_BEGIN)?;
-            self.output
-                .write_all(&self.frame[range.start + TMUX.len()..range.end])?;
+            self.output.write_all(
+                &[
+                    TMUX,
+                    NATIVE_BEGIN,
+                    &self.frame[range.start + TMUX.len()..range.end],
+                ]
+                .concat(),
+            )?;
         }
         self.output.flush()?;
         // A same-pane DSR reply orders the next input after tmux's cursor restoration.
@@ -134,6 +304,136 @@ fn kitty_uploads(frame: &[u8]) -> Vec<Range<usize>> {
 mod tests {
     use super::*;
     use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
+
+    #[test]
+    fn slow_terminal_output_keeps_input_usable_and_limits_pending_frames() {
+        struct Sink {
+            started: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+            first: bool,
+            bytes: std::sync::Arc<parking_lot::Mutex<Vec<u8>>>,
+        }
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if !self.first {
+                    return Err(io::Error::other("terminal closed"));
+                }
+                self.started.send(()).unwrap();
+                self.release
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "test output remained blocked")
+                    })?;
+                self.first = false;
+                self.bytes.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (started, began) = std::sync::mpsc::sync_channel(1);
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        let bytes = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (mut writer, output) = AsyncWriter::new(Sink {
+            started,
+            release: wait,
+            first: true,
+            bytes: bytes.clone(),
+        });
+        let frame = [BEGIN, b"one complete frame", END].concat();
+        writer.write_all(&frame).unwrap();
+        writer.flush().unwrap();
+        began
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(!output.ready().unwrap());
+
+        let reddit = crate::reddit::Reddit::test_at("http://127.0.0.1:9", false);
+        let (pool, _messages) = crate::worker::Pool::start(reddit.clone(), 1, None);
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = crate::app::App::new(
+            crate::config::Config::default(),
+            pool,
+            reddit,
+            dir.path().join("state.json"),
+            ratatui_image::picker::Picker::halfblocks(),
+        );
+        crate::handle_event(
+            &mut app,
+            crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('q'),
+                crossterm::event::KeyModifiers::NONE,
+            )),
+        );
+        assert!(
+            app.quit,
+            "input must be handled while the terminal write is blocked"
+        );
+        writer.write_all(&frame).unwrap();
+        assert_eq!(
+            writer.flush().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        release.send(()).unwrap();
+        output.wait().unwrap();
+        assert_eq!(*bytes.lock(), frame);
+        writer.flush().unwrap();
+        assert_eq!(output.wait().unwrap_err().to_string(), "terminal closed");
+    }
+
+    #[test]
+    fn clipboard_output_queues_behind_a_blocked_frame_without_waiting_on_stdout() {
+        struct Sink {
+            first: bool,
+            started: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+            bytes: std::sync::Arc<parking_lot::Mutex<Vec<u8>>>,
+        }
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.first {
+                    self.started.send(()).unwrap();
+                    self.release
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .unwrap();
+                    self.first = false;
+                }
+                self.bytes.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (started, began) = std::sync::mpsc::sync_channel(1);
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        let bytes = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (mut writer, output) = AsyncWriter::new(Sink {
+            first: true,
+            started,
+            release: wait,
+            bytes: bytes.clone(),
+        });
+        let frame = [BEGIN, b"complete frame", END].concat();
+        writer.write_all(&frame).unwrap();
+        writer.flush().unwrap();
+        began
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let clipboard = b"\x1b]52;c;aHR0cHM6Ly9yZWRkaXQuY29tLw==\x07";
+
+        output.command(clipboard).unwrap();
+        assert!(!output.ready().unwrap());
+        assert_eq!(
+            output.command(clipboard).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        release.send(()).unwrap();
+        output.wait().unwrap();
+
+        assert_eq!(*bytes.lock(), [frame.as_slice(), clipboard].concat());
+    }
 
     fn draw(editing: bool, frame: &crate::video::Frame) -> Vec<u8> {
         let mut bytes = Vec::new();

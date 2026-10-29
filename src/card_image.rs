@@ -22,6 +22,7 @@ const CACHE_BYTES: usize = 256 * 1024 * 1024;
 const CACHE_TILES: usize = 512;
 const NATIVE_BYTES: usize = 128 * 1024 * 1024;
 const BADGE_MIN_PIXELS: f64 = 80.0;
+const VIDEO_BYTES_PER_SECOND: f64 = 4.0 * 1024.0 * 1024.0;
 static NEXT_IMAGE_ID: LazyLock<AtomicU32> = LazyLock::new(|| {
     let seed = *uuid::Uuid::new_v4().as_bytes();
     AtomicU32::new(u32::from_be_bytes([seed[0], seed[1], seed[2], seed[3]]))
@@ -107,10 +108,10 @@ pub enum Tile {
         residency: Arc<Mutex<NativeResidency>>,
     },
     Kitty {
+        upload: String,
         frame: crate::video::Frame,
         size: Size,
         id: u32,
-        tmux: bool,
         buffer: bool,
         sent: AtomicBool,
         residency: Arc<Mutex<NativeResidency>>,
@@ -168,10 +169,9 @@ impl Tile {
                 Some(upload.clone())
             }
             Self::Kitty {
+                upload,
                 frame,
-                size,
                 id,
-                tmux,
                 sent,
                 residency,
                 ..
@@ -181,13 +181,7 @@ impl Tile {
                     return None;
                 }
                 residency.record(*id, frame.width as usize * frame.height as usize * 4);
-                Some(crate::video::kitty_transmit(
-                    *id,
-                    frame,
-                    size.width,
-                    size.height,
-                    *tmux,
-                ))
+                Some(upload.clone())
             }
             Self::Image(_) => None,
         }
@@ -202,8 +196,9 @@ impl Tile {
                         pixels: crate::video::Pixels::Png(data),
                         ..
                     },
+                upload,
                 ..
-            } => data.capacity(),
+            } => data.capacity() + upload.capacity(),
             _ => fallback,
         }
     }
@@ -270,6 +265,7 @@ pub struct Renderer {
     cache: HashMap<Key, Completed>,
     visible: HashSet<Key>,
     order: VecDeque<Key>,
+    video_ready_at: Option<std::time::Instant>,
 }
 
 impl Completed {
@@ -343,6 +339,20 @@ impl Renderer {
             .map(|request| (request.key.clone(), Arc::downgrade(&request.image)))
             .collect();
         let mut work = self.shared.work.lock();
+        if self
+            .video_ready_at
+            .is_some_and(|at| std::time::Instant::now() < at)
+            && work.wanted.is_empty()
+            && work.completed.is_empty()
+            && self
+                .frame
+                .iter()
+                .filter(|request| request.key.video)
+                .all(|request| self.cache.contains_key(&request.key))
+        {
+            self.frame.retain(|request| !request.key.video);
+            next.retain(|(key, _)| !key.video);
+        }
         // Finish this picture despite newer pixels, including completions racing this draw.
         if (work.wanted.iter().any(|(key, _)| key.video)
             || work.completed.iter().any(|done| done.key.video))
@@ -403,6 +413,23 @@ impl Renderer {
             std::mem::take(&mut work.completed)
         };
         let changed = !completed.is_empty();
+        let video_bytes: usize = completed
+            .iter()
+            .filter(|done| done.key.video)
+            .filter_map(|done| done.result.as_ref().ok())
+            .map(|tile| match tile.as_ref() {
+                Tile::Kitty { upload, .. } => upload.len(),
+                _ => tile.size().width as usize * tile.size().height as usize * 16 * 32,
+            })
+            .sum();
+        if video_bytes as f64 > VIDEO_BYTES_PER_SECOND / 24.0 {
+            self.video_ready_at = Some(
+                std::time::Instant::now()
+                    + std::time::Duration::from_secs_f64(
+                        video_bytes as f64 / VIDEO_BYTES_PER_SECOND,
+                    ),
+            );
+        }
         for done in completed {
             let key = done.key.clone();
             self.cache.insert(key.clone(), done);
@@ -463,6 +490,7 @@ impl Renderer {
 
     pub fn clear(&mut self) {
         self.frame.clear();
+        self.video_ready_at = None;
         self.cache.clear();
         self.visible.clear();
         self.order.clear();
@@ -618,11 +646,13 @@ impl Encoder {
             let frame = png_frame(DynamicImage::ImageRgb8(
                 DynamicImage::ImageRgba8(pixels).to_rgb8(),
             ))?;
+            let upload =
+                crate::video::kitty_transmit(id, &frame, size.width, size.height, request.key.tmux);
             return Ok(Tile::Kitty {
+                upload,
                 frame,
                 size,
                 id,
-                tmux: request.key.tmux,
                 buffer: request.buffer,
                 sent: AtomicBool::new(false),
                 residency: Arc::clone(&self.residency),
@@ -1252,14 +1282,7 @@ mod tests {
 
     #[test]
     fn clip_native_frames_should_use_lossless_png_without_outer_compression() {
-        let Tile::Kitty {
-            frame,
-            id,
-            size,
-            tmux,
-            ..
-        } = kitty_video_tile()
-        else {
+        let Tile::Kitty { frame, upload, .. } = kitty_video_tile() else {
             panic!("native tile");
         };
         let crate::video::Pixels::Png(data) = &frame.pixels else {
@@ -1270,9 +1293,8 @@ mod tests {
             (decoded.width(), decoded.height()),
             (frame.width, frame.height)
         );
-        let wire = crate::video::kitty_transmit(id, &frame, size.width, size.height, tmux);
-        assert!(wire.contains("f=100,"));
-        assert!(!wire.contains("o=z,"));
+        assert!(upload.contains("f=100,"));
+        assert!(!upload.contains("o=z,"));
     }
 
     #[test]
@@ -1551,6 +1573,52 @@ mod tests {
                 .unwrap();
             assert_eq!(pixel(&tile), image::Rgba([0, 0, 255, 255]));
         }
+    }
+
+    #[test]
+    fn large_video_frames_keep_the_current_picture_while_the_output_budget_recovers() {
+        #[allow(deprecated)]
+        let mut picker = Picker::from_fontsize(ratatui_image::FontSize::new(8, 16));
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+        let mut seed = 1u32;
+        let image = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+            960,
+            540,
+            |_, _| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                image::Rgb([(seed >> 16) as u8, (seed >> 8) as u8, seed as u8])
+            },
+        )));
+        let mut key = Key::new("video", &picker, Size::new(120, 34), (960, 540), 0, 16, 0);
+        key.video = true;
+        let mut renderer = Renderer::default();
+        renderer.begin();
+        renderer.tile(key.clone(), &image, &picker, Preparation::Refresh);
+        renderer.finish();
+        complete(&mut renderer);
+        let current = renderer
+            .tile(key.clone(), &image, &picker, Preparation::Hold)
+            .unwrap()
+            .unwrap();
+        let next = Arc::new(DynamicImage::new_rgb8(960, 540));
+
+        renderer.begin();
+        let actual = renderer
+            .tile(key, &next, &picker, Preparation::Refresh)
+            .unwrap()
+            .unwrap();
+        renderer.finish();
+
+        assert!(
+            Arc::ptr_eq(&current, &actual),
+            "retain the displayed frame during backpressure"
+        );
+        assert!(
+            !renderer.pending(),
+            "do not encode and queue another large frame immediately"
+        );
     }
 
     #[test]

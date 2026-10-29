@@ -162,6 +162,38 @@ fn read_frames(mut out: impl BufRead, tx: SyncSender<Decoded>, progress: &Decode
     }
 }
 
+pub fn first_frame_preview(
+    url: &str,
+    cancelled: impl Fn() -> bool,
+) -> Result<image::DynamicImage, String> {
+    let decoder = Decoder::spawn(url, 0.0, (640, 640), &[]).map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if cancelled() {
+            return Err("Video preview no longer visible".into());
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("Video preview timed out".into());
+        }
+        match decoder
+            .frames
+            .recv_timeout(left.min(Duration::from_millis(50)))
+        {
+            Ok(decoded) => {
+                return match decoded.frame.pixels {
+                    Pixels::Raw(image) => Ok((*image).clone()),
+                    Pixels::Png(bytes) => {
+                        image::load_from_memory(&bytes).map_err(|error| error.to_string())
+                    }
+                };
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(error) => return Err(format!("Video preview unavailable: {error}")),
+        }
+    }
+}
+
 /// ffmpeg's options up to and including the input.
 ///
 /// A plain GIF is read as a stream: when it can seek, ffmpeg's GIF reader first scans
@@ -242,7 +274,7 @@ fn header_args(headers: &[(String, String)]) -> Vec<String> {
 }
 
 /// A `.gif` file served as itself: Reddit's `.gif?format=mp4` previews are MP4.
-fn plain_gif(url: &str) -> bool {
+pub(crate) fn plain_gif(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
@@ -1774,6 +1806,43 @@ mod tests {
         assert_eq!(decoded(900, 900), Some((856, 856)));
         // Smaller than that: as it is; the terminal enlarges it.
         assert_eq!(decoded(100, 80), Some((100, 80)));
+    }
+
+    #[test]
+    fn a_still_preview_returns_the_first_frame_without_starting_playback() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preview.gif");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let mut encoder = gif::Encoder::new(&mut file, 4, 2, &[90, 120, 150]).unwrap();
+        encoder
+            .write_frame(&gif::Frame::from_palette_pixels(
+                4,
+                2,
+                vec![0; 8],
+                [90, 120, 150],
+                None,
+            ))
+            .unwrap();
+        drop(encoder);
+        drop(file);
+
+        let image =
+            first_frame_preview(url::Url::from_file_path(&path).unwrap().as_str(), || false)
+                .unwrap();
+
+        assert_eq!((image.width(), image.height()), (4, 2));
+        assert_eq!(image.to_rgb8().get_pixel(0, 0).0, [90, 120, 150]);
+        assert!(
+            first_frame_preview(url::Url::from_file_path(&path).unwrap().as_str(), || true)
+                .is_err()
+        );
     }
 
     #[test]
