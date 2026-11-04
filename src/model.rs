@@ -2,9 +2,30 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A person's avatar and their profile page summary, one entry per non-empty line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserProfile {
+    pub icon: Option<String>,
+    pub lines: Vec<String>,
+}
+
+impl UserProfile {
+    pub fn new(icon: Option<String>, text: &str) -> Self {
+        Self {
+            icon,
+            lines: text
+                .lines()
+                .map(|line| unformatted(line).trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubscriptionIcon {
+    #[default]
     Unknown,
     Missing,
     Url(String),
@@ -483,6 +504,8 @@ pub struct Comment {
     pub flair: Option<String>,
     pub is_op: bool,
     pub is_mod: bool,
+    #[serde(default)]
+    pub stickied: bool,
     pub score: Option<i64>,
     /// Absolute creation time, so cached comments age with the clock.
     #[serde(default)]
@@ -756,7 +779,7 @@ mod tests {
     #[test]
     fn a_link_post_should_list_its_preview_but_not_show_it_as_the_posts_picture() {
         let media = Media::Link {
-            url: "https://claude.ai/artifact/x".into(),
+            url: "https://example.com/article".into(),
             thumb: Some("https://external-preview.redd.it/t.png".into()),
         };
 

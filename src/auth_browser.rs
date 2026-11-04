@@ -1,10 +1,11 @@
 //! Browser access runs only in the private, cancellable sign-in helper.
 
-use std::io::{IsTerminal, Read};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::{net::UnixStream, process::CommandExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,8 @@ use crate::auth::Source;
 pub const HELPER: &str = "--browser-auth-helper";
 pub const LIMIT: u64 = 1024 * 1024;
 pub const PACKET_LIMIT: u64 = 8 * LIMIT;
+pub const WINDOW_TIMED_OUT: &str =
+    "The login window timed out before sign-in finished; Enter opens it again.";
 
 #[derive(Serialize, Deserialize)]
 pub enum Request {
@@ -332,11 +335,27 @@ fn browser_executable() -> Option<PathBuf> {
 /// The parent owns this helper's private working directory and process group.
 fn login(executable: &Path) -> Result<String> {
     let profile = std::env::temp_dir().join("login-profile");
-    let mut browser = Command::new(executable)
+    let (mut browser, mut connection) = spawn_login(executable, &profile)?;
+    let result = login_cookies(&mut browser, &mut connection);
+    let _ = browser.kill();
+    let _ = browser.wait();
+    result
+}
+
+fn spawn_login(executable: &Path, profile: &Path) -> Result<(std::process::Child, UnixStream)> {
+    let (connection, child_connection) = UnixStream::pair()?;
+    connection.set_read_timeout(Some(Duration::from_secs(30)))?;
+    connection.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let raw = unsafe { libc::fcntl(child_connection.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut command = Command::new(executable);
+    command
         .arg(format!("--user-data-dir={}", profile.display()))
         .args([
-            "--remote-debugging-port=0",
-            "--remote-debugging-address=127.0.0.1",
+            "--remote-debugging-pipe",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-background-mode",
@@ -344,58 +363,36 @@ fn login(executable: &Path) -> Result<String> {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        command.pre_exec(move || {
+            for target in [3, 4] {
+                if libc::dup2(raw, target) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let browser = command
         .spawn()
         .context("Could not open the separate browser login window")?;
-    let result = login_cookies(&mut browser, &profile);
-    let _ = browser.kill();
-    let _ = browser.wait();
-    result
+    drop(descriptor);
+    drop(child_connection);
+    Ok((browser, connection))
 }
 
-fn login_cookies(browser: &mut std::process::Child, profile: &Path) -> Result<String> {
-    let started = Instant::now();
-    let (port, endpoint) = loop {
-        if browser.try_wait()?.is_some() {
-            bail!("The login window was closed; choose a profile or try again");
-        }
-        if started.elapsed() > Duration::from_secs(30) {
-            bail!("The login window did not start in time");
-        }
-        if let Ok(text) = std::fs::read_to_string(profile.join("DevToolsActivePort"))
-            && let Some(address) = debug_address(&text)
-        {
-            break address;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    let stream = TcpStream::connect_timeout(
-        &SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into(),
-        Duration::from_secs(2),
-    )?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let config = tungstenite::protocol::WebSocketConfig::default()
-        .max_message_size(Some(PACKET_LIMIT as usize))
-        .max_frame_size(Some(PACKET_LIMIT as usize));
-    let (mut socket, _) = tungstenite::client::client_with_config(
-        format!("ws://127.0.0.1:{port}{endpoint}"),
-        stream,
-        Some(config),
-    )
-    .map_err(|_| anyhow::anyhow!("Could not connect to the login window"))?;
+fn login_cookies(browser: &mut std::process::Child, connection: &mut UnixStream) -> Result<String> {
+    let mut reader = BufReader::new(connection.try_clone()?);
     for id in 1..600_u64 {
         if browser.try_wait()?.is_some() {
             bail!("The login window was closed");
         }
-        socket
-            .send(tungstenite::Message::Text(
-                json!({"id":id,"method":"Storage.getCookies"})
-                    .to_string()
-                    .into(),
-            ))
+        connection
+            .write_all(format!("{}\0", json!({"id":id,"method":"Storage.getCookies"})).as_bytes())
             .map_err(|_| anyhow::anyhow!("The login window disconnected"))?;
-        let cookies = read_cookies(&mut socket, id)?;
+        let cookies = read_cookies(&mut reader, id)?;
+        connection.set_read_timeout(Some(Duration::from_secs(2)))?;
         if let Ok(export) = cookie_export(cookies) {
             if crate::reddit::Reddit::from_export(&export, false)
                 .and_then(|candidate| candidate.verify_account())
@@ -407,43 +404,22 @@ fn login_cookies(browser: &mut std::process::Child, profile: &Path) -> Result<St
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    bail!("Sign-in timed out; open the login window again when ready")
+    bail!("{WINDOW_TIMED_OUT}")
 }
 
-fn debug_address(text: &str) -> Option<(u16, String)> {
-    let mut lines = text.lines();
-    let port = lines.next()?.parse::<u16>().ok().filter(|p| *p != 0)?;
-    let endpoint = lines.next()?;
-    let token = endpoint.strip_prefix("/devtools/browser/")?;
-    if token.is_empty()
-        || !token
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
-    {
-        return None;
-    }
-    Some((port, endpoint.into()))
-}
-
-fn read_cookies(
-    socket: &mut tungstenite::WebSocket<TcpStream>,
-    id: u64,
-) -> Result<Vec<BrowserCookie>> {
+fn read_cookies(reader: &mut impl BufRead, id: u64) -> Result<Vec<BrowserCookie>> {
     for _ in 0..32 {
-        let message = socket
-            .read()
+        let mut bytes = Vec::new();
+        reader
+            .take(PACKET_LIMIT + 1)
+            .read_until(0, &mut bytes)
             .map_err(|_| anyhow::anyhow!("The login window stopped responding"))?;
-        let bytes = match message {
-            tungstenite::Message::Text(text) => text.as_bytes().to_vec(),
-            tungstenite::Message::Binary(bytes) => bytes.to_vec(),
-            tungstenite::Message::Close(_) => bail!("The login window disconnected"),
-            _ => continue,
-        };
-        if bytes.len() as u64 > PACKET_LIMIT {
+        if bytes.len() as u64 > PACKET_LIMIT || bytes.last() != Some(&0) {
             bail!("The login window returned too much session data");
         }
-        let value: Value =
-            serde_json::from_slice(&bytes).context("Invalid login window response")?;
+        bytes.pop();
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow::anyhow!("Invalid login window response"))?;
         if value["id"].as_u64() != Some(id) {
             continue;
         }
@@ -673,39 +649,48 @@ mod tests {
     }
 
     #[test]
-    fn when_debug_address_leaves_the_browser_endpoint_it_should_be_rejected() {
-        assert_eq!(debug_address("9222\n//evil.test\n"), None);
-        assert_eq!(
-            debug_address("9222\n/devtools/browser/fixture-id\n"),
-            Some((9222, "/devtools/browser/fixture-id".into()))
-        );
-    }
-
-    #[test]
-    fn when_the_login_socket_sends_a_ping_it_should_still_read_the_cookie_response() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (done, finished) = std::sync::mpsc::channel();
-        let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut socket = tungstenite::accept(stream).unwrap();
-            socket
-                .send(tungstenite::Message::Ping(Vec::new().into()))
-                .unwrap();
-            socket.send(tungstenite::Message::Text(json!({"id":1,"result":{"cookies":[{"domain":".reddit.com","path":"/","secure":true,"expires":-1,"name":"reddit_session","value":"fixture-session"}]}}).to_string().into())).unwrap();
-            let _ = finished.recv_timeout(Duration::from_secs(3));
-        });
-        let stream = TcpStream::connect(address).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+    fn private_login_pipe_reads_events_and_split_cookie_responses() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("browser-pipe-fixture");
+        std::fs::write(&executable, r#"#!/bin/sh
+pipe=
+for argument in "$@"; do
+    case "$argument" in
+        --remote-debugging-pipe) pipe=yes ;;
+        --remote-debugging-port*) exit 4 ;;
+    esac
+done
+test "$pipe" = yes || exit 5
+dd bs=1 count=39 <&3 > /dev/null 2>/dev/null || exit 6
+printf '%s\000' '{"method":"event"}' >&4
+printf '%s' '{"id":1,"result":{"cookies":[' >&4
+printf '%s\000' '{"domain":".reddit.com","path":"/","secure":true,"expires":-1,"name":"reddit_session","value":"fixture-session"}]}}' >&4
+"#).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (mut child, mut connection) = spawn_login(&executable, directory.path()).unwrap();
+        connection
+            .write_all(b"{\"id\":1,\"method\":\"Storage.getCookies\"}\0")
             .unwrap();
-        let (mut socket, _) = tungstenite::client(format!("ws://{address}/"), stream).unwrap();
-        let actual = cookie_export(read_cookies(&mut socket, 1).unwrap()).unwrap();
-        done.send(()).unwrap();
-        server.join().unwrap();
+        let actual =
+            cookie_export(read_cookies(&mut BufReader::new(connection), 1).unwrap()).unwrap();
+        assert!(child.wait().unwrap().success());
         assert_eq!(
             actual,
             ".reddit.com\tTRUE\t/\tTRUE\t0\treddit_session\tfixture-session\n"
         );
+    }
+
+    #[test]
+    fn login_pipe_rejects_oversized_and_unterminated_messages_without_contents() {
+        let mut oversized = json!({"id":1,"result":{"cookies":[{"domain":".reddit.com","path":"/","name":"reddit_session","value":"private".repeat(PACKET_LIMIT as usize / 7 + 1)}]}}).to_string().into_bytes();
+        oversized.push(0);
+        for bytes in [oversized, b"private-incomplete".to_vec()] {
+            let error = read_cookies(&mut std::io::Cursor::new(bytes), 1)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(!error.contains("private"));
+        }
     }
 }

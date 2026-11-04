@@ -22,7 +22,7 @@ const CACHE_BYTES: usize = 256 * 1024 * 1024;
 const CACHE_TILES: usize = 512;
 const NATIVE_BYTES: usize = 128 * 1024 * 1024;
 const BADGE_MIN_PIXELS: f64 = 80.0;
-const VIDEO_BYTES_PER_SECOND: f64 = 4.0 * 1024.0 * 1024.0;
+const VIDEO_BYTES_PER_SECOND: f64 = 12.0 * 1024.0 * 1024.0;
 static NEXT_IMAGE_ID: LazyLock<AtomicU32> = LazyLock::new(|| {
     let seed = *uuid::Uuid::new_v4().as_bytes();
     AtomicU32::new(u32::from_be_bytes([seed[0], seed[1], seed[2], seed[3]]))
@@ -266,6 +266,11 @@ pub struct Renderer {
     visible: HashSet<Key>,
     order: VecDeque<Key>,
     video_ready_at: Option<std::time::Instant>,
+    /// Frames per second of the playing video; its frames share the output budget.
+    video_rate: Option<f64>,
+    /// A video frame waited for the output budget: it shows once the budget allows,
+    /// instead of being skipped for the one after it.
+    video_waiting: bool,
 }
 
 impl Completed {
@@ -280,6 +285,17 @@ impl Completed {
 }
 
 impl Renderer {
+    #[cfg(test)]
+    pub fn fail_cached_tiles(&mut self, error: &str) {
+        for entry in self.cache.values_mut() {
+            entry.result = Err(error.into());
+        }
+    }
+
+    pub fn set_video_rate(&mut self, rate: f64) {
+        self.video_rate = Some(rate);
+    }
+
     pub fn begin(&mut self) {
         self.frame.clear();
         self.poll();
@@ -350,6 +366,7 @@ impl Renderer {
                 .filter(|request| request.key.video)
                 .all(|request| self.cache.contains_key(&request.key))
         {
+            self.video_waiting |= self.frame.iter().any(|request| request.key.video);
             self.frame.retain(|request| !request.key.video);
             next.retain(|(key, _)| !key.video);
         }
@@ -404,15 +421,20 @@ impl Renderer {
     }
 
     pub fn poll(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let resumed = self.video_waiting && self.video_ready_at.is_none_or(|at| now >= at);
+        if resumed {
+            self.video_waiting = false;
+        }
         let completed = {
             let mut work = self.shared.work.lock();
             // Keep the old video visible until every requested strip is ready.
             if work.wanted.iter().any(|(key, _)| key.video) {
-                return false;
+                return resumed;
             }
             std::mem::take(&mut work.completed)
         };
-        let changed = !completed.is_empty();
+        let changed = resumed || !completed.is_empty();
         let video_bytes: usize = completed
             .iter()
             .filter(|done| done.key.video)
@@ -422,7 +444,8 @@ impl Renderer {
                 _ => tile.size().width as usize * tile.size().height as usize * 16 * 32,
             })
             .sum();
-        if video_bytes as f64 > VIDEO_BYTES_PER_SECOND / 24.0 {
+        let rate = self.video_rate.unwrap_or(crate::video::MIN_FPS);
+        if video_bytes as f64 > VIDEO_BYTES_PER_SECOND / rate {
             self.video_ready_at = Some(
                 std::time::Instant::now()
                     + std::time::Duration::from_secs_f64(
@@ -463,6 +486,16 @@ impl Renderer {
         }
     }
 
+    /// How long until a video frame held for the output budget can go out.
+    pub fn video_wake_in(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.video_waiting
+            .then(|| {
+                self.video_ready_at
+                    .map(|at| at.saturating_duration_since(now))
+            })
+            .flatten()
+    }
+
     pub fn pending(&self) -> bool {
         let work = self.shared.work.lock();
         !work.wanted.is_empty() || !work.completed.is_empty()
@@ -491,6 +524,7 @@ impl Renderer {
     pub fn clear(&mut self) {
         self.frame.clear();
         self.video_ready_at = None;
+        self.video_waiting = false;
         self.cache.clear();
         self.visible.clear();
         self.order.clear();
@@ -1619,6 +1653,60 @@ mod tests {
             !renderer.pending(),
             "do not encode and queue another large frame immediately"
         );
+    }
+
+    #[test]
+    fn video_frames_over_their_share_at_the_playing_rate_wait_for_the_output_budget() {
+        #[allow(deprecated)]
+        let mut picker = Picker::from_fontsize(ratatui_image::FontSize::new(8, 16));
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+        let mut seed = 7u32;
+        let image = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+            344,
+            352,
+            |_, _| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                image::Rgb([(seed >> 16) as u8, (seed >> 8) as u8, seed as u8])
+            },
+        )));
+        let mut key = Key::new("video", &picker, Size::new(43, 22), (344, 352), 0, 22, 0);
+        key.video = true;
+        // Whether the frame after this one waits, at `fps`.
+        let next_waits = |fps: f64| {
+            let mut renderer = Renderer::default();
+            renderer.set_video_rate(fps);
+            renderer.begin();
+            renderer.tile(key.clone(), &image, &picker, Preparation::Refresh);
+            renderer.finish();
+            complete(&mut renderer);
+            let current = renderer
+                .tile(key.clone(), &image, &picker, Preparation::Hold)
+                .unwrap()
+                .unwrap();
+            let Tile::Kitty { upload, .. } = current.as_ref() else {
+                panic!("a kitty video frame");
+            };
+            let share = |fps: f64| (VIDEO_BYTES_PER_SECOND / fps) as usize;
+            assert!(
+                (share(30.0)..share(24.0)).contains(&upload.len()),
+                "a frame within a 24 fps share but over a 30 fps one: {}",
+                upload.len()
+            );
+            renderer.begin();
+            renderer.tile(
+                key.clone(),
+                &Arc::new(DynamicImage::new_rgb8(344, 352)),
+                &picker,
+                Preparation::Refresh,
+            );
+            renderer.finish();
+            !renderer.pending()
+        };
+
+        assert!(next_waits(30.0), "30 a second would exceed the budget");
+        assert!(!next_waits(24.0), "24 a second fit it: every frame shows");
     }
 
     #[test]

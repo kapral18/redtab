@@ -39,6 +39,8 @@ pub enum Action {
     FirstTab,
     LastTab,
     CloseTab,
+    JumpBack,
+    JumpForward,
     NextCommunity,
     PreviousCommunity,
     NextPost,
@@ -59,6 +61,10 @@ pub enum Action {
     CommunityFeed,
     Profile,
     Actions,
+    Upvote,
+    Downvote,
+    Save,
+    Reply,
     Community,
     Reddit,
     Membership,
@@ -73,6 +79,7 @@ pub enum Action {
     Reload,
     OpenUrl,
     OpenLinks,
+    CopyLinks,
     Browser,
     SourceBrowser,
     CopyLink,
@@ -121,6 +128,8 @@ pub const BINDINGS: &[Binding] = &[
     binding!("\u{19}", LineUp, "Scroll up one line"),
     binding!("gt", NextTab, "Next tab"),
     binding!("gT", PreviousTab, "Previous tab"),
+    binding!("\u{f}", JumpBack, "Older location in the jump list"),
+    binding!("\u{9}", JumpForward, "Newer location in the jump list"),
     binding!("\u{17}h", FocusLeft, "Focus the pane to the left"),
     binding!("\u{17}l", FocusRight, "Focus the pane to the right"),
     binding!("]s", NextCommunity, "Next subreddit feed"),
@@ -134,49 +143,54 @@ pub const BINDINGS: &[Binding] = &[
     binding!("za", Fold, "Select / fold / unfold comment thread"),
     binding!("/", Search, "Search the current reading context"),
     binding!("r", Reload, "Reload / retry"),
+    binding!("u", Upvote, "Upvote / remove upvote"),
+    binding!("d", Downvote, "Downvote / remove downvote"),
+    binding!("s", Save, "Save / unsave on Reddit"),
+    binding!("c", Reply, "Reply to the post or comment"),
+    binding!("b", Bookmark, "Bookmark the current post locally"),
+    binding!("o", Browser, "Open the current item on Reddit"),
+    binding!("O", Media, "Open media externally"),
+    binding!("gx", OpenLinks, "Choose a body link; default to opening"),
     binding!("yy", CopyLink, "Yank the Reddit permalink"),
+    binding!("yl", CopyLinks, "Choose a body link; default to copying"),
+    binding!("p", Pause, "Play / pause / retry video"),
+    binding!("m", Mute, "Mute / unmute video"),
+    binding!("H", SeekBack, "Seek backward five seconds"),
+    binding!("L", SeekForward, "Seek forward five seconds"),
+    binding!("zs", Spoilers, "Reveal / hide spoilers"),
+    binding!("zi", Images, "Toggle image and video previews"),
+    binding!("zc", ListView, "Toggle Card / Compact view"),
+    binding!("zb", Sidebar, "Toggle the sidebar"),
+    binding!("gh", Home, "Go Home"),
+    binding!("gb", Bookmarks, "Go to local bookmarks"),
+    binding!("ga", AllSubs, "Go to all subscriptions"),
+    binding!("gp", Popular, "Go to Popular"),
+    binding!("gr", All, "Go to all Reddit"),
+    binding!("gc", CommunityFeed, "Go to the current source feed"),
+    binding!("gu", Profile, "Go to a user profile"),
     binding!("q", Close, "Close the current view / quit"),
-    binding!(" aa", Actions, "Reddit content actions"),
+    binding!(" a", Actions, "More Reddit content actions"),
+    binding!(" m", Membership, "Join / leave or follow / unfollow"),
     binding!(" c", Community, "Community / profile tools"),
     binding!(" r", Reddit, "Reddit collections and tools"),
     binding!(" bb", Jump, "Choose / open a buffer"),
     binding!(" bf", FirstTab, "First buffer"),
     binding!(" bl", LastTab, "Last buffer"),
     binding!(" bd", CloseTab, "Delete the current opened buffer"),
-    binding!(" gh", Home, "Go Home"),
-    binding!(" gb", Bookmarks, "Go to local bookmarks"),
-    binding!(" ga", AllSubs, "Go to all subscriptions"),
-    binding!(" gp", Popular, "Go to Popular"),
-    binding!(" gr", All, "Go to all Reddit"),
-    binding!(" gc", CommunityFeed, "Go to the current source feed"),
-    binding!(" gu", Profile, "Go to a user profile"),
-    binding!(" fs", Sort, "Choose feed / comment sort"),
+    binding!(" fs", Sort, "Feed sort (cycles in a search) / comment sort"),
     binding!(" ft", Time, "Cycle feed time range"),
-    binding!(" sp", SearchPosts, "Search posts across Reddit"),
-    binding!(" sc", SearchCommunities, "Search communities"),
-    binding!(" su", SearchPeople, "Search people"),
-    binding!(" se", Explore, "Search and explore Reddit"),
+    binding!(" sp", SearchPosts, "Search tab: posts"),
+    binding!(" sc", SearchCommunities, "Search tab: communities"),
+    binding!(" su", SearchPeople, "Search tab: people"),
+    binding!(" se", Explore, "Search tab: query or Explore"),
     binding!(" ou", OpenUrl, "Open a Reddit URL in redtab"),
-    binding!(" ol", OpenLinks, "Choose a body link to open or copy"),
-    binding!(" or", Browser, "Open the current item on Reddit"),
     binding!(
         " oc",
         SourceBrowser,
         "Open the community / profile in browser"
     ),
-    binding!(" om", Media, "Open media externally"),
-    binding!(" mp", Pause, "Play / pause / retry video"),
-    binding!(" mm", Mute, "Mute / unmute video"),
-    binding!(" mh", SeekBack, "Seek backward five seconds"),
-    binding!(" ml", SeekForward, "Seek forward five seconds"),
-    binding!(" vi", Images, "Toggle image and video previews"),
-    binding!(" vc", ListView, "Toggle Card / Compact view"),
-    binding!(" vb", Sidebar, "Toggle the sidebar"),
-    binding!(" vs", Spoilers, "Reveal / hide spoilers"),
     binding!(" ps", Settings, "Settings and preferences"),
     binding!(" pa", Accounts, "Accounts: switch / add / reconnect"),
-    binding!(" ab", Bookmark, "Bookmark the current post locally"),
-    binding!(" am", Membership, "Join / leave or follow / unfollow"),
 ];
 
 #[derive(Clone, PartialEq, Eq)]
@@ -281,7 +295,10 @@ pub fn context(app: &App) -> Context {
         Some(Overlay::Experience) if app.experience.writing() => Context::Pending,
         Some(Overlay::Experience) => match app.experience.screens.last() {
             Some(Screen::Input(_)) => Context::Input,
-            _ if app.experience.pending.is_some() && !app.experience.loading_more() => {
+            _ if app.experience.pending.is_some()
+                && !app.experience.loading_more()
+                && !app.experience.refreshing =>
+            {
                 Context::Pending
             }
             Some(Screen::Menu { .. }) => Context::Menu,
@@ -289,6 +306,7 @@ pub fn context(app: &App) -> Context {
             Some(Screen::Confirm { .. }) => Context::Confirm,
             _ => Context::Pending,
         },
+        None if app.search_editing() => Context::Input,
         None if app.post_focused() => Context::Post,
         None if app.focus == Focus::Sidebar => Context::Sidebar,
         None => Context::List,
@@ -329,6 +347,14 @@ pub fn label(keys: &str) -> String {
         )
 }
 
+pub fn search_kind_keys(app: &App) -> bool {
+    app.overlay.is_none()
+        && app.active == crate::app::SEARCH_TAB
+        && app.focus == Focus::List
+        && !app.post_focused()
+        && (app.search_editing() || !app.ancestor_following())
+}
+
 pub fn action_label(action: Action) -> String {
     label(
         BINDINGS
@@ -359,6 +385,13 @@ pub fn fold_label(app: &App) -> Option<&'static str> {
     }
 }
 
+pub(crate) fn line_moves_items(app: &App) -> bool {
+    matches!(
+        context(app),
+        Context::Sidebar | Context::Menu | Context::Settings | Context::Accounts | Context::Sort
+    ) || (context(app) == Context::List && app.list_uses_rows())
+}
+
 fn description(app: &App, binding: &Binding) -> &'static str {
     use Action::*;
     match binding.action {
@@ -366,6 +399,17 @@ fn description(app: &App, binding: &Binding) -> &'static str {
         Up if context(app) == Context::Post => "Previous comment / scroll up",
         Down if context(app) == Context::Sidebar => "Next sidebar tab",
         Up if context(app) == Context::Sidebar => "Previous sidebar tab",
+        LineDown | LineUp if line_moves_items(app) => {
+            if binding.action == LineDown {
+                "Next item"
+            } else {
+                "Previous item"
+            }
+        }
+        NextCommunity if app.search_source_context() => "Next Search source; return to results",
+        PreviousCommunity if app.search_source_context() => {
+            "Previous Search source; return to results"
+        }
         NextCommunity if matches!(app.active_tab().kind, TabKind::AllSubs) => {
             "Next community group"
         }
@@ -413,13 +457,9 @@ pub fn available(app: &App, action: Action) -> bool {
     let feed = matches!(
         app.active_tab().kind,
         TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. }
-    );
-    let browse = match app.experience.screens.last() {
-        Some(Screen::Browse { query, page, .. }) if context == Context::Browse => {
-            Some((query, page))
-        }
-        _ => None,
-    };
+    ) || (matches!(app.active_tab().kind, TabKind::Search)
+        && app.active_tab().feed.search.is_some()
+        && !app.search.shows_rows());
     match action {
         Settings => {
             !matches!(
@@ -443,18 +483,31 @@ pub fn available(app: &App, action: Action) -> bool {
             ) && !app.experience.writing()
                 && !app.settings.writing()
         }
-        Right => !matches!(
-            context,
-            Context::Input | Context::Pending | Context::Confirm | Context::Managed
-        ),
+        Right => match context {
+            Context::List if app.search_shows_rows() => app.search.selected_row().is_some(),
+            Context::List => app.current_post().is_some() || app.post_view.is_some(),
+            Context::Post => fold_label(app).is_some(),
+            Context::Browse => matches!(app.experience.screens.last(),
+                Some(Screen::Browse { page, selected, .. }) if page.entries.get(*selected)
+                    .is_some_and(|entry| entry.query.is_some() || entry.target.is_some())),
+            Context::Menu => matches!(app.experience.screens.last(),
+                Some(Screen::Menu { choices, selected, .. }) if choices.get(*selected).is_some()),
+            Context::Accounts => app.auth.choices() > 0,
+            Context::Sidebar | Context::Settings | Context::Sort => true,
+            _ => false,
+        },
         Down | Up | Left | First | Last | PageDown | PageUp | HalfDown | HalfUp | LineDown
         | LineUp | Close => !matches!(
             context,
             Context::Input | Context::Pending | Context::Confirm
         ),
-        FocusLeft | FocusRight => app.overlay.is_none(),
+        FocusLeft => matches!(context, Context::List | Context::Post),
+        FocusRight => context == Context::Sidebar
+            || (context == Context::List
+                && (app.post_view.is_some()
+                    || (app.search_shows_rows() && app.detail_fits() && available(app, Right)))),
         Fold => context == Context::Post && fold_label(app).is_some(),
-        NextPost | PreviousPost => context == Context::Post,
+        NextPost | PreviousPost => context == Context::Post && app.post_parent_position().is_some(),
         NextThread | PreviousThread => {
             context == Context::Post
                 && app
@@ -477,63 +530,80 @@ pub fn available(app: &App, action: Action) -> bool {
                     .is_some_and(|view| !view.spoiler_hidden())
                 && app
                     .current_post()
-                    .is_some_and(|post| matches!(post.media, crate::model::Media::Gallery { .. }))
+                    .is_some_and(|post| matches!(&post.media, crate::model::Media::Gallery { images, .. } if !images.is_empty()))
         }
         NextCommunity | PreviousCommunity => {
             matches!(context, Context::List | Context::Post)
-                && (matches!(app.active_tab().kind, TabKind::AllSubs)
-                    || app.tabs.iter().any(|tab| tab.subreddit().is_some()))
+                && if app.search_source_context() {
+                    app.search.exploring() || !app.search.results.entries.is_empty()
+                } else {
+                    if matches!(app.active_tab().kind, TabKind::AllSubs) {
+                        !app.all_subs.groups.is_empty()
+                    } else {
+                        app.tabs.iter().any(|tab| tab.subreddit().is_some())
+                    }
+                }
         }
-        Pause | Mute | SeekBack | SeekForward => {
-            app.overlay.is_none() && app.video_controls_available()
+        Pause => {
+            matches!(context, Context::List | Context::Post) && app.video_controls_available()
         }
+        Mute => available(app, Pause) && app.selected_video().is_some_and(|player| player.error().is_none()),
+        SeekBack | SeekForward => available(app, Pause) && app.selected_video().is_some_and(|player| player.ready() && player.error().is_none()),
         Media => {
-            app.overlay.is_none()
+            matches!(context, Context::List | Context::Post)
                 && app
                     .current_post()
                     .is_some_and(|post| !matches!(post.media, crate::model::Media::None))
         }
-        OpenLinks => matches!(context, Context::Post | Context::Browse),
+        OpenLinks | CopyLinks => matches!(context, Context::Post | Context::Browse),
         Bookmark => {
             matches!(context, Context::List | Context::Post) && app.current_post().is_some()
         }
         CopyLink => {
             matches!(context, Context::List | Context::Post | Context::Browse)
-                && (context == Context::Browse || app.current_post().is_some())
+                && (context == Context::Browse || app.copy_link_target().is_ok())
+        }
+        Upvote | Downvote | Save | Reply => {
+            available(app, Actions)
+                && app.action_target().is_some_and(|target| target.id.starts_with("t1_") || target.id.starts_with("t3_"))
+                && !(action == Downvote && context == Context::Browse && matches!(
+                    app.experience.screens.last(),
+                    Some(Screen::Browse {
+                        query: crate::reddit::experience::Query::Multi { .. },
+                        ..
+                    })
+                ))
         }
         Actions => {
             matches!(context, Context::List | Context::Post) && app.current_post().is_some()
                 || matches!(app.experience.screens.last(), Some(Screen::Browse { page, selected, .. })
                     if context == Context::Browse && page.entries.get(*selected).is_some_and(|entry| entry.target.is_some()))
         }
-        Membership | Community | CommunityFeed | SourceBrowser => {
-            reading && app.membership_target().is_some()
+        Membership | Community => reading && app.membership_target().is_some(),
+        CommunityFeed => {
+            reading && (app.membership_target().is_some() || app.search_row_path().is_some())
         }
-        Sort => {
-            context == Context::Post
-                || browse.is_some_and(|(query, _)| {
-                    matches!(
-                        query,
-                        crate::reddit::experience::Query::Search {
-                            kind: crate::reddit::experience::SearchKind::Posts,
-                            ..
-                        }
-                    )
-                })
-                || (app.overlay.is_none() && feed)
-        }
+        SourceBrowser => reading && app.source_browser_path().is_some(),
+        Browser => match context {
+            Context::Browse => true,
+            Context::Sidebar => app.source_browser_path().is_some(),
+            Context::List | Context::Post => app.current_post().is_some() || app.source_browser_path().is_some(),
+            _ => false,
+        },
+        Sort => context == Context::Post || (app.overlay.is_none() && feed),
         Time => {
-            browse.is_some_and(|(query, _)| {
-                matches!(query, crate::reddit::experience::Query::Search { .. })
-            }) || (app.overlay.is_none()
-                && feed
-                && app.active_tab().feed.search.is_none()
-                && matches!(
-                    app.active_tab().feed.sort,
-                    crate::model::Sort::Top | crate::model::Sort::Controversial
-                ))
+            (app.overlay.is_none() && feed && app.active_tab().feed.search.is_some())
+                || (app.overlay.is_none()
+                    && feed
+                    && matches!(
+                        app.active_tab().feed.sort,
+                        crate::model::Sort::Top | crate::model::Sort::Controversial
+                    ))
         }
         CloseTab => app.overlay.is_none(),
+        JumpBack | JumpForward => {
+            matches!(context, Context::List | Context::Sidebar | Context::Post)
+        }
         ListView => {
             matches!(context, Context::List | Context::Sidebar)
                 && !matches!(app.active_tab().kind, TabKind::AllSubs)
@@ -577,18 +647,15 @@ pub fn candidates(app: &App) -> Vec<Candidate> {
 pub fn prefix_name(prefix: &str) -> &'static str {
     match prefix {
         " " => "Actions",
-        " a" => "Content actions",
         " b" => "Buffers",
         " f" => "Feed",
-        " g" | "g" => "Go",
-        " m" => "Media",
+        "g" => "Go",
         " o" => "Open",
         " p" => "Preferences",
         " s" => "Search",
-        " v" => "View",
         "[" => "Previous",
         "]" => "Next",
-        "z" => "Folds",
+        "z" => "Folds and view",
         "y" => "Yank",
         "\u{17}" => "Focus pane",
         _ => "Choose action",
@@ -634,7 +701,10 @@ pub fn resolve(app: &mut App, key: KeyEvent) -> Option<Target> {
         {
             c
         }
-        _ => return None,
+        _ => {
+            app.keymap.clear();
+            return None;
+        }
     };
     if app.keymap.prefix.is_empty() {
         app.keymap.scope = Some(scope(app));

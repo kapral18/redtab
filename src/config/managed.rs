@@ -384,7 +384,7 @@ pub(crate) mod tests {
             let directory = tempfile::tempdir().unwrap();
             let source = directory.path().join(source_name);
             let target = directory.path().join(target_name);
-            let text = "# mine\n[media]\nimage_preview = true # keep\n[signed_out.filters]\nkeywords = [\"old\"] # keep array\n";
+            let text = "# mine\n[media]\nimage_preview = true # keep\n[accounts.other.filters]\nkeywords = [\"old\"] # keep array\n";
             fs::write(&source, text).unwrap();
             fs::write(&target, text).unwrap();
             fs::set_permissions(&source, Permissions::from_mode(0o640)).unwrap();
@@ -518,7 +518,7 @@ esac
         fixture.save(&mut store);
 
         assert_eq!(store.persistence, Persistence::Saved);
-        assert_eq!(store.current.accounts.len(), 1);
+        assert_eq!(store.current.accounts.len(), 2);
         assert_eq!(store.current.accounts["reader"].filters.authors, ["bot"]);
         assert_eq!(store.current.accounts["reader"].filters.keywords, ["mine"]);
     }
@@ -574,7 +574,7 @@ esac
         let fixture = Fixture::new();
         let mut store = fixture.store();
         fixture.change(&mut store);
-        fs::write(&fixture.source, "# mine\nall_subs_posts_per_group = 4\n[media]\nimage_preview = true # keep\n[signed_out.filters]\nkeywords = [\"old\"] # keep array\n").unwrap();
+        fs::write(&fixture.source, "# mine\nall_subs_posts_per_group = 4\n[media]\nimage_preview = true # keep\n[accounts.other.filters]\nkeywords = [\"old\"] # keep array\n").unwrap();
 
         let plan = fixture.plan(&store);
         assert_eq!(
@@ -590,7 +590,7 @@ esac
         assert!(!store.current.media.image_preview && store.current.all_subs_posts_per_group == 4);
         assert_eq!(
             fs::read_to_string(&fixture.source).unwrap(),
-            "# mine\nall_subs_posts_per_group = 4\n[media]\nimage_preview = false # keep\n[signed_out.filters]\nkeywords = [\"old\"] # keep array\n"
+            "# mine\nall_subs_posts_per_group = 4\n[media]\nimage_preview = false # keep\n[accounts.other.filters]\nkeywords = [\"old\"] # keep array\n"
         );
         assert_eq!(
             fs::read(&fixture.target).unwrap(),

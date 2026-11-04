@@ -20,7 +20,11 @@ use ratatui::layout::{Position, Rect, Size};
 use ratatui::style::Color;
 use ratatui_image::FontSize;
 
-const FPS: f64 = 24.0;
+/// Frames per second for a source slower than this or naming no rate (a GIF follows the
+/// rate ffmpeg reports for it), and wherever ffmpeg can't follow the source's rate.
+pub(crate) const MIN_FPS: f64 = 24.0;
+/// Faster sources are halved or resampled down to this.
+const MAX_FPS: f64 = 30.0;
 /// Decode at most this width; the pixel budget bounds tall frames.
 const MAX_FRAME_WIDTH: u32 = 1280;
 /// Pixel budget shared by decoder and tiled/native output; portrait frames receive
@@ -33,6 +37,7 @@ const RENDITION_HEADROOM: f64 = 0.75;
 const AHEAD: usize = 3;
 /// A frame this late means a stall: resume from it instead of racing through late frames.
 const STALL: f64 = 0.25;
+const FRAME_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How far `,` and `.` seek, in seconds.
 pub const SEEK_STEP: f64 = 5.0;
 
@@ -65,6 +70,8 @@ struct Log {
     input_error: bool,
     /// ffmpeg closed its log: everything it will say about this run is above.
     ended: bool,
+    /// Frames per second ffmpeg outputs, logged before its first frame.
+    rate: Option<f64>,
 }
 
 /// One ffmpeg run, from a start position to the end of the stream.
@@ -79,6 +86,8 @@ struct Decoder {
 struct Decoded {
     index: u64,
     frame: Frame,
+    /// Frames per second of its run.
+    rate: f64,
 }
 
 #[derive(Default)]
@@ -94,7 +103,7 @@ impl Decoder {
         frame_box: (u32, u32),
         headers: &[(String, String)],
     ) -> io::Result<Self> {
-        let filter = video_filter(frame_box);
+        let filter = video_filter(frame_box, *FPS_EXPRESSIONS);
         let mut child = crate::media::local_command("ffmpeg")
             .args([
                 "-nostdin",
@@ -106,6 +115,9 @@ impl Decoder {
             .args(header_args(headers))
             .args(input_args(url, start))
             .args(["-an", "-sn", "-dn", "-vf", &filter])
+            // The file's metadata would be listed among the output headings read for the
+            // frame rate; the frames don't carry it anyway.
+            .args(["-map_metadata", "-1", "-map_chapters", "-1"])
             // 8-bit RGB even for 10-bit sources.
             .args(["-pix_fmt", "rgb24", "-f", "image2pipe", "-c:v", "ppm", "-"])
             .stdin(Stdio::null())
@@ -120,11 +132,13 @@ impl Decoder {
         let (tx, frames) = sync_channel(AHEAD);
         let progress = Arc::new(DecodeProgress::default());
         let reader_progress = Arc::clone(&progress);
+        let rate_log = Arc::clone(&log);
         std::thread::spawn(move || {
             read_frames(
                 BufReader::with_capacity(1 << 20, stdout),
                 tx,
                 &reader_progress,
+                || logged_rate(&rate_log, Duration::from_secs(1)),
             );
         });
         Ok(Self {
@@ -136,8 +150,33 @@ impl Decoder {
     }
 }
 
-fn read_frames(mut out: impl BufRead, tx: SyncSender<Decoded>, progress: &DecodeProgress) {
+/// The output rate once ffmpeg's log names it; ffmpeg logs it before writing a frame,
+/// but its log is read on another thread. A log that never names it (a heading cut by
+/// another thread's message) gives up after `patience`, as ffmpeg waits on the frames.
+fn logged_rate(log: &Mutex<Log>, patience: Duration) -> f64 {
+    let deadline = Instant::now() + patience;
+    loop {
+        {
+            let log = log.lock();
+            if let Some(rate) = log.rate {
+                return rate;
+            }
+            if log.ended || Instant::now() >= deadline {
+                return MIN_FPS;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn read_frames(
+    mut out: impl BufRead,
+    tx: SyncSender<Decoded>,
+    progress: &DecodeProgress,
+    rate: impl Fn() -> f64,
+) {
     let mut first = FirstFrame::default();
+    let mut known = None;
     while let Ok(Some((width, height, rgb))) = read_ppm(&mut out) {
         let index = progress.read.fetch_add(1, Ordering::Relaxed);
         let same_as_first = first.same(&rgb);
@@ -156,7 +195,8 @@ fn read_frames(mut out: impl BufRead, tx: SyncSender<Decoded>, progress: &Decode
             pixels: Pixels::Raw(Arc::new(image::DynamicImage::ImageRgb8(img))),
             same_as_first,
         };
-        if tx.send(Decoded { index, frame }).is_err() {
+        let rate = *known.get_or_insert_with(&rate);
+        if tx.send(Decoded { index, frame, rate }).is_err() {
             return;
         }
     }
@@ -209,6 +249,9 @@ fn input_args(url: &str, start: f64) -> Vec<String> {
     let start = format!("{start:.3}");
     let http = url.starts_with("http://") || url.starts_with("https://");
     let mut args: Vec<String> = Vec::new();
+    if http {
+        args.extend(["-rw_timeout".into(), "10000000".into()]);
+    }
     if plain_gif(url) {
         if http {
             args.extend(["-seekable".into(), "0".into()]);
@@ -241,6 +284,25 @@ fn input_args(url: &str, start: f64) -> Vec<String> {
         args.extend(["-ss".into(), start, "-i".into(), url.into()]);
     }
     args
+}
+
+/// Whether ffmpeg's fps filter takes an expression of the source's rate (FFmpeg 5.0+).
+/// Older builds take only a fixed rate.
+static FPS_EXPRESSIONS: LazyLock<bool> = LazyLock::new(|| {
+    crate::media::local_command("ffmpeg")
+        .args(["-hide_banner", "-h", "filter=fps"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|out| supports_fps_expressions(&String::from_utf8_lossy(&out.stdout)))
+});
+
+fn supports_fps_expressions(fps_help: &str) -> bool {
+    fps_help.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("fps ")
+            .is_some_and(|rest| rest.trim_start().starts_with("<string>"))
+    })
 }
 
 /// Whether ffmpeg's HTTP reader can split a file into ranged requests (FFmpeg 8.1+).
@@ -342,18 +404,37 @@ fn parse_duration(line: &str) -> Option<f64> {
 
 /// Read ffmpeg's log until it closes, noting what it says about the stream.
 fn read_log(stderr: impl BufRead, log: &Mutex<Log>) {
+    // Input streams are listed first; the rate is the output's.
+    let mut output = false;
     // Split on bytes: invalid UTF-8 must not stop the read, or ffmpeg blocks on a full pipe.
     for line in stderr.split(b'\n') {
         let Ok(line) = line else { break };
         let line = String::from_utf8_lossy(&line);
         let mut log = log.lock();
-        if log.duration.is_none() {
-            log.duration = parse_duration(&line);
+        // Only ffmpeg's own headings count: at their exact indents, on a line of their own.
+        // Metadata, listed among them, can read like anything (a key can even hold a line
+        // break).
+        let heading = line.strip_prefix("[info] ").unwrap_or_default();
+        if log.duration.is_none() && heading.starts_with("  Duration: ") {
+            log.duration = parse_duration(heading);
         }
-        if line.contains("Stream #0:") && line.contains(": Audio: ") {
+        if heading.starts_with("Output #0") {
+            output = true;
+        }
+        if output
+            && log.rate.is_none()
+            && heading.starts_with("  Stream #0:")
+            && heading.contains(": Video: ")
+        {
+            let rate = heading
+                .split(", ")
+                .find_map(|part| part.trim().strip_suffix(" fps")?.parse::<f64>().ok());
+            log.rate = Some(rate.map_or(MIN_FPS, |rate| rate.clamp(MIN_FPS, MAX_FPS)));
+        }
+        if heading.starts_with("  Stream #0:") && heading.contains(": Audio: ") {
             log.audio = true;
         }
-        if line.contains("Stream mapping:") {
+        if heading.starts_with("Stream mapping:") {
             log.streams_read = true;
         }
         // `[http @ 0x7f] [error] …`, or nested: `[vist#0:0/gif @ 0x1] [dec:gif @ 0x2] [error] …`.
@@ -514,6 +595,7 @@ fn resolve(
     frame_box: (u32, u32),
     tall: u32,
     pixels: Option<f64>,
+    fallback: impl FnOnce() -> Result<crate::reddit::VideoManifest, String>,
 ) -> Result<Sources, String> {
     let base = url::Url::parse(url).map_err(|e| format!("bad video URL: {e}"))?;
     if !base.path().ends_with(".m3u8") {
@@ -525,32 +607,56 @@ fn resolve(
         .timeout_global(Some(Duration::from_secs(15)))
         .build()
         .into();
-    let fetch = |at: &url::Url| -> Result<String, String> {
+    let fetch = |at: &url::Url| {
         agent
             .get(at.as_str())
             .call()
             .and_then(|mut r| r.body_mut().with_config().limit(1 << 20).read_to_string())
-            .map_err(|e| match e {
-                ureq::Error::StatusCode(403) => {
-                    "Reddit denied access to this video (HTTP 403)".into()
+    };
+    let explain = |e| match e {
+        ureq::Error::StatusCode(403) => "Reddit denied access to this video (HTTP 403)".into(),
+        ureq::Error::StatusCode(status @ (404 | 410)) => {
+            format!("Video is no longer available (HTTP {status})")
+        }
+        _ => format!("video playlist: {e}"),
+    };
+    let master = match fetch(&base) {
+        Ok(master) => master,
+        Err(error @ ureq::Error::StatusCode(403)) => {
+            if let Ok(manifest) = fallback() {
+                let dimensions: Vec<_> = manifest
+                    .video
+                    .iter()
+                    .map(|r| (r.width, r.height, r.bandwidth))
+                    .collect();
+                if let Some(index) = choose_rendition(&dimensions, frame_box, tall, pixels) {
+                    let video = manifest.video.into_iter().nth(index).unwrap().url;
+                    return Ok(match manifest.audio {
+                        Some(audio) => Sources {
+                            video,
+                            audio: Some(audio),
+                            audio_in_file: false,
+                            headers: Vec::new(),
+                            audio_headers: Vec::new(),
+                        },
+                        None => Sources::file(&video),
+                    });
                 }
-                ureq::Error::StatusCode(status @ (404 | 410)) => {
-                    format!("Video is no longer available (HTTP {status})")
-                }
-                _ => format!("video playlist: {e}"),
-            })
+            }
+            return Err(explain(error));
+        }
+        Err(error) => return Err(explain(error)),
     };
     let join = |path: &str| {
         base.join(path)
             .map_err(|e| format!("bad playlist entry: {e}"))
     };
-    let master = fetch(&base)?;
     let Some((video, audio)) = pick_rendition(&master, frame_box, tall, pixels) else {
         return Ok(Sources::file(url));
     };
     // A playlist's whole file, or the playlist itself when it has none.
     let file = |playlist: url::Url| -> Result<String, String> {
-        let text = fetch(&playlist)?;
+        let text = fetch(&playlist).map_err(explain)?;
         Ok(match media_file(&text) {
             Some(path) => playlist
                 .join(&path)
@@ -615,7 +721,23 @@ fn pick_rendition(
             }
         }
     }
-    // The scale the decoder will apply to it: down or kept, never up.
+    let dimensions: Vec<_> = renditions.iter().map(|r| (r.0, r.1, r.2)).collect();
+    let chosen = &renditions[choose_rendition(&dimensions, frame_box, tall, pixels)?];
+    let audio = chosen.4.as_ref().and_then(|group| {
+        audio_groups
+            .iter()
+            .find(|(g, _)| g == group)
+            .map(|(_, uri)| uri.clone())
+    });
+    Some((chosen.3.clone(), audio))
+}
+
+fn choose_rendition(
+    renditions: &[(u32, u32, u64)],
+    frame_box: (u32, u32),
+    tall: u32,
+    pixels: Option<f64>,
+) -> Option<usize> {
     let covers = |w: u32, h: u32| {
         let (w, h) = (f64::from(w), f64::from(h));
         let high = if w > h { frame_box.1 } else { tall };
@@ -626,19 +748,14 @@ fn pick_rendition(
         };
         w > 0.0 && h > 0.0 && scale <= most
     };
-    let size = |r: &(u32, u32, u64, String, Option<String>)| (u64::from(r.0) * u64::from(r.1), r.2);
-    let chosen = renditions
+    let size = |r: &(u32, u32, u64)| (u64::from(r.0) * u64::from(r.1), r.2);
+    renditions
         .iter()
-        .filter(|r| covers(r.0, r.1))
-        .min_by_key(|r| (size(r).0, std::cmp::Reverse(r.2)))
-        .or_else(|| renditions.iter().max_by_key(|r| size(r)))?;
-    let audio = chosen.4.as_ref().and_then(|group| {
-        audio_groups
-            .iter()
-            .find(|(g, _)| g == group)
-            .map(|(_, uri)| uri.clone())
-    });
-    Some((chosen.3.clone(), audio))
+        .enumerate()
+        .filter(|(_, r)| covers(r.0, r.1))
+        .min_by_key(|(_, r)| (size(r).0, std::cmp::Reverse(r.2)))
+        .or_else(|| renditions.iter().enumerate().max_by_key(|(_, r)| size(r)))
+        .map(|(index, _)| index)
 }
 
 /// The file a media playlist's segments are cut from (`#EXT-X-MAP`), when every
@@ -681,6 +798,8 @@ pub struct Player {
     /// Media time of the current run's first frame.
     start: f64,
     shown: u64,
+    /// Frames per second of the frames shown.
+    rate: f64,
     next: Option<Decoded>,
     frame: Option<Frame>,
     /// Counts frames put on screen; the drawing side sends a frame once per number.
@@ -707,6 +826,7 @@ pub struct Player {
     audio: Option<Audio>,
     duration: Option<f64>,
     error: Option<String>,
+    waiting_since: Option<Instant>,
     /// A message for the reader (no sound, no ffplay), and whether it is an error.
     notice: Option<(String, bool)>,
 }
@@ -720,29 +840,77 @@ fn frame_box(area: Size, font: FontSize) -> (u32, u32) {
     )
 }
 
-/// Preserve source detail up to the displayed size and shared pixel budget.
+/// Preserve source detail up to the displayed size and shared pixel budget, at the
+/// source's own rate within MIN_FPS..=MAX_FPS: resampling 30 fps to another rate drops
+/// or repeats frames unevenly, which shows as judder.
 /// eof_action=pass retains one-frame GIFs shorter than one output frame.
-fn video_filter((w, h): (u32, u32)) -> String {
+fn video_filter((w, h): (u32, u32), expressions: bool) -> String {
     let scale = format!("min(1,min(min({w}/iw,{h}/ih),sqrt({MAX_VIDEO_PIXELS}/(iw*ih))))");
+    let fps = if expressions {
+        format!("'if(gt(source_fps,0),clip(source_fps,{MIN_FPS},{MAX_FPS}),{MIN_FPS})'")
+    } else {
+        MIN_FPS.to_string()
+    };
     format!(
-        "fps={FPS}:eof_action=pass,scale=w='max(2,trunc(iw*{scale}))':h='max(2,trunc(ih*{scale}))':flags=bilinear"
+        "fps={fps}:eof_action=pass,scale=w='max(2,trunc(iw*{scale}))':h='max(2,trunc(ih*{scale}))':flags=bilinear"
     )
+}
+
+fn prepare_playback(
+    resolve: impl FnOnce() -> Result<Sources, String>,
+    prepare: impl FnOnce() + Send,
+) -> Result<Sources, String> {
+    std::thread::scope(|scope| {
+        let preparation = scope.spawn(prepare);
+        let result = resolve();
+        preparation.join().unwrap();
+        result
+    })
 }
 
 impl Player {
     /// Plays `url` (absolute) for an `area` cells big at `font`, from `resume`.
-    pub fn start(url: String, area: Size, font: FontSize, resume: Resume, now: Instant) -> Self {
+    pub fn start(
+        url: String,
+        area: Size,
+        font: FontSize,
+        resume: Resume,
+        now: Instant,
+        fallback: impl FnOnce(
+            Arc<dyn Fn() -> bool + Send + Sync>,
+        ) -> Result<crate::reddit::VideoManifest, String>
+        + Send
+        + 'static,
+    ) -> Self {
         let frame_box = frame_box(area, font);
         let (tx, rx) = sync_channel(1);
         let target = url.clone();
         let cancelled = Arc::new(youtube::Cancellation::default());
         let cancel = Arc::clone(&cancelled);
         std::thread::spawn(move || {
-            let result = if crate::model::youtube_id(&target).is_some() {
-                youtube::resolve(&target, &cancel)
-            } else {
-                resolve(&target, frame_box, frame_box.1, Some(MAX_VIDEO_PIXELS))
-            };
+            let youtube = crate::model::youtube_id(&target).is_some();
+            let result = prepare_playback(
+                || {
+                    if youtube {
+                        youtube::resolve(&target, &cancel)
+                    } else {
+                        let native_cancel = Arc::clone(&cancel);
+                        resolve(
+                            &target,
+                            frame_box,
+                            frame_box.1,
+                            Some(MAX_VIDEO_PIXELS),
+                            || fallback(Arc::new(move || native_cancel.is_cancelled())),
+                        )
+                    }
+                },
+                || {
+                    LazyLock::force(&FPS_EXPRESSIONS);
+                    if youtube {
+                        LazyLock::force(&RANGED_REQUESTS);
+                    }
+                },
+            );
             let _ = tx.send(result);
         });
         let spawn: Spawn = Box::new(move |sources: &Sources, at| {
@@ -776,6 +944,7 @@ impl Player {
             decoder: None,
             start: resume.at,
             shown: 0,
+            rate: MIN_FPS,
             next: None,
             frame: None,
             frame_number: 0,
@@ -792,6 +961,7 @@ impl Player {
             audio: None,
             duration: None,
             error: None,
+            waiting_since: None,
             notice: None,
         };
         if player.sources.is_some() {
@@ -806,7 +976,13 @@ impl Player {
 
     /// When the next frame of this run is due, in media time.
     fn due(&self) -> f64 {
-        self.start + self.next.as_ref().map_or(self.shown, |frame| frame.index) as f64 / FPS
+        self.start
+            + self
+                .next
+                .as_ref()
+                .map_or(self.shown as f64 / self.rate, |next| {
+                    next.index as f64 / next.rate
+                })
     }
 
     /// Start a decoder run (and the sound) at `at` seconds.
@@ -814,6 +990,7 @@ impl Player {
         self.stop_audio();
         self.decoder = None;
         self.next = None;
+        self.waiting_since = None;
         self.start = at;
         self.shown = 0;
         self.unchanged = true;
@@ -884,10 +1061,10 @@ impl Player {
         if let Some(decoder) = &self.decoder
             && let Some(at) = self.audio.as_ref().and_then(|audio| audio.position(now))
         {
-            decoder
-                .progress
-                .target
-                .store(((at - self.start).max(0.0) * FPS) as u64, Ordering::Relaxed);
+            decoder.progress.target.store(
+                ((at - self.start).max(0.0) * self.rate) as u64,
+                Ordering::Relaxed,
+            );
         }
         for _ in 0..8 {
             if !self.receive(now, &mut changed) {
@@ -924,6 +1101,7 @@ impl Player {
     /// - any other at the end, or seeked past it, loops; one with no frame is an error.
     fn receive(&mut self, now: Instant, changed: &mut bool) -> bool {
         if self.next.is_some() {
+            self.waiting_since = None;
             return true;
         }
         let Some(decoder) = &self.decoder else {
@@ -934,6 +1112,7 @@ impl Player {
         let mut log = log.lock();
         match received {
             Ok(frame) => {
+                self.waiting_since = None;
                 self.next = Some(frame);
                 if self.duration.is_none() {
                     self.duration = log.duration;
@@ -945,13 +1124,18 @@ impl Player {
                 }
                 true
             }
-            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Empty) => {
+                drop(log);
+                self.wait_for_frame(now, changed)
+            }
             Err(TryRecvError::Disconnected) => {
                 let decoded = decoder.progress.read.load(Ordering::Relaxed);
                 // The frames can end before the log says why: wait for the rest of it.
                 if !log.ended {
-                    return false;
+                    drop(log);
+                    return self.wait_for_frame(now, changed);
                 }
+                self.waiting_since = None;
                 *changed = true;
                 let error = log.error.take();
                 let input_failed = log.input_error;
@@ -959,11 +1143,13 @@ impl Player {
                 let opened = log.streams_read;
                 // A short still can end before any of its frames learned there is no sound.
                 let audio = log.streams_read.then_some(log.audio);
+                // Frames read but skipped behind the sound can end a run before one shows.
+                let rate = log.rate.unwrap_or(self.rate);
                 drop(log);
                 if let Some(audio) = audio {
                     self.learn_audio(audio, now);
                 }
-                let end = self.start + self.shown.max(decoded) as f64 / FPS;
+                let end = self.start + self.shown.max(decoded) as f64 / rate;
                 // Cut short: before the known end, or (no duration, as for a streamed GIF)
                 // when the input failed, such as a dropped connection. Go on from there,
                 // unless resuming there already failed.
@@ -1001,6 +1187,22 @@ impl Player {
         }
     }
 
+    fn wait_for_frame(&mut self, now: Instant, changed: &mut bool) -> bool {
+        if self.hidden {
+            self.waiting_since = None;
+            return false;
+        }
+        let waiting = self.waiting_since.get_or_insert(now);
+        if now.saturating_duration_since(*waiting) >= FRAME_WAIT_TIMEOUT {
+            self.decoder = None;
+            self.stop_audio();
+            self.waiting_since = None;
+            self.error = Some("Video decoding timed out".into());
+            *changed = true;
+        }
+        false
+    }
+
     /// Learn from ffmpeg's log whether the video's own file has sound.
     fn learn_audio(&mut self, has_audio: bool, now: Instant) {
         let Some(sources) = &mut self.sources else {
@@ -1021,7 +1223,8 @@ impl Player {
     }
 
     fn show_next(&mut self) {
-        if let Some(Decoded { index, frame }) = self.next.take() {
+        if let Some(Decoded { index, frame, rate }) = self.next.take() {
+            self.rate = rate;
             self.unchanged &= frame.same_as_first;
             self.retried = false;
             self.frame = Some(frame);
@@ -1074,6 +1277,7 @@ impl Player {
 
     /// Start or stop the clock and the sound after a change of `paused` or `hidden`.
     fn follow(&mut self, was: bool, now: Instant) {
+        self.waiting_since = None;
         match (was, self.playing()) {
             (true, false) => {
                 self.release_audio(now);
@@ -1110,6 +1314,10 @@ impl Player {
         self.audio
             .as_ref()
             .is_some_and(|audio| audio.position(Instant::now()).is_none())
+    }
+
+    pub fn loading(&self) -> bool {
+        self.error.is_none() && (self.shown == 0 || self.waiting_for_audio())
     }
 
     pub fn paused(&self) -> bool {
@@ -1188,6 +1396,11 @@ impl Player {
         self.clock.running = self.playing();
     }
 
+    /// Frames per second of the frames on screen.
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+
     /// The message for the reader, once: text and whether it is an error.
     pub fn take_notice(&mut self) -> Option<(String, bool)> {
         self.notice.take()
@@ -1241,7 +1454,7 @@ impl Player {
                 && self.sources.is_some()
                 && error != "ffmpeg is not installed"
             {
-                "YouTube playback failed; m opens browser"
+                "YouTube playback failed; open media externally"
             } else {
                 error
             }
@@ -1280,6 +1493,7 @@ impl Player {
         self.next = Some(Decoded {
             index: self.shown,
             frame,
+            rate: self.rate,
         });
         self.show_next();
     }
@@ -1316,6 +1530,13 @@ impl Player {
         )
     }
 
+    /// As if its frames came at `rate` per second.
+    #[cfg(test)]
+    pub fn at_rate(mut self, rate: f64) -> Self {
+        self.rate = rate;
+        self
+    }
+
     #[cfg(test)]
     pub fn buffered(url: &str, area: Size, frame: Frame) -> Self {
         let mut player = Self::new(
@@ -1328,7 +1549,12 @@ impl Player {
             Instant::now(),
         );
         let (tx, frames) = sync_channel(1);
-        tx.send(Decoded { index: 0, frame }).unwrap();
+        tx.send(Decoded {
+            index: 0,
+            frame,
+            rate: MIN_FPS,
+        })
+        .unwrap();
         player.decoder = Some(Decoder {
             child: None,
             frames,
@@ -1550,6 +1776,125 @@ mod tests {
     use super::*;
 
     #[test]
+    fn video_startup_should_overlap_decoder_preparation_with_stream_resolution() {
+        let (prepared, preparation) = sync_channel(1);
+        let (resolved, resolution) = sync_channel(1);
+
+        let actual = prepare_playback(
+            || {
+                resolved.send(()).unwrap();
+                preparation.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(Sources::file("https://example.org/video.mp4"))
+            },
+            move || {
+                prepared.send(()).unwrap();
+                resolution.recv_timeout(Duration::from_secs(2)).unwrap();
+            },
+        )
+        .unwrap();
+
+        assert_eq!(actual.video, "https://example.org/video.mp4");
+        assert_eq!(
+            actual.audio.as_deref(),
+            Some("https://example.org/video.mp4")
+        );
+    }
+
+    #[test]
+    fn native_hls_denial_should_recover_video_and_audio_through_the_relay() {
+        use crate::reddit::tests::{Fixture, Reply};
+        let fixture = Fixture::new(|request| {
+            assert!(!request.headers.contains_key("cookie"));
+            assert!(!request.headers.contains_key("authorization"));
+            match request.url.as_str() {
+                "/clip/HLSPlaylist.m3u8?token=preserved" => Reply::status(403),
+                "/clip/DASHPlaylist.mpd?token=preserved" => Reply {
+                    status: 302,
+                    body: String::new(),
+                    headers: vec![("Location".into(), "/renditions/DASHPlaylist.mpd".into())],
+                },
+                "/renditions/DASHPlaylist.mpd" => Reply {
+                    status: 200,
+                    body: include_str!("../tests/fixtures/reddit-video-dash.mpd").into(),
+                    headers: vec![],
+                },
+                "/renditions/CMAF_360.mp4" => Reply {
+                    status: 200,
+                    body: "video".into(),
+                    headers: vec![],
+                },
+                "/renditions/CMAF_AUDIO_128.mp4" => Reply {
+                    status: 200,
+                    body: "audio".into(),
+                    headers: vec![],
+                },
+                other => panic!("unexpected upstream request: {other}"),
+            }
+        });
+        let reddit = fixture.reddit();
+        let upstream = format!("{}clip/HLSPlaylist.m3u8?token=preserved", fixture.base);
+        let sources = resolve(&upstream, (784, 720), 500, None, || {
+            Ok(reddit
+                .video_fallback(&upstream, || false)
+                .expect("the supplied DASH files should resolve"))
+        })
+        .expect("a denied HLS master must not hide accessible DASH video/audio");
+        assert_eq!(
+            sources.video,
+            reddit
+                .media_url(&format!("{}renditions/CMAF_360.mp4", fixture.base))
+                .unwrap()
+        );
+        assert_eq!(
+            sources.audio.as_deref(),
+            Some(
+                reddit
+                    .media_url(&format!("{}renditions/CMAF_AUDIO_128.mp4", fixture.base))
+                    .unwrap()
+            )
+            .as_deref()
+        );
+        assert!(!sources.audio_in_file);
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .proxy(None)
+            .timeout_global(Some(Duration::from_secs(5)))
+            .build()
+            .into();
+        assert_eq!(
+            agent
+                .get(&sources.video)
+                .call()
+                .unwrap()
+                .body_mut()
+                .read_to_string()
+                .unwrap(),
+            "video"
+        );
+        assert_eq!(
+            agent
+                .get(sources.audio.as_ref().unwrap())
+                .call()
+                .unwrap()
+                .body_mut()
+                .read_to_string()
+                .unwrap(),
+            "audio"
+        );
+    }
+
+    #[test]
+    fn accessible_hls_should_not_request_an_alternative() {
+        let fixture = crate::reddit::tests::Fixture::new(|_| crate::reddit::tests::Reply {
+            status: 200,
+            body: "#EXTM3U\n#EXT-X-ENDLIST\n".into(),
+            headers: vec![],
+        });
+        let url = format!("{}HLSPlaylist.m3u8", fixture.base);
+        let sources = resolve(&url, (640, 360), 360, None, || panic!("HLS already works")).unwrap();
+        assert_eq!(sources.video, url);
+    }
+
+    #[test]
     fn media_failure_should_explain_playlist_denial_without_exposing_the_url() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let url = format!(
@@ -1570,7 +1915,8 @@ mod tests {
             (404, "Video is no longer available (HTTP 404)"),
             (410, "Video is no longer available (HTTP 410)"),
         ] {
-            let error = resolve(&url, (640, 360), 360, None).unwrap_err();
+            let error =
+                resolve(&url, (640, 360), 360, None, || Err("no alternative".into())).unwrap_err();
             assert_eq!(error, expected, "upstream HTTP {status}");
         }
         responder.join().unwrap();
@@ -1608,7 +1954,7 @@ mod tests {
         player.error = Some("failed https://rr1.googlevideo.com/file?token=PRIVATE".into());
         assert_eq!(
             player.error(),
-            Some("YouTube playback failed; m opens browser")
+            Some("YouTube playback failed; open media externally")
         );
 
         player.error = Some("ffmpeg is not installed".into());
@@ -1674,15 +2020,167 @@ mod tests {
     }
 
     #[test]
+    fn the_frame_rate_is_the_one_ffmpeg_outputs_not_the_sources() {
+        let log = Mutex::new(Log::default());
+        let stderr = b"[info]   Metadata:\n\
+[info]     title           : Output #0\n\
+[info]     Output #0       : x\n\
+[info]   Stream #0:0(und): Video: h264 (Main), yuv420p, 1280x720, 60 fps, 60 tbr, 15360 tbn\n\
+[info] Stream mapping:\n\
+[info] Output #0, image2pipe, to 'pipe:':\n\
+[info]   Metadata:\n\
+[info]     title           : clip: Video: x, 2 fps\n\
+[info]     Stream #0:0: Video: x, 24 fps, y: v\n\
+[info]     k\n\
+\x20 Stream #0:0: Video: x, 24 fps, y: v\n\
+[info]     comment         : Output #0, Stream #0:9: Video: x, 0 fps\n\
+[info]   Stream #0:0(und): Video: ppm, rgb24(pc, gbr/unknown/unknown, progressive), 64x36, q=2-31, 200 kb/s, 29.97 fps, 29.97 tbn\n";
+
+        read_log(&stderr[..], &log);
+
+        assert_eq!(log.lock().rate, Some(29.97));
+
+        // Without one, frames must not wait for a rate that never comes.
+        let log = Mutex::new(Log::default());
+        read_log(
+            &b"[info] Output #0, image2pipe, to 'pipe:':\n[info]   Stream #0:0: Video: ppm, rgb24, 64x36\n"[..],
+            &log,
+        );
+        assert_eq!(log.lock().rate, Some(MIN_FPS));
+    }
+
+    #[test]
+    fn source_rate_expressions_should_need_an_fps_filter_taking_a_string() {
+        let before_5_0 = "fps AVOptions:\n   fps               <video_rate> ..FV....... A string describing desired output framerate (default \"25\")\n";
+        let since_5_0 = "fps AVOptions:\n   fps               <string>     ..FV....... A string describing desired output framerate (default \"25\")\n   start_time        <double>     ..FV....... Assume the first PTS should be this value.\n";
+
+        assert!(!supports_fps_expressions(before_5_0));
+        assert!(supports_fps_expressions(since_5_0));
+    }
+
+    /// Frames a `rate` fps source decodes to in its first second, and their rate; None
+    /// without ffmpeg (an optional dependency). Its metadata names another rate the way
+    /// ffmpeg's log would.
+    fn decoded_second(rate: u32) -> Option<(usize, f64)> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{rate}.nut"));
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg(format!("testsrc2=size=64x36:rate={rate}:duration=1"))
+            .args(["-c:v", "ffv1", "-metadata"])
+            .arg("k\n[info]   Stream #0:0: Video: x, 27 fps, y=v")
+            .arg(&path)
+            .status()
+            .is_ok_and(|status| status.success());
+        if !made {
+            return None;
+        }
+        let decoder = Decoder::spawn(path.to_str().unwrap(), 0.0, (64, 36), &[]).unwrap();
+        let mut rates = Vec::new();
+        while let Ok(decoded) = decoder.frames.recv_timeout(Duration::from_secs(20)) {
+            rates.push(decoded.rate);
+        }
+        Some((rates.len(), rates[0]))
+    }
+
+    #[test]
+    fn video_decodes_at_the_sources_own_rate_up_to_30_fps() {
+        let Some(fast) = decoded_second(60) else {
+            return;
+        };
+        let pal = decoded_second(25).unwrap();
+
+        if *FPS_EXPRESSIONS {
+            assert_eq!(fast, (30, 30.0), "60 fps halves evenly");
+            assert_eq!(pal, (25, 25.0), "25 fps keeps every frame");
+        } else {
+            assert_eq!(fast, (24, MIN_FPS));
+            assert_eq!(pal, (24, MIN_FPS));
+        }
+    }
+
+    #[test]
+    fn frames_come_due_at_their_runs_rate() {
+        let t0 = Instant::now();
+        let (mut player, runs) = fed_player(Some(10.0), t0);
+        let run = runs.borrow_mut().remove(0).1;
+        run.rate.set(30.0);
+        for i in 0..16 {
+            run.send(blank()).unwrap();
+            player.tick(after(t0, f64::from(i) / 30.0));
+        }
+
+        assert_eq!(player.shown, 16, "frame 15 is due at 0.5 s");
+        run.send(blank()).unwrap();
+        player.tick(after(t0, 0.52));
+        assert_eq!(player.shown, 16, "frame 16 waits for 0.533 s");
+        player.tick(after(t0, 0.54));
+        assert_eq!(player.shown, 17);
+
+        // A run cut short goes on from where its frames reached at that rate.
+        let (mut player, runs) = fed_player(Some(60.0), t0);
+        let first = runs.borrow_mut().remove(0).1;
+        first.rate.set(30.0);
+        first.send(blank()).unwrap();
+        first.send(blank()).unwrap();
+        drop(first);
+        player.tick(after(t0, 0.1));
+        player.tick(after(t0, 0.2));
+        assert_eq!(runs.borrow()[0].0, 2.0 / 30.0);
+
+        // Frames the sound has passed are skipped by their index at that rate.
+        let (mut player, runs) = fed_player(Some(60.0), t0);
+        let run = runs.borrow_mut().remove(0).1;
+        run.rate.set(30.0);
+        run.send(blank()).unwrap();
+        player.tick(t0);
+        player.audio = Some(Audio::fixture(0.0, t0));
+        player.audio.as_ref().unwrap().observe(10.0, t0);
+        player.tick(t0);
+        let target = &player.decoder.as_ref().unwrap().progress.target;
+        assert_eq!(target.load(Ordering::Relaxed), 300);
+    }
+
+    #[test]
     fn when_a_log_line_is_not_utf8_the_rest_of_the_log_should_still_be_read() {
         let log = Mutex::new(Log::default());
-        let stderr = b"[info] title: caf\xe9\n  Duration: 00:00:10.00, start: 0\nStream mapping:\n";
+        let stderr = b"[info]     title           : caf\xe9\n[info]   Duration: 00:00:10.00, start: 0\n[info] Stream mapping:\n";
 
         read_log(&stderr[..], &log);
 
         let log = log.lock();
         assert_eq!(log.duration, Some(10.0));
         assert!(log.streams_read);
+    }
+
+    #[test]
+    fn metadata_that_reads_like_the_streams_should_not_describe_them() {
+        let log = Mutex::new(Log::default());
+        let stderr = b"[info] Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'v.mp4':\n\
+[info]   Metadata:\n\
+[info]     title           : Duration: 00:00:01.00, start: 0\n\
+[info]     comment         : x Stream #0:1: Audio: aac\n\
+[info]     k               : Stream mapping:\n\
+[info]   Duration: 00:00:05.00, start: 0.000000, bitrate: 41 kb/s\n\
+[info]   Stream #0:0(und): Video: h264 (High), yuv420p, 64x36, 30 fps, 30 tbr\n";
+
+        read_log(&stderr[..], &log);
+
+        let log = log.lock();
+        assert_eq!(log.duration, Some(5.0));
+        assert!(!log.audio, "a silent file");
+        assert!(!log.streams_read, "the mapping is not listed yet");
+    }
+
+    #[test]
+    fn a_log_that_never_names_the_rate_should_not_hold_frames_back() {
+        let (tx, rx) = sync_channel(1);
+        std::thread::spawn(move || {
+            let log = Mutex::new(Log::default());
+            let _ = tx.send(logged_rate(&log, Duration::from_millis(20)));
+        });
+
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok(MIN_FPS));
     }
 
     #[test]
@@ -1754,15 +2252,8 @@ mod tests {
         {
             return None;
         }
-        // One directory per call: the tests run in parallel.
-        let dir = std::env::temp_dir().join(format!(
-            "redtab-filter-{}-{w}x{h}-{}x{}",
-            std::process::id(),
-            frame_box.0,
-            frame_box.1
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("frame.gif");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frame.gif");
         let mut file = std::fs::File::create(&path).unwrap();
         let mut encoder = gif::Encoder::new(&mut file, w, h, &[]).unwrap();
         let pixels = vec![0; usize::from(w) * usize::from(h)];
@@ -1781,8 +2272,6 @@ mod tests {
             .frames
             .recv_timeout(Duration::from_secs(20))
             .unwrap();
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
         Some((frame.frame.width, frame.frame.height))
     }
 
@@ -1979,12 +2468,14 @@ mod tests {
     struct FrameSender {
         tx: SyncSender<Decoded>,
         index: std::cell::Cell<u64>,
+        rate: std::cell::Cell<f64>,
     }
 
     impl FrameSender {
         fn send(&self, frame: Frame) -> Result<(), std::sync::mpsc::SendError<Decoded>> {
             let index = self.index.get();
-            self.tx.send(Decoded { index, frame })?;
+            let rate = self.rate.get();
+            self.tx.send(Decoded { index, frame, rate })?;
             self.index.set(index + 1);
             Ok(())
         }
@@ -1996,6 +2487,7 @@ mod tests {
             FrameSender {
                 tx,
                 index: std::cell::Cell::new(0),
+                rate: std::cell::Cell::new(MIN_FPS),
             },
             rx,
         )
@@ -2029,6 +2521,7 @@ mod tests {
                 error: error.map(|(message, _)| message.into()),
                 input_error: error.is_some_and(|(_, input)| input),
                 ended: true,
+                rate: None,
             };
             Ok(Decoder {
                 child: None,
@@ -2069,6 +2562,60 @@ mod tests {
     }
 
     #[test]
+    fn stalled_video_frames_should_release_the_decoder_and_report_failure() {
+        for started in [false, true] {
+            let t0 = Instant::now();
+            let (spawn, runs) = fed_runs(None, false);
+            let mut player = fed_silent_player(spawn, 0.0, t0);
+            if started {
+                runs.borrow()[0].1.send(blank()).unwrap();
+            }
+            player.tick(t0);
+
+            assert!(player.tick(t0 + Duration::from_secs(31)));
+
+            assert!(player.error().is_some());
+            assert!(!player.loading());
+            assert!(player.decoder.is_none());
+            assert_eq!(player.wake_in(t0 + Duration::from_secs(31)), None);
+        }
+    }
+
+    #[test]
+    fn frame_wait_deadlines_should_restart_after_pause_or_hiding() {
+        for hidden in [false, true] {
+            let t0 = Instant::now();
+            let (spawn, runs) = fed_runs(None, false);
+            let mut player = fed_silent_player(spawn, 0.0, t0);
+            player.tick(t0);
+            if hidden {
+                player.set_hidden(true, t0 + Duration::from_secs(20));
+            } else {
+                player.toggle_pause(t0 + Duration::from_secs(20));
+            }
+            let resumed = t0 + Duration::from_secs(100);
+            player.tick(resumed);
+            assert!(player.error().is_none());
+            if hidden {
+                player.set_hidden(false, resumed);
+            } else {
+                player.toggle_pause(resumed);
+            }
+            player.tick(resumed);
+            player.tick(resumed + Duration::from_secs(20));
+            assert!(player.error().is_none());
+            runs.borrow()[0].1.send(blank()).unwrap();
+            player.tick(resumed + Duration::from_secs(25));
+            player.tick(resumed + Duration::from_secs(45));
+            assert!(player.error().is_none());
+
+            player.tick(resumed + Duration::from_secs(56));
+
+            assert!(player.error().is_some());
+        }
+    }
+
+    #[test]
     fn when_output_stalls_the_decoder_should_discard_frames_behind_the_audio_target() {
         let (tx, rx) = sync_channel(1);
         let progress = Arc::new(DecodeProgress::default());
@@ -2076,12 +2623,15 @@ mod tests {
         tx.send(Decoded {
             index: 0,
             frame: blank(),
+            rate: MIN_FPS,
         })
         .unwrap();
         let reader_progress = Arc::clone(&progress);
         let source = b"P6\n1 1\n255\n\x01\x02\x03".repeat(30);
         let worker = std::thread::spawn(move || {
-            read_frames(std::io::Cursor::new(source), tx, &reader_progress);
+            read_frames(std::io::Cursor::new(source), tx, &reader_progress, || {
+                MIN_FPS
+            });
         });
 
         progress.target.store(12, Ordering::Relaxed);
@@ -2131,6 +2681,7 @@ mod tests {
         player.tick(now);
         player.audio = Some(Audio::fixture(0.0, now));
         assert!(player.waiting_for_audio());
+        assert!(player.loading());
         player.audio.as_ref().unwrap().observe(0.0, after(now, 0.6));
         runs.borrow()[0].1.send(blank()).unwrap();
 
@@ -2138,6 +2689,7 @@ mod tests {
 
         assert_eq!(player.frame_number, 1);
         assert_eq!(player.position(after(now, 0.6)), 0.0);
+        assert!(!player.loading());
     }
 
     #[test]
@@ -2358,7 +2910,7 @@ mod tests {
         drop(first);
         player.tick(after(t0, 0.1));
         player.tick(after(t0, 0.2));
-        assert_eq!(runs.borrow()[0].0, 2.0 / FPS);
+        assert_eq!(runs.borrow()[0].0, 2.0 / MIN_FPS);
     }
 
     #[test]
@@ -2376,7 +2928,7 @@ mod tests {
         player.tick(after(t0, 0.05));
         player.tick(after(t0, 0.15));
 
-        assert_eq!(runs.borrow()[0].0, 2.0 / FPS, "not back to 0:00");
+        assert_eq!(runs.borrow()[0].0, 2.0 / MIN_FPS, "not back to 0:00");
     }
 
     #[test]
@@ -2521,7 +3073,7 @@ mod tests {
         let run = runs.borrow_mut().remove(0).1;
         for i in 0..40 {
             run.send(blank()).unwrap();
-            player.tick(after(t0, f64::from(i) / FPS));
+            player.tick(after(t0, f64::from(i) / MIN_FPS));
         }
 
         assert_eq!(clamped, 2.0, "a second before the failed point");
@@ -2581,7 +3133,7 @@ mod tests {
         assert_eq!(while_logging, 0, "nothing decided before the log ends");
         assert_eq!(
             runs.borrow()[0].0,
-            2.0 / FPS,
+            2.0 / MIN_FPS,
             "then it goes on from the cut"
         );
     }
@@ -2606,7 +3158,7 @@ mod tests {
         }
         drop(first);
         for i in 0..=25 {
-            player.tick(after(t0, f64::from(i) / FPS));
+            player.tick(after(t0, f64::from(i) / MIN_FPS));
         }
         assert_eq!(runs.borrow()[0].0, 0.0);
     }
@@ -2630,15 +3182,18 @@ mod tests {
 
         let args = |url: &str, at: f64| input_args(url, at).join(" ");
 
-        assert_eq!(args(gif, 0.0), format!("-seekable 0 -i {gif}"));
+        assert_eq!(
+            args(gif, 0.0),
+            format!("-rw_timeout 10000000 -seekable 0 -i {gif}")
+        );
         assert_eq!(
             args(gif, 5.0),
-            format!("-seekable 0 -i {gif} -ss 5.000"),
+            format!("-rw_timeout 10000000 -seekable 0 -i {gif} -ss 5.000"),
             "a later start decodes past earlier frames"
         );
         assert_eq!(
             args(mp4, 5.0),
-            format!("-reconnect 1 -ss 5.000 -i {mp4}"),
+            format!("-rw_timeout 10000000 -reconnect 1 -ss 5.000 -i {mp4}"),
             "an MP4 behind a .gif name still seeks"
         );
         let youtube = "https://rr1---sn-x.googlevideo.com/videoplayback?itag=251";
@@ -2649,13 +3204,15 @@ mod tests {
         };
         assert_eq!(
             args(youtube, 5.0),
-            format!("-probesize 32768{ranged} -reconnect 1 -ss 5.000 -i {youtube}"),
+            format!(
+                "-rw_timeout 10000000 -probesize 32768{ranged} -reconnect 1 -ss 5.000 -i {youtube}"
+            ),
             "googlevideo paces one open-ended response near playback speed"
         );
         let lookalike = "https://googlevideo.com.example/videoplayback";
         assert_eq!(
             args(lookalike, 5.0),
-            format!("-reconnect 1 -ss 5.000 -i {lookalike}")
+            format!("-rw_timeout 10000000 -reconnect 1 -ss 5.000 -i {lookalike}")
         );
     }
 

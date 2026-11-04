@@ -34,8 +34,15 @@ const ICON_THREADS: usize = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum FeedQuery {
-    Listing { sort: Sort, time: TimeRange },
-    Search { query: String },
+    Listing {
+        sort: Sort,
+        time: TimeRange,
+    },
+    Search {
+        query: String,
+        sort: crate::reddit::experience::SearchSort,
+        time: TimeRange,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,8 +84,8 @@ impl FeedQuery {
             (FeedTarget::Subreddit(name), Self::Listing { sort, time }) => {
                 reddit.listing_progress(name, *sort, *time, after, progress)
             }
-            (FeedTarget::Subreddit(name), Self::Search { query }) => {
-                reddit.search_progress(name, query, after, progress)
+            (FeedTarget::Subreddit(name), Self::Search { query, sort, time }) => {
+                reddit.search_progress(name, query, *sort, *time, after, progress)
             }
             (FeedTarget::User(name), Self::Listing { sort, time }) => {
                 reddit.user_posts_progress(name, *sort, *time, after, progress)
@@ -106,8 +113,8 @@ impl FeedError {
 
     pub fn access(&self) -> Option<AccessDenied> {
         match self {
-            Self::Access(access) => Some(*access),
-            Self::Other(_) => None,
+            Self::Access(AccessDenied::PrivateCommunity) => Some(AccessDenied::PrivateCommunity),
+            _ => None,
         }
     }
 }
@@ -179,6 +186,12 @@ impl From<DynamicImage> for LoadedImage {
 
 #[derive(Debug)]
 pub enum Job {
+    /// The Search tab's live community or people results; only the latest is wanted.
+    Search {
+        generation: u64,
+        query: crate::reddit::experience::Query,
+        after: Option<String>,
+    },
     Experience {
         generation: u64,
         request: crate::reddit::experience::Request,
@@ -240,6 +253,10 @@ pub enum Job {
     Icon {
         subreddit: String,
     },
+    /// A person's avatar and profile summary for their feed's header.
+    Profile {
+        user: String,
+    },
     /// Fetch the post page to learn full media URLs (galleries, HLS video).
     ResolveMedia {
         permalink: String,
@@ -287,6 +304,10 @@ impl Job {
     fn failed(&self, e: String) -> Msg {
         match self {
             Job::Experience { generation, .. } => Msg::Experience {
+                generation: *generation,
+                result: Err(e),
+            },
+            Job::Search { generation, .. } => Msg::Search {
                 generation: *generation,
                 result: Err(e),
             },
@@ -349,6 +370,10 @@ impl Job {
                 subreddit: subreddit.clone(),
                 result: Err(e),
             },
+            Job::Profile { user } => Msg::Profile {
+                user: user.clone(),
+                result: Err(e),
+            },
             Job::ResolveMedia { permalink } => Msg::MediaResolved {
                 permalink: permalink.clone(),
                 result: Err(e),
@@ -375,12 +400,22 @@ pub enum Msg {
         post: Box<Post>,
         source: Source,
     },
+    GroupProgress {
+        subreddit: String,
+        generation: u64,
+        post: Box<Post>,
+        source: Source,
+    },
     SortedPost {
         generation: u64,
         sort: String,
         result: Result<Box<PostPage>, String>,
     },
     Experience {
+        generation: u64,
+        result: Result<crate::reddit::experience::Response, String>,
+    },
+    Search {
         generation: u64,
         result: Result<crate::reddit::experience::Response, String>,
     },
@@ -432,6 +467,10 @@ pub enum Msg {
         subreddit: String,
         result: Result<Option<String>, String>,
     },
+    Profile {
+        user: String,
+        result: Result<crate::model::UserProfile, String>,
+    },
     MediaResolved {
         permalink: String,
         result: Result<Media, String>,
@@ -471,6 +510,7 @@ struct Queues {
     selected: Sender<Work>,
     foreground_images: Sender<Work>,
     background: Sender<Work>,
+    group_cache: Sender<Work>,
     images: Sender<Work>,
     thumbs: Sender<Work>,
     icons: Sender<Work>,
@@ -479,8 +519,15 @@ struct Queues {
 struct Work {
     job: Job,
     force: bool,
-    cache_only: bool,
+    cache_policy: CachePolicy,
     image_ticket: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CachePolicy {
+    Revalidate,
+    Only,
+    OrFetch,
 }
 
 impl Queues {
@@ -500,9 +547,18 @@ impl Queues {
             Job::Image {
                 background: false, ..
             } => &self.foreground_images,
+            Job::Group { .. } if work.cache_policy == CachePolicy::Only => &self.group_cache,
             Job::Group { .. } => &self.background,
             Job::Feed { .. } => &self.feeds,
             Job::Post { .. } | Job::SortedPost { .. } | Job::MoreReplies { .. } => &self.selected,
+            Job::Experience {
+                request:
+                    crate::reddit::experience::Request::Read {
+                        query: crate::reddit::experience::Query::Thread(_),
+                        ..
+                    },
+                ..
+            } => &self.selected,
             _ => &self.priority,
         };
         let _ = queue.send(work);
@@ -522,10 +578,24 @@ struct Wanted {
     image_tickets: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Generation of the page load the open post waits for.
     post: Mutex<Option<u64>>,
+    experience: Mutex<Option<u64>>,
+    search: Mutex<Option<u64>>,
+    discovery: Mutex<Option<u64>>,
     // None until a view binds demand; each entry tracks its latest dispatched generation.
     groups: Mutex<Option<HashMap<String, Option<u64>>>>,
     icons: Mutex<Option<HashSet<String>>>,
     feeds: Mutex<Option<FeedDemand>>,
+}
+
+impl Wanted {
+    /// Explore's community discovery and the live list search cancel only their own kind.
+    fn search_slot(&self, query: &crate::reddit::experience::Query) -> &Mutex<Option<u64>> {
+        if matches!(query, crate::reddit::experience::Query::Communities) {
+            &self.discovery
+        } else {
+            &self.search
+        }
+    }
 }
 
 struct FeedDemand {
@@ -575,6 +645,7 @@ impl Pool {
             foreground_images: cached(foreground_images_tx),
             selected: cached(selected_tx),
             priority: cached(priority_tx),
+            group_cache: cached(background_tx.clone()),
             background: cached(background_tx),
             images: cached(images_tx),
             thumbs: cached(thumbs_tx),
@@ -619,16 +690,41 @@ impl Pool {
     }
 
     fn enqueue(&self, job: Job, force: bool) {
-        self.enqueue_policy(job, force, false);
+        self.enqueue_policy(job, force, CachePolicy::Revalidate);
     }
 
     pub fn cached(&self, job: Job) {
         if self.cache.is_some() {
-            self.enqueue_policy(job, false, true);
+            self.enqueue_policy(job, false, CachePolicy::Only);
         }
     }
 
-    fn enqueue_policy(&self, job: Job, force: bool, cache_only: bool) {
+    pub fn prefetch_group(&self, subreddit: String, generation: u64) {
+        self.enqueue_policy(
+            Job::Group {
+                subreddit,
+                generation,
+            },
+            false,
+            CachePolicy::OrFetch,
+        );
+    }
+
+    fn enqueue_policy(&self, job: Job, force: bool, cache_policy: CachePolicy) {
+        if let Job::Experience {
+            generation,
+            request: crate::reddit::experience::Request::Read { .. },
+            ..
+        } = &job
+        {
+            self.want_experience(Some(*generation));
+        }
+        if let Job::Search {
+            generation, query, ..
+        } = &job
+        {
+            self.want_search(query, Some(*generation));
+        }
         let image_ticket = match &job {
             Job::Image { url, .. } | Job::VideoFrame { url, .. } => {
                 self.wanted.image_tickets.lock().ok().map(|mut tickets| {
@@ -641,7 +737,7 @@ impl Pool {
             }
             _ => None,
         };
-        if !cache_only
+        if cache_policy != CachePolicy::Only
             && let Job::Group {
                 subreddit,
                 generation,
@@ -652,7 +748,7 @@ impl Pool {
         self.queues.submit(Work {
             job,
             force,
-            cache_only,
+            cache_policy,
             image_ticket,
         });
     }
@@ -703,7 +799,11 @@ impl Pool {
         }
     }
 
-    pub fn set_visible_groups(&self, names: &[&str]) {
+    pub fn icon_wanted(&self, name: &str) -> bool {
+        !icon_unwanted(&name.to_ascii_lowercase(), &self.wanted)
+    }
+
+    pub fn set_group_demand(&self, names: &[&str]) {
         if let Ok(mut groups) = self.wanted.groups.lock() {
             let previous = groups.take().unwrap_or_default();
             *groups = Some(
@@ -728,6 +828,18 @@ impl Pool {
     pub fn want_post(&self, generation: Option<u64>) {
         if let Ok(mut post) = self.wanted.post.lock() {
             *post = generation;
+        }
+    }
+
+    pub fn want_experience(&self, generation: Option<u64>) {
+        if let Ok(mut current) = self.wanted.experience.lock() {
+            *current = generation;
+        }
+    }
+
+    pub fn want_search(&self, query: &crate::reddit::experience::Query, generation: Option<u64>) {
+        if let Ok(mut current) = self.wanted.search_slot(query).lock() {
+            *current = generation;
         }
     }
 
@@ -776,7 +888,7 @@ fn cache_reader(
                 {
                     continue;
                 }
-                if !work.cache_only && background_unwanted(job, &wanted) {
+                if work.cache_policy != CachePolicy::Only && background_unwanted(job, &wanted) {
                     if tx
                         .send(job.failed(crate::reddit::REQUEST_CANCELLED.into()))
                         .is_err()
@@ -809,13 +921,13 @@ fn cache_reader(
                             &tx,
                             &wanted,
                             &mut claim,
-                            work.cache_only,
+                            work.cache_policy,
                         )
                     {
                         continue;
                     }
                 }
-                if work.cache_only {
+                if work.cache_policy == CachePolicy::Only {
                     continue;
                 }
                 // A miss/stale image stays unclaimed until HTTP starts, allowing promotion.
@@ -843,7 +955,7 @@ fn spawn_worker(
                 let Work {
                     job,
                     force,
-                    cache_only: _,
+                    cache_policy: _,
                     image_ticket,
                 } = {
                     let Ok(guard) = rx.lock() else { return };
@@ -908,6 +1020,20 @@ fn spawn_worker(
                 // A job's panic becomes its error instead of killing the worker.
                 let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let generation = job.post_generation();
+                    let experience = match &job {
+                        Job::Experience {
+                            generation,
+                            request: crate::reddit::experience::Request::Read { .. },
+                            ..
+                        } => Some(*generation),
+                        _ => None,
+                    };
+                    let search = match &job {
+                        Job::Search {
+                            generation, query, ..
+                        } => Some((query.clone(), *generation)),
+                        _ => None,
+                    };
                     let group = match &job {
                         Job::Group {
                             subreddit,
@@ -940,7 +1066,16 @@ fn spawn_worker(
                     );
                     let scoped = reddit.for_worker(
                         match job {
-                            Job::Post { .. }
+                            Job::Experience {
+                                request:
+                                    crate::reddit::experience::Request::Read {
+                                        query: crate::reddit::experience::Query::Thread(_),
+                                        ..
+                                    },
+                                ..
+                            }
+                            | Job::Post { .. }
+                            | Job::Search { .. }
                             | Job::SortedPost { .. }
                             | Job::MoreReplies { .. }
                             | Job::Image {
@@ -951,12 +1086,25 @@ fn spawn_worker(
                             } => Priority::Selected,
                             Job::Icon { .. } => Priority::Background,
                             Job::Subscriptions { .. } if !force => Priority::Background,
-                            Job::Feed { .. } | Job::Group { .. } => Priority::Listing,
+                            Job::Feed { .. } => Priority::Listing,
+                            Job::Group { .. } => Priority::Browsing,
                             _ => Priority::Foreground,
                         },
                         retry_reads,
                         move || {
                             cancelled.stopped.load(Ordering::Acquire)
+                                || experience.is_some_and(|generation| {
+                                    cancelled
+                                        .experience
+                                        .lock()
+                                        .is_ok_and(|current| *current != Some(generation))
+                                })
+                                || search.as_ref().is_some_and(|(query, generation)| {
+                                    cancelled
+                                        .search_slot(query)
+                                        .lock()
+                                        .is_ok_and(|current| *current != Some(*generation))
+                                })
                                 || feed.is_some_and(|(tab, generation)| {
                                     feed_unwanted(tab, generation, &cancelled)
                                 })
@@ -987,6 +1135,21 @@ fn spawn_worker(
                     };
                     let mut fallback = None;
                     let msg = run(&scoped, &job, &wanted, &mut |event| {
+                        if let (
+                            Job::Group {
+                                subreddit,
+                                generation,
+                            },
+                            ListingEvent::Post(post),
+                        ) = (&job, &event)
+                        {
+                            let _ = tx.send(Msg::GroupProgress {
+                                subreddit: subreddit.clone(),
+                                generation: *generation,
+                                post: Box::new((*post).clone()),
+                                source,
+                            });
+                        }
                         if let Job::Feed {
                             tab, generation, ..
                         } = &job
@@ -1111,7 +1274,7 @@ fn cached_reply(
     tx: &SyncSender<Msg>,
     wanted: &Wanted,
     claim: &mut ImageClaim<'_>,
-    cache_only: bool,
+    cache_policy: CachePolicy,
 ) -> bool {
     let Some(cache) = cache else {
         return false;
@@ -1125,6 +1288,9 @@ fn cached_reply(
         return false;
     };
     let fresh = now.saturating_sub(entry.fetched_at) < ttl;
+    if matches!(job, Job::Experience { .. }) && !fresh {
+        return false;
+    }
     if matches!(job, Job::ResolveMedia { .. }) && !fresh {
         return false;
     }
@@ -1140,7 +1306,7 @@ fn cached_reply(
         observed: Some((read_start, NEXT_EVENT.fetch_add(1, Ordering::Relaxed))),
         cached: true,
     };
-    let refreshing = !cache_only
+    let refreshing = cache_policy == CachePolicy::Revalidate
         && (!fresh
             || matches!(job, Job::MoreReplies { minimum: Some(minimum), .. } if !source.may_replace(*minimum)));
     let message = Msg::Snapshot {
@@ -1187,6 +1353,15 @@ impl Job {
     fn uses_cache(&self) -> bool {
         matches!(
             self,
+            Job::Experience {
+                request: crate::reddit::experience::Request::Read {
+                    query: crate::reddit::experience::Query::Thread(_),
+                    ..
+                },
+                ..
+            }
+        ) || matches!(
+            self,
             Job::Subscriptions { .. }
                 | Job::Feed { .. }
                 | Job::Group { .. }
@@ -1217,6 +1392,14 @@ impl Job {
                     .cache_request(&FeedTarget::Subreddit(subreddit.clone()), None)?,
                 CONTENT_TTL,
             ),
+            Job::Experience {
+                request:
+                    crate::reddit::experience::Request::Read {
+                        query: crate::reddit::experience::Query::Thread(link),
+                        ..
+                    },
+                ..
+            } => (post_cache_request(link)?, CONTENT_TTL),
             Job::Post { permalink, .. } | Job::ResolveMedia { permalink } => {
                 (post_cache_request(permalink)?, CONTENT_TTL)
             }
@@ -1242,6 +1425,33 @@ impl Job {
 
     fn cached_message(&self, bytes: &[u8]) -> Option<Msg> {
         Some(match self {
+            Job::Experience {
+                generation,
+                request:
+                    crate::reddit::experience::Request::Read {
+                        query: crate::reddit::experience::Query::Thread(link),
+                        ..
+                    },
+                ..
+            } => {
+                let page: PostPage = serde_json::from_slice(bytes).ok()?;
+                let (_, comment) = crate::reddit::experience::thread_location(link).ok()?;
+                fn contains(comments: &[crate::model::Comment], id: &str) -> bool {
+                    comments
+                        .iter()
+                        .any(|comment| comment.id == id || contains(&comment.replies, id))
+                }
+                if comment
+                    .as_ref()
+                    .is_some_and(|id| !contains(&page.comments, id))
+                {
+                    return None;
+                }
+                Msg::Experience {
+                    generation: *generation,
+                    result: Ok(crate::reddit::experience::Response::Thread(Box::new(page))),
+                }
+            }
             Job::Subscriptions { generation } => Msg::Subscriptions {
                 generation: *generation,
                 result: Ok(serde_json::from_slice(bytes).ok()?),
@@ -1321,6 +1531,20 @@ fn superseded_post(job: &Job, wanted: &Wanted) -> bool {
 
 fn background_unwanted(job: &Job, wanted: &Wanted) -> bool {
     match job {
+        Job::Experience {
+            generation,
+            request: crate::reddit::experience::Request::Read { .. },
+            ..
+        } => wanted
+            .experience
+            .lock()
+            .is_ok_and(|current| *current != Some(*generation)),
+        Job::Search {
+            generation, query, ..
+        } => wanted
+            .search_slot(query)
+            .lock()
+            .is_ok_and(|current| *current != Some(*generation)),
         Job::Feed {
             tab, generation, ..
         } => feed_unwanted(*tab, *generation, wanted),
@@ -1333,10 +1557,13 @@ fn background_unwanted(job: &Job, wanted: &Wanted) -> bool {
     }
 }
 
+/// The Search tab's preview of a row's feed; wanted while requested, whatever tab is active.
+pub const PREVIEW_FEED: u64 = u64::MAX;
+
 fn feed_unwanted(tab: u64, generation: u64, wanted: &Wanted) -> bool {
     wanted.feeds.lock().is_ok_and(|feeds| {
         feeds.as_ref().is_some_and(|feeds| {
-            feeds.active != Some(tab)
+            (tab != PREVIEW_FEED && feeds.active != Some(tab))
                 || !feeds
                     .requests
                     .get(&tab)
@@ -1426,7 +1653,10 @@ fn cache_result(
     }
     let ok = matches!(
         &msg,
-        Msg::Subscriptions { result: Ok(_), .. }
+        Msg::Experience {
+            result: Ok(crate::reddit::experience::Response::Thread(_)),
+            ..
+        } | Msg::Subscriptions { result: Ok(_), .. }
             | Msg::Feed { result: Ok(_), .. }
             | Msg::Group { result: Ok(_), .. }
             | Msg::Post { result: Ok(_), .. }
@@ -1451,6 +1681,17 @@ fn cache_result(
         && let Some((key, _)) = job.cache_key(namespace)
     {
         let bytes = match &msg {
+            Msg::Experience {
+                result: Ok(crate::reddit::experience::Response::Thread(value)),
+                ..
+            } => {
+                let full = matches!(job, Job::Experience { request: crate::reddit::experience::Request::Read { query: crate::reddit::experience::Query::Thread(link), .. }, .. } if crate::reddit::experience::thread_location(link).is_ok_and(|(_, comment)| comment.is_none()));
+                if full {
+                    serde_json::to_vec(value).ok()
+                } else {
+                    None
+                }
+            }
             Msg::Subscriptions {
                 result: Ok(value), ..
             } => serde_json::to_vec(value).ok(),
@@ -1517,6 +1758,19 @@ fn run(
             generation: *generation,
             result: reddit.experience(request).map_err(err_string),
         },
+        Job::Search {
+            generation,
+            query,
+            after,
+        } => Msg::Search {
+            generation: *generation,
+            result: reddit
+                .experience(&crate::reddit::experience::Request::Read {
+                    query: query.clone(),
+                    after: after.clone(),
+                })
+                .map_err(err_string),
+        },
         Job::SortedPost {
             generation,
             permalink,
@@ -1566,7 +1820,7 @@ fn run(
                     reddit,
                     &FeedTarget::Subreddit(subreddit.clone()),
                     None,
-                    &mut |_| {},
+                    progress,
                 )
                 .map_err(FeedError::from),
         },
@@ -1622,6 +1876,10 @@ fn run(
         Job::Icon { subreddit } => Msg::Icon {
             subreddit: subreddit.clone(),
             result: reddit.icon(subreddit).map_err(err_string),
+        },
+        Job::Profile { user } => Msg::Profile {
+            user: user.clone(),
+            result: reddit.user_profile(user).map_err(err_string),
         },
         Job::ResolveMedia { permalink } => Msg::MediaResolved {
             permalink: permalink.clone(),
@@ -1862,6 +2120,39 @@ fn download_images(reddit: &Reddit, urls: &[String]) -> anyhow::Result<Vec<PathB
 #[cfg(test)]
 mod tests {
     #[test]
+    fn abandoned_collections_release_workers_during_cooldown() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let reddit = Reddit::test_at(&format!("http://{}", server.server_addr()), false);
+        let (pool, messages) = Pool::start(reddit, 2, None);
+        pool.submit(Job::Experience {
+            generation: 1,
+            request: crate::reddit::experience::Request::Read {
+                query: crate::reddit::experience::Query::Multis,
+                after: None,
+            },
+            invalidations: Vec::new(),
+        });
+        let request = data_request(&server).unwrap();
+        request
+            .respond(
+                tiny_http::Response::empty(429)
+                    .with_header(tiny_http::Header::from_bytes("Retry-After", "10").unwrap()),
+            )
+            .unwrap();
+        pool.want_experience(None);
+        let message = messages
+            .recv_timeout(std::time::Duration::from_millis(700))
+            .expect("abandoned collection should release its worker before cooldown");
+        assert!(matches!(
+            message,
+            Msg::Experience {
+                generation: 1,
+                result: Err(_)
+            }
+        ));
+    }
+
+    #[test]
     fn a_first_frame_job_cancels_when_its_video_leaves_the_viewport() {
         if std::process::Command::new("ffmpeg")
             .arg("-version")
@@ -1920,7 +2211,7 @@ mod tests {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let reddit = Reddit::test_at(&format!("http://{}", server.server_addr()), false);
         let (pool, messages) = Pool::start(reddit, 3, None);
-        pool.set_visible_groups(&["same"]);
+        pool.set_group_demand(&["same"]);
         pool.submit(Job::Group {
             subreddit: "same".into(),
             generation: 1,
@@ -2013,12 +2304,9 @@ mod tests {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let reddit = Reddit::test_at(&format!("http://{}", server.server_addr()), false);
         let (pool, messages) = Pool::start(reddit, 4, None);
-        pool.set_visible_groups(&["old_a", "old_b"]);
+        pool.set_group_demand(&["old_a", "old_b"]);
         for name in ["old_a", "old_b"] {
-            pool.submit(Job::Group {
-                subreddit: name.into(),
-                generation: 1,
-            });
+            pool.prefetch_group(name.into(), 1);
         }
         let first = data_request(&server).unwrap();
         let second = data_request(&server).unwrap();
@@ -2030,7 +2318,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        pool.set_visible_groups(&["new"]);
+        pool.set_group_demand(&["new"]);
         pool.submit(Job::Group {
             subreddit: "new".into(),
             generation: 2,
@@ -2121,6 +2409,177 @@ mod tests {
         assert!(
             matches!(message, Msg::Snapshot { message, .. } if matches!(*message, Msg::Post { generation: 2, result: Ok(_), .. }))
         );
+    }
+
+    #[test]
+    fn island_lookahead_should_reuse_stale_cache_and_fetch_only_misses() {
+        use crate::reddit::tests::{Fixture, Reply};
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let requests = calls.clone();
+        let fixture = Fixture::new(move |request| {
+            requests.lock().unwrap().push(request.url.clone());
+            Reply::json(serde_json::from_str(include_str!("../tests/fixtures/sub.json")).unwrap())
+        });
+        let reddit = fixture.reddit();
+        let listing = reddit
+            .listing("warm", Sort::Hot, TimeRange::Day, None)
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::new(directory.path().to_path_buf());
+        let job = Job::Group {
+            subreddit: "stale".into(),
+            generation: 1,
+        };
+        let key = job.cache_key(&reddit.cache_namespace()).unwrap().0;
+        cache
+            .store(
+                &key,
+                &serde_json::to_vec(&listing).unwrap(),
+                crate::app::now() - 600,
+                cache.reserve_request().unwrap(),
+            )
+            .unwrap();
+        calls.lock().unwrap().clear();
+        let (pool, messages) = Pool::start(reddit, 3, Some(cache));
+        pool.set_group_demand(&["stale", "cold"]);
+
+        pool.prefetch_group("stale".into(), 1);
+        assert!(
+            matches!(next_message(&messages), Msg::Snapshot { refreshing: false, message, .. } if matches!(*message, Msg::Group { generation: 1, result: Ok(_), .. }))
+        );
+        pool.prefetch_group("cold".into(), 2);
+        assert!(
+            matches!(next_message(&messages), Msg::Snapshot { message, .. } if matches!(*message, Msg::Group { generation: 2, result: Ok(_), .. }))
+        );
+
+        let actual = calls.lock().unwrap();
+        assert_eq!(actual.len(), 1, "{actual:?}");
+        assert!(actual[0].starts_with("/r/cold/"), "{actual:?}");
+    }
+
+    #[test]
+    fn island_browsing_should_use_quota_headroom_and_keep_selected_posts_responsive() {
+        use crate::reddit::tests::{Fixture, Reply};
+        let fixture = Fixture::new(|request| Reply {
+            status: 200,
+            body: if request.url.starts_with("/comments/") {
+                include_str!("../tests/fixtures/post.json")
+            } else {
+                include_str!("../tests/fixtures/sub.json")
+            }
+            .into(),
+            headers: vec![
+                ("X-Ratelimit-Remaining".into(), "99".into()),
+                ("X-Ratelimit-Reset".into(), "600".into()),
+            ],
+        });
+        let reddit = fixture.reddit();
+        reddit
+            .listing("seed", Sort::Hot, TimeRange::Day, None)
+            .unwrap();
+        let (pool, messages) = Pool::start(reddit, 3, None);
+        let names: Vec<_> = (0..17).map(|i| format!("island{i}")).collect();
+        pool.set_group_demand(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        for (i, name) in names.iter().take(16).enumerate() {
+            pool.submit(Job::Group {
+                subreddit: name.clone(),
+                generation: i as u64,
+            });
+            let message = match next_message(&messages) {
+                Msg::Snapshot { message, .. } => *message,
+                message => message,
+            };
+            assert!(matches!(message, Msg::Group { result: Ok(_), .. }));
+        }
+
+        pool.submit(Job::Group {
+            subreddit: names[16].clone(),
+            generation: 16,
+        });
+        let message = match next_message(&messages) {
+            Msg::Snapshot { message, .. } => *message,
+            message => message,
+        };
+        assert!(matches!(
+            message,
+            Msg::Group {
+                generation: 16,
+                result: Ok(_),
+                ..
+            }
+        ));
+        pool.want_post(Some(7));
+        pool.submit(Job::Post {
+            generation: 7,
+            permalink: "/comments/p/".into(),
+        });
+
+        let message = match next_message(&messages) {
+            Msg::Snapshot { message, .. } => *message,
+            message => message,
+        };
+        assert!(matches!(
+            message,
+            Msg::Post {
+                generation: 7,
+                result: Ok(_),
+                ..
+            }
+        ));
+        pool.set_group_demand(&[]);
+    }
+
+    #[test]
+    fn island_lookahead_visible_reads_should_bypass_blocked_bulk_cache_warming() {
+        use crate::reddit::tests::{Fixture, Reply};
+        let (started, requests) = sync_channel(1);
+        let fixture = Fixture::new(move |request| {
+            if request.url.starts_with("/r/visible/") {
+                started.send(()).unwrap();
+            }
+            Reply::json(serde_json::from_str(include_str!("../tests/fixtures/sub.json")).unwrap())
+        });
+        let reddit = fixture.reddit();
+        let listing = reddit
+            .listing("warm", Sort::Hot, TimeRange::Day, None)
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::new(directory.path().to_path_buf());
+        let mut bulk = Vec::new();
+        for index in 0..9 {
+            let job = Job::Group {
+                subreddit: format!("bulk{index}"),
+                generation: 1,
+            };
+            let key = job.cache_key(&reddit.cache_namespace()).unwrap().0;
+            cache
+                .store(
+                    &key,
+                    &serde_json::to_vec(&listing).unwrap(),
+                    crate::app::now(),
+                    cache.reserve_request().unwrap(),
+                )
+                .unwrap();
+            bulk.push(job);
+        }
+        let (pool, messages) = Pool::start(reddit, 3, Some(cache));
+        for job in bulk {
+            pool.cached(job);
+        }
+        pool.set_group_demand(&["visible"]);
+        pool.submit(Job::Group {
+            subreddit: "visible".into(),
+            generation: 2,
+        });
+
+        requests
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect(
+                "visible HTTP must start even while bulk cache snapshots fill the result channel",
+            );
+
+        pool.stop();
+        drop(messages);
     }
 
     #[test]
@@ -2261,6 +2720,7 @@ mod tests {
             selected: priority.clone(),
             images,
             priority,
+            group_cache: background.clone(),
             background,
             thumbs,
             icons,
@@ -2271,7 +2731,7 @@ mod tests {
                 background,
             },
             force: false,
-            cache_only: false,
+            cache_policy: CachePolicy::Revalidate,
             image_ticket: None,
         };
 
@@ -2317,6 +2777,7 @@ mod tests {
             selected: priority.clone(),
             images,
             priority,
+            group_cache: background.clone(),
             background,
             thumbs,
             icons,
@@ -2327,7 +2788,7 @@ mod tests {
                 subreddit: "s".into(),
             },
             force: false,
-            cache_only: false,
+            cache_policy: CachePolicy::Revalidate,
             image_ticket: None,
         });
 
@@ -2340,6 +2801,52 @@ mod tests {
         ));
         assert!(background_rx.try_recv().is_err());
         assert!(thumbs_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_search_tabs_preview_and_discovery_should_stay_wanted_beside_other_requests() {
+        use crate::reddit::experience::{ListSearch, Query};
+        let (pool, _messages) = Pool::start(Reddit::test_at("http://127.0.0.1:9", false), 1, None);
+        let preview = |generation| Job::Feed {
+            tab: PREVIEW_FEED,
+            generation,
+            target: FeedTarget::Subreddit("rust".into()),
+            query: FeedQuery::DEFAULT_LISTING,
+            after: None,
+        };
+        pool.want_feeds(Some(3), HashMap::from([(PREVIEW_FEED, HashSet::from([7]))]));
+        assert!(!background_unwanted(&preview(7), &pool.wanted));
+        assert!(background_unwanted(&preview(6), &pool.wanted));
+
+        let discovery = || Job::Search {
+            generation: 1,
+            query: Query::Communities,
+            after: None,
+        };
+        let search = |generation| Job::Search {
+            generation,
+            query: Query::Search {
+                text: "rust".into(),
+                kind: ListSearch::Communities,
+                time: crate::model::TimeRange::All,
+            },
+            after: None,
+        };
+        pool.submit(discovery());
+        pool.submit(search(2));
+        pool.submit(search(3));
+        assert!(!background_unwanted(&discovery(), &pool.wanted));
+        assert!(background_unwanted(&search(2), &pool.wanted));
+        assert!(!background_unwanted(&search(3), &pool.wanted));
+
+        pool.want_search(&Query::Communities, None);
+        assert!(background_unwanted(&discovery(), &pool.wanted));
+        assert!(!background_unwanted(&search(3), &pool.wanted));
+        if let Job::Search { query, .. } = search(3) {
+            pool.want_search(&query, None);
+        }
+        assert!(background_unwanted(&search(3), &pool.wanted));
+        pool.stop();
     }
 
     #[test]
@@ -2374,29 +2881,11 @@ mod tests {
         );
     }
 
-    struct CacheDir(PathBuf);
-    impl CacheDir {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "redtab-worker-cache-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            std::fs::create_dir(&path).unwrap();
-            Self(path)
-        }
-    }
-    impl Drop for CacheDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     #[test]
     fn when_redtab_starts_it_should_remove_only_old_media_folders_of_exited_processes() {
-        let tmp = CacheDir::new();
+        let tmp = tempfile::tempdir().unwrap();
         let folder = |name: &str| {
-            let path = tmp.0.join(name);
+            let path = tmp.path().join(name);
             std::fs::create_dir(&path).unwrap();
             std::fs::write(path.join("a.jpg"), b"x").unwrap();
             path
@@ -2406,9 +2895,9 @@ mod tests {
         let running_old = folder("redtab-media-200-1a2b0");
         let other_name = folder("redtab-media-102-notes");
         let target = folder("unrelated");
-        let link = tmp.0.join("redtab-media-103-1a2b0");
+        let link = tmp.path().join("redtab-media-103-1a2b0");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        let file = tmp.0.join("redtab-media-104-1a2b0");
+        let file = tmp.path().join("redtab-media-104-1a2b0");
         std::fs::write(&file, b"x").unwrap();
         // Everything above was last changed a day and an hour before `now`; one folder
         // a minute short of a day.
@@ -2418,7 +2907,7 @@ mod tests {
             .set_modified(now - MEDIA_GRACE + std::time::Duration::from_secs(60))
             .unwrap();
 
-        remove_stale_media_dirs_in(&tmp.0, now, |pid| pid == 200);
+        remove_stale_media_dirs_in(tmp.path(), now, |pid| pid == 200);
 
         assert!(
             !exited_old.exists(),
@@ -2442,9 +2931,9 @@ mod tests {
 
     #[test]
     fn when_a_redtab_downloads_again_it_should_drop_its_own_downloads_older_than_a_day() {
-        let dir = CacheDir::new();
-        let old = dir.0.join("old.jpg");
-        let recent = dir.0.join("recent.jpg");
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old.jpg");
+        let recent = dir.path().join("recent.jpg");
         std::fs::write(&old, b"x").unwrap();
         std::fs::write(&recent, b"x").unwrap();
         let now = std::time::SystemTime::now() + MEDIA_GRACE;
@@ -2455,16 +2944,21 @@ mod tests {
             .set_modified(now - MEDIA_GRACE + std::time::Duration::from_secs(60))
             .unwrap();
 
-        remove_old_downloads(&dir.0, now);
+        remove_old_downloads(dir.path(), now);
 
         assert!(!old.exists(), "a day old: gone");
         assert!(recent.exists(), "a minute short of a day: kept");
     }
 
     fn next_message(messages: &Receiver<Msg>) -> Msg {
-        messages
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("worker response")
+        loop {
+            let message = messages
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("worker response");
+            if !matches!(message, Msg::GroupProgress { .. }) {
+                return message;
+            }
+        }
     }
 
     fn data_request(server: &tiny_http::Server) -> Option<tiny_http::Request> {
@@ -2510,6 +3004,7 @@ mod tests {
                     selected: sender.clone(),
                     priority: sender.clone(),
                     background: sender.clone(),
+                    group_cache: sender.clone(),
                     images: sender.clone(),
                     thumbs: sender.clone(),
                     icons: sender,
@@ -2564,8 +3059,8 @@ mod tests {
 
     #[test]
     fn when_cached_images_are_delivered_they_should_release_only_terminal_claims() {
-        let dir = CacheDir::new();
-        let cache = Cache::new(dir.0.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
         let (pool, work) = queued_image_pool();
         for (name, fresh, wanted) in [
             ("fresh", true, true),
@@ -2610,7 +3105,7 @@ mod tests {
                 &sender,
                 &pool.wanted,
                 &mut claim,
-                false,
+                CachePolicy::Revalidate,
             );
             let message = next_message(&receiver);
 
@@ -2676,8 +3171,8 @@ mod tests {
 
     #[test]
     fn when_cache_lookup_misses_a_queued_card_image_should_still_allow_foreground_promotion() {
-        let dir = CacheDir::new();
-        assert_queued_image_can_promote(Some(Cache::new(dir.0.clone())));
+        let dir = tempfile::tempdir().unwrap();
+        assert_queued_image_can_promote(Some(Cache::new(dir.path().to_path_buf())));
     }
 
     fn assert_queued_image_can_promote(cache: Option<Cache>) {
@@ -2835,11 +3330,11 @@ mod tests {
     fn when_an_image_finishes_just_after_leaving_view_it_should_remain_reusable_from_cache() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let base = format!("http://{}", server.server_addr());
-        let dir = CacheDir::new();
+        let dir = tempfile::tempdir().unwrap();
         let (pool, messages) = Pool::start(
             Reddit::test_at(&base, false),
             3,
-            Some(Cache::new(dir.0.clone())),
+            Some(Cache::new(dir.path().to_path_buf())),
         );
         let url = format!("{base}/revisit.png");
         pool.want_image(&url);
@@ -2875,11 +3370,64 @@ mod tests {
     }
 
     #[test]
+    fn visible_search_pages_should_start_before_passive_feed_previews() {
+        use crate::reddit::experience::Query;
+        use crate::reddit::tests::{Fixture, Reply};
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let fixture = Fixture::new(move |request| {
+            observed.lock().unwrap().push(request.url.clone());
+            Reply {
+                status: 200,
+                body: serde_json::json!({"kind":"Listing","data":{"children":[],"after":null}})
+                    .to_string(),
+                headers: if request.url.starts_with("/r/seed/") {
+                    vec![
+                        ("x-ratelimit-remaining".into(), "0".into()),
+                        ("x-ratelimit-reset".into(), "2".into()),
+                    ]
+                } else {
+                    Vec::new()
+                },
+            }
+        });
+        let reddit = Reddit::test_at_paced(&fixture.base, std::time::Duration::from_millis(500));
+        reddit
+            .listing("seed", Sort::Hot, TimeRange::Day, None)
+            .unwrap();
+        let (pool, messages) = Pool::start(reddit, 3, None);
+        pool.want_feeds(None, HashMap::from([(PREVIEW_FEED, HashSet::from([1]))]));
+        pool.submit(Job::Feed {
+            tab: PREVIEW_FEED,
+            generation: 1,
+            target: FeedTarget::Subreddit("preview".into()),
+            query: FeedQuery::DEFAULT_LISTING,
+            after: None,
+        });
+        pool.submit(Job::Search {
+            generation: 2,
+            query: Query::Communities,
+            after: Some("next".into()),
+        });
+        for _ in 0..2 {
+            messages
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap();
+        }
+        let actual = calls.lock().unwrap();
+        assert!(
+            actual[1].starts_with("/subreddits/popular.json"),
+            "visible community rows should precede passive preview: {actual:?}"
+        );
+        assert!(actual[2].starts_with("/r/preview/"), "{actual:?}");
+    }
+
+    #[test]
     fn when_priority_http_is_busy_warm_posts_feeds_and_images_should_arrive_from_cache() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let base = format!("http://{}", server.server_addr());
-        let dir = CacheDir::new();
-        let cache = Cache::new(dir.0.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
         let reddit = Reddit::test_at(&base, false);
         let post = Job::Post {
             generation: 7,
@@ -2971,8 +3519,8 @@ mod tests {
 
     #[test]
     fn when_the_account_list_is_cached_it_should_load_without_waiting_for_reddit() {
-        let dir = CacheDir::new();
-        let cache = Cache::new(dir.0.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
         let reddit = Reddit::test_at("http://127.0.0.1:9", false);
         let job = Job::Subscriptions { generation: 7 };
         let (key, _) = job.cache_key(&reddit.cache_namespace()).unwrap();
@@ -3023,8 +3571,8 @@ mod tests {
 
     #[test]
     fn when_membership_finishes_it_should_invalidate_reads_started_during_the_write() {
-        let dir = CacheDir::new();
-        let cache = Cache::new(dir.0.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
         let namespace = "membership-fixture";
         let read = Job::Subscriptions { generation: 1 };
         let job = Job::Membership {
@@ -3123,8 +3671,8 @@ mod tests {
                 _ => panic!("unexpected membership job request"),
             },
         );
-        let dir = CacheDir::new();
-        let cache = Cache::new(dir.0.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
         let reddit = fixture.reddit();
         let (key, _) = (Job::Subscriptions { generation: 1 })
             .cache_key(&reddit.cache_namespace())
@@ -3166,8 +3714,8 @@ mod tests {
 
     #[test]
     fn a_days_old_icon_answers_from_disk_without_asking_reddit() {
-        let dir = CacheDir::new();
-        let cache = Cache::new(dir.0.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
         let reddit = Reddit::test_at("http://127.0.0.1:9", false);
         let icons = [("withicon", Some("/i.png")), ("plain", None)];
         for (name, icon) in icons {
@@ -3212,7 +3760,7 @@ mod tests {
         }
         .cache_key(&namespace)
         .unwrap();
-        let used = std::fs::metadata(dir.0.join(format!("{key}.cache")))
+        let used = std::fs::metadata(dir.path().join(format!("{key}.cache")))
             .unwrap()
             .modified()
             .unwrap();
@@ -3220,9 +3768,132 @@ mod tests {
     }
 
     #[test]
+    fn navigation_cache_islands_publish_posts_before_the_final_snapshot() {
+        use crate::reddit::tests::{Fixture, Reply};
+        let fixture = Fixture::new(|_| {
+            Reply::json(serde_json::from_str(include_str!("../tests/fixtures/sub.json")).unwrap())
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let reddit = fixture.reddit();
+        reddit
+            .listing("popular", Sort::Hot, TimeRange::Day, None)
+            .unwrap();
+        let (pool, messages) = Pool::start(reddit, 3, Some(Cache::new(dir.path().to_path_buf())));
+        pool.submit(Job::Group {
+            subreddit: "popular".into(),
+            generation: 1,
+        });
+
+        assert!(matches!(
+            messages.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(Msg::GroupProgress { generation: 1, .. })
+        ));
+        assert!(
+            matches!(next_message(&messages), Msg::Snapshot { message, .. } if matches!(*message, Msg::Group { generation: 1, result: Ok(_), .. }))
+        );
+    }
+
+    #[test]
+    fn navigation_cache_focused_threads_do_not_replace_full_posts_or_reuse_missing_targets() {
+        use crate::reddit::experience::{Query, Request, Response};
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
+        let page =
+            crate::reddit::parse::parse_post_page(include_str!("../tests/fixtures/post.json"))
+                .unwrap();
+        let full = serde_json::to_vec(&page).unwrap();
+        let namespace = "focused-cache-fixture";
+        let key = Job::Post {
+            generation: 1,
+            permalink: page.post.permalink.clone(),
+        }
+        .cache_key(namespace)
+        .unwrap()
+        .0;
+        cache
+            .store(
+                &key,
+                &full,
+                crate::app::now(),
+                cache.reserve_request().unwrap(),
+            )
+            .unwrap();
+        let job = Job::Experience {
+            generation: 2,
+            request: Request::Read {
+                query: Query::Thread(format!("/comments/{}/_/absent", page.post.id)),
+                after: None,
+            },
+            invalidations: Vec::new(),
+        };
+        assert!(job.cached_message(&full).is_none());
+        let mut partial = page;
+        partial.comments.clear();
+        partial.post.title = "Focused context".into();
+        let (tx, _messages) = sync_channel(8);
+
+        cache_result(
+            Msg::Experience {
+                generation: 2,
+                result: Ok(Response::Thread(Box::new(partial))),
+            },
+            &job,
+            Some(&cache),
+            namespace,
+            &tx,
+            Source {
+                order: Some(cache.reserve_request().unwrap()),
+                ..Source::default()
+            },
+        );
+
+        assert_eq!(cache.load(&key, crate::app::now()).unwrap().bytes, full);
+    }
+
+    #[test]
+    fn navigation_cache_thread_links_reuse_the_full_post_snapshot() {
+        use crate::reddit::experience::{Query, Request, Response};
+        let dir = tempfile::tempdir().unwrap();
+        let reddit = Reddit::test_at("http://127.0.0.1:9", false);
+        let page =
+            crate::reddit::parse::parse_post_page(include_str!("../tests/fixtures/post.json"))
+                .unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
+        let key = Job::Post {
+            generation: 1,
+            permalink: page.post.permalink.clone(),
+        }
+        .cache_key(&reddit.cache_namespace())
+        .unwrap()
+        .0;
+        cache
+            .store(
+                &key,
+                &serde_json::to_vec(&page).unwrap(),
+                crate::app::now(),
+                cache.reserve_request().unwrap(),
+            )
+            .unwrap();
+        let (pool, messages) = Pool::start(reddit, 2, Some(cache));
+
+        pool.submit(Job::Experience {
+            generation: 2,
+            request: Request::Read {
+                query: Query::Thread(page.post.permalink.clone()),
+                after: None,
+            },
+            invalidations: Vec::new(),
+        });
+
+        assert!(matches!(next_message(&messages), Msg::Snapshot {
+            message, source: Source { cached: true, .. }, refreshing: false, ..
+        } if matches!(*message, Msg::Experience { generation: 2, result: Ok(Response::Thread(ref actual)) } if actual.post.id == page.post.id)));
+    }
+
+    #[test]
     fn a_warm_feed_is_readable_after_the_server_shuts_down() {
         use std::io::{BufRead, BufReader, Write};
-        let dir = CacheDir::new();
+        let dir = tempfile::tempdir().unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let reddit = Reddit::test_at(&format!("http://{}", listener.local_addr().unwrap()), false);
         let server = std::thread::spawn(move || {
@@ -3250,7 +3921,11 @@ mod tests {
             subreddit: "popular".into(),
             generation: 0,
         };
-        let (cold, messages) = Pool::start(reddit.clone(), 3, Some(Cache::new(dir.0.clone())));
+        let (cold, messages) = Pool::start(
+            reddit.clone(),
+            3,
+            Some(Cache::new(dir.path().to_path_buf())),
+        );
         cold.submit(job());
         let Msg::Snapshot {
             message,
@@ -3269,7 +3944,7 @@ mod tests {
         };
         server.join().unwrap();
         drop(cold);
-        let (warm, messages) = Pool::start(reddit, 3, Some(Cache::new(dir.0.clone())));
+        let (warm, messages) = Pool::start(reddit, 3, Some(Cache::new(dir.path().to_path_buf())));
 
         warm.submit(job());
 
@@ -3297,7 +3972,7 @@ mod tests {
         use std::io::Write;
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let base = format!("http://{}", server.server_addr());
-        let dir = CacheDir::new();
+        let dir = tempfile::tempdir().unwrap();
         let reddit = Reddit::test_at(&base, false);
         let job = Job::Feed {
             tab: 1,
@@ -3307,7 +3982,7 @@ mod tests {
             after: None,
         };
         let (key, _) = job.cache_key(&reddit.cache_namespace()).unwrap();
-        let (pool, messages) = Pool::start(reddit, 3, Some(Cache::new(dir.0.clone())));
+        let (pool, messages) = Pool::start(reddit, 3, Some(Cache::new(dir.path().to_path_buf())));
         pool.submit(job);
         let request = data_request(&server).unwrap();
         let mut writer = request.into_writer();
@@ -3329,7 +4004,7 @@ mod tests {
             matches!(terminal,Msg::Snapshot{message,..} if matches!(*message,Msg::Feed{result:Err(_),..}))
         );
         assert!(
-            Cache::new(dir.0.clone())
+            Cache::new(dir.path().to_path_buf())
                 .load(&key, crate::app::now())
                 .is_none()
         );
@@ -3337,9 +4012,9 @@ mod tests {
 
     #[test]
     fn when_home_has_an_old_cached_primer_it_should_not_replay_that_incomplete_start() {
-        let dir = CacheDir::new();
+        let dir = tempfile::tempdir().unwrap();
         let reddit = Reddit::test_at("http://127.0.0.1:9", false);
-        let cache = Cache::new(dir.0.clone());
+        let cache = Cache::new(dir.path().to_path_buf());
         let legacy = r#"["browser-home-v1",{"Listing":{"sort":"Best","time":"Day"}},null]"#;
         let key = Cache::key(&reddit.cache_namespace(), legacy);
         let mut listing =
@@ -3386,11 +4061,11 @@ mod tests {
         for disk_cache in [false, true] {
             let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
             let base = format!("http://{}", server.server_addr());
-            let dir = CacheDir::new();
+            let dir = tempfile::tempdir().unwrap();
             let (pool, messages) = Pool::start(
                 Reddit::test_at(&base, false),
                 4,
-                disk_cache.then(|| Cache::new(dir.0.clone())),
+                disk_cache.then(|| Cache::new(dir.path().to_path_buf())),
             );
             pool.submit(Job::Group {
                 subreddit: "private".into(),
@@ -3457,13 +4132,13 @@ mod tests {
 
     #[test]
     fn stale_content_arrives_before_a_failed_refresh() {
-        let dir = CacheDir::new();
+        let dir = tempfile::tempdir().unwrap();
         let reddit = Reddit::test_at("http://127.0.0.1:9", false);
         let job = Job::Group {
             subreddit: "rust".into(),
             generation: 0,
         };
-        let cache = Cache::new(dir.0.clone());
+        let cache = Cache::new(dir.path().to_path_buf());
         let (key, _) = job.cache_key(&reddit.cache_namespace()).unwrap();
         let listing =
             crate::reddit::parse::parse_listing(include_str!("../tests/fixtures/sub.json"))
@@ -3509,13 +4184,13 @@ mod tests {
 
     #[test]
     fn force_refresh_does_not_accept_a_fresh_disk_snapshot() {
-        let dir = CacheDir::new();
+        let dir = tempfile::tempdir().unwrap();
         let reddit = Reddit::test_at("http://127.0.0.1:9", false);
         let job = Job::Post {
             generation: 1,
             permalink: "/r/rust/comments/p/title/".into(),
         };
-        let cache = Cache::new(dir.0.clone());
+        let cache = Cache::new(dir.path().to_path_buf());
         let (key, _) = job.cache_key(&reddit.cache_namespace()).unwrap();
         let page =
             crate::reddit::parse::parse_post_page(include_str!("../tests/fixtures/post.json"))
@@ -3541,11 +4216,11 @@ mod tests {
 
     #[test]
     fn a_thumbnail_read_from_disk_counts_as_used() {
-        let dir = CacheDir::new();
+        let dir = tempfile::tempdir().unwrap();
         let reddit = Reddit::test_at("http://127.0.0.1:9", false);
         let url = "https://i.redd.it/used.png";
         let job = Job::Thumb { url: url.into() };
-        let cache = Cache::new(dir.0.clone());
+        let cache = Cache::new(dir.path().to_path_buf());
         let (key, _) = job.cache_key(&reddit.cache_namespace()).unwrap();
         let image = DynamicImage::ImageRgb8(image::RgbImage::new(2, 2));
         let mut bytes = std::io::Cursor::new(Vec::new());
@@ -3554,7 +4229,7 @@ mod tests {
         let order = cache.reserve_request().unwrap();
         // Stored with its modification time at `day_old`.
         cache.store(&key, bytes.get_ref(), day_old, order).unwrap();
-        let path = dir.0.join(format!("{key}.cache"));
+        let path = dir.path().join(format!("{key}.cache"));
         let (pool, messages) = Pool::start(reddit, 3, Some(cache));
         pool.set_on_screen(&[url]);
 
@@ -3581,14 +4256,14 @@ mod tests {
 
     #[test]
     fn when_a_full_preview_leaves_memory_it_should_return_from_disk_without_http() {
-        let dir = CacheDir::new();
+        let dir = tempfile::tempdir().unwrap();
         let reddit = Reddit::test_at("http://127.0.0.1:9", false);
         let url = "https://i.redd.it/preview.png";
         let job = Job::Image {
             url: url.into(),
             background: true,
         };
-        let cache = Cache::new(dir.0.clone());
+        let cache = Cache::new(dir.path().to_path_buf());
         let order = cache.reserve_request().unwrap();
         let (tx, _messages) = std::sync::mpsc::sync_channel(8);
         cache_result(
@@ -3627,12 +4302,12 @@ mod tests {
 
     #[test]
     fn cached_thumbnail_arrives_before_a_failed_background_refresh() {
-        let dir = CacheDir::new();
+        let dir = tempfile::tempdir().unwrap();
         let reddit = Reddit::test_at("http://127.0.0.1:9", false);
         let job = Job::Thumb {
             url: "https://i.redd.it/cached.png".into(),
         };
-        let cache = Cache::new(dir.0.clone());
+        let cache = Cache::new(dir.path().to_path_buf());
         let (key, _) = job.cache_key(&reddit.cache_namespace()).unwrap();
         let image =
             DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2, 2, image::Rgb([10, 20, 30])));
@@ -3674,12 +4349,12 @@ mod tests {
 
     #[test]
     fn stale_media_resolution_does_not_trigger_a_cached_viewer_action() {
-        let dir = CacheDir::new();
+        let dir = tempfile::tempdir().unwrap();
         let reddit = Reddit::test_at("http://127.0.0.1:9", false);
         let job = Job::ResolveMedia {
             permalink: "/r/pics/comments/p/gallery/".into(),
         };
-        let cache = Cache::new(dir.0.clone());
+        let cache = Cache::new(dir.path().to_path_buf());
         let (key, _) = job.cache_key(&reddit.cache_namespace()).unwrap();
         let page =
             crate::reddit::parse::parse_post_page(include_str!("../tests/fixtures/gallery.json"))
@@ -3703,8 +4378,8 @@ mod tests {
     }
     #[test]
     fn fresh_cached_replies_revalidate_when_the_parent_is_newer() {
-        let dir = CacheDir::new();
-        let cache = Cache::new(dir.0.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
         let older = cache.reserve_request().unwrap();
         let newer = cache.reserve_request().unwrap();
         let reddit = Reddit::test_at("http://127.0.0.1:9", false);

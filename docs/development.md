@@ -11,6 +11,9 @@ cargo clippy --all-targets
 cargo build
 ```
 
+CI runs these checks on Linux and macOS and checks the locked dependencies with
+Rust 1.90.
+
 Tests use synthetic Reddit data, local HTTP fixtures and Ratatui's TestBackend;
 they do not contact Reddit. UI tests cover representative wide, narrow and short
 terminals, display-column layout and color contrast. They do not cover every
@@ -24,9 +27,15 @@ and generated comments use the [settings schema](../src/config/schema.rs).
 Startup graphics negotiation collects replies for at most one second, even when the
 status reply arrives before graphics or cell measurements. A separate child owns
 stdin and is killed/reaped after two seconds. The tmux fallback requires the actual
-pane tty, compatible clients and matching measured client cell sizes. If no client
-shows that window, all attached server clients must agree. Window pixel defaults
-cannot establish native graphics support.
+pane tty, compatible clients in a session containing its window, and matching
+measured client cell sizes. Confirmed Ghostty/Kitty clients use Kitty rather than
+an unsupported protocol hint. Window pixel defaults cannot establish support.
+Native Kitty temporarily uses pane-local `allow-passthrough all`: tmux's `on`
+can discard uploads during redraws or while the window is hidden, without replay.
+Exit restores the previous pane override or inheritance, unless the user changed
+it meanwhile. Commands target the captured socket and pane and have deadlines.
+Uploads still require an attached, unsuspended client whose session contains the
+window; an unrelated attached client cannot establish delivery.
 
 ## Reddit text
 
@@ -37,7 +46,7 @@ spoiler and superscript handling. Spoilers remain linear text markers across
 Markdown formatting boundaries. One styled-line wrapper serves post documents
 and collection dialogs; measurements use those same wrapped lines. Folded
 previews and comment search strip style markers and link-target metadata. Link
-destinations stay in the body separately from visible labels; the local `SPC o l` picker
+destinations stay in the body separately from visible labels; the local `gx` picker
 omits links in hidden spoilers. Raw edit source stays separate. Post and reply
 cache keys are versioned to discard older flattened or URL-dump content.
 
@@ -45,6 +54,33 @@ cache keys are versioned to discard older flattened or URL-dump content.
 
 Selected threads, active feeds and main images have separate worker capacity from
 account work, community listings and other media. Cache readers run independently of HTTP.
+
+Search retires pending row and preview reads when its tab is left. Interrupted
+row pages resume on return with their rows, cursor and selection retained; edits
+made before leaving take precedence over the interrupted query. Late
+cancelled replies cannot replace them. Typed queries retire unused Explore
+discovery. Pool resets leave hidden Search idle until return. Discovery and page
+failures show the actual error beside a separate retry row, naming Esc then r
+while typing.
+
+Search community pages use selected-read HTTP priority ahead of passive post
+previews. The viewport starts the next page one API page before the loaded
+end; only one continuation runs, and cursor/error guards remain in force. Row
+geometry wraps only the current window rather than every loaded community.
+Search drill-down keeps the real community/user feed active and retains its
+Search origin for layout and back navigation. Wide content pairs advance from
+communities/posts to posts/detail. The first Left focuses the post list while
+retaining visible detail. The next closes detail and restores communities/posts,
+releasing detail media ownership while preserving the underlying list state.
+Retained parent rows are inactive and resume their interrupted reads on return.
+
+Scroll-triggered listings, pagination, detail previews and viewport media wait
+200 ms after the last movement, including the first movement after a pause.
+This covers islands, feeds, cards, sidebar navigation, comments and collection
+dialogs. Feed pagination uses the last visible post and the existing five-item
+buffer; redraws and arriving pages do not create further navigation demand.
+Cached visible content and incoming updates stay immediate; direct entry,
+explicit opens and refreshes keep their normal request paths.
 
 Account discovery preserves community and followed-user identities. Only communities
 seed All subs; user tabs fetch submitted posts with distinct feed cache keys.
@@ -57,17 +93,37 @@ subscription reconciliation path. User writes resolve a validated profile fullna
 from `user/<name>/about.json` and use `sr` in `api/subscribe`; community writes keep
 `sr_name`. Neither writes nor ambiguous failures retry automatically. Ordered cache
 tombstones prevent earlier reads from restoring pre-write membership.
-At authenticated admission, selected threads precede visible listings, ordinary
-foreground reads and background reads. Each class yields after two starts when a lower
-class waits, so sustained browsing cannot starve feeds or account actions. All
-classes share a 500 ms minimum between starts and obey server cooldowns. Native
-HTML/GraphQL and classic JSON track separate quota budgets. Each budget has up to 32
-credits, which refill no faster than once per second and stay capped by remaining quota.
-Background normally spends only idle overflow, retaining up to three credits for
-interaction; after two ready higher-priority starts it can borrow one for fairness.
-That turn uses available credit without waiting for the normal background interval.
-Visible island feeds use listing priority. Startup subscription snapshots use background admission;
+Community listings and Search use suffix-free JSON routes on `api.reddit.com`;
+`r/all` retains its `old.reddit.com` JSON route. These hosts receive only
+domain-scoped Reddit cookies; a refusal there does not sign out the saved session.
+At authenticated admission, selected threads precede regular feed listings, ordinary
+foreground reads, island browsing and background reads. Each class yields after two starts when a lower
+class is ready, so sustained browsing cannot starve feeds or account actions. All
+classes obey server cooldowns. Requests with known quota share a 100 ms minimum
+between starts. Background requests additionally stay 500 ms apart; their spacing
+deadline participates in eligibility. Unknown budgets retain one-second pacing and
+conservative shared spacing. Native HTML/GraphQL and classic JSON track separate
+quota budgets. A new budget starts with credit from the reported remaining quota;
+responses preserve spent credit, and credit stays capped by remaining quota and
+in-flight reservations. Adaptive refill remains no faster than once per second.
+Background reads require credit from a 16-request burst, refilled at the reported
+quota rate. Island browsing also spends that credit, preventing an additional
+background burst during navigation, but listings can continue using actual quota.
+Responses preserve spent burst credit. Both leave the final three known credits
+for interactive reads, including post opens; fairness never borrows that reserve.
+After two ready higher-priority starts, background work can use available burst
+credit without waiting for its normal quota interval.
+Visible, refreshed and prefetched islands use browsing priority. Regular feeds
+retain listing priority. Startup subscription snapshots use background admission;
 forced membership refreshes retain foreground priority.
+Bulk island cache warming has a separate reader from viewport demand. Once every
+visible island has usable post rows or a completed empty/error state, one following
+grid row may fetch cold listings through the same admission rules. Lookahead uses
+cached listings, including stale ones, without
+revalidation; explicit refreshes and established islands wait until drawn. It does
+not request offscreen icon metadata or media, and leaving the demand window cancels it.
+New icon metadata requests also wait for visible rows. Enqueueing listings first
+alone cannot guarantee admission order among concurrent workers.
 
 Queued and admission-waiting obsolete reads cancel immediately. Active reads get
 a 500 ms reuse window, checked every 50 ms; returning to the same unfinished post
@@ -95,11 +151,20 @@ connection paused; server cooldowns remain global.
 
 Feed responses publish complete post records as the body arrives. Provisional pages
 keep their request pending and cursor unchanged; only complete responses enter the
-cache. Refreshes retain an existing page until its replacement completes. Best Home
+cache. Refreshes retain an existing page until its replacement completes. Cold All subs
+islands also publish complete posts before the listing tail finishes; established
+islands retain their current order until the complete refresh is accepted. Best Home
 streams complete cards from the browser's ranked HTML, including media and flags,
 without separate post lookups. An initial partial of up to three posts fetches one
 continuation. Cards from that continuation publish after its cursor is validated.
 Failed continuations keep existing content. Cold loads retain the starter and reloads retain the shown page; `r` retries failed loading. Failed combined loads are not cached.
+
+Collection pages retain the 32 most recently used query/cursor responses in memory
+for five minutes per connection. Fresh pages reopen without HTTP; stale first pages
+remain readable during refresh, preserving selection and preview scroll. Stale
+continuations wait for a complete answer. Explicit refreshes bypass cached pages;
+writes, reconnects and content-policy changes clear them. Full thread links reuse
+the ordinary post disk cache; focused comment trees never replace full-post snapshots.
 
 Collection downward navigation prefetches near the last entry. Each gesture starts
 at most one continuation; empty/filtered pages advance on further navigation.
@@ -132,6 +197,27 @@ The decoder discards pictures behind the audio target even after terminal writes
 block the UI. Skipped pictures still count toward EOF.
 Direct YouTube files use a 32 KiB probe limit to avoid unnecessary frame-rate
 analysis before the first picture. Other media keeps its existing probing.
+First-use FFmpeg capability checks run off the UI thread alongside stream
+resolution, keeping the same frame-rate filter and HTTP options. Loading feedback
+lasts until the new decoder supplies a frame and requested audio is ready; a
+retained frame alone does not mark playback ready.
+The loading row stays outside image protocol cells, preserving their upload
+commands and terminal diff flags even in a one-row visible slice.
+
+The selected video owns playback. Up to three recent loaded players remain hidden
+in the existing post/source preview cache, so returning at the same decoder size
+and card/detail ownership resumes without extraction or playlist reloads. Hidden
+players stop their clocks and audio; decoder output blocks on its bounded frame
+channel. Unresolved players are cancelled on departure. The preview cache retains
+at most eight frames/32 MiB; connection resets and disabling images clear it.
+Failed players remain failed until explicit retry.
+
+When a native HLS master returns403, inline playback tries that video's sibling
+DASH manifest once. The bounded reader accepts static, whole-file MP4 renditions
+and selects video at the existing display size and audio at the highest bitrate.
+Every selected file uses the shared media transport and loopback relay; raw XML
+never reaches FFmpeg. Cancellation retires the alternate request. Unsupported or
+failed alternatives preserve the original HLS error and wait for explicit retry.
 
 One background extraction runs at a time. Player disposal cancels it; the worker
 kills and reaps its process group on cancellation, a 20-second deadline or oversized
@@ -174,10 +260,12 @@ Returning to a detail video uses the current sound preference.
 Images above 16 million pixels use validated Reddit resolutions, preferring the
 smallest with a long edge of at least 1600 pixels, or the largest available below
 it. Original URLs stay separate for media handoff and downloads. Still decoding uses a 128 MiB
-allocation budget; oversized originals without a usable preview offer `SPC o r`.
+allocation budget; oversized originals without a usable preview offer `o`.
 
 Native video retains a 921,600-pixel budget, allocated proportionally for portrait
 frames. Fast lossless PNG carries the RGB pixels. Prepared strips publish together;
 alternating hidden Kitty buffers precede synchronized placeholder updates. The
 hardware cursor stays hidden during playback; focused text fields keep their caret.
 The [terminal writer](../src/terminal_output.rs) coordinates uploads and tmux holds.
+Each native hold closes through passthrough even when tmux does not render the
+hidden pane's grid. Card encoding failures paint an error in the same frame.

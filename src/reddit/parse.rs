@@ -271,21 +271,9 @@ pub(super) fn parse_subscriptions(value: Value) -> Result<(Vec<Subscription>, Op
                     && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
             })
             .context("invalid Reddit subscription name")?;
-        let icon = ["community_icon", "icon_img"]
-            .into_iter()
-            .find_map(|key| media_url(&thing.data[key]));
-        let icon = match icon {
-            Some(url) => crate::model::SubscriptionIcon::Url(url),
-            None if thing.data.get("community_icon").is_some()
-                || thing.data.get("icon_img").is_some() =>
-            {
-                crate::model::SubscriptionIcon::Missing
-            }
-            None => crate::model::SubscriptionIcon::Unknown,
-        };
         names.push(Subscription::Community {
             name: name.to_string(),
-            icon,
+            icon: community_icon(&thing.data),
         });
     }
     Ok((names, data.after.filter(|s| !s.is_empty())))
@@ -451,6 +439,24 @@ pub(super) fn post(value: Value) -> Result<(Post, String)> {
         },
         body,
     ))
+}
+
+/// A t5 listing's icon: a usable URL, known to have none, or not in the answer.
+pub(crate) fn community_icon(data: &Value) -> crate::model::SubscriptionIcon {
+    let icon = ["community_icon", "icon_img"]
+        .into_iter()
+        .find_map(|key| media_url(&data[key]));
+    match icon {
+        Some(url) => crate::model::SubscriptionIcon::Url(url),
+        None if data.get("community_icon").is_some() || data.get("icon_img").is_some() => {
+            crate::model::SubscriptionIcon::Missing
+        }
+        None => crate::model::SubscriptionIcon::Unknown,
+    }
+}
+
+pub(crate) fn user_icon(data: &Value) -> crate::model::SubscriptionIcon {
+    media_url(&data["icon_img"]).map_or_else(Default::default, crate::model::SubscriptionIcon::Url)
 }
 
 fn media_url(value: &Value) -> Option<String> {
@@ -681,6 +687,8 @@ struct CommentData {
     #[serde(default)]
     distinguished: Option<String>,
     #[serde(default)]
+    stickied: bool,
+    #[serde(default)]
     score: Option<i64>,
     #[serde(default)]
     score_hidden: bool,
@@ -717,6 +725,7 @@ fn comment(value: Value, post: &str, depth: usize) -> Result<Comment> {
         flair: optional(data.author_flair_text),
         is_op: data.is_submitter,
         is_mod: data.distinguished.as_deref() == Some("moderator"),
+        stickied: data.stickied,
         score: if data.score_hidden { None } else { data.score },
         created: created(data.created_utc),
         body: text::body(data.body_html.as_deref().unwrap_or_default(), &data.body),
@@ -798,6 +807,7 @@ fn comments_from(
     let mut count = 0u64;
     let mut has_more = false;
     let mut ids = HashSet::new();
+    let mut listed = HashSet::new();
     for thing in things {
         match thing.kind.as_str() {
             "t1" => {
@@ -814,7 +824,7 @@ fn comments_from(
                         if !id_valid(id) {
                             bail!("invalid more comment id");
                         }
-                        if children.len() < MORE_LIMIT && !children.iter().any(|c| c == id) {
+                        if children.len() < MORE_LIMIT && listed.insert(id.to_owned()) {
                             children.push(id.to_string());
                         }
                     }
@@ -848,6 +858,7 @@ fn container(id: String, replies: Vec<Comment>, more: Option<MoreReplies>) -> Co
         flair: None,
         is_op: false,
         is_mod: false,
+        stickied: false,
         score: None,
         created: None,
         body: String::new(),
@@ -1392,6 +1403,7 @@ mod tests {
         let comments = &page.comments[0].replies;
         assert!(comments[0].is_op);
         assert!(comments[0].replies[0].is_mod);
+        assert!(comments[0].replies[0].stickied && !comments[0].stickied);
         let cursor: MoreRequest =
             serde_json::from_str(&comments[0].more.as_ref().unwrap().cursor).unwrap();
         assert_eq!(cursor.children, ["c3"]);

@@ -795,7 +795,7 @@ fn when_signed_in_a_feed_should_use_the_exported_session_without_oauth() {
     let fixture = Fixture::new(|r| {
         if r.headers.get("cookie").map(String::as_str) == Some("reddit_session=fixture-session")
             && !r.headers.contains_key("authorization")
-            && r.url.starts_with("/r/rust/hot.json?")
+            && r.url.starts_with("/r/rust/hot?")
         {
             Reply::json(empty_listing())
         } else {
@@ -1466,7 +1466,7 @@ fn listing_search_and_thread_requests_preserve_encoded_parameters() {
         .iter()
         .map(|s| Url::parse(&fixture.base).unwrap().join(s).unwrap())
         .collect();
-    assert_eq!(urls[0].path(), "/r/popular/top.json");
+    assert_eq!(urls[0].path(), "/r/popular/top");
     let pairs: HashMap<_, _> = urls[0].query_pairs().collect();
     assert_eq!(pairs["t"], "year");
     assert_eq!(pairs["after"], "t3_next");
@@ -2168,4 +2168,298 @@ fn conflicting_follow_identity_should_reject_the_whole_subscription_snapshot() {
         ]}}))
     });
     assert!(fixture.reddit().subscriptions().is_err());
+}
+
+/// Serves `body` from `offset` (the client's range), cutting the first response at a
+/// third; a resume gets the rest as 206, or the whole body as 200 when `refuse`.
+fn truncating_upstream(
+    body: Vec<u8>,
+    refuse: bool,
+) -> (String, std::thread::JoinHandle<Vec<Option<usize>>>) {
+    use std::io::{BufRead, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        let mut ranges = Vec::new();
+        for attempt in 0..2 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut range = None;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                    range = value
+                        .trim()
+                        .split('-')
+                        .next()
+                        .unwrap()
+                        .parse::<usize>()
+                        .ok();
+                }
+            }
+            ranges.push(range);
+            let total = body.len();
+            let from = range.unwrap_or(0);
+            if attempt == 0 {
+                let cut = from + (total - from) / 3;
+                if range.is_some() {
+                    write!(
+                        stream,
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {from}-{}/{total}\r\nContent-Length: {}\r\n\r\n",
+                        total - 1,
+                        total - from
+                    )
+                    .unwrap();
+                } else {
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n").unwrap();
+                }
+                stream.write_all(&body[from..cut]).unwrap();
+                stream.flush().unwrap();
+                // A close in the same packet fails the relay's first read, not a later one.
+                std::thread::sleep(Duration::from_millis(200));
+            } else if refuse {
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n").unwrap();
+                stream.write_all(&body).unwrap();
+            } else {
+                write!(
+                    stream,
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {from}-{}/{total}\r\nContent-Length: {}\r\n\r\n",
+                    total - 1,
+                    total - from
+                )
+                .unwrap();
+                stream.write_all(&body[from..]).unwrap();
+            }
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
+        }
+        ranges
+    });
+    (base, handle)
+}
+
+/// The relayed body for a GET with an optional `Range` header.
+fn relayed_body(reddit: &Reddit, url: &str, range: Option<&str>) -> Vec<u8> {
+    use std::io::{Read, Write};
+    let local = url::Url::parse(&reddit.media_url(url).unwrap()).unwrap();
+    let mut client =
+        std::net::TcpStream::connect(format!("127.0.0.1:{}", local.port().unwrap())).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let range = range.map_or(String::new(), |range| format!("Range: {range}\r\n"));
+    write!(
+        client,
+        "GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\n{range}\r\n",
+        local.path()
+    )
+    .unwrap();
+    let mut response = Vec::new();
+    let _ = client.read_to_end(&mut response);
+    let start = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    response[start..].to_vec()
+}
+
+#[test]
+fn media_relay_should_resume_a_body_that_ends_before_its_length() {
+    let body: Vec<u8> = (0..90_000u32).map(|i| (i % 251) as u8).collect();
+    for (range, from) in [(None, 0), (Some("bytes=1000-"), 1000)] {
+        let (base, upstream) = truncating_upstream(body.clone(), false);
+        let reddit = Reddit::test_at(&base, false);
+
+        let received = relayed_body(&reddit, &format!("{base}segment.ts"), range);
+
+        assert!(
+            received == body[from..],
+            "resumed bytes must continue the body exactly from {from}"
+        );
+        let resumed_at = from + (body.len() - from) / 3;
+        assert_eq!(
+            upstream.join().unwrap(),
+            [range.map(|_| from), Some(resumed_at)]
+        );
+    }
+}
+
+#[test]
+fn media_relay_should_end_short_rather_than_splice_a_refused_resume() {
+    let body: Vec<u8> = (0..90_000u32).map(|i| (i % 251) as u8).collect();
+    let (base, upstream) = truncating_upstream(body.clone(), true);
+    let reddit = Reddit::test_at(&base, false);
+
+    let received = relayed_body(&reddit, &format!("{base}segment.ts"), None);
+
+    assert!(received.len() < body.len());
+    assert!(
+        received == body[..received.len()],
+        "no foreign bytes after the cut"
+    );
+    assert_eq!(upstream.join().unwrap(), [None, Some(body.len() / 3)]);
+}
+
+#[test]
+fn searches_and_community_listings_should_use_scoped_hosts_and_refuse_other_origins() {
+    let reddit = Reddit::with_transport(
+        Transport::new().unwrap(),
+        false,
+        API,
+        session::Session::parse(
+            ".reddit.com\tTRUE\t/\tTRUE\t0\treddit_session\tfixture-session\n",
+            0,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for kind in [
+        experience::ListSearch::Communities,
+        experience::ListSearch::People,
+    ] {
+        let query = experience::Query::Search {
+            text: "rust".into(),
+            kind,
+            time: crate::model::TimeRange::All,
+        };
+        let url = reddit.read_url(&query, None).unwrap();
+        assert_eq!(url.host_str(), Some("api.reddit.com"));
+        assert!(!url.path().ends_with(".json"), "{url}");
+    }
+    let url = reddit
+        .search_url(
+            "rust",
+            "async",
+            experience::SearchSort::Top,
+            crate::model::TimeRange::Week,
+            None,
+        )
+        .unwrap();
+    let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(
+        (params["sort"].as_str(), params["t"].as_str()),
+        ("top", "week")
+    );
+    assert_eq!(
+        (url.host_str(), url.path()),
+        (Some("api.reddit.com"), "/r/rust/search")
+    );
+    let communities = reddit
+        .read_url(&experience::Query::Communities, None)
+        .unwrap();
+    assert_eq!(communities.host_str(), Some("www.reddit.com"));
+    let all = reddit.listing_url("all", crate::model::Sort::Hot).unwrap();
+    assert_eq!(
+        (all.host_str(), all.path()),
+        (Some("old.reddit.com"), "/r/all/hot.json")
+    );
+    let rust = reddit.listing_url("rust", crate::model::Sort::Hot).unwrap();
+    assert_eq!(
+        (rust.host_str(), rust.path()),
+        (Some("api.reddit.com"), "/r/rust/hot")
+    );
+
+    let error = reddit
+        .request(
+            Url::parse("https://new.reddit.com/search").unwrap(),
+            "application/json",
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "refusing to send Reddit cookies to another origin"
+    );
+}
+
+#[test]
+fn a_search_host_should_get_only_reddit_wide_cookies_and_its_401_should_not_sign_out() {
+    let cookies = Arc::new(Mutex::new(Vec::new()));
+    let seen = cookies.clone();
+    let fixture = Fixture::new(move |request| {
+        seen.lock().push(request.headers.get("cookie").cloned());
+        if request.url.contains("q=refused") {
+            return Reply {
+                status: 401,
+                body: String::new(),
+                headers: vec![],
+            };
+        }
+        Reply::json(empty_listing())
+    });
+    let mut reddit = Reddit::with_transport(
+        Transport::new().unwrap(),
+        false,
+        "http://localhost:9/",
+        session::Session::parse(
+            ".reddit.com\tTRUE\t/\tTRUE\t0\treddit_session\tfixture-session\nwww.reddit.com\tFALSE\t/\tTRUE\t0\tprefs\twww-only\n",
+            0,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let inner = Arc::get_mut(&mut reddit.0).unwrap();
+    inner.classic = Url::parse(&fixture.base).unwrap();
+    inner.old = Url::parse(&fixture.base).unwrap();
+
+    reddit.search("rust", "async", None).unwrap();
+    reddit
+        .listing(
+            "all",
+            crate::model::Sort::Hot,
+            crate::model::TimeRange::Day,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        cookies.lock().as_slice(),
+        [
+            Some("reddit_session=fixture-session".to_string()),
+            Some("reddit_session=fixture-session".to_string())
+        ]
+    );
+
+    let error = reddit.search("rust", "refused", None).unwrap_err();
+    assert_eq!(error.to_string(), CLASSIC_REFUSED);
+    assert!(!reddit.needs_sign_in());
+    assert_ne!(reddit.health(), Health::Down);
+
+    let mut www_only = Reddit::with_transport(
+        Transport::new().unwrap(),
+        false,
+        "http://localhost:9/",
+        session::Session::parse(
+            "www.reddit.com\tFALSE\t/\tTRUE\t0\treddit_session\twww-session\n",
+            0,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    Arc::get_mut(&mut www_only.0).unwrap().classic = Url::parse(&fixture.base).unwrap();
+    let requests = cookies.lock().len();
+    let error = www_only.search("rust", "async", None).unwrap_err();
+    assert_eq!(error.to_string(), CLASSIC_SESSION);
+    assert_eq!(cookies.lock().len(), requests);
+    assert!(!www_only.needs_sign_in());
+    assert_ne!(www_only.health(), Health::Down);
+
+    let mut expired = Reddit::with_transport(
+        Transport::new().unwrap(),
+        false,
+        "http://localhost:9/",
+        session::Session::parse(
+            ".reddit.com\tTRUE\t/\tTRUE\t1\treddit_session\tfixture-session\n",
+            0,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    Arc::get_mut(&mut expired.0).unwrap().classic = Url::parse(&fixture.base).unwrap();
+    let error = expired.search("rust", "async", None).unwrap_err();
+    assert_eq!(error.to_string(), session::SIGN_IN);
 }

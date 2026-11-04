@@ -38,7 +38,7 @@ impl Reddit {
     pub fn preferences(&self) -> Result<Preferences> {
         let account = self
             .account()
-            .context("Connect an identified Reddit account with A")?;
+            .context("Connect an identified Reddit account in Accounts")?;
         let response = self.request(self.0.api.join("settings/preferences")?, "text/html")?;
         let mut html = String::new();
         use std::io::Read;
@@ -51,7 +51,7 @@ impl Reddit {
     pub fn set_preference(&self, key: Preference, value: bool) -> Result<Preferences> {
         let account = self
             .account()
-            .context("Connect an identified Reddit account with A")?;
+            .context("Connect an identified Reddit account in Accounts")?;
         let me = self.get(self.0.api.join("api/me.json")?)?;
         if me["data"]["id"].as_str() != Some(&account.id) {
             bail!("Reddit account changed; reconnect before saving preferences");
@@ -105,7 +105,7 @@ fn parse(html: &str, expected: &str) -> Result<Preferences> {
     if let Some(id) = initial["identity"]["id"].as_str()
         && id.strip_prefix("t2_").unwrap_or(id) != expected
     {
-        bail!("Reddit preferences belong to another account; reconnect with A");
+        bail!("Reddit preferences belong to another account; reconnect through Accounts");
     }
     let prefs = &initial["identity"]["preferences"];
     let age_gated = node.value().attr("is-age-gated-and-not-verified").is_some();

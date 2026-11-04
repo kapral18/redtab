@@ -550,13 +550,6 @@ mod tests {
         assert_eq!(values["media"]["image_preview"].as_bool(), Some(true));
         assert!(values["media"].get("video_autoplay").is_none());
         assert!(values.get("show_nsfw").is_none());
-        assert_eq!(
-            values["signed_out"]["filters"]["authors"]
-                .as_array()
-                .unwrap()
-                .len(),
-            0
-        );
     }
 
     #[test]
@@ -811,30 +804,28 @@ mod tests {
     }
 
     #[test]
-    fn scoped_settings_should_remove_and_readd_the_same_account_and_keep_signed_out_separate() {
+    fn scoped_settings_should_remove_and_readd_the_same_account() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let mut store = Store::open(Some(&path)).unwrap();
-        change(&mut store, "filters.keywords", "[\"signed out\"]");
         store.select_account(Some("first"));
-        assert!(store.current.filters.keywords.is_empty());
         change(&mut store, "filters.keywords", "[\"first\"]");
-        fs::write(&path, "[signed_out.filters]\nkeywords=[\"signed out\"]\n").unwrap();
+        fs::write(&path, "[accounts.other.filters]\nkeywords=[\"other\"]\n").unwrap();
         store.reload();
         assert!(store.current.filters.keywords.is_empty());
         assert!(!store.current.accounts.contains_key("first"));
         change(&mut store, "filters.keywords", "[\"again\"]");
-        store.select_account(None);
-        assert_eq!(store.current.filters.keywords, ["signed out"]);
         assert_eq!(store.current.accounts["first"].filters.keywords, ["again"]);
+        assert_eq!(store.current.accounts["other"].filters.keywords, ["other"]);
     }
 
     #[test]
     fn settings_review_array_edits_should_keep_internal_and_removed_element_comments() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        fs::write(&path, "# top\n[signed_out.filters]\nkeywords = [\n # before first\n \"old\", # first note\n \"removed\", # removed note\n # trailing note\n] # outer\n").unwrap();
+        fs::write(&path, "# top\n[accounts.reader.filters]\nkeywords = [\n # before first\n \"old\", # first note\n \"removed\", # removed note\n # trailing note\n] # outer\n").unwrap();
         let mut store = Store::open(Some(&path)).unwrap();
+        store.select_account(Some("reader"));
         for input in ["[\"new\"]", "[]", "[\"one\", \"two\"]"] {
             change(&mut store, "filters.keywords", input);
             let text = fs::read_to_string(&path).unwrap();

@@ -24,6 +24,8 @@ If import fails, choose **Open a separate Reddit login window**. This needs a
 Chrome/Chromium-compatible browser. Complete sign-in and confirm the verified
 account in redtab. The temporary profile is closed and removed on completion or
 cancellation. Browser challenges can still prevent sign-in.
+The separate window communicates over private inherited pipes; it does not open
+a browser debugging TCP port.
 
 ## Manage saved accounts
 
@@ -86,15 +88,19 @@ Reconnecting preserves the current reading state when redtab recognizes the same
 account, or the same cookie for an unidentified account.
 
 Saved sessions are encrypted by the OS credential store. Loaded cookies stay in
-memory and are sent only to `https://www.reddit.com`. They are never logged,
+memory and are sent only to `https://www.reddit.com`, `https://api.reddit.com`
+and `https://old.reddit.com`. The latter two receive only domain-wide `.reddit.com`
+cookies. Cookies are never logged,
 cached or passed to media players. Browser imports may create private temporary
 database snapshots; redtab removes its helper directory on completion or cancellation.
 Cached content can include private posts your account can access.
 
 redtab connects directly, ignoring `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and
 `NO_PROXY`. External video players receive a loopback stream, so keep redtab open
-while they play. Authenticated requests start at least 500 ms apart. When Reddit
-reports available quota, short bursts can start at that spacing; consumed credits
+while they play. With available quota, authenticated requests can start 100 ms
+apart; background requests stay at least 500 ms apart. Without quota information,
+native-page/GraphQL requests and classic JSON requests each stay at least one
+second apart. Consumed credits
 refill no faster than once per second and stay capped by the reported remaining
 budget. Media uses a separate path.
 

@@ -7,7 +7,7 @@ Press `SPC p s` or `F2` to browse all settings. `Enter` toggles a boolean or ope
 The screen separates **Reddit settings — u/name**, **Reader settings — u/name**,
 and **This device — all accounts**. Reddit preferences save to that account;
 reader rules save under its Reddit username in TOML. Device settings are
-shared. Switching accounts loads its own rules; signed-out browsing has separate rules.
+shared. Switching accounts loads that account's rules.
 
 Reddit values load in the background on connection and when opening F2. Unavailable
 values are labelled, not presented as defaults. A save checks account identity,
@@ -20,7 +20,7 @@ changes or offer a confirmed chezmoi source save.
 
 The default is `$XDG_CONFIG_HOME/redtab/config.toml`, usually
 `~/.config/redtab/config.toml`. Use `redtab --config PATH` to choose another file.
-The first normal launch creates an annotated config with active defaults for device and signed-out reader settings.
+The first normal launch creates an annotated config with active defaults for device settings.
 `--check` does not create one.
 
 Every key is optional; removing a key restores its default. Saves preserve comments,
@@ -36,7 +36,7 @@ browser and image viewer.
 all_subs_posts_per_group = 3
 
 [media]
-image_preview = true       # also controlled by SPC v i
+image_preview = true       # also controlled by zi
 
 [accounts.example_user.filters]
 keywords = ["giveaway"]    # case-insensitive title matches
@@ -59,13 +59,12 @@ arrive. Ordinary listings request 25 posts per page; filters can reduce the numb
 
 Replace `example_user` with your Reddit username without `u/`. Account names match
 without regard to case; saves retain the existing table spelling. Duplicate tables
-for the same username are rejected. An unidentified connection must reconnect with
-`SPC p a` before editing reader rules; it does not use signed-out rules. F2 creates the
-account tables when you edit reader rules.
-Use `[signed_out.filters]` and `[signed_out.highlight]` for signed-out browsing.
-There is no global filter inheritance. Removing an account section restores empty
-reader rules for that account. `media.image_preview` controls terminal graphics;
-account mature-content and autoplay preferences have no TOML keys.
+for the same username are rejected. F2 lists reader rules only for an identified
+account; sign in, or reconnect an unidentified connection, with `SPC p a` to edit them.
+F2 creates the account tables when you edit reader rules. There is no global filter
+inheritance. Removing an account section restores empty reader rules for that account.
+`media.image_preview` controls terminal graphics; account mature-content and autoplay
+preferences have no TOML keys.
 
 Commands are argument arrays, not shell strings. redtab appends the URL or file
 paths; shell expansion does not run.
@@ -100,7 +99,7 @@ the confirmation or save is active. An approved save finishes before redtab exit
 If apply fails, the source may already contain the edit; `r` prepares a fresh
 confirmation and retries. Source or target changes while confirming require
 another review. Templates, generated/encrypted sources, symlink targets and
-read-only sources remain session-only with an explanation. The `SPC v i` shortcut keeps
+read-only sources remain session-only with an explanation. The `zi` shortcut keeps
 session changes until you open F2 to review saving them.
 
 ## Mature content and autoplay
@@ -109,7 +108,7 @@ F2 reads these preferences from Reddit. **Show NSFW** updates Reddit's native
 mature-content setting for feeds and search. Reddit
 may require completing a setting in its native interface; redtab reports that
 restriction. Content reloads after a confirmed change. **Autoplay videos** controls
-selected videos and GIFs; when off, press `SPC m p` to play manually.
+selected videos and GIFs; when off, press `p` to play manually.
 
 Preference failures leave the confirmed runtime policy intact and show an error.
 Refresh with `r` before another change if a save cannot be confirmed. Local reader

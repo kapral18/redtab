@@ -9,11 +9,23 @@ use crate::model::Sort;
 pub mod map;
 pub use map::State;
 
-pub fn handle(app: &mut App, mut key: KeyEvent) {
+pub fn handle(app: &mut App, key: KeyEvent) {
+    dispatch(app, key);
+    app.settle_jump();
+}
+
+fn dispatch(app: &mut App, key: KeyEvent) {
     if key.kind == KeyEventKind::Release {
         return;
     }
+    let mut key = legacy(key);
     map::sync(app);
+    if key.code == KeyCode::Char('i')
+        && key.modifiers == KeyModifiers::CONTROL
+        && !map::available(app, map::Action::JumpForward)
+    {
+        key = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    }
     if app.ancestor_following() {
         if app.keymap.prefix.is_empty()
             && key.modifiers.is_empty()
@@ -54,14 +66,6 @@ pub fn handle(app: &mut App, mut key: KeyEvent) {
         if !navigating && !paging_hint && !cancelling_prefix {
             app.cancel_ancestor_follow();
         }
-    }
-    if key.code == KeyCode::Char('h')
-        && key.modifiers.difference(KeyModifiers::ALT) == KeyModifiers::CONTROL
-    {
-        key = KeyEvent::new(
-            KeyCode::Backspace,
-            key.modifiers.intersection(KeyModifiers::ALT),
-        );
     }
     let ctrl = key.modifiers == KeyModifiers::CONTROL;
     let alt = key.modifiers == KeyModifiers::ALT;
@@ -142,6 +146,14 @@ pub fn handle(app: &mut App, mut key: KeyEvent) {
             dispatch_overlay(app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
             return;
         }
+        if context == map::Context::Confirm && matches!(app.overlay, Some(Overlay::Auth)) {
+            if key.modifiers.is_empty()
+                && matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q'))
+            {
+                dispatch_overlay(app, key);
+            }
+            return;
+        }
         if key.modifiers.is_empty()
             && key.code == KeyCode::Char('d')
             && matches!(app.overlay, Some(Overlay::Auth))
@@ -195,7 +207,7 @@ pub fn handle(app: &mut App, mut key: KeyEvent) {
         return;
     }
     match key.code {
-        KeyCode::F(3) if app.overlay.is_none() => app.search_explore(),
+        KeyCode::F(3) if app.overlay.is_none() => app.open_search(None),
         KeyCode::Down => execute(app, map::Action::Down),
         KeyCode::Up => execute(app, map::Action::Up),
         KeyCode::Left => execute(app, map::Action::Left),
@@ -203,16 +215,34 @@ pub fn handle(app: &mut App, mut key: KeyEvent) {
             execute(app, map::Action::Right)
         }
         KeyCode::Enter if app.overlay.is_some() => dispatch_overlay(app, key),
-        KeyCode::Enter => execute(app, map::Action::Right),
+        KeyCode::Enter if map::available(app, map::Action::Right) => {
+            execute(app, map::Action::Right)
+        }
         KeyCode::Home => execute(app, map::Action::First),
         KeyCode::End => execute(app, map::Action::Last),
         KeyCode::PageDown => execute(app, map::Action::PageDown),
         KeyCode::PageUp => execute(app, map::Action::PageUp),
+        KeyCode::Tab | KeyCode::BackTab if map::search_kind_keys(app) => {
+            app.cycle_search_kind(key.code == KeyCode::Tab)
+        }
         KeyCode::Tab if app.overlay.is_none() => app.cycle_tab(true, true),
         KeyCode::BackTab if app.overlay.is_none() => app.cycle_tab(false, true),
         KeyCode::Esc | KeyCode::Backspace => back(app),
         _ => dispatch_overlay(app, key),
     }
+}
+
+/// The kitty keyboard protocol reports these chords apart; they keep their terminal meaning.
+fn legacy(key: KeyEvent) -> KeyEvent {
+    let alt = key.modifiers.intersection(KeyModifiers::ALT);
+    let ctrl = key.modifiers.difference(KeyModifiers::ALT) == KeyModifiers::CONTROL;
+    let code = match key.code {
+        KeyCode::Char('h') | KeyCode::Backspace if ctrl => KeyCode::Backspace,
+        KeyCode::Char('[') if ctrl => KeyCode::Esc,
+        KeyCode::Char('m') if ctrl => KeyCode::Enter,
+        _ => return key,
+    };
+    KeyEvent::new(code, alt)
 }
 
 fn plain(key: KeyEvent) -> bool {
@@ -227,6 +257,10 @@ fn input_key(app: &mut App, mut key: KeyEvent) {
     if (key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Backspace)
         || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('w'))
     {
+        if app.search_editing() {
+            app.search_key(key);
+            return;
+        }
         match &mut app.overlay {
             Some(Overlay::Picker(picker)) => {
                 delete_word(&mut picker.input);
@@ -278,7 +312,11 @@ fn input_key(app: &mut App, mut key: KeyEvent) {
     } else if !plain(key) {
         return;
     }
-    dispatch_overlay(app, key);
+    if app.search_editing() {
+        app.search_key(key);
+    } else {
+        dispatch_overlay(app, key);
+    }
 }
 
 fn dispatch_overlay(app: &mut App, key: KeyEvent) {
@@ -369,6 +407,10 @@ pub fn paste(app: &mut App, text: &str) {
         app.experience_paste(text);
         return;
     }
+    if app.overlay.is_none() && app.search_editing() {
+        app.search_paste(text);
+        return;
+    }
     match &mut app.overlay {
         Some(Overlay::Picker(picker)) => {
             picker
@@ -453,7 +495,12 @@ fn handle_overlay(app: &mut App, overlay: Overlay, key: KeyEvent) -> Option<Over
         Overlay::Picker(mut picker) => {
             match (key.code, ctrl) {
                 (KeyCode::Esc, _) => return None,
-                (KeyCode::Enter, _) => {
+                (KeyCode::Enter, _)
+                    if app
+                        .picker_entries(&picker.input)
+                        .get(picker.selected)
+                        .is_some() =>
+                {
                     app.picker_accept(&picker);
                     return None;
                 }
@@ -543,10 +590,10 @@ fn back(app: &mut App) {
         app.close_post();
     } else if app.focus == Focus::Sidebar {
         app.focus_main();
-    } else if !app.clear_search() {
+    } else if app.active == crate::app::SEARCH_TAB || !app.clear_search() {
         if app.post_view.is_some() {
             app.close_post();
-        } else {
+        } else if !app.return_to_search() {
             app.status = None;
         }
     }
@@ -554,7 +601,7 @@ fn back(app: &mut App) {
 
 fn leave_collection(app: &mut App) {
     if matches!(app.overlay, Some(Overlay::Experience)) {
-        app.experience = crate::app::experience::Experience::default();
+        app.clear_experience();
         app.overlay = None;
     }
 }
@@ -591,8 +638,10 @@ fn execute(app: &mut App, action: map::Action) {
             leave_collection(app);
             app.close_active_tab();
         }
+        JumpBack | JumpForward => app.jump(action == JumpForward),
         Home | Bookmarks | AllSubs => {
             leave_collection(app);
+            app.close_post();
             app.focus_main();
             app.switch_tab(match action {
                 Home => 0,
@@ -602,6 +651,7 @@ fn execute(app: &mut App, action: map::Action) {
         }
         Popular | All => {
             leave_collection(app);
+            app.close_post();
             app.focus_main();
             app.open_subreddit(if action == Popular { "popular" } else { "all" });
         }
@@ -619,18 +669,22 @@ fn execute(app: &mut App, action: map::Action) {
         FocusLeft => {
             if app.post_focused() {
                 app.focus_main();
+            } else if app.focus == Focus::List
+                && app.search_feed_open()
+                && app.post_view.is_none()
+                && app.detail_fits()
+            {
+                app.return_to_search();
             } else {
                 app.focus_sidebar();
             }
         }
-        FocusRight => {
-            if app.focus == Focus::Sidebar {
-                app.focus_main();
-            } else if app.post_view.is_some() {
-                app.focus = Focus::Post;
-            }
-        }
+        FocusRight => focus_right(app),
         Actions => app.show_actions(),
+        Upvote => app.quick_action("u"),
+        Downvote => app.quick_action("d"),
+        Save => app.quick_action("s"),
+        Reply => app.quick_action("c"),
         Community => app.community_menu(),
         Reddit => app.reddit_menu(),
         Membership => app.show_membership(),
@@ -638,23 +692,28 @@ fn execute(app: &mut App, action: map::Action) {
         Search => {
             if context == Context::Post {
                 app.find_in_comments();
+            } else if app.overlay.is_none() && app.active == crate::app::SEARCH_TAB {
+                app.edit_search();
             } else if app.overlay.is_none()
                 && matches!(app.active_tab().kind, TabKind::Subreddit { .. })
             {
                 let input = app.active_tab().feed.search.clone().unwrap_or_default();
                 app.overlay = Some(Overlay::Search { input });
             } else {
-                app.show_search(crate::reddit::experience::SearchKind::Posts);
+                app.open_search(None);
             }
         }
-        SearchPosts | SearchCommunities | SearchPeople => app.show_search(match action {
+        SearchPosts | SearchCommunities | SearchPeople => app.open_search(Some(match action {
             SearchPosts => crate::reddit::experience::SearchKind::Posts,
             SearchCommunities => crate::reddit::experience::SearchKind::Communities,
             _ => crate::reddit::experience::SearchKind::People,
-        }),
-        Explore => app.search_explore(),
+        })),
+        Explore => app.open_search(None),
         Sort if context == Context::Post => app.comment_tools(),
-        Sort | Time | Reload if context == Context::Browse => app.collection_action(action),
+        Sort if app.overlay.is_none() && app.active_tab().feed.search.is_some() => {
+            app.cycle_search_sort()
+        }
+        Reload if context == Context::Browse => app.collection_action(action),
         Sort => {
             let selected = app
                 .active_tab()
@@ -667,8 +726,8 @@ fn execute(app: &mut App, action: map::Action) {
         Time => app.cycle_time(),
         Reload => app.reload(),
         OpenUrl => app.show_open_link(),
-        OpenLinks => app.show_body_links(),
-        Browser if context == Context::Browse => app.experience_native(),
+        OpenLinks | CopyLinks => app.show_body_links(action == CopyLinks),
+        Browser if context == Context::Browse => app.open_experience_item(),
         Browser => app.open_in_browser(),
         SourceBrowser => app.open_source_in_browser(),
         CopyLink if context == Context::Browse => app.copy_experience_link(),
@@ -683,6 +742,20 @@ fn execute(app: &mut App, action: map::Action) {
         Spoilers => app.toggle_spoilers(),
         Settings => app.show_settings(),
         Accounts => app.show_auth(),
+    }
+}
+
+fn focus_right(app: &mut App) {
+    if app.focus == Focus::Sidebar {
+        if app.search_feed_open() && app.post_view.is_none() && app.detail_fits() {
+            app.return_to_search();
+        } else {
+            app.focus_main();
+        }
+    } else if app.post_view.is_some() {
+        app.focus = Focus::Post;
+    } else if app.search_shows_rows() && app.detail_fits() {
+        app.open_search_row();
     }
 }
 
@@ -756,12 +829,17 @@ fn navigate(app: &mut App, action: map::Action) {
                 } else if !app.leave_comment() {
                     app.close_post();
                 }
-            } else if context != Context::Sidebar {
+            } else if context == Context::List && app.search_feed_open() && app.post_view.is_some()
+            {
+                app.close_post();
+                app.focus_main();
+            } else if context != Context::Sidebar && !app.return_to_search() {
                 app.focus_sidebar();
             }
         }
-        Right if context == Context::Sidebar => app.focus_main(),
+        Right if context == Context::Sidebar => focus_right(app),
         Right if context == Context::Post => app.activate_comment(),
+        Right if app.search_shows_rows() => app.open_search_row(),
         Right => app.open_current_post(),
         First | Last if context == Context::Sidebar => app.sidebar_edge(action == Last),
         First | Last if context == Context::Post => {
@@ -823,6 +901,20 @@ pub fn footer_hints(app: &App) -> Vec<(String, String)> {
     let candidates = map::candidates(app);
     let mut result = Vec::new();
     let context = map::context(app);
+    if app.active == crate::app::SEARCH_TAB
+        && app.overlay.is_none()
+        && matches!(context, map::Context::Input | map::Context::List)
+    {
+        if app.search_editing() {
+            return [("↑↓", "choose"), ("Tab", "kind"), ("⏎/Esc", "results")]
+                .map(|(key, label)| (key.to_string(), label.to_string()))
+                .to_vec();
+        }
+        result.push(("/".into(), "type".into()));
+        if map::search_kind_keys(app) {
+            result.push(("Tab".into(), "kind".into()));
+        }
+    }
     let priorities = [
         (
             Pause,
@@ -852,7 +944,14 @@ pub fn footer_hints(app: &App) -> Vec<(String, String)> {
                 "open"
             },
         ),
-        (NextCommunity, "next community"),
+        (
+            NextCommunity,
+            if app.search_source_context() {
+                "next source"
+            } else {
+                "next community"
+            },
+        ),
         (NextThread, "next root"),
         (NextPost, "next post"),
         (
@@ -893,6 +992,18 @@ pub fn footer_hints(app: &App) -> Vec<(String, String)> {
         (ListView, "view"),
         (Left, "back"),
     ];
+    // Reading a post, the way out outranks the motions that stay in it.
+    let mut priorities = priorities.to_vec();
+    if context == map::Context::Post
+        && let Some(at) = priorities.iter().position(|(action, _)| *action == Left)
+    {
+        let back = priorities.remove(at);
+        let after = priorities
+            .iter()
+            .position(|(action, _)| *action == Right)
+            .map_or(0, |right| right + 1);
+        priorities.insert(after, back);
+    }
     for (action, description) in priorities {
         if action == CloseTab
             && !matches!(

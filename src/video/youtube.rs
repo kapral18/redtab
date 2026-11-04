@@ -15,8 +15,11 @@ use super::Sources;
 
 const LIMIT: usize = 4 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(20);
-const UNAVAILABLE: &str = "YouTube unavailable; SPC m p retries or SPC o m opens browser";
-const OUTPUT_TOO_LARGE: &str = "YouTube metadata exceeds the inline limit; SPC o m opens browser";
+const UNAVAILABLE: &str = "YouTube unavailable; p retries or O opens browser";
+const OUTDATED: &str = "Update yt-dlp to 2026.08.19 or newer; O opens browser";
+/// The first yt-dlp release with every option and player client `command` passes.
+const MINIMUM_VERSION: (u32, u32, u32) = (2026, 8, 19);
+const OUTPUT_TOO_LARGE: &str = "YouTube metadata exceeds the inline limit; O opens browser";
 const CANCELLED: &str = "YouTube resolution cancelled";
 const FORMAT: &str = "bestvideo[protocol=https][width<=1920][height<=1920][fps<=30]+bestaudio[protocol=https]/best[protocol=https][width<=1920][height<=1920][fps<=30]";
 const PLAYBACK_METADATA: &str = "%(.{id,_type,availability,is_live,live_status,requested_formats,url,protocol,vcodec,acodec,http_headers})j";
@@ -90,7 +93,7 @@ impl Resolver {
             if cancelled.is_cancelled() {
                 Err(CANCELLED.to_owned())
             } else if started.elapsed() >= timeout {
-                Err("YouTube resolution timed out; SPC o m opens browser".to_owned())
+                Err("YouTube resolution timed out; O opens browser".to_owned())
             } else {
                 Ok(())
             }
@@ -110,7 +113,20 @@ impl Resolver {
             return Ok(sources);
         }
         let page = format!("https://www.youtube.com/watch?v={id}");
-        let bytes = extract(command(program, &page), cancelled, check)?;
+        let bytes = match extract(command(program, &page), cancelled, check) {
+            // Older releases ignore the unknown player client, so their failures exit 1
+            // like any other. The probe needs no permit: other videos go on meanwhile.
+            Err(error) if error == UNAVAILABLE && check().is_ok() => {
+                drop(_permit);
+                return Err(if outdated(program, cancelled, check) {
+                    OUTDATED
+                } else {
+                    UNAVAILABLE
+                }
+                .into());
+            }
+            result => result?,
+        };
         let sources = parse(&bytes, &id)?;
         let ttl = stream_ttl(&sources)?;
         check()?;
@@ -128,42 +144,48 @@ impl Resolver {
     }
 }
 
-fn command(program: &OsStr, page: &str) -> Command {
+/// yt-dlp without user config, its output piped, in its own process group.
+fn base(program: &OsStr) -> Command {
     let mut command = crate::media::local_command(program.to_str().unwrap_or("yt-dlp"));
     command
-        .args([
-            "--ignore-config",
-            "--no-plugin-dirs",
-            "--no-cookies",
-            "--no-cookies-from-browser",
-            "--no-cache-dir",
-            "--no-remote-components",
-            "--js-runtimes",
-            "node",
-            "--no-playlist",
-            "--skip-download",
-            "--print",
-            PLAYBACK_METADATA,
-            "--no-warnings",
-            "--no-progress",
-            "--socket-timeout",
-            "8",
-            "--retries",
-            "0",
-            "--extractor-retries",
-            "0",
-            // FORMAT excludes HLS, so its manifests cannot contribute a playable stream.
-            "--extractor-args",
-            "youtube:skip=hls;player_client=visionos",
-            "--format",
-            FORMAT,
-            "--",
-            page,
-        ])
+        .arg("--ignore-config")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .process_group(0);
+    command
+}
+
+fn command(program: &OsStr, page: &str) -> Command {
+    let mut command = base(program);
+    command.args([
+        "--no-plugin-dirs",
+        "--no-cookies",
+        "--no-cookies-from-browser",
+        "--no-cache-dir",
+        "--no-remote-components",
+        "--js-runtimes",
+        "node",
+        "--no-playlist",
+        "--skip-download",
+        "--print",
+        PLAYBACK_METADATA,
+        "--no-warnings",
+        "--no-progress",
+        "--socket-timeout",
+        "8",
+        "--retries",
+        "0",
+        "--extractor-retries",
+        "0",
+        // FORMAT excludes HLS, so its manifests cannot contribute a playable stream.
+        "--extractor-args",
+        "youtube:skip=hls;player_client=visionos",
+        "--format",
+        FORMAT,
+        "--",
+        page,
+    ]);
     command
 }
 
@@ -196,7 +218,7 @@ fn extract(
 ) -> Result<Vec<u8>, String> {
     let child = command.spawn().map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
-            "Install yt-dlp for YouTube playback; SPC o m opens browser".into()
+            "Install yt-dlp for YouTube playback; O opens browser".into()
         } else {
             UNAVAILABLE.to_owned()
         }
@@ -239,11 +261,46 @@ fn extract(
             drain(&mut stdout, &mut bytes)?;
             return if status.success() {
                 Ok(bytes)
+            } else if status.code() == Some(2) {
+                // yt-dlp exits 2 for an option it does not know, before any network use.
+                Err(OUTDATED.into())
             } else {
                 Err(UNAVAILABLE.into())
             };
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Whether `program --version` names a release older than `MINIMUM_VERSION`. An unknown
+/// answer counts as current, so only a known old version replaces the generic message.
+fn outdated(
+    program: &OsStr,
+    cancellation: &Cancellation,
+    check: impl Fn() -> Result<(), String>,
+) -> bool {
+    let mut command = base(program);
+    command.arg("--version");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let Ok(bytes) = extract(command, cancellation, || {
+        check()?;
+        if Instant::now() < deadline {
+            Ok(())
+        } else {
+            Err(UNAVAILABLE.into())
+        }
+    }) else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let mut parts = text.trim().split('.').map(|part| part.parse::<u32>().ok());
+    match (
+        parts.next().flatten(),
+        parts.next().flatten(),
+        parts.next().flatten(),
+    ) {
+        (Some(year), Some(month), Some(day)) => (year, month, day) < MINIMUM_VERSION,
+        _ => false,
     }
 }
 
@@ -277,7 +334,7 @@ fn parse(bytes: &[u8], id: &str) -> Result<Sources, String> {
             .as_str()
             .is_some_and(|access| !matches!(access, "public" | "unlisted"))
     {
-        return Err("This YouTube video needs the browser; press SPC o m".into());
+        return Err("This YouTube video needs the browser; press O".into());
     }
     let formats = info["requested_formats"].as_array();
     let video = formats
@@ -386,7 +443,7 @@ fn stream_ttl(sources: &Sources) -> Result<Duration, String> {
         }
     }
     if seconds == 0 {
-        return Err("YouTube stream expired; SPC m p retries or SPC o m opens browser".into());
+        return Err("YouTube stream expired; p retries or O opens browser".into());
     }
     Ok(Duration::from_secs(seconds))
 }
@@ -713,8 +770,16 @@ mod tests {
     fn when_the_tool_is_missing_or_fails_it_should_report_an_action_without_stderr() {
         let fake = Fake::new("echo PRIVATE-COOKIE >&2; exit 1");
         let error = fake.resolve(&Resolver::default()).unwrap_err();
-        assert!(error.contains("browser"));
-        assert!(!error.contains("PRIVATE-COOKIE"));
+        assert_eq!(error, UNAVAILABLE);
+        for body in [
+            "echo PRIVATE-COOKIE >&2; exit 2",
+            r#"case " $* " in *" --version "*) echo 2026.07.04 ;; *) echo PRIVATE-COOKIE >&2; exit 1 ;; esac"#,
+        ] {
+            let old = Fake::new(body);
+            let error = old.resolve(&Resolver::default()).unwrap_err();
+            assert!(error.contains("Update yt-dlp"), "{body}: {error}");
+            assert!(!error.contains("PRIVATE-COOKIE"));
+        }
         let missing = fake.dir.path().join("deleted-probe");
         let error = Resolver::default()
             .resolve_with(PAGE, &Cancellation::default(), missing.as_os_str(), TIMEOUT)
@@ -803,7 +868,7 @@ mod tests {
 
         assert_eq!(
             actual.unwrap_err(),
-            "YouTube metadata exceeds the inline limit; SPC o m opens browser"
+            "YouTube metadata exceeds the inline limit; O opens browser"
         );
     }
 

@@ -21,9 +21,9 @@ Optional programs:
 | Program | Used for |
 | --- | --- |
 | `ffmpeg` | Inline video and GIF playback (8.1 or newer seeks YouTube faster) |
-| `yt-dlp` and Deno or Node.js | Inline public YouTube videos and Shorts |
+| `yt-dlp` (2026.08.19 or newer) and Deno 2.3+ or Node.js 22+ | Inline public YouTube videos and Shorts |
 | `ffplay` | Sound during inline playback |
-| `mpv` | Opening videos with `SPC o m` |
+| `mpv` | Opening videos with `O` |
 | `secret-tool` | Saved sessions on Linux; included in Debian/Ubuntu's `libsecret-tools` |
 
 ## Find what you need

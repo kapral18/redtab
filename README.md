@@ -2,6 +2,8 @@
 
 Reddit in your terminal, with tabs, inline media and keyboard controls.
 
+![redtab renderer showing synthetic example posts](docs/assets/terminal.png)
+
 - Browse Home, subscriptions and subreddit tabs.
 - View images and galleries, play videos and GIFs, and read discussions side by side.
 - Search Reddit, follow comment threads, vote, save, reply and post.
@@ -9,6 +11,7 @@ Reddit in your terminal, with tabs, inline media and keyboard controls.
 
 Sign in with your browser's Reddit session, saved in your OS credential store.
 No Reddit API registration is needed.
+Reddit can change the browser endpoints redtab uses; updates may be needed when it does.
 
 ## Get started
 

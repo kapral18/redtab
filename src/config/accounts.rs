@@ -20,7 +20,6 @@ pub(super) struct Document {
     media: Media,
     commands: Commands,
     accounts: BTreeMap<String, ReaderSettings>,
-    signed_out: ReaderSettings,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -52,14 +51,13 @@ impl From<Config> for Document {
             },
             commands: c.commands,
             accounts: c.accounts,
-            signed_out: c.signed_out,
         }
     }
 }
 
 impl From<Document> for Config {
     fn from(d: Document) -> Self {
-        let mut config = Self {
+        Self {
             all_subs_posts_per_group: d.all_subs_posts_per_group,
             media: MediaSettings {
                 image_preview: d.media.image_preview,
@@ -67,11 +65,8 @@ impl From<Document> for Config {
             },
             commands: d.commands,
             accounts: d.accounts,
-            signed_out: d.signed_out,
             ..Self::default()
-        };
-        config.select_account(None);
-        config
+        }
     }
 }
 
@@ -83,24 +78,22 @@ impl Config {
                 .find(|key| key.eq_ignore_ascii_case(name))
                 .map_or_else(|| name.to_owned(), Clone::clone)
         });
-        let reader = match &self.active_account {
-            Some(id) => self.accounts.get(id).cloned().unwrap_or_default(),
-            None => self.signed_out.clone(),
-        };
+        let reader = self
+            .active_account
+            .as_ref()
+            .and_then(|id| self.accounts.get(id).cloned())
+            .unwrap_or_default();
         self.filters = reader.filters;
         self.highlight = reader.highlight;
     }
 
     pub(super) fn store_reader(&mut self) {
-        let reader = ReaderSettings {
-            filters: self.filters.clone(),
-            highlight: self.highlight.clone(),
-        };
-        match &self.active_account {
-            Some(id) => {
-                self.accounts.insert(id.clone(), reader);
-            }
-            None => self.signed_out = reader,
+        if let Some(id) = &self.active_account {
+            let reader = ReaderSettings {
+                filters: self.filters.clone(),
+                highlight: self.highlight.clone(),
+            };
+            self.accounts.insert(id.clone(), reader);
         }
     }
 
@@ -226,16 +219,17 @@ impl Config {
 mod tests {
     use super::*;
     #[test]
-    fn when_switching_between_accounts_and_signed_out_rules_should_be_isolated() {
-        let mut config:Config=toml::from_str("[accounts.first.filters]\nkeywords=[\"first\"]\n[accounts.second.filters]\nauthors=[\"bot\"]\n[signed_out.highlight]\nkeywords=[\"offline\"]\n").unwrap();
+    fn when_switching_between_accounts_rules_should_be_isolated() {
+        let mut config:Config=toml::from_str("[accounts.first.filters]\nkeywords=[\"first\"]\n[accounts.second.filters]\nauthors=[\"bot\"]\n[accounts.second.highlight]\nkeywords=[\"offline\"]\n").unwrap();
         config.select_account(Some("first"));
         assert_eq!(config.filters.keywords, ["first"]);
         config.select_account(Some("second"));
         assert!(config.filters.keywords.is_empty());
         assert_eq!(config.filters.authors, ["bot"]);
+        assert_eq!(config.highlight.keywords, ["offline"]);
         config.select_account(None);
         assert!(config.filters.authors.is_empty());
-        assert_eq!(config.highlight.keywords, ["offline"]);
+        assert!(config.highlight.keywords.is_empty());
         config.select_account(Some("first"));
         assert!(config.highlight.keywords.is_empty());
         assert_eq!(config.filters.keywords, ["first"]);

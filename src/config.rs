@@ -24,7 +24,6 @@ pub struct Config {
     pub highlight: Highlight,
     pub commands: Commands,
     pub accounts: std::collections::BTreeMap<String, ReaderSettings>,
-    pub signed_out: ReaderSettings,
     /// Selected reader username; an empty name means the connection is unidentified.
     pub active_account: Option<String>,
     /// The loaded file, empty for a config built in code. Error messages and `--check`
@@ -106,7 +105,6 @@ impl Default for Config {
             highlight: Highlight::default(),
             commands: Commands::default(),
             accounts: Default::default(),
-            signed_out: ReaderSettings::default(),
             active_account: None,
             path: PathBuf::new(),
         }
@@ -290,7 +288,7 @@ mod tests {
 
     #[test]
     fn config_values_that_would_fail_later_are_rejected_at_load() {
-        let dir = tempdir::Dir::new();
+        let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let load = |text: &str| {
             std::fs::write(&config_path, text).unwrap();
@@ -357,42 +355,10 @@ mod tests {
 
     #[test]
     fn config_file_rejects_unknown_keys() {
-        let dir = tempdir::Dir::new();
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "all_subs_posts_per_group = 3\nunknown = 1\n").unwrap();
 
         assert!(Config::load(Some(&path)).is_err());
-    }
-
-    /// Minimal self-cleaning temp dir (no extra dependency).
-    mod tempdir {
-        use std::path::{Path, PathBuf};
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        static N: AtomicU32 = AtomicU32::new(0);
-
-        pub struct Dir(PathBuf);
-
-        impl Dir {
-            pub fn new() -> Self {
-                let path = std::env::temp_dir().join(format!(
-                    "redtab-test-{}-{}",
-                    std::process::id(),
-                    N.fetch_add(1, Ordering::Relaxed)
-                ));
-                std::fs::create_dir_all(&path).unwrap();
-                Dir(path)
-            }
-
-            pub fn path(&self) -> &Path {
-                &self.0
-            }
-        }
-
-        impl Drop for Dir {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
     }
 }

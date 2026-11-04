@@ -11,6 +11,8 @@ and terminal-emulator controls are outside this reference.
   one outer row where space permits.
 - Separate form fields, compact posts and expanded cards by one blank row.
   Community islands have two columns between cards and one row between card rows.
+- Show partial islands and post entries at the bottom of the content area.
+  Keep the selected entry fully visible when space allows.
 - Size dialogs to content; scroll long menus, collections and help. Keep the
   primary action and Back/Cancel visible. Short pickers use one input row.
 - Keep dialog bounds and list, preview and control regions stable while changing
@@ -22,6 +24,15 @@ and terminal-emulator controls are outside this reference.
   failures and recovery keys take priority over counts and freshness.
 - Use a full-width background, bold text and marker for selection. Distinguish
   unfocused selection and focused borders without relying on color.
+- Accent marks only the focused pane. With two or more panes on screen (sidebar,
+  list, open post, or the feed opened beside Search), a thin accent outline
+  surrounds the focused pane, and the footer names it (`SIDEBAR`, `LIST`, `POST`)
+  in the activity slot while nothing loads. Every pane keeps a one-cell inset for
+  the outline, so moving focus never moves content; a lone pane uses those cells
+  for content and has no outline. Inside, only the focused pane's selection uses
+  the accent `▌`; an unfocused list or comment selection keeps its background with
+  a grey `│`. Outside the sidebar's focus its active tab is a location, not a
+  cursor: bold name and `●`, no row background. No pane is tinted or dimmed.
 - Give the dark palette an explicit background and readable muted text.
   `NO_COLOR` retains markers and modifiers; the terminal supplies colors.
 - Align labels and values, mark optional fields, and measure the same wrapped
@@ -49,17 +60,83 @@ the work. Use compact variants when the surrounding layout has only one row.
 | Media preparation | Centered spinner within the reserved image/video slot; inline for embedded pictures and playback status |
 | Account or write action | Warm spinner with the specific action and its existing controls; pending writes retain drafts and block duplicate submission |
 
-Home, community, user and subreddit-search feeds buffer background replacements
-of loaded pages. The fixed header distinguishes **New posts** from **Feed details
-updated**, followed by **r refresh**. Detail updates include scores, comments,
-ordering or pagination changes among existing posts. `r` applies the latest buffered
-pages and shows the first visible post from the top, clearing the old scroll position.
-Home keeps Reddit's Best ranking; a refresh can still rank the same post first.
-Initial loads and new pagination pages appear immediately. With no buffered update,
-`r` fetches fresh content or retries a failed read.
+### Update rules
 
-Subscriptions and Following each show a loading row while the account list loads,
-including before any entries arrive. Refresh keeps existing rows visible.
+Scrolling moves content immediately. New scroll-triggered requests wait until
+movement stops for 200 ms, across lists, cards, islands, comments and collection
+dialogs. Existing pixels and incoming updates remain visible during that wait.
+Explicit opens and refreshes start immediately.
+In Compact and Card feeds, navigation requests the next batch when the bottom of
+the view enters a five-item buffer before the loaded end.
+
+Every list and the post page follow the same rules when data arrives:
+
+1. **Only new items announce themselves.** New items lead the list: when a background
+   refresh of a feed's first page or an All subs island (including the refetch of a
+   shown one whose posts are five minutes old) ranks an unseen item above
+   every item already shown (pinned posts aside), every unseen item in that answer
+   waits behind **New posts · r refresh**, so `r` always finds them at the top.
+   While an open post has focus, `r` refreshes that post and the list shows only
+   **New posts**.
+   Everything else applies as it arrives, with no notice: scores, comment counts,
+   text, media URLs, reordering, removals, later pages, and unseen items that enter
+   lower in the ranking. While an answer waits, the posts it drops stay until `r`, or
+   until a refetched next page shows they left the listing, so nothing shown
+   disappears just because new posts arrived; an All subs island also keeps its
+   order until `r`. If a later page, a filter or a removal leaves nothing new leading,
+   the waiting answer applies like any other update and the notice clears.
+   In All subs, acknowledging the notice applies the downloaded updates without
+   forcing subscription or island reloads. With no notice, `r` fetches fresh content or retries.
+   Switching into a feed or All subs applies posts already waiting before entry.
+   Answers arriving afterward leave new leading posts behind the notice. A cached
+   list stays in its displayed order during its initial live refresh; matching posts
+   still receive updated scores and text. Following the same open post between
+   these views keeps arrivals waiting.
+2. **Arrivals never move what you are reading.** Only scrolling moves the selection.
+   Updates keep the selected item and its screen position: a reorder, a picture
+   loading, or a resize moves the view to keep it. Where the selection is when an
+   answer arrives decides two cases:
+   - An untouched top, the first row of a list or island that you have not
+     scrolled into and whose post is not open from it, stays on the list's first
+     post, whatever the answer puts there.
+   - The post being read, the open post or any other selection, stays in its row
+     when a background answer to the shown tab drops it, and leaves with the first
+     update after you move off it. Hidden tabs and `r` show the list as Reddit
+     returns it, so a selection their answer drops hands its row to the post now
+     there.
+
+   Reddit lists (`SPC r`) scroll with their selection, so they keep the selected
+   entry and its row follows it.
+3. **`r` shows new items from the top.** When `r` applies waiting items, or its fetch
+   brings new ones, the view goes to the top of the list or page. When nothing new
+   arrives, `r` keeps your position. Moving, scrolling or opening a post before the
+   answer arrives cancels the jump: new list items then wait behind the notice, and
+   new comments on the post page arrive in place.
+4. **Older answers never replace newer ones.** Cached or late responses that are
+   provably older than what is shown are ignored.
+
+| Surface | New items | Other updates | `r` |
+| --- | --- | --- | --- |
+| Home, community, user and search feeds | First-page answers led by unseen posts hold every unseen post; a feed showing nothing takes its answer at once. Unseen posts entering lower, revalidated later pages and pagination appear at once. In community, user and search feeds, rows missing from a page's new answer may have moved onto the next page, so they stay just below that page until the next page answers. Any page keeps them while a next page is loaded or requested, which is then fetched again from the new end at once; otherwise the first page keeps them only while its answer waits behind the notice, and a later page keeps them until the next page loads as you scroll. Kept rows that the next page does not contain then leave. Home pages are separate personalized batches: a row Home drops leaves at once, or once the answer waiting behind the notice applies | Live; selection and screen row kept. An untouched top stays on the first post; the post being read stays in its row when a background answer drops it | Applies waiting posts, or fetches; jumps to the top only when new posts arrive. Switching into the feed applies posts already waiting; later answers leave new posts behind the notice. Retrying a failed next page keeps position |
+| All subs islands | Answers led by unseen posts hold every unseen post, and the island keeps its posts in their order until `r`, updating their scores and text; an island showing nothing (empty, refused, emptied by a filter or newly denied access) takes its answer at once. Cold islands show complete post records before the response finishes; established islands keep their current records until completion | Live. Every island reserves room for all the posts it may show, so loading never resizes the grid, and the selected island keeps its row when islands load or join above it. An untouched island top stays on the island's first post; the post being read keeps its slot when a background answer reranks or drops it | Applies waiting posts, then jumps to the top. A refetch that brings new posts before you move also jumps to the top. Switching into All subs applies posts already waiting; later answers leave new posts behind the notice |
+| Bookmarks | Local; saves merged from another instance appear at once | Selection and screen row follow the bookmark; an untouched top stays on the first bookmark. A bookmark removed elsewhere leaves at once and its row goes to the next bookmark | — |
+| Reddit lists (`SPC r`: profile, saved, hidden, votes, inbox, custom feeds, communities) | Recent pages reopen from memory; stale first pages remain readable while refreshing | After an action, the list is read again and keeps the selected entry and its preview scroll; an entry beyond the first page, or one the action removed, keeps its place within the first page | Reads the list again, keeping the selected entry; a failed next page retries, keeping position |
+| Post page | Comments arrive live when the page opens or after your own writes; there is no background polling | Live, anchored to the line or comment being read, including header rewraps as ages change and loads that land after a fold | Jumps to the top only when an unseen comment comes before every comment you have seen (seen pinned comments are skipped); unseen replies and lower comments arrive in place |
+| Sidebar | Subscriptions sync in place; a spinner on the section header shows progress without shifting the listed tabs. Loading rows appear only before the first subscription list arrives | — | `r` in All subs resyncs |
+
+Writes such as hide, report and delete remove the post from every feed and island
+(local bookmarks keep it), keep it out of listings for the rest of the session unless
+you unhide it, and mark it read, so it leaves unread counts; a hidden post also stays
+hidden on Reddit until you unhide it. A refetch after a write follows rule 1: its new
+posts wait behind the notice. Unread counts cover every post observed in a community
+that you have not read and your filters allow, including pinned posts, posts beyond an
+island's preview and posts waiting behind the notice.
+
+All subs warms at most the following grid row of cold islands once the visible
+islands have readable rows or completed empty/error states. New icon metadata
+requests follow the same readiness rule. Lookahead reuses stale cached listings without refreshing them;
+established islands and explicit refreshes wait until visible. Icons and media
+follow actual visibility, and obsolete lookahead requests cancel on navigation.
 
 Animation advances at most every 100 ms while the active view or sidebar is busy. Help and
 static overlays pause it; busy dialogs animate their own progress. Completion or
@@ -67,7 +144,10 @@ failure stops it. Redraws reuse cached media.
 
 Visible videos load posters or first-frame stills independently of selection and
 autoplay. Selected playback supplies its own frame rather than starting a second
-preview decode. Large native video frames are paced by encoded size to limit
+preview decode. Selected cards and detail reserve a text row inside the media slot
+for animated loading until the new playback frame and requested audio are ready.
+Posters and retained frames keep the remaining space; full media geometry stays fixed.
+Large native video frames are paced by encoded size to limit
 terminal output; playback can skip frames while retaining pixel detail and media time.
 A background output owner commits one complete terminal frame at a time; input and
 application state continue updating while it writes. Exit and panic restoration wait
@@ -85,13 +165,14 @@ Rendering: [main UI](../src/ui.rs).
 
 | Surface | Fields and layout |
 | --- | --- |
-| Frame | Sidebar, list, retained detail, focus divider, footer and overlays; split/fullscreen follows width |
+| Frame | Sidebar, list, retained detail, focus outline, footer and overlays; split/fullscreen follows width |
 | Sidebar identity | Name and version, separate from navigation |
-| Sidebar navigation | Home, Bookmarks, All subs, Subscriptions, Following, Opened; selected tab stays visible |
+| Sidebar navigation | Home, Bookmarks, All subs and Search stay fixed above scrolling Subscriptions, Following and Opened sections. Very short sidebars prioritize the selected tab when all fixed entries cannot fit |
+| Search tab | One bar across the tab, above the list and the preview: query box (accent while typing; empty, it names the kind typing searches) with Posts/Communities/People tabs at its right (below it when the tab is under 66 columns wide). The searched kind is accent and underlined; in Explore, which shows no kind's results, the chosen kind is only bold. Under the bar one title line: "<Kind> matching “q”", or "Explore" with "popular feeds and suggested communities" when that fits whole. The footer leads with `/ type` and `Tab kind`; while typing it shows `↑↓ choose`, `Tab kind` and `⏎/Esc results`; Enter runs a pending query and leaves typing without opening a row, and the sidebar offers `Esc list keys` and `F1 help`. Posts then show a line of sort, time and freshness chips and the feed cards. Communities/People and Explore (Popular, All Reddit, suggested communities) show spaced entries with a one-cell gap after the community icon, the person's avatar or the glyph, beside a wrapped name and a dimmed summary of up to three lines: a community's description, or a person's karma. Summaries shorten with an ellipsis and fit the pane height. Explore fills the pane and prefetches another page when the loaded end is within one API page beyond the viewport. Pages load sequentially and failures wait for retry. Scrolling keeps its viewport until selection crosses an edge, including when moving upward. Loading or next-page status stays below the entries. Failed discovery/pages show the actual error and a separate retry row; typing requires Esc then r, the list uses r, and a focused detail requires C-w h then r to retry its visible feed. When needed, empty-feed search/sort/source and membership/access hints name the list-focus sequence. Sidebar commands keep their active feed; clearing its local filter uses Esc then Esc. Retained detail advertises retry, spoiler, gallery, media and reply activation keys only while it owns input (spoiler galleries advertise browsing only after reveal); its document cache updates those cues with focus. The selected row's hot posts show as feed cards in the Card/Compact view with pictures and no selection marker (hide filters applied): in a right column where a post would open beside the list (the same widths as a feed and its post), hidden when narrower. A person's preview starts with their profile summary: the avatar beside the post and comment karma line, then their description, at most a third of the pane, above their posts. The preview reuses a matching loaded Hot feed or cached posts, updates fields in place and holds changed membership or order until `r`. Only unseen leading posts show the refresh notice; metadata edits, reranking and lower-ranked additions do not. Status belongs to the selected source. Opening a matching feed applies waiting preview posts; returning reconciles its newer snapshot and pending posts, preserving other queries and newer failures. A failed refresh keeps the displayed posts with a failure marker and the retry keys for the current focus. Failures name Esc then r while typing and r from the list. With Search results focused, "No matches" names `Tab` when it changes kind, and an empty preview names Enter; other focuses direct the reader back to Search. `l`/`Enter` opens the selected community or person as an active feed. At split widths the sidebar stays in place while the content pair advances from community rows and posts to post list and post detail. `j`/`k` acts on the focused list; only that list has the active selection marker. Source rows use ten-item pages, five-item half pages and one-item `C-e`/`C-y` motions. `gc` and source-menu feed commands retain the same Search return path as Enter. `o`/`SPC o c`/`yy` target the selected source URL, including Popular and All; membership stays unavailable for those two feeds. `C-w h`/`C-w l` follow visible panes, activating the post preview when focused. Escape applies ordinary detail/filter rules before returning a nested feed to Search. Inactive parent rows direct retry/query changes back to Search instead of advertising keys that act on the child feed. The first `h`/Left focuses the post list while keeping detail visible. The second closes detail and shifts the pair back to community rows and posts, keeping focus on posts. The third focuses Search rows with query, kind and list position preserved. Narrow layouts show one content layer at a time. Explicit tab switching ends that return path; `F3` returns to typing in Search |
 | Sidebar tab | Number, community icon or user avatar/person glyph, name, community unread count (`?` when unknown), selection |
-| Sidebar status | Reddit up/unknown/paused/down/signed out; images on/off; signed out offers `SPC p a` |
-| Home/community/user header | Title, Card/Compact, sort, eligible time range, search; stable title/state rows |
-| Membership | User feeds show Following/Not following/unknown beside `SPC a m unfollow`/`SPC a m follow`/`SPC a m check`; communities show Joined/Not joined/unknown and leave/join/check. Both use confirmation, progress and automatic sidebar reconciliation |
+| Sidebar status | Reddit up/unknown/paused/down/signed out; images on/off; signed out offers `SPC p a` (Esc first while typing in Search), when it fits |
+| Home/community/user header | Title, Card/Compact, sort, eligible time range; a search shows its query, search sort and time range; stable title/state rows. A user feed then shows the person's profile summary above the posts in a fixed block of three rows (at most a third of the pane): the avatar beside the post and comment karma line, then up to two description lines. People results supply it; otherwise the tab asks Reddit once, and again after `r` on the tab or a Show NSFW change. The block reads "Loading profile…" until it arrives and "Profile unavailable" with the retry key after a failure, so the list never moves. With NSFW hidden, an NSFW profile shows only its karma. The sidebar uses Following's avatar, or the profile's when Following has none or it failed |
+| Membership | User feeds show Following/Not following/unknown beside `SPC m unfollow`/`SPC m follow`/`SPC m check`; communities show Joined/Not joined/unknown and leave/join/check. Both use confirmation, progress and automatic sidebar reconciliation |
 | Feed activity | Unread count, loading, refresh/continuation error and freshness; refresh errors retain posts |
 | Compact post | Two rows: selection, thumbnail, score, unread/bookmark/pin, title; then comments, safety labels, community, author, age, flair and media/domain |
 | Expanded card | Metadata, wrapped title, media, score and comment count; stable loading geometry and continuous scrolling |
@@ -116,7 +197,7 @@ Rendering: [main UI](../src/ui.rs).
 Post bodies, comments, messages, search previews, community descriptions, rules,
 wiki pages and custom-feed descriptions share formatted text rendering. Bold,
 italic, strikethrough, headings, code, quotes, numbered/nested lists, tables and
-links retain their meaning when wrapped. Links show styled labels; `SPC o l` opens a
+links retain their meaning when wrapped. Links show styled labels; `gx` opens a
 link picker for the selected comment, post body or dialog text. Select a label
 with `j`/`k` and `Enter`, then open its destination in the browser or copy its URL.
 Raw URLs remain visible. Superscript
@@ -135,10 +216,14 @@ A modal pauses video and retains its background frame. Warm graphics are reused;
 see [rendering](development.md#media-rendering) for transport details.
 
 Video/GIF state includes playback, loading/error, pause, position/duration and
-sound. One player serves the settled selected card, or detail when open. Keep
-geometry stable without a poster; retain pause within the same item. Show status
-beside the picture and controls in the footer. Failures keep the poster and
-retry/media guidance. Turning off **Autoplay videos** in F2 requires `SPC m p` to start.
+sound. One active player serves the settled selected card, or detail when open.
+If Reddit denies a native HLS master, playback tries the same video's DASH
+video and audio files before showing the error.
+Up to three recent loaded players stay hidden for reuse, with clocks and audio
+stopped; older entries keep only bounded preview frames and playback position.
+Geometry stays stable while loading. A failed video without a usable poster or
+frame collapses to one status row; `p` retries with its normal media area.
+Posters and retained frames remain visible, with controls in the footer. Turning off **Autoplay videos** in F2 requires `p` to start.
 
 Unread counts share local observation/read history across sidebar, Jump, feeds and
 islands. Only an accepted, revealed post document drawn outside overlays records a
@@ -158,9 +243,6 @@ Required fields below describe client validation.
 | Form | Fields and defaults | Submission |
 | --- | --- | --- |
 | Open Reddit URL (`SPC o u`) | Reddit URL; required, empty, single line | Open post/comment, community or user feed; invalid links retain input |
-| Search posts | Query; required, empty, single line | Search |
-| Search communities | Query; required, empty, single line | Search |
-| Search people | Query; required, empty, single line | Search |
 | User profile | Username; required, empty; accepts `u/` | Open |
 | Reply | Reply; required, empty Markdown body | Reply |
 | Edit | Body; required Markdown, initialized from raw content | Save to captured target |
@@ -187,7 +269,6 @@ Presentation: [menu renderer](../src/ui/experience.rs).
 
 | Menu/group | Choices |
 | --- | --- |
-| Search and explore (`SPC s e` or `F3`) | Search posts, communities, people; discover communities; Popular; All Reddit. Results open posts or feeds directly. |
 | Reddit / Notifications | Unread, comment replies, post replies, mentions, inbox, native notifications |
 | Reddit / Messages | Chat on Reddit |
 | Reddit / Your account | Profile, saved, hidden, upvoted, downvoted; connected accounts only |
@@ -233,9 +314,8 @@ Presentation: [dialogs](../src/ui/experience.rs).
 | Failed continuation | Retain entries/selection and the failed continuation; `r` retries it |
 | Pending/successful write | Sending state blocks duplicate actions; update only after acknowledgment |
 | Profile | Username, karma/description, Overview/Posts/Comments |
-| User feed | Following tabs show submitted posts in Card/Compact with community metadata, sorting and pagination. `SPC a m` and the first profile tool follow/unfollow; unfollow moves the retained feed to Opened. Post details target the actual community/profile |
+| User feed | Following tabs show submitted posts in Card/Compact with community metadata, sorting and pagination. `SPC m` and the first profile tool follow/unfollow; unfollow moves the retained feed to Opened. Post details target the actual community/profile |
 | Inbox | Category, entries, read/unread actions, preview and pagination |
-| Search | Posts/Communities/People, query, supported sort/time, results, preview and automatic loading near the end |
 | Community | Title, members, description/sidebar, Rules and Wiki |
 | Rules/wiki | Scrollable text; missing wiki says unavailable; no entry/action/paging hints |
 | Moderators | Usernames and profile links; no content-action hint without a target |
@@ -244,10 +324,11 @@ Presentation: [dialogs](../src/ui/experience.rs).
 | Empty subscriptions/bookmarks | Distinguish disconnected, no joined communities and no bookmarks; offer relevant connect/reload/jump guidance |
 | Post | Loading/error, failed refresh of existing content, spoilers, empty/folded/loaded/loading comments |
 
-Empty feeds distinguish sign-out, loading, read failure, private access, unknown
-restriction, filtering and no results/posts. Only an explicit private reason labels
-a community private; generic HTTP 403 does not imply a Reddit outage. Private
-access offers `SPC o r` to Reddit and `r` to recheck. Denied cached posts stay unselectable.
+Empty feeds distinguish sign-out, loading, read failure, private access, filtering
+and no results/posts. Only an explicit private reason restricts a community.
+Generic HTTP 403 remains a request failure: cached posts stay readable, and `r`
+retries; it does not establish a community restriction or a Reddit outage. Private
+access offers `o` to Reddit and `r` to recheck. Private cached posts stay unselectable.
 Tabs and All subs share access observations; only a sufficiently newer success
 clears a denial. Successful empty lists with NSFW off suggest `F2` → **Show NSFW**
 without claiming it caused the empty result. Keep this guidance compact in islands
@@ -279,7 +360,7 @@ the name. Hide credentials; selecting a source precedes importing it.
 
 [Settings](../src/ui/settings.rs) groups Reddit account preferences, local reader
 rules for the named account, and device settings shared by all accounts;
-the selection shows its exact local file key and description. Account values load
+the selection shows its local file key, or "Reddit account", and its description. Account values load
 in the background and display unknown/error states until confirmed. Booleans toggle; other
 values use a TOML editor. Keep editing, validation and save/conflict feedback
 visible. See [Settings](configuration.md#save-status-and-recovery) for status and recovery.

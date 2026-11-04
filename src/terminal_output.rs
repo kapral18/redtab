@@ -2,11 +2,247 @@
 
 use std::io::{self, Write};
 use std::ops::Range;
+use std::os::fd::AsRawFd;
+use std::time::{Duration, Instant};
+
+pub fn inside_tmux() -> bool {
+    std::env::var("TERM").is_ok_and(|term| term.starts_with("tmux"))
+        || std::env::var("TERM_PROGRAM").is_ok_and(|program| program == "tmux")
+}
+
+pub struct TmuxPane {
+    socket: String,
+    id: String,
+}
+
+impl TmuxPane {
+    pub fn for_stdout() -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        if !inside_tmux() {
+            return None;
+        }
+        let tmux = std::env::var("TMUX").ok()?;
+        let socket = tmux.rsplitn(3, ',').nth(2)?.to_owned();
+        let pane = Self {
+            socket,
+            id: std::env::var("TMUX_PANE").ok()?,
+        };
+        let tty = pane.command_for_pane(&["display-message", "-p", "#{pane_tty}"])?;
+        let tty = std::fs::metadata(tty.trim()).ok()?;
+        let stdout = std::fs::metadata("/dev/stdout").ok()?;
+        (tty.rdev() == stdout.rdev()).then_some(pane)
+    }
+
+    pub fn command_for_pane(&self, args: &[&str]) -> Option<String> {
+        self.command(&[&args[..1], &["-t", &self.id], &args[1..]].concat())
+    }
+
+    pub fn command(&self, args: &[&str]) -> Option<String> {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("tmux")
+            .args(["-S", &self.socket])
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+        let output = child.wait_with_output().ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+}
+
+pub struct TmuxPassthrough<C: Fn(&[&str]) -> Option<String>> {
+    command: C,
+    previous: String,
+    expected: &'static str,
+}
+
+impl<C: Fn(&[&str]) -> Option<String>> TmuxPassthrough<C> {
+    pub fn capture(command: C) -> Option<Self> {
+        let previous = command(&["show-options", "-pqv", "allow-passthrough"])?;
+        Some(Self {
+            command,
+            previous,
+            expected: "on",
+        })
+    }
+
+    pub fn enable_native(&mut self) -> bool {
+        if (self.command)(&["set-option", "-p", "allow-passthrough", "all"]).is_none() {
+            return false;
+        }
+        self.expected = "all";
+        true
+    }
+}
+
+impl<C: Fn(&[&str]) -> Option<String>> Drop for TmuxPassthrough<C> {
+    fn drop(&mut self) {
+        let current = (self.command)(&["show-options", "-pqv", "allow-passthrough"]);
+        if current.as_deref() != Some(self.expected)
+            || current.as_deref() == Some(self.previous.as_str())
+        {
+            return;
+        }
+        if self.previous.is_empty() {
+            (self.command)(&["set-option", "-pu", "allow-passthrough"]);
+        } else {
+            (self.command)(&["set-option", "-p", "allow-passthrough", &self.previous]);
+        }
+    }
+}
+
+pub struct TerminalWriter {
+    file: std::fs::File,
+    timeout: Duration,
+    deadline: Option<Instant>,
+}
+
+impl TerminalWriter {
+    pub fn open(timeout: Duration) -> io::Result<Self> {
+        Self::for_descriptor(libc::STDOUT_FILENO, timeout)
+    }
+
+    pub fn enter_screen(&mut self) -> io::Result<()> {
+        crossterm::execute!(
+            self,
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableBracketedPaste,
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        )?;
+        // tmux ignores the kitty request; it reports C-i apart from Tab only in
+        // modifyOtherKeys mode 2, and crossterm parses only its csi-u format.
+        if TmuxPane::for_stdout()
+            .and_then(|pane| pane.command(&["show-options", "-gv", "extended-keys-format"]))
+            .is_some_and(|format| format == "csi-u")
+        {
+            self.write_all(MODIFY_OTHER_KEYS_ON.as_bytes())?;
+            self.flush()?;
+            MODIFY_OTHER_KEYS.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn for_descriptor(descriptor: libc::c_int, timeout: Duration) -> io::Result<Self> {
+        use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+        let mut path = [0; 1024];
+        let result = unsafe { libc::ttyname_r(descriptor, path.as_mut_ptr(), path.len()) };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result));
+        }
+        let path = unsafe { std::ffi::CStr::from_ptr(path.as_ptr()) };
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(std::ffi::OsStr::from_bytes(path.to_bytes()))?;
+        Ok(Self {
+            file,
+            timeout,
+            deadline: None,
+        })
+    }
+}
+
+impl Write for TerminalWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let deadline = *self
+            .deadline
+            .get_or_insert_with(|| Instant::now() + self.timeout);
+        loop {
+            match self.file.write(bytes) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                result => return result,
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "terminal output stalled",
+                ));
+            }
+            let mut descriptor = libc::pollfd {
+                fd: self.file.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let result = unsafe {
+                libc::poll(
+                    &mut descriptor,
+                    1,
+                    remaining.as_millis().clamp(1, i32::MAX as u128) as i32,
+                )
+            };
+            if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.deadline = None;
+        Ok(())
+    }
+}
+
+pub fn diagnostic(message: std::fmt::Arguments<'_>) {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let descriptor = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_DUPFD_CLOEXEC, 0) };
+    if descriptor >= 0 {
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        diagnostic_to(
+            std::fs::File::from(descriptor),
+            format!("{message}\n"),
+            Duration::from_millis(100),
+        );
+    }
+}
+
+fn diagnostic_to(output: impl Write + Send + 'static, message: String, timeout: Duration) {
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    let _ = std::thread::Builder::new()
+        .name("redtab-diagnostic".into())
+        .spawn(move || {
+            let mut output = output;
+            let _ = output.write_all(message.as_bytes());
+            let _ = send.send(());
+        });
+    let _ = receive.recv_timeout(timeout);
+}
 
 const BEGIN: &[u8] = b"\x1b[?2026h";
 const END: &[u8] = b"\x1b[?2026l";
 const TMUX: &[u8] = b"\x1bPtmux;";
 const NATIVE_BEGIN: &[u8] = b"\x1b\x1b[?2026h";
+const MODIFY_OTHER_KEYS_ON: &str = "\x1b[>4;2m";
+pub const MODIFY_OTHER_KEYS_OFF: &str = "\x1b[>4;0m";
+static MODIFY_OTHER_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `enter_screen` asked tmux for modifyOtherKeys, so restoring must undo it.
+pub fn modify_other_keys() -> bool {
+    MODIFY_OTHER_KEYS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub const TMUX_END: &str = "\x1bPtmux;\x1b\x1b[?2026l\x1b\\";
 
 #[derive(Default)]
@@ -37,6 +273,10 @@ static OUTPUT: std::sync::OnceLock<OutputHandle> = std::sync::OnceLock::new();
 
 pub fn install_output(output: OutputHandle) {
     let _ = OUTPUT.set(output);
+}
+
+pub fn drain_output() -> io::Result<()> {
+    OUTPUT.get().map_or(Ok(()), OutputHandle::wait)
 }
 
 pub fn queue_command(bytes: &[u8]) -> io::Result<()> {
@@ -78,9 +318,21 @@ impl OutputHandle {
     }
 
     pub fn wait(&self) -> io::Result<()> {
+        self.wait_for(Duration::from_secs(3))
+    }
+
+    fn wait_for(&self, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
         let mut state = self.shared.state.lock();
         while state.pending != 0 {
-            self.shared.changed.wait(&mut state);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "terminal output did not drain",
+                ));
+            }
+            self.shared.changed.wait_for(&mut state, remaining);
         }
         match state.error.take() {
             Some(error) => Err(error),
@@ -229,9 +481,7 @@ impl<W: Write, B: FnMut() -> io::Result<()>> Writer<W, B> {
             start = range.end;
         }
         self.output.write_all(&self.frame[start..])?;
-        if !self.barrier_enabled {
-            self.output.write_all(TMUX_END.as_bytes())?;
-        }
+        self.output.write_all(TMUX_END.as_bytes())?;
         Ok(())
     }
 }
@@ -303,6 +553,173 @@ fn kitty_uploads(frame: &[u8]) -> Vec<Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_passthrough_should_restore_the_original_pane_override_even_after_unwinding() {
+        use std::cell::RefCell;
+        for original in ["", "off", "on", "all"] {
+            let option = RefCell::new(original.to_owned());
+            let command = |args: &[&str]| match args {
+                ["show-options", "-pqv", "allow-passthrough"] => Some(option.borrow().clone()),
+                ["set-option", "-p", "allow-passthrough", value] => {
+                    *option.borrow_mut() = (*value).to_owned();
+                    Some(String::new())
+                }
+                ["set-option", "-pu", "allow-passthrough"] => {
+                    option.borrow_mut().clear();
+                    Some(String::new())
+                }
+                _ => panic!("unexpected tmux command: {args:?}"),
+            };
+            let mut passthrough = TmuxPassthrough::capture(command).unwrap();
+            *option.borrow_mut() = "on".into();
+            assert!(passthrough.enable_native());
+            assert_eq!(*option.borrow(), "all");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _passthrough = passthrough;
+                panic!("exit fixture");
+            }));
+            assert!(result.is_err());
+            assert_eq!(*option.borrow(), original);
+        }
+    }
+
+    #[test]
+    fn passthrough_cleanup_should_preserve_a_later_user_override() {
+        use std::cell::RefCell;
+        let option = RefCell::new("on".to_owned());
+        let command = |args: &[&str]| {
+            if let ["set-option", "-p", "allow-passthrough", value] = args {
+                *option.borrow_mut() = (*value).to_owned();
+            }
+            Some(option.borrow().clone())
+        };
+        let mut passthrough = TmuxPassthrough::capture(command).unwrap();
+        assert!(passthrough.enable_native());
+        *option.borrow_mut() = "off".into();
+
+        drop(passthrough);
+
+        assert_eq!(*option.borrow(), "off");
+    }
+
+    #[test]
+    fn a_stalled_output_drain_returns_without_waiting_for_the_sink() {
+        struct Sink(std::sync::mpsc::Receiver<()>);
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.recv().unwrap();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (release, receive) = std::sync::mpsc::channel();
+        let (mut writer, output) = AsyncWriter::new(Sink(receive));
+        writer.write_all(b"frame").unwrap();
+        writer.flush().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            release.send(()).unwrap();
+        });
+        assert_eq!(
+            output
+                .wait_for(Duration::from_millis(30))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        release.join().unwrap();
+        output.wait().unwrap();
+    }
+
+    #[test]
+    fn terminal_writer_reopens_the_requested_tty_and_bounds_screen_entry() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let master = unsafe { OwnedFd::from_raw_fd(master) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        let flags = unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) };
+        let mut output =
+            TerminalWriter::for_descriptor(slave.as_raw_fd(), Duration::from_millis(50)).unwrap();
+        output.write_all(b"same terminal").unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) },
+            flags
+        );
+        let mut input = std::fs::File::from(master);
+        let mut bytes = [0; 13];
+        std::io::Read::read_exact(&mut input, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"same terminal");
+        output.flush().unwrap();
+        assert_eq!(unsafe { libc::tcflow(slave.as_raw_fd(), libc::TCOOFF) }, 0);
+        loop {
+            match output.file.write(&[b'x'; 4096]) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("cannot fill terminal: {error}"),
+            }
+        }
+        let started = Instant::now();
+        assert_eq!(
+            output.enter_screen().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn redirected_diagnostics_return_before_a_stalled_pipe_and_finish_when_it_drains() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let mut descriptors = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        let read = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+        let write = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+        let message = "x".repeat(4 * 1024 * 1024);
+        let started = Instant::now();
+        diagnostic_to(
+            std::fs::File::from(write),
+            message.clone(),
+            Duration::from_millis(30),
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let mut received = String::new();
+        std::io::Read::read_to_string(&mut std::fs::File::from(read), &mut received).unwrap();
+        assert_eq!(received, message);
+    }
+
+    #[test]
+    fn terminal_writes_stop_when_the_receiver_never_reads() {
+        let (sender, _receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        sender.set_nonblocking(true).unwrap();
+        let descriptor: std::os::fd::OwnedFd = sender.into();
+        let mut output = TerminalWriter {
+            file: descriptor.into(),
+            timeout: Duration::from_millis(30),
+            deadline: None,
+        };
+        assert_eq!(
+            output
+                .write_all(&vec![0; 4 * 1024 * 1024])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
     use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
 
     #[test]
@@ -548,6 +965,7 @@ mod tests {
             BEGIN,
             b"old to new middle done",
             END,
+            TMUX_END.as_bytes(),
         ]
         .concat();
         assert_eq!(writer.output, expected);

@@ -6,9 +6,10 @@ mod help;
 mod keymap;
 mod loading;
 mod rich_text;
+mod search;
 mod settings;
 
-use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
@@ -26,11 +27,10 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     App, CARD_MIN_WIDTH, CardImageProtocol, CardImageSlot, CardScroll, DETAIL_MIN_WIDTH, Focus,
-    Group, ImageSlot, MAIN_MIN_WIDTH, Overlay, PickerEntry, PostView, RowKind, Tab, TabKind,
-    UnreadBadge,
+    ImageSlot, MAIN_MIN_WIDTH, Overlay, PickerEntry, PostView, RowKind, Tab, TabKind, UnreadBadge,
 };
 use crate::model::{Media, PICTURE, Post, SPOILER_END, SPOILER_START, Sort};
-use crate::reddit::{AccessDenied, Health};
+use crate::reddit::Health;
 use crate::state::ListView;
 use crate::video;
 
@@ -68,6 +68,11 @@ const THUMB_RESERVE: usize = THUMB_COLS as usize + 1;
 const ICON_COLS: u16 = 2;
 const PANEL_PAD: u16 = 1;
 const PANEL_GAP: u16 = 1;
+/// The list and detail panes' inset, which leaves room for the focus outline.
+const PANE_MARGIN: Margin = Margin {
+    horizontal: PANEL_PAD + 1,
+    vertical: 1,
+};
 const POPUP_OUTER_X: u16 = 2;
 const POPUP_OUTER_Y: u16 = 1;
 const NSFW_EMPTY_HINT: &str = "NSFW is off. Press F2 and enable Show NSFW in Settings.";
@@ -129,6 +134,7 @@ struct CardPicture {
     selected: bool,
     detail: bool,
     post_id: Option<String>,
+    video_url: Option<String>,
     video_frame: bool,
 }
 
@@ -179,7 +185,36 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let mut spots = Vec::new();
     let mut pictures = ListPictures::default();
     let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(main);
-    let (main, detail) = if app.post_view.is_some() {
+    let search_feed = app.search_feed_open() && app.post_view.is_none();
+    let body = if (app.active == crate::app::SEARCH_TAB || search_feed) && !body.is_empty() {
+        search::draw_bar(
+            f,
+            app,
+            body,
+            Margin {
+                horizontal: PANEL_PAD,
+                vertical: 0,
+            },
+        )
+    } else {
+        body
+    };
+    let wants_preview =
+        app.post_view.is_none() && app.active == crate::app::SEARCH_TAB && app.search.shows_rows();
+    let preview_beside = wants_preview && app.detail_fits();
+    let search_feed_beside = search_feed && app.detail_fits();
+    if app.active == crate::app::SEARCH_TAB {
+        app.search_preview_drawn(preview_beside);
+    }
+    let (main, detail) = if preview_beside || search_feed_beside {
+        let main_width = (body.width / 5 * 2).max(MAIN_MIN_WIDTH);
+        let [main, detail] = Layout::horizontal([
+            Constraint::Length(main_width),
+            Constraint::Min(DETAIL_MIN_WIDTH),
+        ])
+        .areas(body);
+        (main, Some(detail))
+    } else if app.post_view.is_some() {
         if app.detail_fits() {
             let main_width = (body.width / 5 * 2).max(MAIN_MIN_WIDTH);
             let [main, detail] = Layout::horizontal([
@@ -187,12 +222,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 Constraint::Min(DETAIL_MIN_WIDTH),
             ])
             .areas(body);
-            f.render_widget(
-                Block::default().borders(Borders::LEFT).border_style(
-                    Style::new().fg(if app.post_focused() { ACCENT } else { SURFACE1 }),
-                ),
-                detail,
-            );
             (main, Some(detail))
         } else {
             (Rect::default(), Some(body))
@@ -200,35 +229,66 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         (body, None)
     };
+    let beside = if preview_beside {
+        Beside::Preview
+    } else if search_feed_beside {
+        Beside::Feed
+    } else {
+        Beside::Post
+    };
+    let panes = panes(app, sidebar, main, detail, beside);
+    // A lone pane needs no outline, so it keeps the cells the outline would take.
+    let margin = if panes.len() >= 2 {
+        PANE_MARGIN
+    } else {
+        Margin {
+            horizontal: PANEL_PAD,
+            vertical: 0,
+        }
+    };
     if main.is_empty() || !matches!(app.active_tab().kind, TabKind::AllSubs) {
-        app.groups_drawn(&[], &sidebar_icons);
+        let mut icons = sidebar_icons.clone();
+        if (app.active == crate::app::SEARCH_TAB || search_feed_beside) && !main.is_empty() {
+            icons.extend(search::shown_communities(app, main.inner(margin)));
+        }
+        app.groups_drawn(&[], &icons, &[]);
     }
     if let Some(name) = app.active_tab().subreddit().map(str::to_string) {
         app.demand_icon(&name);
     }
-    let margin = Margin {
-        horizontal: PANEL_PAD,
-        vertical: 0,
-    };
     let mut list_loader = None;
     if !main.is_empty() {
         let body = main.inner(margin);
-        match app.active_tab().kind {
-            TabKind::Home => list_loader = draw_feed(f, app, body, &mut pictures),
-            TabKind::AllSubs => {
-                list_loader = draw_all_subs(f, app, body, &mut spots, &sidebar_icons)
-            }
-            TabKind::Bookmarks => draw_bookmarks(f, app, body, &mut pictures),
-            TabKind::Subreddit { .. } | TabKind::User { .. } => {
-                list_loader = draw_feed(f, app, body, &mut pictures)
+        if search_feed_beside {
+            list_loader = search::draw(f, app, body, &mut pictures);
+        } else {
+            match app.active_tab().kind {
+                TabKind::Home => list_loader = draw_feed(f, app, body, &mut pictures),
+                TabKind::AllSubs => {
+                    list_loader = draw_all_subs(f, app, body, &mut spots, &sidebar_icons)
+                }
+                TabKind::Bookmarks => draw_bookmarks(f, app, body, &mut pictures),
+                TabKind::Search => list_loader = search::draw(f, app, body, &mut pictures),
+                TabKind::Subreddit { .. } | TabKind::User { .. } => {
+                    list_loader = draw_feed(f, app, body, &mut pictures)
+                }
             }
         }
     }
-    let post_loader =
-        detail.and_then(|detail| draw_post(f, app, detail.inner(margin), &mut pictures));
+    let post_loader = detail.and_then(|detail| {
+        if search_feed_beside {
+            list_loader = draw_feed(f, app, detail.inner(margin), &mut pictures);
+            None
+        } else if preview_beside {
+            search::draw_preview(f, app, detail.inner(margin), &mut pictures)
+        } else {
+            draw_post(f, app, detail.inner(margin), &mut pictures)
+        }
+    });
     if sidebar_width > 0 {
         draw_sidebar(f, app, &sidebar_layout, &mut spots);
     }
+    outline_focused(f, &panes);
     spots.extend(pictures.thumbs);
     let covered = draw_overlay(f, app);
     draw_card_pictures(f, app, &pictures.cards, covered);
@@ -244,7 +304,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         post: visible(post_loader),
     };
     app.loading_drawn(app.loading_active());
-    draw_footer(f, app, footer, &loaders);
+    draw_footer(f, app, footer, &loaders, &panes);
     // On very short terminals a dialog may also cover the underlying footer.
     if covered.is_some_and(|area| area.intersects(footer)) {
         draw_overlay(f, app);
@@ -324,7 +384,15 @@ fn thumb_reserve<'a>(app: &App, mut posts: impl Iterator<Item = &'a Post>) -> us
 fn tab_icon<'a>(app: &'a App, tab: &'a Tab) -> Option<&'a str> {
     match &tab.kind {
         TabKind::Subreddit { name, .. } => app.shown_icon(name),
-        TabKind::User { icon, .. } if app.thumbnails_on() => app.usable_thumb(icon.as_deref()),
+        // Following's avatar first; a known profile's stands in for a missing or failed one.
+        TabKind::User { name, icon, .. } if app.thumbnails_on() => {
+            app.usable_thumb(icon.as_deref()).or_else(|| {
+                app.usable_thumb(
+                    app.user_profile(name)
+                        .and_then(|profile| profile.icon.as_deref()),
+                )
+            })
+        }
         _ => None,
     }
 }
@@ -376,6 +444,54 @@ fn choice_style(selected: bool) -> Style {
         Style::new().fg(TEXT).bg(SURFACE0).bold()
     } else {
         Style::new().fg(SUBTEXT)
+    }
+}
+
+/// The focusable panes on screen, left to right, with their footer names and whether
+/// each has focus. Beside Search the right column holds either a preview, which is
+/// never focused, or the opened feed, which owns list focus while the Search rows
+/// beside it wait.
+fn panes(
+    app: &App,
+    sidebar: Rect,
+    main: Rect,
+    detail: Option<Rect>,
+    beside: Beside,
+) -> Vec<(Rect, &'static str, bool)> {
+    let (list, post) = match beside {
+        Beside::Preview => (main, None),
+        Beside::Feed => (detail.unwrap_or_default(), None),
+        Beside::Post => (main, detail.filter(|_| app.post_view.is_some())),
+    };
+    [
+        (sidebar, "sidebar", app.focus == Focus::Sidebar),
+        (list, "list", app.focus == Focus::List),
+        (post.unwrap_or_default(), "post", app.post_focused()),
+    ]
+    .into_iter()
+    .filter(|(area, ..)| !area.is_empty())
+    .collect()
+}
+
+enum Beside {
+    Preview,
+    Feed,
+    Post,
+}
+
+/// With two or more panes on screen, outlines the focused one in accent. Each pane then
+/// keeps a one-cell inset on every side for it, so moving focus never moves content.
+fn outline_focused(f: &mut Frame, panes: &[(Rect, &'static str, bool)]) {
+    if panes.len() < 2 {
+        return;
+    }
+    if let Some(&(area, ..)) = panes.iter().find(|pane| pane.2) {
+        f.render_widget(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(ACCENT)),
+            area,
+        );
     }
 }
 
@@ -540,6 +656,8 @@ fn unread_chip(badge: UnreadBadge) -> Option<Span<'static>> {
 
 enum SideRow {
     Section(&'static str),
+    /// A section header whose listed tabs are syncing.
+    SyncingSection(&'static str),
     Loading,
     Tab(usize),
     Blank,
@@ -554,10 +672,16 @@ struct SidebarLayout {
 }
 
 fn sidebar_layout(app: &App, area: Rect) -> SidebarLayout {
+    // One more column on the left keeps the row marker off the focus outline.
     let inner = area.inner(Margin {
         horizontal: PANEL_PAD,
         vertical: PANEL_PAD,
     });
+    let inner = Rect {
+        x: inner.x + 1,
+        width: inner.width.saturating_sub(1),
+        ..inner
+    };
     let [brand, list, status] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
@@ -565,26 +689,32 @@ fn sidebar_layout(app: &App, area: Rect) -> SidebarLayout {
     ])
     .areas(inner);
 
-    let mut rows = vec![
+    let fixed = [
         SideRow::Tab(0),
         SideRow::Tab(1),
         SideRow::Tab(crate::app::ALL_SUBS_TAB),
+        SideRow::Tab(crate::app::SEARCH_TAB),
     ];
+    let fixed_active = fixed
+        .iter()
+        .position(|row| matches!(row, SideRow::Tab(index) if *index == app.active));
+    let mut rows = Vec::new();
     let (pinned, following, opened) = app.sidebar_tabs();
-    if !pinned.is_empty() || app.all_subs.loading {
+    // Placeholders stand in only before the first listing; a resync never adds rows.
+    let first_load = app.all_subs.loading && app.all_subs.freshness.is_none();
+    let section = |name, empty| match (app.all_subs.loading, empty) {
+        (false, _) => vec![SideRow::Section(name)],
+        (true, true) => vec![SideRow::Section(name), SideRow::Loading],
+        (true, false) => vec![SideRow::SyncingSection(name)],
+    };
+    if !pinned.is_empty() || first_load {
         rows.push(SideRow::Blank);
-        rows.push(SideRow::Section("SUBSCRIPTIONS"));
-        if app.all_subs.loading {
-            rows.push(SideRow::Loading);
-        }
+        rows.extend(section("SUBSCRIPTIONS", pinned.is_empty()));
         rows.extend(pinned.into_iter().map(SideRow::Tab));
     }
-    if !following.is_empty() || app.all_subs.loading {
+    if !following.is_empty() || first_load {
         rows.push(SideRow::Blank);
-        rows.push(SideRow::Section("FOLLOWING"));
-        if app.all_subs.loading {
-            rows.push(SideRow::Loading);
-        }
+        rows.extend(section("FOLLOWING", following.is_empty()));
         rows.extend(following.into_iter().map(SideRow::Tab));
     }
     if !opened.is_empty() {
@@ -593,23 +723,34 @@ fn sidebar_layout(app: &App, area: Rect) -> SidebarLayout {
         rows.extend(opened.into_iter().map(SideRow::Tab));
     }
 
-    // Window the list so the active tab stays visible, a little off the edge.
     let height = list.height as usize;
+    let fixed_height = fixed
+        .len()
+        .min(height.saturating_sub(usize::from(fixed_active.is_none())));
+    let fixed_start = fixed_active.map_or(0, |index| {
+        index.saturating_sub(fixed_height.saturating_sub(1))
+    });
+    let scroll_height = height.saturating_sub(fixed_height);
     let active_row = rows
         .iter()
         .position(|r| matches!(r, SideRow::Tab(i) if *i == app.active))
         .unwrap_or(0);
-    let start = if rows.len() <= height {
+    let start = if rows.len() <= scroll_height {
         0
     } else {
         active_row
-            .saturating_sub(height / 2)
-            .min(rows.len() - height)
+            .saturating_sub(scroll_height / 2)
+            .min(rows.len() - scroll_height)
     };
     let rows = if area.width == 0 {
         Vec::new()
     } else {
-        rows.into_iter().skip(start).take(height).collect()
+        fixed
+            .into_iter()
+            .skip(fixed_start)
+            .take(fixed_height)
+            .chain(rows.into_iter().skip(start).take(scroll_height))
+            .collect()
     };
     SidebarLayout {
         area,
@@ -641,12 +782,21 @@ fn draw_sidebar(f: &mut Frame, app: &App, layout: &SidebarLayout, spots: &mut Ve
                     Style::new().fg(OVERLAY),
                 ),
             ]),
-            Line::from(vec![
-                key_chip("F3"),
-                Span::styled(" search ", Style::new().fg(SUBTEXT)),
-                key_chip("SPC"),
-                Span::styled(" keys", Style::new().fg(SUBTEXT)),
-            ]),
+            Line::from(if app.search_editing() {
+                vec![
+                    key_chip("Esc"),
+                    Span::styled(" list keys ", Style::new().fg(SUBTEXT)),
+                    key_chip("F1"),
+                    Span::styled(" help", Style::new().fg(SUBTEXT)),
+                ]
+            } else {
+                vec![
+                    key_chip("F3"),
+                    Span::styled(" search ", Style::new().fg(SUBTEXT)),
+                    key_chip("SPC"),
+                    Span::styled(" keys", Style::new().fg(SUBTEXT)),
+                ]
+            }),
         ])
         .style(panel),
         brand,
@@ -658,6 +808,16 @@ fn draw_sidebar(f: &mut Frame, app: &App, layout: &SidebarLayout, spots: &mut Ve
         .enumerate()
         .map(|(k, row)| match row {
             SideRow::Blank => Line::raw(""),
+            SideRow::SyncingSection(name) => Line::from(vec![
+                Span::styled(
+                    format!("  {name} "),
+                    Style::new().fg(OVERLAY).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    loading::glyph(app.loading_frame).to_string(),
+                    loading::style(loading::Kind::Background),
+                ),
+            ]),
             SideRow::Section(name) => Line::styled(
                 format!("  {name}"),
                 Style::new().fg(OVERLAY).add_modifier(Modifier::BOLD),
@@ -686,11 +846,15 @@ fn draw_sidebar(f: &mut Frame, app: &App, layout: &SidebarLayout, spots: &mut Ve
     f.render_widget(Paragraph::new(lines).style(panel), list);
 
     let (dot, color, label) = match app.health {
-        Health::SignedOut => ("○", YELLOW, "connect: SPC p a"),
-        Health::Unknown => ("○", OVERLAY, "reddit"),
-        Health::Up => ("●", GREEN, "reddit"),
-        Health::Paused => ("◐", YELLOW, "reddit paused"),
-        Health::Down => ("✗", RED, "reddit down"),
+        Health::SignedOut => (
+            "○",
+            YELLOW,
+            format!("connect: {}", search::reading_key(app, "SPC p a")),
+        ),
+        Health::Unknown => ("○", OVERLAY, "reddit".into()),
+        Health::Up => ("●", GREEN, "reddit".into()),
+        Health::Paused => ("◐", YELLOW, "reddit paused".into()),
+        Health::Down => ("✗", RED, "reddit down".into()),
     };
     let img = if app.inline_images_on() {
         "img on"
@@ -699,7 +863,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, layout: &SidebarLayout, spots: &mut Ve
     };
     // " ✗ reddit down  ◧ img off" is the label plus 14 columns; narrower sidebars drop the state.
     let label = if width >= label.len() + 14 {
-        label
+        label.as_str()
     } else {
         "reddit"
     };
@@ -725,17 +889,19 @@ fn sidebar_item(app: &App, index: usize, width: usize) -> Line<'static> {
         TabKind::Home => ("⌂", "Home"),
         TabKind::AllSubs => ("▦", "All subs"),
         TabKind::Bookmarks => ("★", "Bookmarks"),
+        TabKind::Search => ("⌕", "Search"),
         TabKind::Subreddit { name, .. } => ("#", name.as_str()),
     };
     let badge = match tab.kind {
         TabKind::Bookmarks => UnreadBadge::Count(app.visible_bookmarks().count()),
         _ => app.badge(tab),
     };
-    // With focus in the sidebar, its row stands out more than the list's selection.
-    let base = match (active, app.focus == Focus::Sidebar) {
-        (true, true) => Style::new().bg(SURFACE1),
-        (true, false) => Style::new().bg(SURFACE0),
-        (false, _) => Style::new(),
+    let focused = app.focus == Focus::Sidebar;
+    // Without focus the active tab is a place, not a cursor: no row background or accent.
+    let base = if active && focused {
+        Style::new().bg(SURFACE1)
+    } else {
+        Style::new()
     };
     let number = if index < 9 {
         format!("{}", index + 1)
@@ -750,11 +916,22 @@ fn sidebar_item(app: &App, index: usize, width: usize) -> Line<'static> {
     };
     let mut spans = vec![
         Span::styled(
-            selection_marker(active, app.focus == Focus::Sidebar),
-            base.fg(ACCENT),
+            match (active, focused) {
+                (true, true) => "▌",
+                (true, false) => "●",
+                _ => " ",
+            },
+            base.fg(if focused { ACCENT } else { SUBTEXT }),
         ),
         Span::styled(number, base.fg(if active { TEXT } else { OVERLAY })),
-        Span::styled(slot, base.fg(if active { ACCENT } else { OVERLAY })),
+        Span::styled(
+            slot,
+            base.fg(match (active, focused) {
+                (true, true) => ACCENT,
+                (true, false) => TEXT,
+                _ => OVERLAY,
+            }),
+        ),
     ];
     let badge_text = match (badge, &tab.kind) {
         (UnreadBadge::Count(0) | UnreadBadge::Unavailable, _) => String::new(),
@@ -837,8 +1014,17 @@ fn sort_chip(sort: Sort) -> Span<'static> {
 }
 
 fn list_view_chip(app: &App) -> Span<'static> {
+    let key = if matches!(
+        crate::keys::map::context(app),
+        crate::keys::map::Context::List | crate::keys::map::Context::Sidebar
+    ) && app.help_scroll.is_none()
+    {
+        "zc "
+    } else {
+        ""
+    };
     chip(
-        format!("SPC v c {}", app.state.list_view().label()),
+        format!("{key}{}", app.state.list_view().label()),
         TEXT,
         SURFACE0,
     )
@@ -987,6 +1173,8 @@ fn media_label(media: &Media, tag: &str) -> String {
 struct ListSpec<'a> {
     posts: &'a [&'a Post],
     selected: usize,
+    /// The search preview lists posts without choosing one.
+    show_selection: bool,
     show_subreddit: bool,
     offset: usize,
     scroll: CardScroll,
@@ -1028,6 +1216,19 @@ fn fit_picture(
         bounds.height,
         f64::INFINITY,
     )
+}
+
+fn failed_video_without_picture(app: &App, post: &Post, still: Option<&str>) -> bool {
+    app.video_failed_without_frame(post)
+        && still.is_none_or(|url| {
+            post.media.video_url() == Some(url)
+                || (!matches!(
+                    app.card_images.get(url),
+                    Some(CardImageSlot::Ready { .. } | CardImageSlot::Cached { .. })
+                ) && !matches!(app.images.get(url), Some(ImageSlot::Ready { .. }))
+                    && (matches!(app.card_images.get(url), Some(CardImageSlot::Failed(_)))
+                        || matches!(app.images.get(url), Some(ImageSlot::Failed(_)))))
+        })
 }
 
 fn expanded_card(app: &App, post: &Post, width: usize, opts: &CardOpts, height: u16) -> PostCard {
@@ -1106,7 +1307,15 @@ fn expanded_card(app: &App, post: &Post, width: usize, opts: &CardOpts, height: 
             line.spans.splice(1..1, padding);
         }
     }
-    let preview = !post.spoiler
+    let failed_without_picture = failed_video_without_picture(app, post, image.as_deref());
+    if failed_without_picture {
+        lines.push(Line::from(vec![
+            marker.clone(),
+            Span::styled("▶ video unavailable · O opens media", bg.fg(OVERLAY)),
+        ]));
+    }
+    let preview = !failed_without_picture
+        && !post.spoiler
         && width >= 8
         && app.inline_images_on()
         && (image.is_some() || post.media.video_url().is_some());
@@ -1282,6 +1491,16 @@ fn shift_card_rows(
     (index, line.min(height(index)))
 }
 
+/// Row of card `target` when card `index` is drawn first with `line` rows hidden.
+fn card_row(index: usize, line: usize, target: usize, height: impl Fn(usize) -> usize) -> isize {
+    let rows = |cards: std::ops::Range<usize>| cards.map(|i| height(i) as isize + 1).sum::<isize>();
+    if target >= index {
+        rows(index..target) - line as isize
+    } else {
+        -rows(target..index) - line as isize
+    }
+}
+
 fn card_viewport_end(
     index: usize,
     line: usize,
@@ -1318,13 +1537,14 @@ fn draw_card_list(
         return None;
     }
     let width = area.width.saturating_sub(2) as usize;
+    let show_selection = spec.show_selection;
     let card_at = |i, selected| {
         expanded_card(
             app,
             spec.posts[i],
             width,
             &CardOpts {
-                selected: i == selected,
+                selected: show_selection && i == selected,
 
                 show_subreddit: spec.show_subreddit,
                 reserve: 0,
@@ -1335,65 +1555,103 @@ fn draw_card_list(
     let scroll = &mut spec.scroll;
     let offset = &mut spec.offset;
     let pending = std::mem::take(&mut scroll.pending);
-    let anchor = scroll
+    let mut anchor = scroll
         .post
         .as_ref()
         .and_then(|id| spec.posts.iter().position(|post| &post.id == id));
-    if let Some(index) = anchor {
-        *offset = index;
-    } else {
-        scroll.line = 0;
-        *offset = (*offset).min(spec.selected);
-        if card_at(spec.selected, spec.selected).height() > usize::from(area.height) {
-            *offset = spec.selected;
-        }
-        let mut used = 0;
-        for i in (*offset..=spec.selected).rev() {
-            used += card_at(i, spec.selected).height() + 1;
-            if used > usize::from(area.height) {
-                *offset = (i + 1).min(spec.selected);
-                break;
+    let height = |i| card_at(i, spec.selected).height();
+    let (first_visible, last_visible) = loop {
+        if let Some(index) = anchor {
+            *offset = index;
+        } else {
+            scroll.line = 0;
+            *offset = (*offset).min(spec.selected);
+            if height(spec.selected) > usize::from(area.height) {
+                *offset = spec.selected;
+            }
+            let mut used = 0;
+            for i in (*offset..=spec.selected).rev() {
+                used += height(i) + 1;
+                if used > usize::from(area.height) {
+                    *offset = (i + 1).min(spec.selected);
+                    break;
+                }
             }
         }
-    }
-    scroll.viewport = area.height as usize;
-    let height = |i| card_at(i, spec.selected).height();
-    let anchor_height = height(*offset);
-    scroll.line = scroll.line.min(if scroll.height != anchor_height {
-        anchor_height.saturating_sub(1)
-    } else {
-        anchor_height
-    });
-    (*offset, scroll.line) =
-        shift_card_rows(*offset, scroll.line, pending, spec.posts.len(), height);
-    let (available, _) = card_viewport_end(
-        *offset,
-        scroll.line,
-        scroll.viewport,
-        spec.posts.len(),
-        height,
-    );
-    if available < scroll.viewport {
-        let last = spec.posts.len() - 1;
-        (*offset, scroll.line) = shift_card_rows(
-            last,
-            height(last),
-            -(scroll.viewport as isize),
+        scroll.viewport = area.height as usize;
+        let anchor_height = height(*offset);
+        scroll.line = scroll.line.min(if scroll.height != anchor_height {
+            anchor_height.saturating_sub(1)
+        } else {
+            anchor_height
+        });
+        let mut delta = pending;
+        if pending == 0
+            && spec.selected.abs_diff(*offset) <= scroll.viewport
+            && let Some((id, row, fitted)) = &scroll.selected
+            && (0..scroll.viewport as isize).contains(row)
+            && spec.posts[spec.selected].id == *id
+        {
+            // A card that fitted and no longer fits below its row moves up until it does.
+            let fits = scroll.viewport as isize - height(spec.selected) as isize;
+            let target = if *fitted {
+                (*row).min(fits.max(0))
+            } else {
+                *row
+            };
+            delta = card_row(*offset, scroll.line, spec.selected, height) - target;
+        }
+        (*offset, scroll.line) =
+            shift_card_rows(*offset, scroll.line, delta, spec.posts.len(), height);
+        let (available, _) = card_viewport_end(
+            *offset,
+            scroll.line,
+            scroll.viewport,
             spec.posts.len(),
             height,
         );
-    }
-    let (_, last_visible) = card_viewport_end(
-        *offset,
-        scroll.line,
-        scroll.viewport,
-        spec.posts.len(),
-        height,
-    );
-    let first_visible = (*offset + usize::from(scroll.line == height(*offset))).min(last_visible);
+        if available < scroll.viewport {
+            let last = spec.posts.len() - 1;
+            (*offset, scroll.line) = shift_card_rows(
+                last,
+                height(last),
+                -(scroll.viewport as isize),
+                spec.posts.len(),
+                height,
+            );
+        }
+        let (_, last_visible) = card_viewport_end(
+            *offset,
+            scroll.line,
+            scroll.viewport,
+            spec.posts.len(),
+            height,
+        );
+        let first_visible =
+            (*offset + usize::from(scroll.line == height(*offset))).min(last_visible);
+        // Only scrolling moves the selection; data, picture and size changes move the view
+        // to the selected post instead.
+        if anchor.is_some()
+            && pending == 0
+            && !(first_visible..=last_visible).contains(&spec.selected)
+        {
+            anchor = None;
+            continue;
+        }
+        break (first_visible, last_visible);
+    };
     spec.selected = spec.selected.clamp(first_visible, last_visible);
     scroll.height = card_at(*offset, spec.selected).height();
     scroll.post = Some(spec.posts[*offset].id.clone());
+    let selected_height = card_at(spec.selected, spec.selected).height() as isize;
+    let row = card_row(*offset, scroll.line, spec.selected, |i| {
+        card_at(i, spec.selected).height()
+    });
+    scroll.selected = Some((
+        spec.posts[spec.selected].id.clone(),
+        row,
+        row >= 0 && row + selected_height <= scroll.viewport as isize,
+    ));
     let mut y = area.y;
     let mut shown = 0;
     for i in *offset..spec.posts.len() {
@@ -1449,9 +1707,10 @@ fn draw_card_list(
                         }
                         _ => None,
                     },
-                    selected: i == spec.selected,
+                    selected: spec.show_selection && i == spec.selected,
                     detail: false,
                     post_id: Some(spec.posts[i].id.clone()),
+                    video_url: spec.posts[i].media.video_url().map(str::to_string),
                     video_frame: false,
                 });
             }
@@ -1487,7 +1746,7 @@ fn draw_card_list(
     } else {
         draw_scrollbar(f, area, *offset, shown, spec.posts.len());
     }
-    (pending != 0).then_some(last_visible)
+    Some(last_visible)
 }
 
 fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture], covered: Option<Rect>) {
@@ -1498,6 +1757,19 @@ fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture], cover
             .find(|spot| spot.selected)
             .map(|spot| spot.size),
     );
+    let mut spots = spots.to_vec();
+    let mut loading_rows = Vec::new();
+    if let Some(label) = app.video_loading() {
+        for spot in spots.iter_mut().filter(|spot| {
+            spot.selected && (spot.detail || app.post_view.is_none()) && !spot.area.is_empty()
+        }) {
+            loading_rows.push((
+                Rect::new(spot.area.x, spot.area.bottom() - 1, spot.area.width, 1),
+                label,
+            ));
+            spot.area.height -= 1;
+        }
+    }
     let urls: Vec<&str> = spots
         .iter()
         .filter_map(|spot| {
@@ -1508,15 +1780,26 @@ fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture], cover
         .collect();
     app.card_pictures_drawn(&urls);
     app.card_renderer.begin();
-    for spot in spots {
-        if spot.selected
-            && let Some((
-                video::Frame {
-                    pixels: video::Pixels::Raw(image),
-                    ..
-                },
-                playing,
-            )) = app.video_preview(!spot.detail)
+    for spot in &spots {
+        if spot.area.is_empty() {
+            continue;
+        }
+        let preview = if spot.selected {
+            app.video_preview(!spot.detail)
+        } else {
+            spot.post_id
+                .as_deref()
+                .zip(spot.video_url.as_deref())
+                .and_then(|(post, source)| app.inactive_card_frame(post, source))
+                .map(|frame| (frame, false))
+        };
+        if let Some((
+            video::Frame {
+                pixels: video::Pixels::Raw(image),
+                ..
+            },
+            playing,
+        )) = preview
         {
             let image = image.clone();
             let mut spot = spot.clone();
@@ -1562,18 +1845,11 @@ fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture], cover
                 .selected_video()
                 .is_some_and(|player| player.error().is_some())
             {
-                spot.status("unavailable · SPC o m opens media")
-            } else if app.config.media.video_autoplay || app.selected_video().is_some() {
-                draw_visible_loading(
-                    f,
-                    spot.area,
-                    covered,
-                    &spot.status("loading video…"),
-                    app.loading_frame,
-                );
+                spot.status("unavailable · O opens media")
+            } else if app.video_loading().is_some() {
                 continue;
             } else {
-                spot.status("SPC m p play/pause")
+                spot.status("p play/pause")
             };
             draw_visible_status(f, spot.area, covered, &label);
             continue;
@@ -1617,6 +1893,12 @@ fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture], cover
                         phase: app.loading_frame,
                     },
                 ) {
+                    draw_visible_status(
+                        f,
+                        spot.area,
+                        covered,
+                        &spot.status(&format!("image unavailable: {error}")),
+                    );
                     *slot = CardImageSlot::Failed(error);
                 }
             }
@@ -1636,6 +1918,9 @@ fn draw_card_pictures(f: &mut Frame, app: &mut App, spots: &[CardPicture], cover
         }
     }
     app.card_renderer.finish();
+    for (area, label) in loading_rows {
+        draw_visible_loading(f, area, covered, label, app.loading_frame);
+    }
 }
 
 struct CardRender<'a> {
@@ -1843,7 +2128,7 @@ fn draw_picture_status(f: &mut Frame, area: Rect, label: &str) {
     );
 }
 
-fn draw_pagination_error(f: &mut Frame, mut area: Rect, label: &'static str) {
+fn draw_pagination_error(f: &mut Frame, mut area: Rect, label: &str) {
     if area.is_empty() {
         return;
     }
@@ -1863,7 +2148,7 @@ fn draw_pagination_error(f: &mut Frame, mut area: Rect, label: &'static str) {
     centered(
         f,
         inner,
-        vec![Line::styled(label, Style::new().fg(RED).bold())],
+        vec![Line::styled(label.to_string(), Style::new().fg(RED).bold())],
     );
 }
 
@@ -1881,17 +2166,22 @@ fn draw_post_list(
     spec.scroll.viewport = area.height as usize;
     const ITEM: usize = 3;
     let offset = &mut spec.offset;
-    let fits = (area.height as usize / ITEM).max(1);
+    let fits = ((area.height as usize + 1) / ITEM).max(1);
     if spec.selected < *offset {
         *offset = spec.selected;
     } else if spec.selected >= *offset + fits {
         *offset = spec.selected + 1 - fits;
     }
+    let shown = spec
+        .posts
+        .len()
+        .saturating_sub(*offset)
+        .min((area.height as usize).div_ceil(ITEM));
     let width = area.width.saturating_sub(2) as usize;
     let reserve = thumb_reserve(app, spec.posts.iter().copied());
     let mut lines = Vec::new();
     let mut tail_y = None;
-    for (i, post) in spec.posts.iter().enumerate().skip(*offset).take(fits) {
+    for (i, post) in spec.posts.iter().enumerate().skip(*offset).take(shown) {
         let y = area.y + lines.len() as u16;
         if let Some(url) = row_thumb(app, post)
             && y + THUMB_ROWS <= area.bottom()
@@ -1907,7 +2197,7 @@ fn draw_post_list(
             });
         }
         let opts = CardOpts {
-            selected: i == spec.selected,
+            selected: spec.show_selection && i == spec.selected,
 
             show_subreddit: spec.show_subreddit,
             reserve,
@@ -1925,8 +2215,8 @@ fn draw_post_list(
         let tail_area = Rect::new(area.x, y, area.width.saturating_sub(2), area.bottom() - y);
         spec.append_area = Some(tail_area);
     }
-    draw_scrollbar(f, area, *offset, fits, spec.posts.len());
-    None
+    draw_scrollbar(f, area, *offset, shown, spec.posts.len());
+    (shown > 0).then(|| *offset + shown - 1)
 }
 
 fn draw_scrollbar(f: &mut Frame, area: Rect, offset: usize, visible: usize, total: usize) {
@@ -1957,8 +2247,18 @@ fn draw_scrollbar(f: &mut Frame, area: Rect, offset: usize, visible: usize, tota
 
 // ----- home wall -----------------------------------------------------------
 
-fn card_height(app: &App, group: &Group) -> u16 {
-    let shown = app.group_posts(group).count().max(1) as u16;
+fn new_posts_chip(app: &App) -> Span<'static> {
+    let label = if app.post_focused() {
+        "New posts".to_string()
+    } else {
+        format!("New posts · {} refresh", search::reading_key(app, "r"))
+    };
+    chip(label, ACCENT, SURFACE0)
+}
+
+/// Every island reserves room for all the posts it may show, so loading never moves the grid.
+fn card_height(app: &App) -> u16 {
+    let shown = app.config.all_subs_posts_per_group.max(1) as u16;
     // borders + top/bottom padding + 2 lines per post + a gap between posts
     2 + 2 + shown * 2 + shown.saturating_sub(1)
 }
@@ -1973,7 +2273,7 @@ fn draw_all_subs(
     sidebar_icons: &[String],
 ) -> Option<Rect> {
     if app.all_subs.groups.is_empty() {
-        app.groups_drawn(&[], sidebar_icons);
+        app.groups_drawn(&[], sidebar_icons, &[]);
     }
     let total_new: usize = app
         .all_subs
@@ -2006,6 +2306,9 @@ fn draw_all_subs(
         SUBTEXT,
         SURFACE0,
     )];
+    if app.all_subs.has_new_posts(&app.config) {
+        chips.insert(0, new_posts_chip(app));
+    }
     if total_new > 0 {
         chips.push(chip(format!("● {total_new} unread"), CRUST, ACCENT));
     }
@@ -2034,7 +2337,11 @@ fn draw_all_subs(
             0..0,
             [
                 chip("✗ subs failed", RED, SURFACE0),
-                chip("r retry", RED, SURFACE0),
+                chip(
+                    format!("{} retry", search::list_reading_key(app, "r")),
+                    RED,
+                    SURFACE0,
+                ),
             ],
         );
     }
@@ -2065,7 +2372,10 @@ fn draw_all_subs(
         let (title, hint) = if let Some(error) = &app.all_subs.error {
             (
                 "Could not load subscriptions",
-                format!("{error} — press r to retry"),
+                format!(
+                    "{error} — press {} to retry",
+                    search::list_reading_key(app, "r")
+                ),
             )
         } else if app.all_subs.loading {
             return loading::draw(
@@ -2078,44 +2388,38 @@ fn draw_all_subs(
         } else {
             (
                 "No joined communities",
-                "join communities on Reddit, then press r; SPC b b opens any subreddit".to_string(),
+                format!(
+                    "join communities on Reddit, then press {}; SPC b b opens any subreddit",
+                    search::list_reading_key(app, "r")
+                ),
             )
         };
         empty_state(f, body, "▦", title, &hint);
         return None;
     }
     let cols = (body.width / CARD_MIN_WIDTH).clamp(1, 3) as usize;
-    let heights: Vec<u16> = app
-        .all_subs
-        .groups
-        .chunks(cols)
-        .map(|row| {
-            let card = row
-                .iter()
-                .map(|group| card_height(app, group))
-                .max()
-                .unwrap_or(4);
-            card + CARD_ROW_GAP
-        })
-        .collect();
+    let row_height = card_height(app) + CARD_ROW_GAP;
+    let rows = app.all_subs.groups.len().div_ceil(cols);
     let selected_row = app.all_subs.group / cols;
-    let mut offset = app.all_subs.offset.min(selected_row);
-    // The gap after the last visible row may fall outside the body.
-    let fits = |rows: &[u16]| rows.iter().sum::<u16>() - CARD_ROW_GAP <= body.height;
-    while !fits(&heights[offset..=selected_row]) && offset < selected_row {
-        offset += 1;
-    }
+    let selected = &app.all_subs.groups[app.all_subs.group].subreddit;
+    let offset = match &app.all_subs.drawn {
+        Some((name, above)) if name == selected => selected_row.saturating_sub(*above),
+        _ => app.all_subs.offset.min(selected_row),
+    };
+    let visible_rows =
+        ((usize::from(body.height) + usize::from(CARD_ROW_GAP)) / usize::from(row_height)).max(1);
+    let offset = offset.max((selected_row + 1).saturating_sub(visible_rows));
     app.all_subs.offset = offset;
+    app.all_subs.drawn = Some((selected.clone(), selected_row - offset));
 
     let bottom = body.y + body.height;
     let mut y = body.y;
     let mut shown = 0;
     let mut visible = Vec::new();
-    for (row_index, &h) in heights.iter().enumerate().skip(offset) {
+    for row_index in offset..rows {
         let entries = (app.all_subs.groups.len() - row_index * cols).min(cols);
-        let card = h - CARD_ROW_GAP;
-        // Later rows only when whole; the first row always shows, clipped in a short pane.
-        if y >= bottom || (row_index > offset && y + card > bottom) {
+        let card = row_height - CARD_ROW_GAP;
+        if y >= bottom {
             break;
         }
         let row_area = Rect {
@@ -2131,25 +2435,23 @@ fn draw_all_subs(
         for (column, cell) in cells.iter().take(entries).enumerate() {
             visible.push((row_index * cols + column, *cell));
         }
-        y += h;
+        y = y.saturating_add(row_height);
         shown += 1;
     }
+    let lookahead = visible.last().map_or_else(Vec::new, |(index, _)| {
+        let start = (index / cols + 1) * cols;
+        (start..(start + cols).min(app.all_subs.groups.len())).collect::<Vec<_>>()
+    });
     app.groups_drawn(
         &visible.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
         sidebar_icons,
+        &lookahead,
     );
     for (index, cell) in visible {
         draw_group_card(f, app, index, cell, spots);
     }
-    draw_scrollbar(f, body, offset, shown.max(1), heights.len());
+    draw_scrollbar(f, body, offset, shown.max(1), rows);
     None
-}
-
-fn access_title(access: AccessDenied) -> &'static str {
-    match access {
-        AccessDenied::PrivateCommunity => "Private community",
-        AccessDenied::Forbidden => "Access restricted",
-    }
 }
 
 fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &mut Vec<ImageSpot>) {
@@ -2228,9 +2530,9 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
             top: PANEL_PAD,
             bottom: PANEL_PAD,
         });
-    if access.is_some() {
+    if access.is_some() && focused {
         block = block.title_bottom(Line::styled(" o Reddit ", Style::new().fg(YELLOW)));
-    } else if group.error.is_some() {
+    } else if group.error.is_some() && focused {
         block = block.title_bottom(Line::styled(" ✗ r retry ", Style::new().fg(RED)));
     }
     let inner = block.inner(area);
@@ -2239,26 +2541,15 @@ fn draw_group_card(f: &mut Frame, app: &App, index: usize, area: Rect, spots: &m
     let posts: Vec<_> = app.group_posts(group).collect();
     // (line in the card, URL) for each post row with a thumbnail.
     let mut thumbs: Vec<(u16, std::borrow::Cow<'_, str>)> = Vec::new();
-    let lines: Vec<Line> = if let Some(access) = access {
+    let lines: Vec<Line> = if access.is_some() {
         let title = if width < 24 {
-            if access == AccessDenied::PrivateCommunity {
-                "Private"
-            } else {
-                "Restricted"
-            }
+            "Private"
         } else {
-            access_title(access)
+            "Private community"
         };
         vec![
             Line::styled(format!(" 🔒 {title}"), Style::new().fg(YELLOW)),
-            Line::styled(
-                if access == AccessDenied::PrivateCommunity {
-                    " Approved members only"
-                } else {
-                    " Check access on Reddit"
-                },
-                Style::new().fg(OVERLAY),
-            ),
+            Line::styled(" Approved members only", Style::new().fg(OVERLAY)),
         ]
     } else if group.posts.is_empty()
         && (group.loading || (group.freshness.is_none() && group.error.is_none()))
@@ -2370,7 +2661,8 @@ fn membership_chip(app: &App, target: &crate::model::MembershipTarget) -> Span<'
         status.into()
     } else {
         format!(
-            "{status} · SPC a m {}",
+            "{status} · {} {}",
+            search::list_reading_key(app, "SPC m"),
             membership.map_or_else(
                 || "check".into(),
                 |joined| target.action(!joined).to_ascii_lowercase()
@@ -2378,6 +2670,93 @@ fn membership_chip(app: &App, target: &crate::model::MembershipTarget) -> Span<'
         )
     };
     chip(label, color, SURFACE0)
+}
+
+/// A user feed's profile block: the karma line and up to two description lines.
+const USER_PROFILE_ROWS: usize = 3;
+
+/// A user's profile page summary above their posts: the avatar beside the karma line,
+/// then the description, wrapped to at most a third of the pane.
+fn draw_profile(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    profile: &crate::model::UserProfile,
+    pictures: &mut ListPictures,
+    fixed: Option<usize>,
+) -> Rect {
+    const TEXT_START: usize = ICON_COLS as usize + 3;
+    let text_width = usize::from(area.width).saturating_sub(TEXT_START).max(1);
+    let limit = usize::from(area.height / 3).min(fixed.unwrap_or(usize::MAX));
+    let mut wrapped: Vec<String> = profile
+        .lines
+        .iter()
+        .flat_map(|line| {
+            textwrap::wrap(
+                line,
+                textwrap::Options::new(text_width)
+                    .word_splitter(textwrap::WordSplitter::NoHyphenation),
+            )
+            .into_iter()
+            .map(|line| line.into_owned())
+            .collect::<Vec<_>>()
+        })
+        .collect();
+    if wrapped.is_empty() || limit == 0 {
+        return area;
+    }
+    if wrapped.len() > limit {
+        wrapped.truncate(limit);
+        if let Some(last) = wrapped.last_mut() {
+            *last = truncate(&format!("{last}…"), text_width);
+        }
+    }
+    let lines: Vec<Line> = wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| {
+            Line::from(vec![
+                Span::styled(
+                    if index == 0 {
+                        format!("  {:width$} ", "@", width = usize::from(ICON_COLS))
+                    } else {
+                        " ".repeat(TEXT_START)
+                    },
+                    Style::new().fg(OVERLAY),
+                ),
+                Span::styled(
+                    text,
+                    if index == 0 {
+                        Style::new().fg(TEXT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::new().fg(SUBTEXT)
+                    },
+                ),
+            ])
+        })
+        .collect();
+    let height = fixed.map_or(lines.len(), |_| limit) as u16;
+    let [head, _, rest] = Layout::vertical([
+        Constraint::Length(height),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    if app.thumbnails_on()
+        && let Some(url) = app.usable_thumb(profile.icon.as_deref())
+    {
+        pictures.thumbs.push(ImageSpot {
+            url: url.to_string(),
+            area: Rect {
+                x: head.x + 2,
+                y: head.y,
+                width: ICON_COLS,
+                height: 1,
+            },
+        });
+    }
+    f.render_widget(Paragraph::new(lines), head);
+    rest
 }
 
 fn draw_feed(
@@ -2394,13 +2773,27 @@ fn draw_feed(
     let feed = &tab.feed;
     let access = tab.subreddit().and_then(|_| feed.access_denied());
     let mut chips = vec![list_view_chip(app)];
-    if access.is_none()
-        && let Some(summary) = feed.update_summary(&app.config)
-    {
-        chips.insert(0, chip(format!("{summary} · r refresh"), ACCENT, SURFACE0));
+    if access.is_none() && feed.has_new_posts(&app.config) {
+        chips.insert(0, new_posts_chip(app));
     }
+    let search_tab = matches!(tab.kind, TabKind::Search);
+    let retry = search::list_reading_key(app, "r");
     match &feed.search {
-        Some(q) => chips.push(chip(format!("🔍 {q}"), SKY, SURFACE0)),
+        Some(q) => {
+            if !search_tab {
+                chips.push(chip(format!("🔍 {q}"), SKY, SURFACE0));
+            }
+            chips.push(chip(
+                format!("⇅ {}", feed.search_sort.as_str()),
+                SUBTEXT,
+                SURFACE0,
+            ));
+            chips.push(chip(
+                format!("◷ {}", feed.search_time.as_str()),
+                SUBTEXT,
+                SURFACE0,
+            ));
+        }
         None => {
             chips.push(sort_chip(feed.sort));
             if feed.sort.takes_time() {
@@ -2436,18 +2829,21 @@ fn draw_feed(
             SURFACE0,
         ));
     }
-    if let Some(access) = access {
-        chips.insert(0, chip(access_title(access), YELLOW, SURFACE0));
+    if access.is_some() {
+        chips.insert(0, chip("Private community", YELLOW, SURFACE0));
     }
     if access.is_none() && feed.error().is_some() && !feed.posts.is_empty() {
-        let (label, retry) = if feed.page_failed() {
-            ("✗ next page failed", "r retry")
+        let label = if feed.page_failed() {
+            "✗ next page failed"
         } else {
-            ("✗ reload failed", "r retry")
+            "✗ reload failed"
         };
         chips.splice(
             0..0,
-            [chip(label, RED, SURFACE0), chip(retry, RED, SURFACE0)],
+            [
+                chip(label, RED, SURFACE0),
+                chip(format!("{retry} retry"), RED, SURFACE0),
+            ],
         );
     }
     if let Some(freshness) = feed.freshness.filter(|_| access.is_none()) {
@@ -2470,36 +2866,61 @@ fn draw_feed(
     let current = feed.shows_current_query();
     let offset = feed.offset;
     let scroll = feed.cards.clone();
-    let body = view_header(f, area, &title, chips);
+    let mut body = if search_tab {
+        search::feed_header(f, app, area, chips)
+    } else {
+        view_header(f, area, &title, chips)
+    };
+    // A fixed block, loading or not, keeps the list still when the profile arrives.
+    if let TabKind::User { name, .. } = &tab.kind {
+        let status;
+        let profile = match app.user_profile(name) {
+            Some(profile) => profile,
+            None => {
+                status = crate::model::UserProfile::new(
+                    None,
+                    &if app.profile_failed(name) {
+                        format!("Profile unavailable — press {retry} to retry")
+                    } else {
+                        "Loading profile…".into()
+                    },
+                );
+                &status
+            }
+        };
+        body = draw_profile(f, app, body, profile, pictures, Some(USER_PROFILE_ROWS));
+    }
     if app.reddit.needs_sign_in() && posts.is_empty() {
         empty_state(
             f,
             body,
             "○",
             "Connect Reddit",
-            "Press SPC p a to connect your account",
+            &format!(
+                "Press {} to connect your account",
+                search::reading_key(app, "SPC p a")
+            ),
         );
         return None;
     }
-    if let Some(access) = access {
+    if access.is_some() {
         let compact = body.width < 36 || body.height < 8;
-        let guidance = if compact && access == AccessDenied::PrivateCommunity {
-            "Approved members only · SPC o r Reddit"
-        } else if compact {
-            "Check access · SPC o r Reddit"
-        } else if access == AccessDenied::PrivateCommunity {
-            "Only approved members can view this community. Press SPC o r to open Reddit and check access."
+        let open = search::list_reading_key(app, "o");
+        let guidance = if compact {
+            format!("Approved members only · {open} Reddit")
         } else {
-            "Reddit denied access to this community. Press SPC o r to open Reddit and check access or sign in."
+            format!(
+                "Only approved members can view this community. Press {open} to open Reddit and check access."
+            )
         };
-        empty_state(f, body, "🔒", access_title(access), guidance);
+        empty_state(f, body, "🔒", "Private community", &guidance);
         return None;
     }
     if let Some(e) = error.filter(|_| posts.is_empty()) {
-        let (title, retry) = if feed.page_failed() {
-            ("Could not load more posts", "r")
+        let title = if feed.page_failed() {
+            "Could not load more posts"
         } else {
-            ("Could not load posts", "r")
+            "Could not load posts"
         };
         empty_state(
             f,
@@ -2528,44 +2949,60 @@ fn draw_feed(
                 "Every loaded post is hidden",
                 "F2 Settings: check Show NSFW and hidden keywords, flairs or authors",
             );
+        } else if search_tab {
+            empty_content_state(
+                f,
+                body,
+                "No results",
+                &search::empty_hint(app),
+                app.config.show_nsfw,
+            );
         } else if feed.search.is_some() {
+            let edit = search::list_reading_key(app, "/");
+            let clear = search::list_reading_key(app, "Esc");
+            let action = format!("{edit} edits the search, {clear} clears it");
             let hint = if app.config.show_nsfw {
-                "/ edits the search, Esc clears it".to_string()
+                action
             } else {
-                format!("{NSFW_EMPTY_HINT} / edits the search, Esc clears it.")
+                format!("{NSFW_EMPTY_HINT} {action}.")
             };
             empty_content_state(f, body, "No results", &hint, app.config.show_nsfw);
         } else if !app.config.show_nsfw {
             empty_content_state(f, body, "No visible posts", NSFW_EMPTY_HINT, false);
         } else {
+            let sort = search::list_reading_key(app, "SPC f s");
+            let source = search::list_reading_key(app, "SPC o c");
             empty_state(
                 f,
                 body,
                 "∅",
                 "No posts here",
-                if matches!(tab.kind, TabKind::User { .. }) {
-                    "SPC f s sorts · SPC o c opens this profile"
+                &if matches!(tab.kind, TabKind::User { .. }) {
+                    format!("{sort} sorts · {source} opens this profile")
                 } else {
-                    "SPC f s changes sort; SPC b b opens a subreddit"
+                    format!("{sort} changes sort; SPC b b opens a subreddit")
                 },
             );
         }
         return None;
     }
-    let show_subreddit = matches!(tab.kind, TabKind::Home | TabKind::User { .. })
-        || matches!(community, Some("all" | "popular"));
+    let show_subreddit = matches!(
+        tab.kind,
+        TabKind::Home | TabKind::User { .. } | TabKind::Search
+    ) || matches!(community, Some("all" | "popular"));
     let mut spec = ListSpec {
         posts: &posts,
         selected,
+        show_selection: true,
         show_subreddit,
         offset,
         scroll,
         append_area: None,
     };
-    let scrolled_end = draw_post_list(f, app, body, &mut spec, pictures);
+    let last_visible = draw_post_list(f, app, body, &mut spec, pictures);
     let (selected, offset, scroll, append_area) =
         (spec.selected, spec.offset, spec.scroll, spec.append_area);
-    app.set_list_viewport(selected, offset, scroll, scrolled_end);
+    app.set_list_viewport(selected, offset, scroll, last_visible);
     let append_area = append_area?;
     let feed = &app.active_tab().feed;
     if feed.loading_more() || feed.receiving() {
@@ -2576,30 +3013,27 @@ fn draw_feed(
             waiting.as_deref().unwrap_or("Loading posts"),
             app.loading_frame,
         )
-    } else {
-        let label = if feed.page_failed() {
-            Some("✗ Next page failed · r retries")
+    } else if feed.page_failed() {
+        draw_pagination_error(
+            f,
+            append_area,
+            &format!("✗ Next page failed · {retry} retries"),
+        );
+        None
+    } else if let Some((label, _)) = feed_activity(feed, !app.reddit.needs_sign_in()) {
+        let kind = if !feed.shows_current_query() {
+            loading::Kind::Initial
         } else {
-            feed_activity(feed, !app.reddit.needs_sign_in()).map(|(label, _)| label)
+            loading::Kind::Background
         };
-        if let Some(label) = label {
-            if feed.page_failed() {
-                draw_pagination_error(f, append_area, label);
-            } else {
-                let kind = if !feed.shows_current_query() {
-                    loading::Kind::Initial
-                } else {
-                    loading::Kind::Background
-                };
-                return loading::draw(
-                    f,
-                    append_area,
-                    kind,
-                    waiting.as_deref().unwrap_or(label),
-                    app.loading_frame,
-                );
-            }
-        }
+        loading::draw(
+            f,
+            append_area,
+            kind,
+            waiting.as_deref().unwrap_or(label),
+            app.loading_frame,
+        )
+    } else {
         None
     }
 }
@@ -2612,7 +3046,11 @@ fn draw_bookmarks(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListP
         "★ Bookmarks",
         vec![
             list_view_chip(app),
-            chip(format!("{count} saved"), SUBTEXT, SURFACE0),
+            chip(
+                format!("{count} bookmark{}", if count == 1 { "" } else { "s" }),
+                SUBTEXT,
+                SURFACE0,
+            ),
         ],
     );
     let posts: Vec<&Post> = app.visible_bookmarks().map(|b| &b.post).collect();
@@ -2629,7 +3067,7 @@ fn draw_bookmarks(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListP
             if count == 0 && !app.state.bookmarks().is_empty() {
                 NSFW_EMPTY_HINT
             } else {
-                "press SPC a b on any post to keep it here"
+                "press b on any post to keep it here"
             },
         );
         return;
@@ -2638,15 +3076,15 @@ fn draw_bookmarks(f: &mut Frame, app: &mut App, area: Rect, pictures: &mut ListP
     let mut spec = ListSpec {
         posts: &posts,
         selected,
-
+        show_selection: true,
         show_subreddit: true,
         offset: app.active_tab().feed.offset,
         scroll: app.active_tab().feed.cards.clone(),
         append_area: None,
     };
-    let scrolled_end = draw_post_list(f, app, body, &mut spec, pictures);
+    let last_visible = draw_post_list(f, app, body, &mut spec, pictures);
     let (selected, offset, scroll) = (spec.selected, spec.offset, spec.scroll);
-    app.set_list_viewport(selected, offset, scroll, scrolled_end);
+    app.set_list_viewport(selected, offset, scroll, last_visible);
 }
 
 // ----- post view -----------------------------------------------------------
@@ -2724,6 +3162,7 @@ const TEXT_PICTURES_KEPT: usize = 24;
 /// What the post document needs to lay out pictures in its text: the loaded images (none
 /// when images are off), and the most rows one may take, so it fits the text area whole.
 struct DocumentContext<'a> {
+    focused: bool,
     phase: usize,
     images: Option<&'a HashMap<String, ImageSlot>>,
     font: ratatui_image::FontSize,
@@ -2732,6 +3171,7 @@ struct DocumentContext<'a> {
 
 /// A picture in the post document: its URL, first line, the columns before it and its
 /// cells once it loaded.
+#[derive(Clone, Debug)]
 struct DocPicture {
     url: String,
     line: usize,
@@ -2859,6 +3299,10 @@ fn thread_prefix(depth: usize, visible: usize) -> Vec<Span<'static>> {
 }
 
 fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures) -> Option<Rect> {
+    let controls = crate::keys::map::context(app) == crate::keys::map::Context::Post
+        && app.help_scroll.is_none();
+    let gallery_controls =
+        controls && crate::keys::map::available(app, crate::keys::map::Action::NextImage);
     let view = app.post_view.as_ref()?;
     let post = view.shown_post();
     let now = Utc::now();
@@ -2937,9 +3381,14 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
         Media::Gallery { images, .. } if !images.is_empty() => {
             stats.push(Span::styled(
                 format!(
-                    "   image {}/{} · [i ]i browse",
+                    "   image {}/{}{}",
                     view.gallery_index % images.len() + 1,
-                    images.len()
+                    images.len(),
+                    if gallery_controls {
+                        " · [i ]i browse"
+                    } else {
+                        ""
+                    }
                 ),
                 Style::new().fg(TEAL),
             ));
@@ -2955,7 +3404,9 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
             if let Some(tag) = m.tag() {
                 stats.push(Span::raw("   "));
                 stats.push(chip(media_label(m, &tag), TEAL, SURFACE1));
-                stats.push(Span::styled("  SPC o m opens", Style::new().fg(OVERLAY)));
+                if controls {
+                    stats.push(Span::styled("  O opens", Style::new().fg(OVERLAY)));
+                }
             }
         }
     }
@@ -2967,12 +3418,8 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
         Paragraph::new(header).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(if app.post_focused() {
-                    BorderType::Double
-                } else {
-                    BorderType::Rounded
-                })
-                .border_style(Style::new().fg(if app.post_focused() { ACCENT } else { SURFACE1 }))
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(SURFACE1))
                 .padding(Padding::horizontal(PANEL_PAD))
                 .title_bottom(Line::styled(
                     view.freshness
@@ -3036,18 +3483,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
                 .flatten()
         })
         .or_else(|| video.then_some((16, 9)));
-    let failed_without_picture = video
-        && still_url.is_none_or(|url| app.video_uses_playback(url))
-        && app.video_preview(false).is_none()
-        && app.selected_video().is_some_and(|player| {
-            player.error().is_some()
-                && post
-                    .media
-                    .video_url()
-                    .and_then(|url| app.playback_url(url))
-                    .as_deref()
-                    == Some(player.url.as_str())
-        });
+    let failed_without_picture = video && failed_video_without_picture(app, post, still_url);
     let main_size = main_pixels
         .filter(|_| !failed_without_picture)
         .map(|pixels| {
@@ -3059,6 +3495,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
             )
         });
     let video_id = video.then(|| post.id.clone());
+    let video_url = post.media.video_url().map(str::to_string);
     let main_url = still_url.map(str::to_string).or_else(|| video_id.clone());
     let main_image = main_url.as_deref().filter(|_| !hide_image).map(|url| {
         let size = if app.inline_images_on() && !failed_without_picture {
@@ -3075,6 +3512,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
     }
     let video_status = video.then(|| video_status(app));
     let sizes = DocumentContext {
+        focused: controls,
         phase: app.loading_frame,
         images: app.inline_images_on().then_some(&app.images),
         font: app.image_picker.font_size(),
@@ -3086,19 +3524,60 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
         view.content_changed = true;
     }
     let mut more_lines = std::mem::take(&mut view.rendered_more);
+    let key = document_key(view, width, now, &sizes, main_image, overflow_title);
+    // Relative ages can wrap a header to another line count: that moves the text below
+    // like an edit does. A spinner frame advancing in the same draw changes no layout.
+    let clock_only = view.page.document_cache.as_ref().is_some_and(|cache| {
+        cache.key.second != key.second
+            && DocumentKey {
+                second: key.second,
+                phase: key.phase,
+                ..cache.key.clone()
+            } == key
+    });
+    let cached = view
+        .page
+        .document_cache
+        .take()
+        .filter(|cache| cache.key == key && !view.content_changed && view.rewrapped.is_none());
     let PostDocument {
         mut lines,
         spans,
         pictures,
-    } = post_document(
-        view,
-        width,
-        now,
-        Some(&mut more_lines),
-        &sizes,
-        main_image,
-        overflow_title,
-    );
+    } = if let Some(cache) = cached {
+        PostDocument {
+            lines: std::mem::take(&mut view.rendered_document),
+            spans: cache.spans,
+            pictures: cache.pictures,
+        }
+    } else {
+        post_document(
+            view,
+            width,
+            now,
+            Some(&mut more_lines),
+            &sizes,
+            main_image,
+            overflow_title,
+        )
+    };
+    // A header rewrapping as its age changes moves the rows after it, even when another
+    // rewrap keeps the document's length.
+    if clock_only
+        && !view.rendered_document.is_empty()
+        && (lines.len() != view.rendered_document.len()
+            || spans
+                .iter()
+                .map(|(start, _)| *start)
+                .ne(view.row_starts.iter().copied()))
+    {
+        view.content_changed = true;
+    }
+    view.page.document_cache = Some(CachedDocument {
+        key,
+        spans: spans.clone(),
+        pictures: pictures.clone(),
+    });
     if let Some(status) = video_status
         && let Some(picture) = pictures.iter().find(|p| p.main)
         && picture.rows() > 0
@@ -3230,6 +3709,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
         hold.offset = scroll as isize - start as isize;
     }
     view.drawn_cursor = (!view.free_scroll).then_some(view.cursor);
+    view.record_drawn_anchor();
     let height = doc_area.height as usize;
     view.page_height = height;
     let total = lines.len();
@@ -3299,6 +3779,7 @@ fn draw_post(f: &mut Frame, app: &mut App, area: Rect, media: &mut ListPictures)
                     selected: video,
                     detail: true,
                     post_id: video_id.clone(),
+                    video_url: video_url.clone(),
                     video_frame: false,
                 });
             }
@@ -3516,6 +3997,80 @@ struct PostDocument {
     pictures: Vec<DocPicture>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DocumentImage {
+    Loading,
+    Ready(u32, u32),
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DocumentKey {
+    focused: bool,
+    width: usize,
+    second: i64,
+    selected: Option<usize>,
+    collapsed: HashSet<String>,
+    reveal: bool,
+    hidden: bool,
+    phase: usize,
+    font: (u16, u16),
+    rows: u16,
+    images: Option<Vec<(String, DocumentImage)>>,
+    main: Option<(String, Option<Size>)>,
+    title: Option<Style>,
+    error: Option<String>,
+    loading_more: HashSet<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CachedDocument {
+    key: DocumentKey,
+    spans: Vec<(usize, usize)>,
+    pictures: Vec<DocPicture>,
+}
+
+fn document_key(
+    view: &PostView,
+    width: usize,
+    now: DateTime<Utc>,
+    sizes: &DocumentContext<'_>,
+    main: Option<(&str, Option<Size>)>,
+    title: Option<Style>,
+) -> DocumentKey {
+    let images = sizes.images.map(|images| {
+        let mut state: Vec<_> = images
+            .iter()
+            .map(|(url, slot)| match slot {
+                ImageSlot::Ready { pixels, .. } => {
+                    (url.clone(), DocumentImage::Ready(pixels.0, pixels.1))
+                }
+                ImageSlot::Failed(_) => (url.clone(), DocumentImage::Failed),
+                ImageSlot::Loading => (url.clone(), DocumentImage::Loading),
+            })
+            .collect();
+        state.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        state
+    });
+    DocumentKey {
+        focused: sizes.focused,
+        width,
+        second: now.timestamp(),
+        selected: (!view.free_scroll).then_some(view.cursor),
+        collapsed: view.collapsed.clone(),
+        reveal: view.reveal_spoilers,
+        hidden: view.spoiler_hidden(),
+        phase: sizes.phase,
+        font: (sizes.font.width, sizes.font.height),
+        rows: sizes.rows,
+        images,
+        main: main.map(|(url, size)| (url.into(), size)),
+        title,
+        error: view.error.clone(),
+        loading_more: view.loading_more.clone(),
+    }
+}
+
 /// Selftext, comment spans, pictures and More-row geometry for the displayed document.
 fn post_document(
     view: &PostView,
@@ -3544,13 +4099,15 @@ fn post_document(
             format!("✗ Could not load the post: {e}"),
             Style::new().fg(RED),
         ));
-        lines.push(Line::styled("press r to retry", Style::new().fg(OVERLAY)));
+        if sizes.focused {
+            lines.push(Line::styled("press r to retry", Style::new().fg(OVERLAY)));
+        }
         return PostDocument {
             lines,
             ..PostDocument::default()
         };
     }
-    let Some(page) = &view.page else {
+    let Some(page) = view.page.as_ref() else {
         lines.push(Line::raw(""));
 
         return PostDocument {
@@ -3568,7 +4125,11 @@ fn post_document(
             n => format!(" and its {} comments", format_count(n as i64)),
         };
         lines.push(Line::styled(
-            format!("⚠ Spoiler · SPC v s reveals the post{comments}"),
+            if sizes.focused {
+                format!("⚠ Spoiler · zs reveals the post{comments}")
+            } else {
+                format!("⚠ Spoiler · post{comments} hidden")
+            },
             Style::new().fg(YELLOW).add_modifier(Modifier::BOLD),
         ));
         return PostDocument {
@@ -3615,7 +4176,10 @@ fn post_document(
         } else {
             Style::new()
         };
-        let bar = Span::styled(if selected { "▌" } else { " " }, bg.fg(ACCENT));
+        let bar = Span::styled(
+            selection_marker(selected, sizes.focused),
+            bg.fg(if sizes.focused { ACCENT } else { OVERLAY }),
+        );
         let mut prefix = vec![bar.clone()];
         let visible_depth = row.depth.min(width.saturating_sub(18) / 2);
         prefix.extend(thread_prefix(row.depth, visible_depth));
@@ -3746,12 +4310,16 @@ fn post_document(
                     continue;
                 } else {
                     match more.count {
-                        Some(n) => format!(
-                            "↳ {n} more {} · Enter",
-                            if n == 1 { "reply" } else { "replies" }
-                        ),
-                        None => "↳ more replies · Enter".to_string(),
+                        Some(n) => {
+                            format!("↳ {n} more {}", if n == 1 { "reply" } else { "replies" })
+                        }
+                        None => "↳ more replies".to_string(),
                     }
+                };
+                let text = if sizes.focused {
+                    format!("{text} · Enter")
+                } else {
+                    text
                 };
                 line.push(Span::styled(text, bg.fg(SKY)));
                 if selected {
@@ -3775,9 +4343,10 @@ fn post_document(
 }
 
 fn video_status(app: &App) -> Line<'static> {
+    use crate::keys::map::{self, Action};
     let dim = Style::new().fg(OVERLAY);
     let mut spans = vec![Span::raw(" ")];
-    let controls = app.video_controls_available();
+    let controls = map::available(app, Action::Pause);
     if !controls {
         spans.push(key_chip("l"));
         spans.push(Span::styled(" return · ", dim));
@@ -3789,7 +4358,7 @@ fn video_status(app: &App) -> Line<'static> {
             Style::new().fg(RED),
         )),
         (None, _) if !app.config.media.video_autoplay && controls => {
-            spans.push(key_chip("SPC m p"));
+            spans.push(key_chip("p"));
             spans.push(Span::styled(" play · autoplay off", dim));
         }
         (None, _) if !app.config.media.video_autoplay => {
@@ -3801,16 +4370,15 @@ fn video_status(app: &App) -> Line<'static> {
         (Some(player), None) => {
             let at = video::clock_text(player.position(Instant::now()));
             let icon = if player.paused() { "⏸" } else { "▶" };
-            let time = if player.frame().is_none() {
-                "loading video…".to_string()
-            } else if player.waiting_for_audio() {
-                "starting audio…".to_string()
+            let loading = app.video_loading();
+            let time = if let Some(label) = loading {
+                label.to_string()
             } else if let Some(total) = player.duration() {
                 format!("{at} / {}", video::clock_text(total))
             } else {
                 at
             };
-            if player.frame().is_none() || player.waiting_for_audio() {
+            if loading.is_some() {
                 spans
                     .extend(loading::caption(loading::Kind::Media, &time, app.loading_frame).spans);
             } else {
@@ -3830,13 +4398,13 @@ fn video_status(app: &App) -> Line<'static> {
             ));
             let pause = if player.paused() { "play" } else { "pause" };
             let sound = if wanted { "mute" } else { "sound" };
-            for (key, label) in [
-                ("SPC m p", pause),
-                ("SPC m m", sound),
-                ("SPC m h/l", "seek"),
+            for (_, key, label) in [
+                (Action::Pause, "p", pause),
+                (Action::Mute, "m", sound),
+                (Action::SeekForward, "H/L", "seek"),
             ]
             .into_iter()
-            .filter(|_| controls)
+            .filter(|(action, _, _)| map::available(app, *action))
             {
                 spans.push(Span::raw("   "));
                 spans.push(key_chip(key));
@@ -3935,10 +4503,7 @@ fn loading_activity(app: &App, loaders: &VisibleLoaders) -> Option<&'static str>
     if app.media_loading() {
         return Some("media");
     }
-    if app
-        .selected_video()
-        .is_some_and(|player| player.resolving() || player.waiting_for_audio())
-    {
+    if app.video_loading().is_some() {
         return Some("video");
     }
     let post = app
@@ -3962,6 +4527,10 @@ fn loading_activity(app: &App, loaders: &VisibleLoaders) -> Option<&'static str>
                 feed_activity(&app.active_tab().feed, !app.reddit.needs_sign_in())
                     .map(|(_, activity)| activity)
             }
+            TabKind::Search if !app.search.shows_rows() => {
+                feed_activity(&app.active_tab().feed, !app.reddit.needs_sign_in())
+                    .map(|(_, activity)| activity)
+            }
             TabKind::AllSubs if app.all_subs.loading => Some("subs"),
             TabKind::AllSubs if app.all_subs.groups.iter().any(|group| group.loading) => {
                 Some("communities")
@@ -3979,7 +4548,13 @@ fn loading_activity(app: &App, loaders: &VisibleLoaders) -> Option<&'static str>
     active.or_else(|| app.images_loading().then_some("images"))
 }
 
-fn draw_footer(f: &mut Frame, app: &App, area: Rect, loaders: &VisibleLoaders) {
+fn draw_footer(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    loaders: &VisibleLoaders,
+    panes: &[(Rect, &'static str, bool)],
+) {
     let progress = app.membership_progress();
     let cooldown = app
         .reddit
@@ -4054,19 +4629,22 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, loaders: &VisibleLoaders) {
             .current_post()
             .is_some_and(|post| post.media.youtube_url().is_some())
         {
-            "SPC o m browser"
+            "O browser"
         } else {
-            "SPC o m media"
+            "O media"
         };
         let label = if content_width < 28 {
-            "✗ SPC m p retry".into()
+            "✗ p retry".into()
         } else {
-            format!("✗ SPC m p retry · {error} · {handoff}")
+            format!("✗ p retry · {error} · {handoff}")
         };
         Line::from(Span::styled(label, Style::new().fg(RED)))
     } else if app.health == Health::SignedOut {
         Line::from(Span::styled(
-            " Reddit sign-in required · SPC p a connect",
+            format!(
+                " Reddit sign-in required · {} connect",
+                search::reading_key(app, "SPC p a")
+            ),
             Style::new().fg(YELLOW),
         ))
     } else if app.health == Health::Down {
@@ -4110,7 +4688,28 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, loaders: &VisibleLoaders) {
         line,
         Rect::new(area.x, area.y, content_width as u16, area.height),
     );
-    if let Some(activity) = loading_activity(app, loaders).filter(|_| activity_width > 0) {
+    let activity = loading_activity(app, loaders).filter(|_| activity_width > 0);
+    // With two or more panes visible, the idle activity slot names the focused pane.
+    if activity.is_none()
+        && activity_width > 0
+        && panes.len() >= 2
+        && let Some(&(_, name, _)) = panes.iter().find(|pane| pane.2)
+    {
+        f.render_widget(
+            Line::from(fit_spans(
+                vec![chip(name.to_uppercase(), CRUST, ACCENT)],
+                activity_width,
+            ))
+            .alignment(Alignment::Right),
+            Rect::new(
+                area.x + content_width as u16,
+                area.y,
+                activity_width.saturating_sub(1) as u16,
+                area.height,
+            ),
+        );
+    }
+    if let Some(activity) = activity {
         let kind = match activity {
             "Loading more posts…" | "replies" => loading::Kind::More,
             "images" => loading::Kind::Media,
@@ -4317,6 +4916,7 @@ fn draw_picker(f: &mut Frame, app: &App, input: &str, selected: usize) -> Rect {
                             TabKind::Home => "⌂",
                             TabKind::AllSubs => "▦",
                             TabKind::Bookmarks => "★",
+                            TabKind::Search => "⌕",
                             TabKind::Subreddit { .. } => "#",
                             TabKind::User { .. } => "@",
                         };
@@ -4925,12 +5525,46 @@ pub(crate) mod tests {
     use super::*;
     use crate::config::Config;
     use crate::model::{Comment, PostPage, ReplyPage};
-    use crate::reddit::Reddit;
+    use crate::reddit::{AccessDenied, Reddit};
     use crate::worker::{Msg, Pool};
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui_image::picker::Picker;
+
+    #[test]
+    fn unchanged_redraws_reuse_document_text_and_content_updates_replace_it() {
+        let mut app = image_post("Stable layout marker");
+        screen(&mut app, 100, 40);
+        let marker_pointer = |app: &App| {
+            app.post_view
+                .as_ref()
+                .unwrap()
+                .rendered_document
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.contains("Stable layout marker"))
+                .unwrap()
+                .content
+                .as_ptr()
+        };
+        let pointer = marker_pointer(&app);
+        screen(&mut app, 100, 40);
+        assert_eq!(
+            marker_pointer(&app),
+            pointer,
+            "unchanged text should not be allocated and wrapped on every media draw"
+        );
+        let view = app.post_view.as_ref().unwrap();
+        let generation = view.generation;
+        let mut page = view.page.clone().unwrap();
+        page.body = "Changed layout marker".into();
+        app.on_msg(Msg::Post {
+            generation,
+            result: Ok(Box::new(page)),
+        });
+        assert!(screen(&mut app, 100, 40).contains("Changed layout marker"));
+    }
 
     fn app(subscriptions: &[&str]) -> App {
         let reddit = Reddit::test_at("http://127.0.0.1:9", false);
@@ -4939,11 +5573,7 @@ pub(crate) mod tests {
 
     fn app_with_client(subscriptions: &[&str], reddit: Reddit) -> App {
         let (pool, _rx) = Pool::start(reddit.clone(), 3, None);
-        let state = std::env::temp_dir().join(format!(
-            "redtab-ui-test-{}-{:?}.json",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let state = crate::test_support::state_path();
         let mut app = App::new(
             Config {
                 media: crate::config::MediaSettings {
@@ -4970,6 +5600,8 @@ pub(crate) mod tests {
             })
             .collect()),
         });
+        app.config.select_account(Some("t"));
+        app.settings.store.select_account(Some("t"));
         app.active = crate::app::ALL_SUBS_TAB;
         app
     }
@@ -5323,6 +5955,7 @@ pub(crate) mod tests {
                     text: String::new(),
                     entries: (0..20)
                         .map(|index| Entry {
+                            icon: Default::default(),
                             title: format!("Entry {index}"),
                             body: match index {
                                 0 => "Short preview".into(),
@@ -5385,7 +6018,7 @@ pub(crate) mod tests {
                 let (area, shown) = popup_snapshot(&mut app, width, height);
                 let description = shown
                     .lines()
-                    .position(|line| line.contains(field.key))
+                    .position(|line| line.contains(&field.file_key(&app.config)))
                     .unwrap();
                 layouts.push((area, description));
                 assert!(shown.contains(field.label), "{shown}");
@@ -5497,10 +6130,13 @@ pub(crate) mod tests {
                     .iter()
                     .enumerate()
                     .map(|(index, body)| Entry {
+                        icon: Default::default(),
                         title: format!("Entry {index}"),
                         body: (*body).into(),
                         target: None,
-                        query: None,
+                        query: Some(crate::reddit::experience::Query::Profile(format!(
+                            "reader{index}"
+                        ))),
                         post: None,
                     })
                     .collect(),
@@ -5628,7 +6264,7 @@ pub(crate) mod tests {
         assert!(
             sections
                 .iter()
-                .any(|(keys, action)| keys == "C-d" && action == "Half page down")
+                .any(|(keys, action)| keys == "C-d / C-u" && action == "Half page down / up")
         );
         key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         app.experience.pending = Some((1, Request::Read { query, after: None }));
@@ -5798,7 +6434,7 @@ pub(crate) mod tests {
         app.open_subreddit("rust");
         let shown = screen(&mut app, 120, 24);
         assert!(
-            shown.contains("Joined") && shown.contains("SPC a m leave"),
+            shown.contains("Joined") && shown.contains("SPC m leave"),
             "{shown}"
         );
         app.open_subreddit("armenia");
@@ -5863,6 +6499,293 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn distant_island_selection_should_fit_after_more_than_u16_max_rows() {
+        let mut app = app(&[]);
+        app.config.all_subs_posts_per_group = 10;
+        app.all_subs.groups = (0..6000)
+            .map(|index| crate::app::Group {
+                subreddit: format!("community{index}"),
+                loading: true,
+                ..Default::default()
+            })
+            .collect();
+        app.all_subs.group = 5999;
+        let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
+
+        terminal
+            .draw(|f| {
+                draw_all_subs(f, &mut app, f.area(), &mut Vec::new(), &[]);
+            })
+            .unwrap();
+
+        assert_eq!(app.all_subs.offset, 5999);
+        assert!(buffer_text(terminal.backend().buffer()).contains("community5999"));
+    }
+
+    #[test]
+    fn island_lookahead_should_load_only_the_visible_and_following_grid_rows() {
+        for (width, selected, remaining, visible, expected) in [
+            (60, 0, 0, vec![0], vec![0, 1]),
+            (180, 0, 0, vec![0, 1, 2], vec![0, 1, 2, 3, 4, 5]),
+            (180, 11, 0, vec![9, 10, 11], vec![9, 10, 11]),
+            (60, 0, 5, vec![0, 1], vec![0, 1, 2]),
+            (
+                180,
+                0,
+                5,
+                vec![0, 1, 2, 3, 4, 5],
+                vec![0, 1, 2, 3, 4, 5, 6, 7, 8],
+            ),
+        ] {
+            let mut app = app(&["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]);
+            app.active = 2;
+            app.all_subs.group = selected;
+            let height = card_height(&app) + 4 + remaining;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+
+            terminal
+                .draw(|f| {
+                    draw_all_subs(f, &mut app, f.area(), &mut Vec::new(), &[]);
+                })
+                .unwrap();
+
+            let loading = |app: &App| {
+                app.all_subs
+                    .groups
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, group)| group.loading.then_some(i))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(loading(&app), visible);
+            for &index in &visible {
+                let name = app.all_subs.groups[index].subreddit.clone();
+                let mut post = post_with(&format!("stream{index}"), Media::None);
+                post.subreddit = name.clone();
+                app.on_msg(Msg::GroupProgress {
+                    subreddit: name,
+                    generation: app.all_subs.groups[index].generation,
+                    post: Box::new(post),
+                    source: Default::default(),
+                });
+            }
+            terminal
+                .draw(|f| {
+                    draw_all_subs(f, &mut app, f.area(), &mut Vec::new(), &[]);
+                })
+                .unwrap();
+            let text = buffer_text(terminal.backend().buffer());
+            for index in visible {
+                assert!(text.contains(&format!("stream{index}")), "{text}");
+            }
+            let actual: Vec<_> = app
+                .all_subs
+                .groups
+                .iter()
+                .enumerate()
+                .filter_map(|(i, group)| group.loading.then_some(i))
+                .collect();
+            assert_eq!(actual, expected);
+            assert!(!app.all_subs.has_new_posts(&app.config));
+        }
+    }
+
+    #[test]
+    fn partial_bottom_islands_should_render_and_load_then_scroll_fully_into_selection() {
+        for (width, columns) in [(60, 1), (180, 3)] {
+            for remaining in [1, 5] {
+                let mut app = app(&["a", "b", "c", "d", "e", "f", "g", "h", "i"]);
+                for group in &mut app.all_subs.groups {
+                    let mut post = post_with(&format!("post_{}", group.subreddit), Media::None);
+                    post.subreddit = group.subreddit.clone();
+                    group.posts = vec![post];
+                }
+                let height = 3 + card_height(&app) + CARD_ROW_GAP + remaining;
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+
+                terminal
+                    .draw(|f| {
+                        draw_all_subs(f, &mut app, f.area(), &mut Vec::new(), &[]);
+                    })
+                    .unwrap();
+
+                let text = buffer_text(terminal.backend().buffer());
+                let name = &app.all_subs.groups[columns].subreddit;
+                assert!(
+                    text.lines()
+                        .nth((height - remaining) as usize)
+                        .unwrap()
+                        .contains(&format!("#  {name}")),
+                    "{text}"
+                );
+                if remaining == 5 {
+                    assert!(text.contains(&format!("post_{name}")), "{text}");
+                }
+                let loading: Vec<_> = app
+                    .all_subs
+                    .groups
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, group)| group.loading.then_some(index))
+                    .collect();
+                assert_eq!(loading, (0..columns * 2).collect::<Vec<_>>());
+
+                app.move_all_subs_group(columns as isize);
+                terminal
+                    .draw(|f| {
+                        draw_all_subs(f, &mut app, f.area(), &mut Vec::new(), &[]);
+                    })
+                    .unwrap();
+
+                let selected = &app.all_subs.groups[columns].subreddit;
+                assert_eq!(app.all_subs.offset, 1);
+                assert!(
+                    buffer_text(terminal.backend().buffer()).contains(&format!("post_{selected}"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn islands_loading_or_joining_above_keep_the_selected_island_in_place() {
+        let mut app = app(&["go", "rust", "vim"]);
+        app.switch_tab(crate::app::ALL_SUBS_TAB);
+        let titled = |id: &str, sub: &str| {
+            let mut post = post_with(id, Media::None);
+            post.subreddit = sub.into();
+            post.title = format!("Title {id}");
+            post
+        };
+        let answer = |app: &App, sub: &str, ids: &[&str]| Msg::Group {
+            generation: app
+                .all_subs
+                .groups
+                .iter()
+                .find(|group| group.subreddit == sub)
+                .unwrap()
+                .generation,
+            subreddit: sub.into(),
+            result: Ok(crate::model::Listing {
+                posts: ids.iter().map(|id| titled(id, sub)).collect(),
+                after: None,
+            }),
+        };
+        let row = |shown: &str| shown.lines().position(|line| line.contains("Title v1"));
+        app.on_msg(answer(&app, "go", &["g1"]));
+        app.on_msg(answer(&app, "rust", &["r1"]));
+        app.on_msg(answer(&app, "vim", &["v1", "v2", "v3"]));
+        screen(&mut app, 100, 60);
+        app.move_selection(2);
+        assert_eq!(app.current_post().unwrap().id, "v1");
+        let before = row(&screen(&mut app, 100, 60));
+        assert!(before.is_some());
+
+        app.on_msg(answer(&app, "go", &["g1", "g2", "g3"]));
+        assert_eq!(row(&screen(&mut app, 100, 60)), before);
+
+        app.on_msg(Msg::Subscriptions {
+            generation: 0,
+            result: Ok(["ada", "go", "rust", "vim"]
+                .into_iter()
+                .map(|name| crate::model::Subscription::Community {
+                    name: name.into(),
+                    icon: crate::model::SubscriptionIcon::Unknown,
+                })
+                .collect()),
+        });
+        let shown = screen(&mut app, 100, 60);
+
+        assert_eq!(app.current_post().unwrap().id, "v1");
+        assert_eq!(row(&shown), before, "{shown}");
+    }
+
+    #[test]
+    fn the_notice_offers_r_only_while_r_would_apply_it() {
+        let mut app = app(&["rust", "vim"]);
+        app.switch_tab(crate::app::ALL_SUBS_TAB);
+        let titled = |id: &str, sub: &str| {
+            let mut post = post_with(id, Media::None);
+            post.subreddit = sub.into();
+            post.title = format!("Title {id}");
+            post
+        };
+        let answer = |app: &App, sub: &str, ids: &[&str]| Msg::Group {
+            generation: app
+                .all_subs
+                .groups
+                .iter()
+                .find(|group| group.subreddit == sub)
+                .unwrap()
+                .generation,
+            subreddit: sub.into(),
+            result: Ok(crate::model::Listing {
+                posts: ids.iter().map(|id| titled(id, sub)).collect(),
+                after: None,
+            }),
+        };
+        app.on_msg(answer(&app, "rust", &["r1", "r2"]));
+        app.on_msg(answer(&app, "vim", &["v1"]));
+        app.on_msg(answer(&app, "rust", &["fresh", "r1", "r2"]));
+        screen(&mut app, 200, 40);
+
+        press_keys(&mut app, "l");
+        assert!(app.post_focused());
+        let reading = screen(&mut app, 200, 40);
+
+        assert!(reading.contains("New posts"), "{reading}");
+        assert!(!reading.contains("r refresh"), "{reading}");
+        app.focus = Focus::List;
+        assert!(screen(&mut app, 200, 40).contains("New posts · r refresh"));
+    }
+
+    #[test]
+    fn island_arrivals_wait_behind_the_notice_and_r_shows_them_from_the_top() {
+        let mut app = app(&["rust", "vim"]);
+        app.switch_tab(crate::app::ALL_SUBS_TAB);
+        let titled = |id: &str, sub: &str| {
+            let mut post = post_with(id, Media::None);
+            post.subreddit = sub.into();
+            post.title = format!("Title {id}");
+            post
+        };
+        let answer = |app: &App, sub: &str, posts: Vec<Post>| Msg::Group {
+            generation: app
+                .all_subs
+                .groups
+                .iter()
+                .find(|group| group.subreddit == sub)
+                .unwrap()
+                .generation,
+            subreddit: sub.into(),
+            result: Ok(crate::model::Listing { posts, after: None }),
+        };
+        let rust = vec![titled("r1", "rust"), titled("r2", "rust")];
+        app.on_msg(answer(&app, "rust", rust.clone()));
+        app.on_msg(answer(&app, "vim", vec![titled("v1", "vim")]));
+        screen(&mut app, 120, 40);
+        app.move_selection(2);
+        assert_eq!(app.current_post().unwrap().id, "v1");
+
+        let mut refreshed = vec![titled("fresh", "rust")];
+        refreshed.extend(rust);
+        refreshed[1].score = Some(99);
+        app.on_msg(answer(&app, "rust", refreshed));
+        let pending = screen(&mut app, 120, 40);
+
+        assert!(pending.contains("New posts · r refresh"), "{pending}");
+        assert!(!pending.contains("Title fresh"), "{pending}");
+        assert!(pending.contains("99"), "{pending}");
+        assert_eq!(app.current_post().unwrap().id, "v1");
+
+        press_keys(&mut app, "r");
+        let applied = screen(&mut app, 120, 40);
+
+        assert!(!applied.contains("r refresh"), "{applied}");
+        assert!(applied.contains("Title fresh"), "{applied}");
+        assert_eq!(app.current_post().unwrap().id, "fresh");
+    }
+
+    #[test]
     fn when_subscriptions_are_loading_empty_or_failed_all_subs_should_explain_the_state() {
         let mut app = app(&[]);
         app.all_subs.loading = true;
@@ -5891,7 +6814,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn sidebar_lists_tabs_vertically_with_sections() {
+    fn sidebar_keeps_global_navigation_fixed_while_feed_sections_scroll() {
         let mut app = app(&["neovim", "rust"]);
 
         let s = screen(&mut app, 120, 30);
@@ -5908,6 +6831,42 @@ pub(crate) mod tests {
         assert!(row_of("Bookmarks") < row_of("SUBSCRIPTIONS"));
         assert!(row_of("SUBSCRIPTIONS") < row_of("neovim"));
         assert!(row_of("neovim") < row_of("rust"));
+        let globals = ["Home", "Bookmarks", "All subs", "Search"];
+        let expected_rows = globals.map(row_of);
+        assert!(!expected_rows.contains(&usize::MAX));
+        app.on_msg(Msg::Subscriptions {
+            generation: 0,
+            result: Ok((0..24)
+                .map(|i| crate::model::Subscription::Community {
+                    name: format!("sub{i:02}"),
+                    icon: crate::model::SubscriptionIcon::Unknown,
+                })
+                .collect()),
+        });
+        app.open_subreddit("opened");
+        let sidebar = |app: &mut App, height| {
+            screen(app, 120, height)
+                .lines()
+                .map(|line| line.chars().take(30).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for height in [30, 11] {
+            let actual = sidebar(&mut app, height);
+            let actual_rows = globals.map(|name| {
+                actual
+                    .lines()
+                    .position(|line| line.contains(name))
+                    .unwrap_or(usize::MAX)
+            });
+            assert_eq!(actual_rows, expected_rows, "{actual}");
+            assert!(actual.contains("opened"), "{actual}");
+        }
+        let actual = sidebar(&mut app, 8);
+        assert!(actual.contains("opened"), "{actual}");
+        app.switch_tab(crate::app::SEARCH_TAB);
+        let actual = sidebar(&mut app, 8);
+        assert!(actual.contains("Search"), "{actual}");
     }
 
     #[test]
@@ -5959,6 +6918,7 @@ pub(crate) mod tests {
         let mut app = app(&[]);
         app.active = 0;
         app.tabs[0].feed.loaded = true;
+        app.all_subs.freshness = None;
         app.all_subs.loading = true;
         let sidebar = |app: &mut App| {
             screen(app, 120, 30)
@@ -5993,13 +6953,19 @@ pub(crate) mod tests {
         );
         assert!(!actual.contains("Loading"), "{actual}");
 
+        let rows = |actual: &str| {
+            actual
+                .lines()
+                .position(|line| line.contains("rust"))
+                .zip(actual.lines().position(|line| line.contains("reader")))
+        };
+        let settled = rows(&actual);
         app.all_subs.loading = true;
         let actual = sidebar(&mut app);
-        assert!(
-            actual.contains("rust") && actual.contains("reader"),
-            "{actual}"
-        );
-        assert_eq!(actual.matches("⠋ Loading").count(), 2, "{actual}");
+        assert_eq!(rows(&actual), settled, "{actual}");
+        assert!(!actual.contains("Loading"), "{actual}");
+        assert!(actual.contains("SUBSCRIPTIONS ⠋"), "{actual}");
+        assert!(actual.contains("FOLLOWING ⠋"), "{actual}");
 
         app.on_msg(Msg::Subscriptions {
             generation: 0,
@@ -6011,6 +6977,21 @@ pub(crate) mod tests {
             "{actual}"
         );
         assert!(!actual.contains("Loading"), "{actual}");
+
+        // An emptied section does not reappear as a placeholder while syncing.
+        app.on_msg(Msg::Subscriptions {
+            generation: 0,
+            result: Ok(vec![crate::model::Subscription::Community {
+                name: "rust".into(),
+                icon: crate::model::SubscriptionIcon::Unknown,
+            }]),
+        });
+        let settled = sidebar(&mut app);
+        assert!(!settled.contains("FOLLOWING"), "{settled}");
+        app.all_subs.loading = true;
+        let actual = sidebar(&mut app);
+        assert!(!actual.contains("Loading"), "{actual}");
+        assert_eq!(rows(&actual), rows(&settled), "{actual}");
     }
 
     #[test]
@@ -6101,6 +7082,7 @@ pub(crate) mod tests {
             flair: None,
             is_op: false,
             is_mod: false,
+            stickied: false,
             score: None,
             body: "reply".into(),
             replies: vec![],
@@ -6537,11 +7519,7 @@ pub(crate) mod tests {
         });
         let reddit = fixture.reddit();
         let (pool, messages) = Pool::start(reddit.clone(), 3, None);
-        let state = std::env::temp_dir().join(format!(
-            "redtab-private-ui-{}-{:?}.json",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let state = crate::test_support::state_path();
         let mut app = App::new(
             Config {
                 media: crate::config::MediaSettings {
@@ -6558,7 +7536,7 @@ pub(crate) mod tests {
         app.open_subreddit("doit");
         app.on_msg(
             messages
-                .recv_timeout(std::time::Duration::from_secs(2))
+                .recv_timeout(std::time::Duration::from_secs(30))
                 .unwrap(),
         );
 
@@ -6579,7 +7557,7 @@ pub(crate) mod tests {
             let words = actual.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(words.contains("Private community"), "{actual}");
             assert!(
-                words.contains("SPC o r Reddit") || words.contains("SPC o r to open Reddit"),
+                words.contains("o Reddit") || words.contains("o to open Reddit"),
                 "{actual}"
             );
             assert!(
@@ -6623,53 +7601,51 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn private_community_unclassified_denial_should_not_claim_private() {
+    fn unclassified_request_denial_should_keep_cached_posts_and_offer_retry_when_empty() {
         let mut app = denied_community(AccessDenied::Forbidden);
         let actual = screen(&mut app, 100, 24);
-        assert!(actual.contains("Access restricted"), "{actual}");
+        assert!(app.current_post().is_some(), "{actual}");
         assert!(
-            !actual.contains("Private community") && !actual.contains("Could not load posts"),
+            !actual.contains("Access restricted") && !actual.contains("Private community"),
+            "{actual}"
+        );
+        let current = app.active;
+        app.tabs[current].feed.posts.clear();
+        let actual = screen(&mut app, 100, 24);
+        assert!(
+            actual.contains("Could not load posts") && actual.contains("retry"),
+            "{actual}"
+        );
+        assert!(
+            !actual.contains("Access restricted") && !actual.contains("Private community"),
             "{actual}"
         );
     }
 
     #[test]
     fn private_community_island_should_show_approval_guidance_with_cached_posts() {
-        for (access, title, guidance) in [
-            (
+        let mut app = app(&["doit"]);
+        app.all_subs.groups[0].posts = (0..3)
+            .map(|i| post_with(&format!("cached{i}"), Media::None))
+            .collect();
+        app.all_subs.post = 2;
+        app.on_msg(Msg::Group {
+            subreddit: "doit".into(),
+            generation: app.all_subs.groups[0].generation,
+            result: Err(crate::worker::FeedError::Access(
                 AccessDenied::PrivateCommunity,
-                "Private community",
-                "Approved members only",
-            ),
-            (
-                AccessDenied::Forbidden,
-                "Access restricted",
-                "Check access on Reddit",
-            ),
-        ] {
-            for selected in 0..3 {
-                let mut app = app(&["doit"]);
-                app.all_subs.groups[0].posts = (0..3)
-                    .map(|i| post_with(&format!("cached{i}"), Media::None))
-                    .collect();
-                app.all_subs.post = selected;
-                app.on_msg(Msg::Group {
-                    subreddit: "doit".into(),
-                    generation: app.all_subs.groups[0].generation,
-                    result: Err(crate::worker::FeedError::Access(access)),
-                });
-                let actual = screen(&mut app, 100, 24);
-                assert!(
-                    actual.contains(title) && actual.contains(guidance),
-                    "selection={selected}: {actual}"
-                );
-                assert!(
-                    !actual.contains("r retry") && !actual.contains("cached"),
-                    "{actual}"
-                );
-                assert!(app.current_post().is_none());
-            }
-        }
+            )),
+        });
+        let actual = screen(&mut app, 100, 24);
+        assert!(
+            actual.contains("Private community") && actual.contains("Approved members only"),
+            "{actual}"
+        );
+        assert!(
+            !actual.contains("r retry") && !actual.contains("cached"),
+            "{actual}"
+        );
+        assert!(app.current_post().is_none());
     }
 
     #[test]
@@ -6689,18 +7665,15 @@ pub(crate) mod tests {
     #[test]
     fn private_community_browser_key_should_open_the_community_without_a_selected_post() {
         let mut app = denied_community(AccessDenied::PrivateCommunity);
-        let file = std::env::temp_dir().join(format!(
-            "redtab-private-browser-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("opened-url");
         app.config.commands.browser = vec![
             "/bin/sh".into(),
             "-c".into(),
             "printf '%s' \"$1\" > \"$0\"".into(),
             file.to_string_lossy().into_owned(),
         ];
-        press_keys(&mut app, " or");
+        press_keys(&mut app, "o");
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         let actual = loop {
             if let Ok(text) = std::fs::read_to_string(&file)
@@ -6714,7 +7687,6 @@ pub(crate) mod tests {
             );
             std::thread::yield_now();
         };
-        std::fs::remove_file(file).unwrap();
         assert_eq!(actual, "https://www.reddit.com/r/s/");
     }
 
@@ -6795,8 +7767,8 @@ pub(crate) mod tests {
                 ((1600, 900), false),
             ] {
                 let mut app = card_feed_app(kitty());
-                app.tabs[3].feed.posts.truncate(1);
-                let post = &mut app.tabs[3].feed.posts[0];
+                app.tabs[4].feed.posts.truncate(1);
+                let post = &mut app.tabs[4].feed.posts[0];
                 post.preview_size = Some(pixels);
                 if video {
                     post.media = Media::Video {
@@ -6932,6 +7904,22 @@ pub(crate) mod tests {
             .unwrap()
             .post
             .preview_size = Some((1080, 1920));
+        let url = app.reddit.media_url(VIDEO).unwrap();
+        let mut player = video::Player::showing(
+            &url,
+            video::Frame {
+                width: 180,
+                height: 320,
+                pixels: video::Pixels::Raw(std::sync::Arc::new(image::DynamicImage::new_rgb8(
+                    180, 320,
+                ))),
+                same_as_first: false,
+            },
+        );
+        if !player.paused() {
+            player.toggle_pause(Instant::now());
+        }
+        app.video = Some(player);
 
         let actual = screen(&mut app, 100, 20);
 
@@ -6942,8 +7930,8 @@ pub(crate) mod tests {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(footer.contains("SPC m p play"), "{actual}");
-        assert!(footer.contains("SPC m m sound"), "{actual}");
+        assert!(footer.contains("p play"), "{actual}");
+        assert!(footer.contains("m sound"), "{actual}");
     }
 
     #[test]
@@ -6963,7 +7951,7 @@ pub(crate) mod tests {
         let actual = screen(&mut app, 100, 20);
 
         assert!(
-            actual.lines().last().unwrap().contains("SPC m p retry"),
+            actual.lines().last().unwrap().contains("p retry"),
             "{actual}"
         );
     }
@@ -6979,7 +7967,7 @@ pub(crate) mod tests {
         assert!(app.video_area.is_none());
         let actual = screen(&mut app, 100, 50);
         assert!(
-            actual.lines().last().unwrap().contains("SPC m p retry"),
+            actual.lines().last().unwrap().contains("p retry"),
             "{actual}"
         );
     }
@@ -7014,13 +8002,13 @@ pub(crate) mod tests {
         picker.set_protocol_type(ProtocolType::Iterm2);
         let mut app = card_feed_app(picker);
         let poster = "https://i.redd.it/p1.jpeg";
-        app.tabs[3].feed.posts.truncate(1);
-        app.tabs[3].feed.posts[0].media = Media::Video {
+        app.tabs[4].feed.posts.truncate(1);
+        app.tabs[4].feed.posts[0].media = Media::Video {
             gif: false,
             url: Some(VIDEO.into()),
             poster: Some(poster.into()),
         };
-        app.tabs[3].feed.posts[0].preview_size = Some((160, 90));
+        app.tabs[4].feed.posts[0].preview_size = Some((160, 90));
         app.card_images.insert(
             poster.into(),
             CardImageSlot::Ready {
@@ -7037,7 +8025,8 @@ pub(crate) mod tests {
             post,
             body: String::new(),
             comments: vec![],
-        });
+        })
+        .into();
         let url = app.reddit.media_url(VIDEO).unwrap();
         app.video = Some(video::Player::showing(
             &url,
@@ -7088,7 +8077,7 @@ pub(crate) mod tests {
         let view = app.post_view.as_ref().unwrap();
 
         assert!(shown.contains("body below the full image"));
-        assert_eq!(view.rendered_pictures.first().map(|p| p.2), Some(20));
+        assert_eq!(view.rendered_pictures.first().map(|p| p.2), Some(19));
         assert_eq!(view.scroll, 0);
     }
 
@@ -7169,7 +8158,7 @@ pub(crate) mod tests {
         let failed = detail_pictures(&mut app, 80, 30);
         assert_eq!(failed[0].size, first[0].size);
 
-        app.post_view.as_mut().unwrap().page = None;
+        app.post_view.as_mut().unwrap().page = None.into();
         assert!(detail_pictures(&mut app, 80, 30).is_empty());
     }
 
@@ -7263,7 +8252,7 @@ pub(crate) mod tests {
 
         let cells = placeholder_cells(&mut app, 100, 40);
 
-        assert_eq!(cells.len(), 10 * 20);
+        assert_eq!(cells.len(), 10 * 19);
         assert_eq!(app.post_view.as_ref().unwrap().scroll, 0);
     }
 
@@ -7319,7 +8308,7 @@ pub(crate) mod tests {
 
     #[test]
     fn when_a_post_image_is_small_the_text_should_start_right_below_it() {
-        // A 140×73 image fills 70 columns of 8×16 cells: 19 picture rows.
+        // A 140×73 image fills 68 columns of 8×16 cells: 18 picture rows.
         let mut app = image_post("first line of the body");
         let slot = ready(&app, 140, 73);
         app.images.insert("https://i.redd.it/big.jpeg".into(), slot);
@@ -7331,8 +8320,8 @@ pub(crate) mod tests {
             - s.lines()
                 .position(|line| line.contains('╰') || line.contains('╚'))
                 .unwrap();
-        // 19 picture rows plus three rows of spacing.
-        assert_eq!(gap, 22, "rows between header and text");
+        // 18 picture rows plus three rows of spacing.
+        assert_eq!(gap, 21, "rows between header and text");
     }
 
     #[test]
@@ -7619,8 +8608,14 @@ pub(crate) mod tests {
             "{opened}"
         );
         assert!(
-            !searching.contains("time") && searching.contains("close"),
+            searching.contains("time") && searching.contains("close"),
             "{searching}"
+        );
+        feed.search("neovim".into());
+        let header = screen(&mut feed, 120, 6);
+        assert!(
+            header.contains("neovim") && header.contains("⇅ relevance") && header.contains("◷ all"),
+            "{header}"
         );
     }
 
@@ -7636,7 +8631,7 @@ pub(crate) mod tests {
             .join("\n\n");
         screen(&mut app, 100, 60);
         // Reveal; select "marker 1" (row 2); `h`, `l` hold it at scroll 0.
-        for keys in [" vs", "j", "j", "j", "h", "l"] {
+        for keys in ["zs", "j", "j", "j", "h", "l"] {
             press_keys(&mut app, keys);
             screen(&mut app, 100, 60);
         }
@@ -7644,7 +8639,7 @@ pub(crate) mod tests {
         let held = (view.cursor, view.hold_view.is_some(), view.scroll);
 
         // Hiding the spoilers again adds lines above the held comment.
-        press_keys(&mut app, " vs");
+        press_keys(&mut app, "zs");
         let s = screen(&mut app, 100, 60);
 
         assert_eq!(held, (2, true, 0));
@@ -7712,7 +8707,7 @@ pub(crate) mod tests {
             .hold_view
             .is_some_and(|h| h.top);
         let row_of = |s: &str| s.lines().position(|l| l.contains("marker 1 "));
-        press_keys(&mut app, " vi");
+        press_keys(&mut app, "zi");
         let before = row_of(&screen(&mut app, 100, 60));
 
         load_two_replies_above(&mut app);
@@ -7726,10 +8721,10 @@ pub(crate) mod tests {
     #[test]
     fn images_on_and_a_load_in_one_pass_show_the_image() {
         let mut app = marker_selected_under_the_image();
-        press_keys(&mut app, " vi");
+        press_keys(&mut app, "zi");
         screen(&mut app, 100, 60);
 
-        press_keys(&mut app, " vi");
+        press_keys(&mut app, "zi");
         load_two_replies_above(&mut app);
         let s = screen(&mut app, 100, 60);
 
@@ -7757,7 +8752,7 @@ pub(crate) mod tests {
         screen(&mut app, 100, 60);
 
         // A spoiler only below it is revealed.
-        press_keys(&mut app, " vs");
+        press_keys(&mut app, "zs");
         let s = screen(&mut app, 100, 60);
 
         assert!(s.contains("loading image"), "{s}");
@@ -7821,7 +8816,7 @@ pub(crate) mod tests {
         assert_eq!(app.post_view.as_ref().unwrap().cursor, 2, "c2 selected");
 
         // Spoilers above it rewrap, then replies load above it.
-        press_keys(&mut app, " vs");
+        press_keys(&mut app, "zs");
         let after_v = draw(&mut app);
         app.on_msg(Msg::MoreReplies {
             generation: app.post_view.as_ref().unwrap().generation,
@@ -7919,6 +8914,123 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_header_age_rewrapping_above_keeps_the_text_being_read() {
+        let opened = |age: i64, width: u16| {
+            let (mut app, _) = open_long_post(|_| {});
+            let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
+            page.comments[0].body = paragraphs("line", 1..=40);
+            page.comments[0].created = Some(Utc::now() - chrono::Duration::seconds(age));
+            screen(&mut app, width, 30);
+            app
+        };
+        let len = |app: &App| app.post_view.as_ref().unwrap().rendered_document.len();
+        // A width where "just now" wraps the header and "1m ago" does not.
+        let width = (40..140)
+            .find(|&width| len(&opened(10, width)) > len(&opened(120, width)))
+            .expect("some width rewraps the header");
+        let shown = |s: &str, needle: &str| {
+            s.lines()
+                .enumerate()
+                .find_map(|(row, l)| l.split(needle).nth(1).map(|r| (row, r.to_string())))
+        };
+        let created = Utc::now() - chrono::Duration::seconds(58);
+        let mut apps: Vec<_> = (0..2)
+            .map(|_| {
+                let (mut app, _) = open_long_post(|_| {});
+                let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
+                page.comments[0].body = paragraphs("line", 1..=40);
+                page.comments[0].created = Some(created);
+                let mut second = page.comments[0].clone();
+                second.id = "second".into();
+                second.body = "short".into();
+                second.created = None;
+                page.comments.push(second);
+                screen(&mut app, width, 30);
+                app
+            })
+            .collect();
+        // Reading by scrolling, then with a later comment selected.
+        let view = apps[0].post_view.as_mut().unwrap();
+        view.scroll = view.row_starts[0] + 10;
+        let view = apps[1].post_view.as_mut().unwrap();
+        view.cursor = 1;
+        view.free_scroll = false;
+        view.scroll = view.row_starts[1] - 5;
+        screen(&mut apps[1], width, 30);
+        let befores: Vec<_> = apps
+            .iter_mut()
+            .map(|app| {
+                let screen = screen(app, width, 30);
+                (shown(&screen, "line "), len(app))
+            })
+            .collect();
+        let selected = shown(&screen(&mut apps[1], width, 30), "▌");
+
+        let wait = created + chrono::Duration::milliseconds(60_300) - Utc::now();
+        std::thread::sleep(wait.to_std().unwrap_or_default());
+
+        for (app, (before, lines_before)) in apps.iter_mut().zip(befores) {
+            let after = shown(&screen(app, width, 30), "line ");
+            assert!(len(app) < lines_before, "the header lost a line");
+            assert!(before.is_some());
+            assert_eq!(after, before, "the text being read stays");
+        }
+        assert!(selected.is_some());
+        assert_eq!(shown(&screen(&mut apps[1], width, 30), "▌"), selected);
+    }
+
+    #[test]
+    fn a_header_shrinking_above_while_one_grows_below_keeps_the_text_being_read() {
+        let opened = |age: i64, width: u16| {
+            let (mut app, _) = open_long_post(|_| {});
+            let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
+            page.comments[0].body = paragraphs("line", 1..=40);
+            page.comments[0].created = Some(Utc::now() - chrono::Duration::seconds(age));
+            screen(&mut app, width, 30);
+            app
+        };
+        let len = |app: &App| app.post_view.as_ref().unwrap().rendered_document.len();
+        // A width where "just now" wraps and "1m ago" does not, while "9m ago" fits and
+        // "10m ago" wraps: the document keeps its length as one header shrinks and one grows.
+        let width = (40..140)
+            .find(|&width| {
+                len(&opened(10, width)) > len(&opened(120, width))
+                    && len(&opened(590, width)) < len(&opened(610, width))
+            })
+            .expect("some width rewraps both headers");
+        let created = Utc::now() - chrono::Duration::seconds(58);
+        let (mut app, _) = open_long_post(|_| {});
+        let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
+        page.comments[0].body = paragraphs("line", 1..=40);
+        page.comments[0].created = Some(created);
+        let mut below = page.comments[0].clone();
+        below.id = "below".into();
+        below.body = "short".into();
+        below.created = Some(created - chrono::Duration::seconds(540));
+        page.comments.push(below);
+        screen(&mut app, width, 30);
+        let view = app.post_view.as_mut().unwrap();
+        view.scroll = view.row_starts[0] + 10;
+        let shown = |s: &str| {
+            s.lines()
+                .enumerate()
+                .find_map(|(row, l)| l.split("line ").nth(1).map(|r| (row, r.to_string())))
+        };
+        let lines_before = len(&app);
+        let before = shown(&screen(&mut app, width, 30));
+
+        let wait = created + chrono::Duration::milliseconds(60_300) - Utc::now();
+        std::thread::sleep(wait.to_std().unwrap_or_default());
+        // A spinner advancing in the same draw, as while anything loads.
+        app.loading_frame += 1;
+        let after = shown(&screen(&mut app, width, 30));
+
+        assert_eq!(len(&app), lines_before, "the rewraps cancel out");
+        assert!(before.is_some());
+        assert_eq!(after, before, "the text being read stays");
+    }
+
+    #[test]
     fn revealing_spoilers_above_keeps_the_text_being_read() {
         let (mut app, _) = open_long_post(|_| {});
         let page = app.post_view.as_mut().unwrap().page.as_mut().unwrap();
@@ -7939,7 +9051,7 @@ pub(crate) mod tests {
         };
         let before = shown(&screen(&mut app, 100, 30));
 
-        press_keys(&mut app, " vs");
+        press_keys(&mut app, "zs");
         let after = shown(&screen(&mut app, 100, 30));
         let revealed_start = app.post_view.as_ref().unwrap().row_starts[0];
 
@@ -8031,11 +9143,11 @@ pub(crate) mod tests {
 
         // Paging after `v` moves on from the kept text, drawn or not in between.
         assert_eq!(
-            scroll_after(&[&[" vs", "\u{6}"]]),
-            scroll_after(&[&[" vs"], &["\u{6}"]])
+            scroll_after(&[&["zs", "\u{6}"]]),
+            scroll_after(&[&["zs"], &["\u{6}"]])
         );
         // Hiding again adds lines above; `g` in the same batch still goes to the top.
-        assert_eq!(scroll_after(&[&[" vs"], &[" vs", "gg"]]), 0);
+        assert_eq!(scroll_after(&[&["zs"], &["zs", "gg"]]), 0);
     }
 
     #[test]
@@ -8051,7 +9163,7 @@ pub(crate) mod tests {
         };
         let before = shown(&screen(&mut app, 100, 30));
 
-        press_keys(&mut app, " vs");
+        press_keys(&mut app, "zs");
         let after = shown(&screen(&mut app, 100, 30));
 
         assert!(before.is_some());
@@ -8075,7 +9187,7 @@ pub(crate) mod tests {
             screen(&mut app, 100, 30);
             app.post_view.as_mut().unwrap().scroll = scroll;
             before.push(shown(&screen(&mut app, 100, 30)));
-            press_keys(&mut app, " vs");
+            press_keys(&mut app, "zs");
             after.push(shown(&screen(&mut app, 100, 30)));
         }
 
@@ -8163,11 +9275,11 @@ pub(crate) mod tests {
         };
 
         assert_eq!(
-            after(&[&[" vs", "\u{6}"]]).0,
-            after(&[&[" vs"], &["\u{6}"]]).0
+            after(&[&["zs", "\u{6}"]]).0,
+            after(&[&["zs"], &["\u{6}"]]).0
         );
         // Hiding again adds lines above; `g` in the same batch still goes to the top.
-        assert_eq!(after(&[&[" vs"], &[" vs", "gg"]]).1, 0);
+        assert_eq!(after(&[&["zs"], &["zs", "gg"]]).1, 0);
     }
 
     #[test]
@@ -8186,13 +9298,13 @@ pub(crate) mod tests {
         let hidden = screen(&mut app, 100, 30);
         // No comment can be selected or folded while unseen.
         let rows_hidden = app.post_view.as_ref().unwrap().rows().is_empty();
-        press_keys(&mut app, " vs");
+        press_keys(&mut app, "zs");
         let shown = screen(&mut app, 100, 30);
 
         assert!(masked.contains("the butler did it"), "{masked}");
         assert!(masked.contains("so ▒▒▒▒▒▒▒ was the sled"), "{masked}");
         assert!(
-            hidden.contains("SPC v s reveals the post and its comment"),
+            hidden.contains("zs reveals the post and its comment"),
             "{hidden}"
         );
         assert!(
@@ -8215,15 +9327,15 @@ pub(crate) mod tests {
         press(&mut app, 'G');
         let after_g = reading(&app);
         // Reveal and draw, then hide and press `j` before the next draw.
-        press_keys(&mut app, " vs");
+        press_keys(&mut app, "zs");
         screen(&mut app, 100, 30);
-        press_keys(&mut app, " vs");
+        press_keys(&mut app, "zs");
         press(&mut app, 'j');
         let after_hide_j = reading(&app);
         // Hidden (positions cleared), then reveal and `G` before the next draw:
         // `G` scrolls down to the last comment, it does not hold the view.
         screen(&mut app, 100, 30);
-        press_keys(&mut app, " vs");
+        press_keys(&mut app, "zs");
         press(&mut app, 'G');
         let g_holds = app.post_view.as_ref().unwrap().hold_view.is_some();
 
@@ -8531,7 +9643,7 @@ pub(crate) mod tests {
         let mut app = feed_app(Picker::halfblocks());
         app.no_color = true;
 
-        press_keys(&mut app, " vi");
+        press_keys(&mut app, "zi");
         let s = screen(&mut app, 100, 20);
 
         assert!(app.show_images, "i changes nothing it cannot show");
@@ -8549,7 +9661,7 @@ pub(crate) mod tests {
     #[test]
     fn lists_with_no_thumbnail_to_show_keep_text_only_rows() {
         let mut spoilers = feed_app(kitty());
-        for p in &mut spoilers.tabs[3].feed.posts {
+        for p in &mut spoilers.tabs[4].feed.posts {
             p.spoiler = true;
         }
         let mut images_off = feed_app(kitty());
@@ -8593,7 +9705,7 @@ pub(crate) mod tests {
     #[test]
     fn a_spoiler_post_lists_with_a_chip_and_no_thumbnail() {
         let mut app = feed_app(kitty());
-        app.tabs[3].feed.posts[0].spoiler = true;
+        app.tabs[4].feed.posts[0].spoiler = true;
 
         let s = screen(&mut app, 100, 20);
 
@@ -8665,9 +9777,9 @@ pub(crate) mod tests {
         let mut app = app(&["s"]);
         app.image_picker = picker;
         app.show_images = true;
-        app.switch_tab(3);
-        let tab = app.tabs[3].id;
-        let generation = app.tabs[3].feed.generation;
+        app.switch_tab(4);
+        let tab = app.tabs[4].id;
+        let generation = app.tabs[4].feed.generation;
         let posts = (1..=8)
             .map(|i| {
                 let media = if i == 2 {
@@ -8781,9 +9893,9 @@ pub(crate) mod tests {
     #[test]
     fn when_decoded_link_pixels_are_small_the_declared_large_preview_should_not_enlarge_them() {
         let mut app = card_feed_app(kitty());
-        app.tabs[3].feed.posts.truncate(1);
+        app.tabs[4].feed.posts.truncate(1);
         let url = "https://preview.redd.it/article.jpeg";
-        let post = &mut app.tabs[3].feed.posts[0];
+        let post = &mut app.tabs[4].feed.posts[0];
         post.media = Media::Link {
             url: "https://example.com/story".into(),
             thumb: Some(url.into()),
@@ -8799,7 +9911,7 @@ pub(crate) mod tests {
 
         let card = expanded_card(
             &app,
-            &app.tabs[3].feed.posts[0],
+            &app.tabs[4].feed.posts[0],
             180,
             &CardOpts {
                 selected: true,
@@ -8889,10 +10001,10 @@ pub(crate) mod tests {
         first.preview_size = Some((160, 90));
         let mut selected = post_with("selected", Media::None);
         selected.title = "Selected text post".into();
-        app.tabs[3].feed.posts = vec![first, selected];
-        app.tabs[3].feed.selected = 1;
-        app.tabs[3].feed.offset = 0;
-        app.tabs[3].feed.cards = Default::default();
+        app.tabs[4].feed.posts = vec![first, selected];
+        app.tabs[4].feed.selected = 1;
+        app.tabs[4].feed.offset = 0;
+        app.tabs[4].feed.cards = Default::default();
         first_screen(&mut app, 100, 40);
         assert!(
             app.card_images.contains_key(VIDEO),
@@ -8923,8 +10035,8 @@ pub(crate) mod tests {
     {
         let mut app = card_feed_app(kitty());
         app.config.media.video_autoplay = false;
-        app.tabs[3].feed.posts.truncate(1);
-        app.tabs[3].feed.posts[0].media = Media::Link {
+        app.tabs[4].feed.posts.truncate(1);
+        app.tabs[4].feed.posts[0].media = Media::Link {
             url: "https://www.youtube.com/shorts/dQw4w9WgXcQ".into(),
             thumb: Some("https://preview.redd.it/youtube.jpg".into()),
         };
@@ -8990,7 +10102,7 @@ pub(crate) mod tests {
     }
 
     fn feed_with_next_page_in(mut app: App, view: ListView) -> App {
-        app.switch_tab(3);
+        app.switch_tab(4);
         if app.state.list_view() != view {
             app.state.toggle_list_view();
         }
@@ -9024,7 +10136,7 @@ pub(crate) mod tests {
         for kind in ["image", "video", "gallery", "link"] {
             let mut app = card_with_image(640, 320);
             let url = "https://i.redd.it/p1.jpeg";
-            app.tabs[3].feed.posts[0].media = match kind {
+            app.tabs[4].feed.posts[0].media = match kind {
                 "video" => Media::Video {
                     gif: false,
                     url: Some(VIDEO.into()),
@@ -9044,7 +10156,7 @@ pub(crate) mod tests {
                     preview: None,
                 },
             };
-            app.tabs[3]
+            app.tabs[4]
                 .feed
                 .posts
                 .extend((0..10).map(|i| post_with(&format!("tail{i}"), Media::None)));
@@ -9073,8 +10185,9 @@ pub(crate) mod tests {
     fn when_card_previews_resize_their_native_strips_should_fill_the_fitted_box() {
         for kind in ["image", "gallery", "video", "gif", "link"] {
             let mut app = card_with_image(320, 640);
+            app.config.media.video_autoplay = false;
             let url = "https://i.redd.it/p1.jpeg";
-            app.tabs[3].feed.posts[0].media = match kind {
+            app.tabs[4].feed.posts[0].media = match kind {
                 "gallery" => Media::Gallery {
                     images: vec![url.into()],
                     previews: Vec::new(),
@@ -9145,7 +10258,7 @@ pub(crate) mod tests {
     #[test]
     fn warm_navigation_replay_should_display_loaded_cards_without_media_work() {
         let mut app = card_feed_app(kitty());
-        app.tabs[3].feed.posts = (0..12)
+        app.tabs[4].feed.posts = (0..12)
             .map(|i| {
                 let mut post = post_with(
                     &format!("warm{i}"),
@@ -9159,8 +10272,8 @@ pub(crate) mod tests {
             })
             .collect();
         for i in 0..12 {
-            app.tabs[3].feed.selected = i;
-            app.tabs[3].feed.cards = CardScroll::default();
+            app.tabs[4].feed.selected = i;
+            app.tabs[4].feed.cards = CardScroll::default();
             let url = format!("https://i.redd.it/warm{i}.png");
             app.card_pictures_drawn(&[&url]);
             app.on_msg(Msg::Image {
@@ -9235,7 +10348,7 @@ pub(crate) mod tests {
     #[test]
     fn when_a_partial_card_becomes_fully_visible_its_remaining_strips_should_be_ready() {
         let mut app = card_with_image(640, 640);
-        app.tabs[3].feed.posts.push(post_with(
+        app.tabs[4].feed.posts.push(post_with(
             "p2",
             Media::Image {
                 url: "https://i.redd.it/p2.jpeg".into(),
@@ -9267,7 +10380,7 @@ pub(crate) mod tests {
     fn the_same_loaded_image_on_another_post_should_reuse_its_native_encoding() {
         let mut app = card_with_image(640, 320);
         screen(&mut app, 100, 40);
-        app.tabs[3].feed.posts[0].id = "crosspost".into();
+        app.tabs[4].feed.posts[0].id = "crosspost".into();
         let shown = first_screen(&mut app, 100, 40);
         assert!(!shown.contains("preparing image"));
         assert!(!shown.contains("_G"));
@@ -9291,7 +10404,7 @@ pub(crate) mod tests {
         let mut app = card_with_decoded_image();
         app.focus_sidebar();
         app.switch_tab(1);
-        app.switch_tab(3);
+        app.switch_tab(4);
 
         let actual = first_screen(&mut app, 100, 24);
 
@@ -9308,7 +10421,7 @@ pub(crate) mod tests {
         screen(&mut app, 100, 24);
         app.focus_sidebar();
         app.switch_tab(1);
-        app.switch_tab(3);
+        app.switch_tab(4);
 
         let actual = first_screen(&mut app, 100, 24);
 
@@ -9322,7 +10435,7 @@ pub(crate) mod tests {
         let mut app = card_with_decoded_image();
         app.focus_sidebar();
         app.switch_tab(1);
-        app.switch_tab(3);
+        app.switch_tab(4);
         first_screen(&mut app, 100, 24);
 
         std::thread::sleep(crate::app::NAV_SETTLE);
@@ -9346,6 +10459,7 @@ pub(crate) mod tests {
                 title: "Custom feeds".into(),
                 text: String::new(),
                 entries: vec![Entry {
+                    icon: Default::default(),
                     title: "Existing feed".into(),
                     body: String::new(),
                     target: None,
@@ -9381,7 +10495,14 @@ pub(crate) mod tests {
                 ..
             })
         ));
-        app.on_experience(91, Err("offline".into()));
+        app.on_experience(
+            91,
+            Err("offline".into()),
+            crate::cache::Freshness {
+                fetched_at: crate::app::now(),
+                source: Default::default(),
+            },
+        );
         for (width, height) in [(24, 10), (40, 12), (100, 30)] {
             let actual = screen(&mut app, width, height);
             assert!(actual.contains("Existing feed"), "{actual}");
@@ -9499,7 +10620,7 @@ pub(crate) mod tests {
             let reddit = fixture.reddit();
             assert!(reddit.search("s", "first", None).is_err());
             let mut app = app_with_client(&["s"], reddit.clone());
-            app.switch_tab(3);
+            app.switch_tab(4);
             if append {
                 app.on_msg(Msg::Feed {
                     tab: app.active_tab().id,
@@ -9510,7 +10631,7 @@ pub(crate) mod tests {
                         after: Some("next".into()),
                     }),
                 });
-                app.load_feed(3, true);
+                app.load_feed(4, true);
             }
             app.status = None;
             let deadline = Instant::now() + Duration::from_secs(1);
@@ -9531,7 +10652,7 @@ pub(crate) mod tests {
     #[test]
     fn when_an_empty_feed_has_a_failed_next_page_it_should_offer_the_cursor_retry_key() {
         let mut app = app(&["s"]);
-        app.switch_tab(3);
+        app.switch_tab(4);
         let tab = app.active_tab().id;
         app.on_msg(Msg::Feed {
             tab,
@@ -9542,7 +10663,7 @@ pub(crate) mod tests {
                 after: Some("next".into()),
             }),
         });
-        app.load_feed(3, true);
+        app.load_feed(4, true);
         app.on_msg(Msg::Feed {
             tab,
             generation: app.active_tab().feed.generation,
@@ -9562,7 +10683,7 @@ pub(crate) mod tests {
     fn when_an_initial_page_streams_card_and_compact_views_should_keep_the_append_loader() {
         for view in [ListView::Card, ListView::Compact] {
             let mut app = app(&["s"]);
-            app.switch_tab(3);
+            app.switch_tab(4);
             if app.state.list_view() != view {
                 app.state.toggle_list_view();
             }
@@ -9591,7 +10712,7 @@ pub(crate) mod tests {
     #[test]
     fn when_compact_pagination_starts_it_should_render_a_skeleton_after_the_entries() {
         let mut app = feed_with_next_page(ListView::Compact);
-        app.load_feed(3, true);
+        app.load_feed(4, true);
 
         let actual = screen(&mut app, 80, 20);
 
@@ -9616,7 +10737,7 @@ pub(crate) mod tests {
         let mut app = feed_with_next_page(ListView::Card);
         screen(&mut app, 80, 20);
         let geometry = app.active_tab().feed.cards.clone();
-        app.load_feed(3, true);
+        app.load_feed(4, true);
 
         let actual = screen(&mut app, 80, 20);
 
@@ -9639,12 +10760,110 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn when_scrolling_starts_pagination_the_same_draw_should_show_the_append_loader() {
+    fn navigation_should_prefetch_near_the_visible_end_without_draining_filtered_pages() {
+        for (view, height, delayed_draw) in [
+            (ListView::Compact, 72, false),
+            (ListView::Card, 96, false),
+            (ListView::Compact, 72, true),
+            (ListView::Card, 96, true),
+        ] {
+            let mut app = feed_with_next_page(view);
+            app.config.filters.keywords = vec!["hidden".into()];
+            app.tabs[4].feed.posts = (0..25)
+                .map(|i| {
+                    let mut post = post_with(&format!("p{i}"), Media::None);
+                    post.title = format!("Entry {i:02} end");
+                    post
+                })
+                .collect();
+            screen(&mut app, 100, height);
+            screen(&mut app, 100, height + 1);
+            assert!(
+                !app.active_tab().feed.loading_more(),
+                "redraws must not fetch"
+            );
+
+            app.move_selection(1);
+            if delayed_draw {
+                std::thread::sleep(crate::app::NAV_SETTLE);
+                app.tick();
+            }
+            let actual = screen(&mut app, 100, height);
+            assert!(actual.contains("Entry 20 end"), "view={view:?}: {actual}");
+            assert!(!actual.contains("Entry 24 end"), "view={view:?}: {actual}");
+            assert_eq!(app.active_tab().feed.selected, 1);
+            if !delayed_draw {
+                assert!(
+                    !app.active_tab().feed.loading_more(),
+                    "navigation must settle first"
+                );
+                std::thread::sleep(crate::app::NAV_SETTLE);
+                app.tick();
+            }
+
+            assert!(
+                app.active_tab().feed.loading_more(),
+                "view={view:?}: the visible edge should prefetch before selection reaches the end"
+            );
+            let generation = app.active_tab().feed.generation;
+            let mut hidden = post_with("filtered", Media::None);
+            hidden.title = "hidden entry".into();
+            app.on_msg(Msg::Feed {
+                tab: app.active_tab().id,
+                generation,
+                append: true,
+                result: Ok(crate::model::Listing {
+                    posts: vec![hidden],
+                    after: Some("again".into()),
+                }),
+            });
+            screen(&mut app, 100, height);
+            screen(&mut app, 100, height + 1);
+            app.tick();
+
+            assert!(
+                !app.active_tab().feed.loading_more(),
+                "a filtered append must wait for new navigation"
+            );
+            assert_eq!(app.active_tab().feed.generation, generation);
+            assert_eq!(app.active_tab().feed.selected, 1);
+
+            app.select_edge(true);
+            std::thread::sleep(crate::app::NAV_SETTLE);
+            app.tick();
+            assert!(app.active_tab().feed.loading_more());
+            let generation = app.active_tab().feed.generation;
+            let mut hidden = post_with("filtered-again", Media::None);
+            hidden.title = "hidden again".into();
+            app.on_msg(Msg::Feed {
+                tab: app.active_tab().id,
+                generation,
+                append: true,
+                result: Ok(crate::model::Listing {
+                    posts: vec![hidden],
+                    after: Some("last".into()),
+                }),
+            });
+            screen(&mut app, 100, height);
+            assert!(
+                !app.active_tab().feed.loading_more(),
+                "the request before drawing consumes navigation intent"
+            );
+            assert_eq!(app.active_tab().feed.generation, generation);
+        }
+    }
+
+    #[test]
+    fn scrolling_should_defer_pagination_until_settled_then_show_the_append_loader() {
         let mut app = feed_with_next_page(ListView::Card);
         screen(&mut app, 80, 20);
         assert!(!app.active_tab().feed.loading_more());
         app.scroll_card(1);
 
+        screen(&mut app, 80, 20);
+        assert!(!app.active_tab().feed.loading_more());
+        std::thread::sleep(crate::app::NAV_SETTLE);
+        app.tick();
         let actual = screen(&mut app, 80, 20);
 
         assert!(app.active_tab().feed.loading_more());
@@ -9661,7 +10880,7 @@ pub(crate) mod tests {
     #[test]
     fn when_a_long_notification_is_visible_the_append_loader_should_remain_visible() {
         let mut app = feed_with_next_page(ListView::Compact);
-        app.load_feed(3, true);
+        app.load_feed(4, true);
         app.info("Checking membership and keeping the current reading position while posts load");
 
         let actual = screen(&mut app, 80, 20);
@@ -9689,7 +10908,7 @@ pub(crate) mod tests {
                 comments: vec![],
             })),
         });
-        app.load_feed(3, true);
+        app.load_feed(4, true);
 
         let actual = screen(&mut app, 158, 20);
 
@@ -9716,7 +10935,7 @@ pub(crate) mod tests {
                     comments: vec![reply("c".into())],
                 })),
             });
-            app.load_feed(3, true);
+            app.load_feed(4, true);
             if replies {
                 let view = app.post_view.as_mut().unwrap();
                 view.page.as_mut().unwrap().comments[0].more = Some(crate::model::MoreReplies {
@@ -9741,12 +10960,12 @@ pub(crate) mod tests {
         }
 
         let mut app = feed_with_next_page(ListView::Card);
-        app.tabs[3]
+        app.tabs[4]
             .feed
             .posts
             .extend((0..8).map(|i| post_with(&format!("post{i}"), Media::None)));
         app.open_current_post();
-        app.load_feed(3, true);
+        app.load_feed(4, true);
         let actual = screen(&mut app, 158, 20);
         assert!(actual.contains("Loading post"), "{actual}");
         assert!(
@@ -9788,7 +11007,7 @@ pub(crate) mod tests {
             app.focus = focus;
             let view = app.post_view.as_mut().unwrap();
             view.post.title = (0..200).map(|i| format!("Segment{i:02} ")).collect();
-            view.page = None;
+            view.page = None.into();
             view.loading = true;
             let actual = screen(&mut app, width, 20);
             let view = app.post_view.as_ref().unwrap();
@@ -9817,7 +11036,7 @@ pub(crate) mod tests {
     #[test]
     fn when_a_notification_is_visible_the_card_append_loader_should_remain_visible() {
         let mut app = feed_with_next_page(ListView::Card);
-        app.load_feed(3, true);
+        app.load_feed(4, true);
         app.info("Still browsing");
 
         let actual = screen(&mut app, 80, 20);
@@ -9834,11 +11053,11 @@ pub(crate) mod tests {
     #[test]
     fn when_the_append_position_is_offscreen_pagination_should_use_the_footer() {
         let mut app = feed_with_next_page(ListView::Card);
-        app.tabs[3]
+        app.tabs[4]
             .feed
             .posts
             .extend((0..8).map(|i| post_with(&format!("post{i}"), Media::None)));
-        app.load_feed(3, true);
+        app.load_feed(4, true);
 
         let actual = screen(&mut app, 80, 20);
 
@@ -9855,7 +11074,7 @@ pub(crate) mod tests {
     #[test]
     fn when_jump_covers_the_append_loader_pagination_should_use_the_footer() {
         let mut app = feed_with_next_page(ListView::Compact);
-        app.load_feed(3, true);
+        app.load_feed(4, true);
         app.overlay = Some(Overlay::Picker(crate::app::PickerState::default()));
 
         let actual = screen(&mut app, 80, 20);
@@ -9871,8 +11090,8 @@ pub(crate) mod tests {
     fn when_the_append_loader_animates_cached_graphics_should_not_be_prepared_or_uploaded_again() {
         let mut app = card_with_image(640, 320);
         screen(&mut app, 100, 40);
-        app.tabs[3].feed.after = Some("next".into());
-        app.load_feed(3, true);
+        app.tabs[4].feed.after = Some("next".into());
+        app.load_feed(4, true);
         screen(&mut app, 100, 40);
         app.loading_frame = 1;
 
@@ -9909,7 +11128,7 @@ pub(crate) mod tests {
     #[test]
     fn when_a_page_finishes_it_should_remove_the_loading_boundary() {
         let mut app = feed_with_next_page(ListView::Card);
-        app.load_feed(3, true);
+        app.load_feed(4, true);
         app.on_msg(Msg::Feed {
             tab: app.active_tab().id,
             generation: app.active_tab().feed.generation,
@@ -9933,7 +11152,7 @@ pub(crate) mod tests {
     #[test]
     fn when_a_page_fails_it_should_replace_loading_with_the_retry_action() {
         let mut app = feed_with_next_page(ListView::Card);
-        app.load_feed(3, true);
+        app.load_feed(4, true);
         app.on_msg(Msg::Feed {
             tab: app.active_tab().id,
             generation: app.active_tab().feed.generation,
@@ -9954,7 +11173,7 @@ pub(crate) mod tests {
     #[test]
     fn when_cached_posts_are_refreshing_a_single_background_loader_should_keep_activity_visible() {
         let mut app = feed_with_next_page(ListView::Card);
-        app.load_feed(3, false);
+        app.load_feed(4, false);
         app.on_msg(Msg::Snapshot {
             message: Box::new(Msg::Feed {
                 tab: app.active_tab().id,
@@ -10070,7 +11289,7 @@ pub(crate) mod tests {
 
     fn refreshing_thumbnail_app() -> App {
         let mut app = feed_app(kitty());
-        app.tabs[3].feed.posts.truncate(1);
+        app.tabs[4].feed.posts.truncate(1);
         app.thumbs_drawn(&["https://i.redd.it/p1.jpeg"]);
         app.on_msg(Msg::Snapshot {
             message: Box::new(Msg::Thumb {
@@ -10109,6 +11328,7 @@ pub(crate) mod tests {
                 } else {
                     feed_with_next_page(ListView::Card)
                 };
+                app.config.media.video_autoplay = false;
                 app.image_picker = kitty();
                 app.show_images = true;
                 app.health = Health::Up;
@@ -10122,7 +11342,7 @@ pub(crate) mod tests {
                 let footer = |app: &App| {
                     let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
                     terminal
-                        .draw(|f| draw_footer(f, app, f.area(), &VisibleLoaders::default()))
+                        .draw(|f| draw_footer(f, app, f.area(), &VisibleLoaders::default(), &[]))
                         .unwrap();
                     terminal.backend().buffer().clone()
                 };
@@ -10195,7 +11415,7 @@ pub(crate) mod tests {
         app.on_msg(Msg::ThumbSkipped {
             url: "https://i.redd.it/p1.jpeg".into(),
         });
-        app.tabs[3].feed.posts.clear();
+        app.tabs[4].feed.posts.clear();
 
         let actual = first_screen(&mut app, 100, 20);
 
@@ -10281,7 +11501,7 @@ pub(crate) mod tests {
         });
         let mut app =
             feed_with_next_page_in(app_with_client(&["s"], fixture.reddit()), ListView::Card);
-        app.tabs[3].feed.posts[0].media = Media::Video {
+        app.tabs[4].feed.posts[0].media = Media::Video {
             gif: false,
             url: None,
             poster: None,
@@ -10302,14 +11522,14 @@ pub(crate) mod tests {
     #[test]
     fn when_media_loading_fails_the_footer_should_show_the_error_and_stop_activity() {
         let mut app = feed_with_next_page(ListView::Card);
-        app.tabs[3].feed.posts[0].media = Media::Video {
+        app.tabs[4].feed.posts[0].media = Media::Video {
             gif: false,
             url: None,
             poster: None,
         };
         app.open_media();
         app.on_msg(Msg::MediaResolved {
-            permalink: app.tabs[3].feed.posts[0].permalink.clone(),
+            permalink: app.tabs[4].feed.posts[0].permalink.clone(),
             result: Err("offline".into()),
         });
 
@@ -10326,12 +11546,12 @@ pub(crate) mod tests {
     fn when_a_feed_opens_it_should_default_to_cards_with_wrapped_titles() {
         let mut app = card_feed_app(Picker::halfblocks());
         app.show_images = false;
-        app.tabs[3].feed.posts[0].title =
+        app.tabs[4].feed.posts[0].title =
             "First line of the title followed by a second line ending in 東京".into();
 
         let actual = screen(&mut app, 70, 20);
 
-        assert!(actual.contains("SPC v c Card"), "{actual}");
+        assert!(actual.contains("zc Card"), "{actual}");
         assert!(actual.contains("First line of the title"), "{actual}");
         assert!(actual.contains("ending in 東"), "{actual}");
         assert!(actual.contains('京'), "{actual}");
@@ -10342,26 +11562,20 @@ pub(crate) mod tests {
     fn when_view_is_toggled_it_should_keep_the_selected_post_and_restore_cards() {
         let mut app = card_feed_app(Picker::halfblocks());
         app.move_selection(4);
-        let state_path = std::env::temp_dir().join(format!(
-            "redtab-ui-test-{}-{:?}.json",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let state_path = app.state_path().to_path_buf();
         let before = app.current_post().unwrap().id;
 
-        press_keys(&mut app, " vc");
+        press_keys(&mut app, "zc");
         let compact = screen(&mut app, 100, 20);
         let (saved, warning) = crate::state::State::load(&state_path);
         assert!(warning.is_none());
         assert_eq!(saved.list_view(), ListView::Compact);
-        assert!(compact.contains("SPC v c Compact"), "{compact}");
+        assert!(compact.contains("zc Compact"), "{compact}");
         assert_eq!(app.current_post().unwrap().id, before);
 
-        press_keys(&mut app, " vc");
+        press_keys(&mut app, "zc");
         let cards = screen(&mut app, 100, 20);
-        std::fs::remove_file(&state_path).unwrap();
-        std::fs::remove_file(state_path.with_extension("json.lock")).unwrap();
-        assert!(cards.contains("SPC v c Card"), "{cards}");
+        assert!(cards.contains("zc Card"), "{cards}");
         assert!(cards.contains("p5"), "{cards}");
         assert!(!cards.contains("……"), "{cards}");
         assert_eq!(app.current_post().unwrap().id, before);
@@ -10392,8 +11606,8 @@ pub(crate) mod tests {
 
     fn card_with_image(width: u32, height: u32) -> App {
         let mut app = card_feed_app(kitty());
-        app.tabs[3].feed.posts.truncate(1);
-        app.tabs[3].feed.posts[0].title = "Full width image".into();
+        app.tabs[4].feed.posts.truncate(1);
+        app.tabs[4].feed.posts[0].title = "Full width image".into();
         screen(&mut app, 100, 20);
         app.on_msg(Msg::Image {
             url: "https://i.redd.it/p1.jpeg".into(),
@@ -10402,15 +11616,30 @@ pub(crate) mod tests {
         app
     }
 
+    #[test]
+    fn encoding_failures_should_show_an_error_in_the_first_failed_frame() {
+        let mut app = card_with_image(320, 180);
+        screen(&mut app, 100, 20);
+        app.card_renderer.fail_cached_tiles("encoder failed");
+
+        let actual = first_screen(&mut app, 100, 20);
+
+        assert!(actual.contains("image unavailable:"), "{actual}");
+        assert!(matches!(
+            app.card_images.get("https://i.redd.it/p1.jpeg"),
+            Some(CardImageSlot::Failed(error)) if error == "encoder failed"
+        ));
+    }
+
     fn video_card_with_poster(image: image::DynamicImage) -> App {
         let mut app = card_feed_app(kitty());
-        app.tabs[3].feed.posts.truncate(1);
-        app.tabs[3].feed.posts[0].media = Media::Video {
+        app.tabs[4].feed.posts.truncate(1);
+        app.tabs[4].feed.posts[0].media = Media::Video {
             gif: false,
             url: Some("https://v.redd.it/example/HLSPlaylist.m3u8".into()),
             poster: Some("https://i.redd.it/p1.jpeg".into()),
         };
-        app.tabs[3].feed.posts[0].preview_size = Some((image.width(), image.height()));
+        app.tabs[4].feed.posts[0].preview_size = Some((image.width(), image.height()));
         first_screen(&mut app, 100, 20);
         app.on_msg(Msg::Image {
             url: "https://i.redd.it/p1.jpeg".into(),
@@ -10429,7 +11658,7 @@ pub(crate) mod tests {
         let words = actual.split_whitespace().collect::<Vec<_>>().join(" ");
 
         assert!(words.contains("l return"), "{actual}");
-        assert!(!words.contains("SPC m p play"), "{actual}");
+        assert!(!words.contains("p play"), "{actual}");
     }
 
     #[test]
@@ -10440,14 +11669,14 @@ pub(crate) mod tests {
         let actual = screen(&mut app, 100, 30);
         let words = actual.split_whitespace().collect::<Vec<_>>().join(" ");
 
-        assert!(words.contains("SPC m p play"), "{actual}");
+        assert!(words.contains("p play"), "{actual}");
         assert!(!actual.contains("loading video"), "{actual}");
     }
 
     #[test]
     fn card_media_known_portrait_size_without_a_poster_should_keep_its_geometry() {
         let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 640));
-        if let Media::Video { poster, .. } = &mut app.tabs[3].feed.posts[0].media {
+        if let Media::Video { poster, .. } = &mut app.tabs[4].feed.posts[0].media {
             *poster = None;
         }
         let mut pictures = ListPictures::default();
@@ -10466,7 +11695,7 @@ pub(crate) mod tests {
     #[test]
     fn card_media_unavailable_stream_should_not_offer_a_play_button() {
         let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 180));
-        if let Media::Video { url, .. } = &mut app.tabs[3].feed.posts[0].media {
+        if let Media::Video { url, .. } = &mut app.tabs[4].feed.posts[0].media {
             *url = None;
         }
         let mut pictures = ListPictures::default();
@@ -10488,7 +11717,7 @@ pub(crate) mod tests {
     #[test]
     fn card_media_converted_gif_should_reach_the_gif_overlay() {
         let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 180));
-        if let Media::Video { gif, .. } = &mut app.tabs[3].feed.posts[0].media {
+        if let Media::Video { gif, .. } = &mut app.tabs[4].feed.posts[0].media {
             *gif = true;
         }
         let mut pictures = ListPictures::default();
@@ -10511,7 +11740,7 @@ pub(crate) mod tests {
         let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 180));
         app.video = Some(video::Player::silent(VIDEO, Size::new(68, 17)));
 
-        press_keys(&mut app, " mp");
+        press_keys(&mut app, "p");
 
         assert!(app.video.as_ref().unwrap().paused());
     }
@@ -10529,7 +11758,181 @@ pub(crate) mod tests {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(footer.contains("SPC m p play"), "{actual}");
+        assert!(footer.contains("p play"), "{actual}");
+    }
+
+    #[test]
+    fn video_startup_should_emit_loading_text_without_losing_image_uploads() {
+        for protocol in [
+            ProtocolType::Kitty,
+            ProtocolType::Sixel,
+            ProtocolType::Iterm2,
+        ] {
+            let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 180));
+            app.image_picker.set_protocol_type(protocol);
+            app.config.media.video_autoplay = true;
+            let size = if protocol == ProtocolType::Kitty {
+                Size::new(10, 1)
+            } else {
+                Size::new(40, 8)
+            };
+            let picture = CardPicture {
+                url: Some("https://i.redd.it/p1.jpeg".into()),
+                area: Rect::new(0, 0, size.width, size.height),
+                size,
+                skipped: 0,
+                pixels: (320, 180),
+                indicator: Some(Indicator::Video {
+                    gif: false,
+                    play: true,
+                }),
+                selected: true,
+                detail: false,
+                post_id: Some("p1".into()),
+                video_url: Some("https://v.redd.it/example/HLSPlaylist.m3u8".into()),
+                video_frame: false,
+            };
+            let draw = |app: &mut App| {
+                let mut terminal =
+                    Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
+                loop {
+                    terminal
+                        .draw(|f| draw_card_pictures(f, app, std::slice::from_ref(&picture), None))
+                        .unwrap();
+                    if !app.card_renderer.pending() {
+                        break;
+                    }
+                    app.card_renderer.wait_for_completion();
+                    app.card_renderer.poll();
+                }
+                terminal.backend().buffer().clone()
+            };
+
+            let startup = draw(&mut app);
+            let empty = ratatui::buffer::Buffer::empty(startup.area);
+            let updates = empty.diff(&startup);
+            assert!(
+                updates
+                    .iter()
+                    .any(|(_, _, cell)| cell.symbol() == loading::glyph(0)),
+                "{protocol:?}: loading must reach terminal updates"
+            );
+
+            app.config.media.video_autoplay = false;
+            let idle = draw(&mut app);
+            if protocol == ProtocolType::Kitty {
+                assert!(
+                    buffer_text(&idle).contains("_Ga=T"),
+                    "the image upload must survive a one-row loading slot"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn video_startup_should_stop_loading_when_the_initial_thread_request_fails() {
+        let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 180));
+        app.config.media.video_autoplay = true;
+        app.open_current_post();
+        screen(&mut app, 100, 30);
+        let generation = app.post_view.as_ref().unwrap().generation;
+        assert_eq!(
+            loading_activity(&app, &VisibleLoaders::default()),
+            Some("video")
+        );
+
+        app.on_msg(Msg::Post {
+            generation,
+            result: Err("fixture request failed".into()),
+        });
+        let actual = screen(&mut app, 100, 30);
+
+        assert!(actual.contains("Could not load the post"), "{actual}");
+        assert_ne!(
+            loading_activity(&app, &VisibleLoaders::default()),
+            Some("video")
+        );
+        assert!(!app.loading_active());
+    }
+
+    #[test]
+    fn video_startup_should_stay_visible_over_posters_and_retained_frames_until_playing() {
+        let frame = video::Frame {
+            width: 32,
+            height: 18,
+            pixels: video::Pixels::Raw(std::sync::Arc::new(image::DynamicImage::new_rgb8(32, 18))),
+            same_as_first: false,
+        };
+        for detail in [false, true] {
+            let mut app = if detail {
+                open_video_post()
+            } else {
+                video_card_with_poster(image::DynamicImage::new_rgb8(320, 180))
+            };
+            app.config.media.video_autoplay = true;
+            let url = app
+                .playback_url(if detail {
+                    VIDEO
+                } else {
+                    "https://v.redd.it/example/HLSPlaylist.m3u8"
+                })
+                .unwrap();
+            let height = if detail { 30 } else { 20 };
+
+            let actual = screen(&mut app, 100, height);
+            assert!(
+                actual
+                    .lines()
+                    .take(height as usize - 1)
+                    .any(|line| line.contains("loading video")),
+                "{actual}"
+            );
+            assert!(app.loading_active());
+
+            for resolving in [true, false] {
+                let mut player = if resolving {
+                    video::Player::pending(&url, Size::new(32, 18))
+                } else {
+                    video::Player::silent(&url, Size::new(32, 18))
+                };
+                player.retain_frame(Some(frame.clone()));
+                app.video = Some(player);
+
+                let actual = screen(&mut app, 100, height);
+                assert!(
+                    actual
+                        .lines()
+                        .take(height as usize - 1)
+                        .any(|line| line.contains("loading video")),
+                    "{actual}"
+                );
+                assert!(app.loading_active());
+                assert_eq!(
+                    loading_activity(&app, &VisibleLoaders::default()),
+                    Some("video")
+                );
+            }
+
+            app.video.as_mut().unwrap().show(frame.clone());
+            let actual = screen(&mut app, 100, height);
+            assert!(!actual.contains("loading video"), "{actual}");
+            assert!(!app.loading_active());
+
+            app.video = Some(video::Player::unavailable(&url, Size::new(32, 18)));
+            let actual = screen(&mut app, 100, height);
+            assert!(!actual.contains("loading video"), "{actual}");
+            assert!(!app.loading_active());
+
+            app.video = None;
+            app.config.media.video_autoplay = false;
+            let actual = screen(&mut app, 100, height);
+            assert!(!actual.contains("loading video"), "{actual}");
+            assert!(app.video_loading().is_none());
+            assert_ne!(
+                loading_activity(&app, &VisibleLoaders::default()),
+                Some("video")
+            );
+        }
     }
 
     #[test]
@@ -10590,7 +11993,7 @@ pub(crate) mod tests {
     #[test]
     fn when_a_flat_poster_url_is_used_by_an_image_post_it_should_still_render_the_pixels() {
         let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 180));
-        app.tabs[3].feed.posts[0].media = Media::Image {
+        app.tabs[4].feed.posts[0].media = Media::Image {
             url: "https://i.redd.it/p1.jpeg".into(),
             preview: None,
         };
@@ -10605,8 +12008,8 @@ pub(crate) mod tests {
     fn when_a_gif_card_has_a_flat_first_frame_it_should_keep_its_play_indicator() {
         let mut app = card_feed_app(kitty());
         app.config.media.video_autoplay = false;
-        app.tabs[3].feed.posts.truncate(1);
-        app.tabs[3].feed.posts[0].media = Media::Image {
+        app.tabs[4].feed.posts.truncate(1);
+        app.tabs[4].feed.posts[0].media = Media::Image {
             url: "https://i.redd.it/animation.gif".into(),
             preview: None,
         };
@@ -10705,13 +12108,13 @@ pub(crate) mod tests {
         post.title = "Target ● body".into();
         post.stickied = true;
         app.state.toggle_bookmark(&post, 1);
-        app.tabs[3].feed.posts[0] = post;
+        app.tabs[4].feed.posts[0] = post;
         app.config.highlight.keywords = vec!["Target".into()];
 
         let actual = screen_buffer(&mut app, 100, 20);
 
         let dots: Vec<_> = (25..98)
-            .map(|x| &actual[(x, 4)])
+            .map(|x| &actual[(x, 5)])
             .filter(|cell| cell.symbol() == "●")
             .map(|cell| cell.fg)
             .collect();
@@ -10726,7 +12129,7 @@ pub(crate) mod tests {
         post.title = "New title".into();
         post.stickied = true;
         app.state.toggle_bookmark(&post, 1);
-        app.tabs[3].feed.posts[0] = post;
+        app.tabs[4].feed.posts[0] = post;
 
         let actual = screen_buffer(&mut app, 14, 20);
 
@@ -10745,12 +12148,12 @@ pub(crate) mod tests {
         let mut post = post_with("fresh", Media::None);
         post.title = "Read ● body".into();
         app.state.mark_read(&post, 1);
-        app.tabs[3].feed.posts[0] = post;
+        app.tabs[4].feed.posts[0] = post;
 
         let actual = screen_buffer(&mut app, 100, 20);
 
         let dots: Vec<_> = (25..98)
-            .map(|x| &actual[(x, 4)])
+            .map(|x| &actual[(x, 5)])
             .filter(|cell| cell.symbol() == "●")
             .map(|cell| cell.fg)
             .collect();
@@ -10764,12 +12167,12 @@ pub(crate) mod tests {
         let actual = screen_buffer(&mut app, 100, 40);
 
         assert!(
-            (3..23).all(|y| actual[(25, y)].symbol() == "▌" && actual[(25, y)].fg == ACCENT),
+            (4..24).all(|y| actual[(26, y)].symbol() == "▌" && actual[(26, y)].fg == ACCENT),
             "{}",
             buffer_text(&actual)
         );
-        assert!(actual[(27, 5)].symbol().contains('\u{10EEEE}'));
-        assert_eq!(actual[(25, 23)].symbol(), " ", "inter-card gap stays clear");
+        assert!(actual[(28, 6)].symbol().contains('\u{10EEEE}'));
+        assert_eq!(actual[(26, 24)].symbol(), " ", "inter-card gap stays clear");
     }
 
     #[test]
@@ -10780,7 +12183,7 @@ pub(crate) mod tests {
         let actual = screen_buffer(&mut app, 100, 40);
 
         assert!(
-            (3..23).all(|y| actual[(25, y)].symbol() == "│" && actual[(25, y)].fg == OVERLAY),
+            (4..24).all(|y| actual[(26, y)].symbol() == "│" && actual[(26, y)].fg == OVERLAY),
             "{}",
             buffer_text(&actual)
         );
@@ -10789,36 +12192,38 @@ pub(crate) mod tests {
     #[test]
     fn when_card_style_scrolls_into_an_image_the_bar_should_remain_visible_with_native_pixels() {
         let mut app = card_with_image(320, 640);
-        app.tabs[3].feed.posts.push(post_with("tail", Media::None));
-        app.tabs[3].feed.posts.push(post_with("tail2", Media::None));
+        app.tabs[4].feed.posts.push(post_with("tail", Media::None));
+        app.tabs[4].feed.posts.push(post_with("tail2", Media::None));
         app.scroll_card(3);
+        std::thread::sleep(crate::app::NAV_SETTLE);
+        app.tick();
 
         let actual = screen_buffer(&mut app, 100, 20);
 
         assert!(
-            (3..12).all(|y| actual[(25, y)].symbol() == "▌" && actual[(25, y)].fg == ACCENT),
+            (4..12).all(|y| actual[(26, y)].symbol() == "▌" && actual[(26, y)].fg == ACCENT),
             "{}",
             buffer_text(&actual)
         );
-        assert!(actual[(56, 3)].symbol().contains('\u{10EEEE}'));
+        assert!(actual[(57, 4)].symbol().contains('\u{10EEEE}'));
         assert_eq!(app.active_tab().feed.cards.line, 3);
     }
 
     #[test]
     fn when_a_short_card_view_loads_pagination_it_should_keep_the_footer_status_visible() {
         let mut app = feed_with_next_page(ListView::Card);
-        app.load_feed(3, true);
+        app.load_feed(4, true);
 
         let actual = screen(&mut app, 50, 5);
 
         assert!(actual.lines().last().unwrap().contains('⠋'), "{actual}");
-        assert!(actual.contains("Existing po"), "{actual}");
+        assert!(actual.contains("Existing"), "{actual}");
     }
 
     #[test]
     fn when_a_large_card_image_arrives_it_should_leave_the_ui_thread_responsive() {
         let mut app = card_feed_app(kitty());
-        app.tabs[3].feed.posts.truncate(1);
+        app.tabs[4].feed.posts.truncate(1);
         screen(&mut app, 100, 20);
         let message = Msg::Image {
             url: "https://i.redd.it/p1.jpeg".into(),
@@ -10843,7 +12248,7 @@ pub(crate) mod tests {
     #[test]
     fn when_revisiting_a_card_after_pixel_eviction_its_geometry_should_stay_reserved() {
         let mut app = card_with_image(320, 640);
-        app.tabs[3].feed.posts.push(post_with("p2", Media::None));
+        app.tabs[4].feed.posts.push(post_with("p2", Media::None));
         screen(&mut app, 100, 20);
         app.card_images.clear();
         app.move_selection(1);
@@ -10852,7 +12257,7 @@ pub(crate) mod tests {
 
         let actual = screen(&mut app, 100, 20);
 
-        assert_eq!(app.active_tab().feed.cards.height, 12, "{actual}");
+        assert_eq!(app.active_tab().feed.cards.height, 11, "{actual}");
         assert!(actual.contains("p2"), "{actual}");
     }
 
@@ -10862,15 +12267,15 @@ pub(crate) mod tests {
             let mut app = video_card_with_poster(image::DynamicImage::ImageRgb8(
                 image::RgbImage::from_fn(320, 640, |x, _| image::Rgb([x as u8, 128, 255])),
             ));
-            app.tabs[3].feed.posts[0].title = "Full width image".into();
+            app.tabs[4].feed.posts[0].title = "Full width image".into();
             if video {
-                app.tabs[3].feed.posts[0].media = Media::Video {
+                app.tabs[4].feed.posts[0].media = Media::Video {
                     gif: false,
                     url: Some("https://v.redd.it/example/HLSPlaylist.m3u8".into()),
                     poster: Some("https://i.redd.it/p1.jpeg".into()),
                 };
             } else {
-                app.tabs[3].feed.posts[0].media = Media::Image {
+                app.tabs[4].feed.posts[0].media = Media::Image {
                     url: "https://i.redd.it/p1.jpeg".into(),
                     preview: None,
                 };
@@ -10896,7 +12301,7 @@ pub(crate) mod tests {
                 "retained image/poster must render immediately: {actual}"
             );
             assert!(!actual.contains("loading image"), "{actual}");
-            assert_eq!(app.active_tab().feed.cards.height, 12);
+            assert_eq!(app.active_tab().feed.cards.height, 11);
             std::thread::sleep(crate::app::NAV_SETTLE);
             app.tick();
             screen(&mut app, 100, 20);
@@ -10922,18 +12327,18 @@ pub(crate) mod tests {
                 app.card_images.get("https://i.redd.it/p1.jpeg"),
                 Some(CardImageSlot::Ready { .. })
             ));
-            assert_eq!(app.active_tab().feed.cards.height, 12);
+            assert_eq!(app.active_tab().feed.cards.height, 11);
         }
     }
 
     #[test]
     fn when_a_card_has_listing_dimensions_loading_and_failure_should_keep_its_height() {
         let mut app = card_feed_app(kitty());
-        app.tabs[3].feed.posts.truncate(1);
-        app.tabs[3].feed.posts[0].title = "Reserved portrait".into();
-        app.tabs[3].feed.posts[0].preview_size = Some((320, 640));
+        app.tabs[4].feed.posts.truncate(1);
+        app.tabs[4].feed.posts[0].title = "Reserved portrait".into();
+        app.tabs[4].feed.posts[0].preview_size = Some((320, 640));
         screen(&mut app, 100, 20);
-        assert_eq!(app.active_tab().feed.cards.height, 12);
+        assert_eq!(app.active_tab().feed.cards.height, 11);
         app.scroll_card(16);
 
         app.on_msg(Msg::Image {
@@ -10942,7 +12347,7 @@ pub(crate) mod tests {
         });
         let actual = screen(&mut app, 100, 20);
 
-        assert_eq!(app.active_tab().feed.cards.height, 12, "{actual}");
+        assert_eq!(app.active_tab().feed.cards.height, 11, "{actual}");
         assert_eq!(app.active_tab().feed.cards.line, 0);
         assert!(actual.contains("offline"), "{actual}");
     }
@@ -10950,9 +12355,9 @@ pub(crate) mod tests {
     #[test]
     fn when_a_reserved_image_finishes_loading_the_selected_card_should_not_move() {
         let mut app = card_feed_app(kitty());
-        app.tabs[3].feed.posts.truncate(1);
-        app.tabs[3].feed.posts[0].title = "Reserved landscape".into();
-        app.tabs[3].feed.posts[0].preview_size = Some((640, 320));
+        app.tabs[4].feed.posts.truncate(1);
+        app.tabs[4].feed.posts[0].title = "Reserved landscape".into();
+        app.tabs[4].feed.posts[0].preview_size = Some((640, 320));
         let before = screen(&mut app, 100, 40);
         let row = |screen: &str| screen.lines().position(|line| line.contains("comments"));
         assert_eq!(app.active_tab().feed.cards.height, 20);
@@ -10971,7 +12376,7 @@ pub(crate) mod tests {
     #[test]
     fn when_neighboring_images_load_navigating_back_should_keep_the_same_card_positions() {
         let mut app = card_feed_app(kitty());
-        app.tabs[3].feed.posts.iter_mut().for_each(|post| {
+        app.tabs[4].feed.posts.iter_mut().for_each(|post| {
             post.title = post.id.clone();
             post.preview_size = Some((640, 320));
         });
@@ -11003,12 +12408,125 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_top_card_scrolled_into_keeps_its_place_when_an_answer_reranks_or_drops_it() {
+        // The scroll may not be drawn yet when the answer arrives.
+        for (drawn, drop) in [(true, false), (false, false), (true, true), (false, true)] {
+            let mut app = card_feed_app(kitty());
+            screen(&mut app, 100, 20);
+            let read = app.current_post().unwrap().id;
+            app.scroll_card(3);
+            if drawn {
+                screen(&mut app, 100, 20);
+                assert!(app.active_tab().feed.cards.line > 0);
+            }
+            let mut posts = app.tabs[4].feed.posts.clone();
+            if drop {
+                posts.remove(0);
+            } else {
+                posts.swap(0, 1);
+            }
+            let (tab, generation) = (app.tabs[4].id, app.tabs[4].feed.generation);
+
+            app.on_msg(Msg::Feed {
+                tab,
+                generation,
+                append: false,
+                result: Ok(crate::model::Listing { posts, after: None }),
+            });
+            screen(&mut app, 100, 20);
+
+            assert_eq!(
+                app.current_post().unwrap().id,
+                read,
+                "drawn {drawn} drop {drop}"
+            );
+            assert_eq!(app.active_tab().feed.cards.line, 3);
+        }
+
+        // Scrolling back to the top, or up at it, before the answer is drawn leaves the
+        // top untouched: it shows the answer's first post from its first row.
+        for back in [true, false] {
+            let mut app = card_feed_app(kitty());
+            screen(&mut app, 100, 20);
+            if back {
+                app.scroll_card(3);
+                screen(&mut app, 100, 20);
+                app.scroll_card(-3);
+            } else {
+                app.scroll_card(-5);
+            }
+            let mut posts = app.tabs[4].feed.posts.clone();
+            posts.swap(0, 1);
+            let first = posts[0].id.clone();
+            let (tab, generation) = (app.tabs[4].id, app.tabs[4].feed.generation);
+
+            app.on_msg(Msg::Feed {
+                tab,
+                generation,
+                append: false,
+                result: Ok(crate::model::Listing { posts, after: None }),
+            });
+            screen(&mut app, 100, 20);
+
+            assert_eq!(app.current_post().unwrap().id, first, "back {back}");
+            assert_eq!(app.active_tab().feed.selected, 0);
+            assert_eq!(app.active_tab().feed.cards.line, 0);
+        }
+    }
+
+    #[test]
+    fn scroll_keys_before_the_draw_scroll_from_the_new_top() {
+        // Between an answer at the top, or `r` bringing new posts from further down, and
+        // the next draw, scroll keys scroll from the new first post.
+        for (page, manual) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut app = card_feed_app(kitty());
+            screen(&mut app, 100, 20);
+            let mut posts = app.tabs[4].feed.posts.clone();
+            if manual {
+                app.move_selection(3);
+                screen(&mut app, 100, 20);
+                let mut new = posts[0].clone();
+                new.id = "new".into();
+                posts.insert(0, new);
+                app.reload();
+            } else {
+                posts.swap(0, 1);
+            }
+            let first = posts[0].id.clone();
+            let (tab, generation) = (app.tabs[4].id, app.tabs[4].feed.generation);
+            app.on_msg(Msg::Feed {
+                tab,
+                generation,
+                append: false,
+                result: Ok(crate::model::Listing { posts, after: None }),
+            });
+
+            if page {
+                app.page_list(1, 2);
+            } else {
+                app.scroll_card(3);
+            }
+            screen(&mut app, 100, 20);
+
+            let feed = &app.active_tab().feed;
+            let case = format!("page {page} manual {manual}");
+            if page {
+                assert!(feed.selected <= 1, "{case}: {}", feed.selected);
+                assert!(feed.selected > 0 || feed.cards.line > 0, "{case}");
+            } else {
+                assert_eq!(app.current_post().unwrap().id, first, "{case}");
+                assert_eq!((feed.offset, feed.cards.line), (0, 3), "{case}");
+            }
+        }
+    }
+
+    #[test]
     fn when_a_scrolled_loading_card_receives_pixels_it_should_keep_the_visible_row() {
         let mut app = card_feed_app(kitty());
-        app.tabs[3].feed.posts.truncate(1);
-        app.tabs[3].feed.posts.push(post_with("tail", Media::None));
-        app.tabs[3].feed.posts.push(post_with("tail2", Media::None));
-        app.tabs[3].feed.posts[0].title = "Loading image".into();
+        app.tabs[4].feed.posts.truncate(1);
+        app.tabs[4].feed.posts.push(post_with("tail", Media::None));
+        app.tabs[4].feed.posts.push(post_with("tail2", Media::None));
+        app.tabs[4].feed.posts[0].title = "Loading image".into();
         screen(&mut app, 100, 20);
         app.scroll_card(3);
         screen(&mut app, 100, 20);
@@ -11029,8 +12547,8 @@ pub(crate) mod tests {
     #[test]
     fn when_paging_a_bookmark_before_its_image_loads_it_should_keep_all_reserved_media_visible() {
         let mut app = card_feed_app(kitty());
-        app.tabs[3].feed.posts[0].title = "Reserved bookmark".into();
-        app.tabs[3].feed.posts[0].preview_size = Some((320, 640));
+        app.tabs[4].feed.posts[0].title = "Reserved bookmark".into();
+        app.tabs[4].feed.posts[0].preview_size = Some((320, 640));
         app.state.toggle_bookmark(&app.current_post().unwrap(), 1);
         app.switch_tab(1);
         screen(&mut app, 100, 20);
@@ -11039,7 +12557,7 @@ pub(crate) mod tests {
         screen(&mut app, 100, 20);
 
         assert_eq!(app.active_tab().feed.cards.line, 0);
-        assert_eq!(app.active_tab().feed.cards.height, 12);
+        assert_eq!(app.active_tab().feed.cards.height, 11);
         assert_eq!(app.current_post().unwrap().id, "p1");
     }
 
@@ -11049,11 +12567,11 @@ pub(crate) mod tests {
 
         let cells = placeholder_cells(&mut app, 100, 20);
 
-        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(43));
-        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(78));
+        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(45));
+        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(76));
         assert!(matches!(app.card_images.get("https://i.redd.it/p1.jpeg"),
             Some(CardImageSlot::Ready { protocol: Some(protocol), .. })
-                if protocol.size == Size::new(36, 9)));
+                if protocol.size == Size::new(32, 8)));
     }
 
     #[test]
@@ -11062,11 +12580,11 @@ pub(crate) mod tests {
 
         let cells = placeholder_cells(&mut app, 100, 20);
 
-        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(56));
+        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(57));
         assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(64));
         assert!(matches!(app.card_images.get("https://i.redd.it/p1.jpeg"),
             Some(CardImageSlot::Ready { protocol: Some(protocol), .. })
-                if protocol.size == Size::new(9, 9)));
+                if protocol.size == Size::new(8, 8)));
     }
 
     #[test]
@@ -11076,8 +12594,8 @@ pub(crate) mod tests {
 
         let cells = placeholder_cells(&mut app, 100, 20);
 
-        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(43));
-        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(78));
+        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(45));
+        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(76));
     }
 
     fn card_png(protocol: &ratatui_image::protocol::Protocol) -> image::RgbImage {
@@ -11176,13 +12694,13 @@ pub(crate) mod tests {
         else {
             panic!("card protocol");
         };
-        let crate::card_image::Tile::Image(encoded) = protocol.tiles[&(0, 0, 1, 68)].as_ref()
+        let crate::card_image::Tile::Image(encoded) = protocol.tiles[&(0, 0, 1, 66)].as_ref()
         else {
             panic!("still-image tile");
         };
         let pixels = card_png(encoded);
-        assert_eq!(pixels.dimensions(), (544, 16));
-        assert!((120..=136).contains(&pixels.get_pixel(272, 8)[0]));
+        assert_eq!(pixels.dimensions(), (528, 16));
+        assert!((120..=136).contains(&pixels.get_pixel(264, 8)[0]));
     }
 
     #[test]
@@ -11204,7 +12722,7 @@ pub(crate) mod tests {
 
     fn two_tall_media_cards() -> App {
         let mut app = card_feed_app(kitty());
-        let mut first = app.tabs[3].feed.posts[0].clone();
+        let mut first = app.tabs[4].feed.posts[0].clone();
         first.title = "Full width image".into();
         first.preview_size = Some((320, 640));
         let mut next = post_with(
@@ -11253,9 +12771,9 @@ pub(crate) mod tests {
             actual
                 .lines()
                 .position(|line| line.contains("Following video")),
-            Some(9)
+            Some(10)
         );
-        assert_eq!(app.active_tab().feed.cards.line, 8);
+        assert_eq!(app.active_tab().feed.cards.line, 7);
         assert_eq!(app.current_post().unwrap().id, "p1");
     }
 
@@ -11273,12 +12791,12 @@ pub(crate) mod tests {
         let actual = screen(&mut app, 100, 20);
 
         assert_eq!(app.active_tab().feed.offset, 0);
-        assert_eq!(app.active_tab().feed.cards.line, 1);
+        assert_eq!(app.active_tab().feed.cards.line, 2);
         assert_eq!(
             actual
                 .lines()
                 .position(|line| line.contains("Following video")),
-            Some(16)
+            Some(15)
         );
     }
 
@@ -11286,7 +12804,7 @@ pub(crate) mod tests {
     fn when_half_page_keys_are_batched_their_row_distances_should_accumulate() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = two_tall_media_cards();
-        app.tabs[3].feed.posts.push(post_with("tail", Media::None));
+        app.tabs[4].feed.posts.push(post_with("tail", Media::None));
         app.scroll_card(0);
         screen(&mut app, 100, 20);
 
@@ -11314,8 +12832,8 @@ pub(crate) mod tests {
     #[test]
     fn when_line_scrolling_crosses_a_separator_it_should_move_exactly_one_row_each_way() {
         let mut app = two_tall_media_cards();
-        app.tabs[3].feed.posts.push(post_with("tail", Media::None));
-        app.scroll_card(12);
+        app.tabs[4].feed.posts.push(post_with("tail", Media::None));
+        app.scroll_card(11);
         screen(&mut app, 100, 20);
 
         app.scroll_card(1);
@@ -11326,19 +12844,19 @@ pub(crate) mod tests {
         assert_eq!(
             down.lines()
                 .position(|line| line.contains("Following video")),
-            Some(4)
+            Some(5)
         );
         assert_eq!(
             up.lines().position(|line| line.contains("Following video")),
-            Some(5)
+            Some(6)
         );
-        assert_eq!(app.active_tab().feed.cards.line, 12);
+        assert_eq!(app.active_tab().feed.cards.line, 11);
     }
 
     #[test]
     fn when_a_half_page_spans_short_cards_it_should_consume_all_rows() {
         let mut app = card_feed_app(kitty());
-        for post in &mut app.tabs[3].feed.posts {
+        for post in &mut app.tabs[4].feed.posts {
             post.media = Media::None;
             post.title = post.id.clone();
         }
@@ -11347,25 +12865,25 @@ pub(crate) mod tests {
         app.page_list(1, 2);
         screen(&mut app, 100, 20);
 
-        assert_eq!(app.active_tab().feed.offset, 2);
-        assert_eq!(app.active_tab().feed.cards.line, 0);
+        assert_eq!(app.active_tab().feed.offset, 1);
+        assert_eq!(app.active_tab().feed.cards.line, 3);
         assert_eq!(app.current_post().unwrap().id, "p3");
     }
 
     #[test]
     fn when_scrolling_from_a_short_card_into_tall_media_it_should_keep_the_overshoot() {
         let mut app = two_tall_media_cards();
-        app.tabs[3].feed.posts[0].media = Media::None;
-        let mut following = app.tabs[3].feed.posts[1].clone();
+        app.tabs[4].feed.posts[0].media = Media::None;
+        let mut following = app.tabs[4].feed.posts[1].clone();
         following.id = "tail".into();
-        app.tabs[3].feed.posts.push(following);
+        app.tabs[4].feed.posts.push(following);
         screen(&mut app, 100, 20);
 
         app.page_list(1, 2);
         screen(&mut app, 100, 20);
 
         assert_eq!(app.active_tab().feed.offset, 1);
-        assert_eq!(app.active_tab().feed.cards.line, 4);
+        assert_eq!(app.active_tab().feed.cards.line, 3);
         assert_eq!(app.current_post().unwrap().id, "p2");
     }
 
@@ -11393,9 +12911,9 @@ pub(crate) mod tests {
     fn when_bookmarks_half_page_across_tall_media_the_next_card_should_enter_naturally() {
         let mut app = two_tall_media_cards();
         app.state
-            .toggle_bookmark(&app.tabs[3].feed.posts[1].clone(), 1);
+            .toggle_bookmark(&app.tabs[4].feed.posts[1].clone(), 1);
         app.state
-            .toggle_bookmark(&app.tabs[3].feed.posts[0].clone(), 2);
+            .toggle_bookmark(&app.tabs[4].feed.posts[0].clone(), 2);
         app.switch_tab(1);
         screen(&mut app, 100, 20);
         app.scroll_card(0);
@@ -11404,12 +12922,12 @@ pub(crate) mod tests {
         app.page_list(1, 2);
         let actual = screen(&mut app, 100, 20);
 
-        assert_eq!(app.active_tab().feed.cards.line, 8);
+        assert_eq!(app.active_tab().feed.cards.line, 7);
         assert_eq!(
             actual
                 .lines()
                 .position(|line| line.contains("Following video")),
-            Some(9)
+            Some(10)
         );
     }
 
@@ -11417,16 +12935,23 @@ pub(crate) mod tests {
     fn when_bookmarks_reorder_before_the_viewport_its_anchor_should_follow_the_post() {
         let mut app = two_tall_media_cards();
         app.state
-            .toggle_bookmark(&app.tabs[3].feed.posts[1].clone(), 1);
+            .toggle_bookmark(&app.tabs[4].feed.posts[1].clone(), 1);
         app.state
-            .toggle_bookmark(&app.tabs[3].feed.posts[0].clone(), 2);
+            .toggle_bookmark(&app.tabs[4].feed.posts[0].clone(), 2);
         app.switch_tab(1);
         screen(&mut app, 100, 20);
         app.scroll_card(8);
         screen(&mut app, 100, 20);
+        let selected = app.current_post().unwrap().id;
 
         app.state
             .toggle_bookmark(&post_with("inserted", Media::None), 3);
+        // The state merge re-selects the bookmark by id.
+        let index = app
+            .visible_bookmarks()
+            .position(|bookmark| bookmark.post.id == selected)
+            .unwrap();
+        app.tabs[1].feed.selected = index;
         screen(&mut app, 100, 20);
 
         assert_eq!(app.active_tab().feed.cards.post.as_deref(), Some("p1"));
@@ -11437,10 +12962,10 @@ pub(crate) mod tests {
     #[test]
     fn when_the_scrolled_bookmark_is_removed_it_should_reveal_a_surviving_post() {
         let mut app = two_tall_media_cards();
-        let second = app.tabs[3].feed.posts[1].clone();
+        let second = app.tabs[4].feed.posts[1].clone();
         app.state.toggle_bookmark(&second, 1);
         app.state
-            .toggle_bookmark(&app.tabs[3].feed.posts[0].clone(), 2);
+            .toggle_bookmark(&app.tabs[4].feed.posts[0].clone(), 2);
         app.switch_tab(1);
         screen(&mut app, 100, 20);
         app.scroll_card(82);
@@ -11456,7 +12981,7 @@ pub(crate) mod tests {
     #[test]
     fn when_bookmarks_are_empty_row_keys_should_not_queue_a_scroll_for_future_entries() {
         let mut app = two_tall_media_cards();
-        let first = app.tabs[3].feed.posts[0].clone();
+        let first = app.tabs[4].feed.posts[0].clone();
         app.state.toggle_bookmark(&first, 1);
         app.switch_tab(1);
         screen(&mut app, 100, 20);
@@ -11469,12 +12994,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn buffered_feed_notice_keeps_card_and_compact_rows_fixed_until_r() {
+    fn buffered_feed_refresh_shows_the_list_top_without_reordering_pinned_posts() {
         for (view, index) in [
             (crate::state::ListView::Card, 0),
             (crate::state::ListView::Compact, 0),
-            (crate::state::ListView::Card, 3),
-            (crate::state::ListView::Compact, 3),
+            (crate::state::ListView::Card, 4),
+            (crate::state::ListView::Compact, 4),
         ] {
             for width in [40, 100] {
                 let mut app = app(&["rust"]);
@@ -11486,6 +13011,8 @@ pub(crate) mod tests {
                 let tab = app.active_tab().id;
                 let mut first = post_with("old", Media::None);
                 first.title = "Existing post".into();
+                first.stickied = true;
+                let second = post_with("second", Media::None);
                 let answer = |generation, posts| Msg::Feed {
                     tab,
                     generation,
@@ -11494,7 +13021,7 @@ pub(crate) mod tests {
                 };
                 app.on_msg(answer(
                     app.active_tab().feed.generation,
-                    vec![first.clone()],
+                    vec![first.clone(), second.clone()],
                 ));
                 let before = screen(&mut app, width, 20);
                 let row = before
@@ -11507,7 +13034,7 @@ pub(crate) mod tests {
 
                 app.on_msg(answer(
                     app.active_tab().feed.generation,
-                    vec![next.clone(), first],
+                    vec![first, next.clone(), second],
                 ));
                 let pending = screen(&mut app, width, 20);
 
@@ -11525,86 +13052,383 @@ pub(crate) mod tests {
                 );
                 let refreshed = screen(&mut app, width, 20);
                 assert!(!refreshed.contains("r refresh"), "{refreshed}");
-                assert_eq!(app.active_tab().feed.posts[0].id, "new");
-                assert_eq!(app.current_post().unwrap().id, "new");
                 assert_eq!(
-                    refreshed
-                        .lines()
-                        .position(|line| line.contains(&next.title)),
-                    Some(row)
+                    app.active_tab()
+                        .feed
+                        .posts
+                        .iter()
+                        .map(|post| post.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["old", "new", "second"]
                 );
+                assert_eq!(app.current_post().unwrap().id, "old");
+                assert!(refreshed.contains("Existing post"), "{refreshed}");
+                assert!(refreshed.contains(&next.title), "{refreshed}");
             }
         }
     }
 
     #[test]
-    fn home_update_notices_distinguish_existing_post_updates_from_new_posts() {
-        let mut app = app(&[]);
+    fn live_reorders_keep_the_selected_card_selected_and_visible() {
+        let mut app = app(&["rust"]);
+        if app.state.list_view() != crate::state::ListView::Card {
+            app.state.toggle_list_view();
+        }
         app.toggle_sidebar();
-        app.switch_tab(0);
+        app.switch_tab(4);
         let tab = app.active_tab().id;
+        let posts: Vec<_> = (0..8)
+            .map(|n| {
+                let mut post = post_with(&format!("p{n}"), Media::None);
+                post.title = format!("Post number {n}");
+                post
+            })
+            .collect();
         let answer = |generation, posts| Msg::Feed {
             tab,
             generation,
             append: false,
             result: Ok(crate::model::Listing { posts, after: None }),
         };
-        let mut first = post_with("armenia", Media::None);
-        first.title = "Zakharova".into();
-        let mut second = post_with("other", Media::None);
-        second.title = "Other post".into();
+        app.on_msg(answer(app.active_tab().feed.generation, posts.clone()));
+        screen(&mut app, 100, 20);
+        app.move_selection(1);
+        screen(&mut app, 100, 20);
+        assert_eq!(app.current_post().unwrap().id, "p1");
+
+        let mut reordered = posts.clone();
+        let selected = reordered.remove(1);
+        reordered.push(selected);
+        app.load_feed(app.active, false);
+        app.on_msg(answer(app.active_tab().feed.generation, reordered));
+        let shown = screen(&mut app, 100, 20);
+
+        assert_eq!(app.current_post().unwrap().id, "p1");
+        assert!(shown.contains("Post number 1"), "{shown}");
+    }
+
+    #[test]
+    fn a_card_entering_or_leaving_above_the_selection_keeps_the_selected_card_on_its_row() {
+        let mut app = app(&["rust"]);
+        if app.state.list_view() != crate::state::ListView::Card {
+            app.state.toggle_list_view();
+        }
+        app.toggle_sidebar();
+        app.switch_tab(4);
+        let tab = app.active_tab().id;
+        let post = |id: &str| {
+            let mut post = post_with(id, Media::None);
+            post.title = format!("Post {id}");
+            post
+        };
+        let answer = |generation, ids: &[&str]| Msg::Feed {
+            tab,
+            generation,
+            append: false,
+            result: Ok(crate::model::Listing {
+                posts: ids.iter().map(|id| post(id)).collect(),
+                after: None,
+            }),
+        };
+        let row = |shown: &str| shown.lines().position(|line| line.contains("Post p2"));
         app.on_msg(answer(
             app.active_tab().feed.generation,
-            vec![first.clone(), second.clone()],
+            &["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"],
         ));
-        first.score = Some(42);
-        first.comments = 12;
-        let mut new = post_with("new", Media::None);
-        new.title = "New post".into();
-        let mut hidden = post_with("hidden", Media::None);
-        hidden.author = "blocked".into();
-        app.config.filters.authors.push("blocked".into());
+        screen(&mut app, 100, 30);
+        app.move_selection(2);
+        let before = row(&screen(&mut app, 100, 30));
+        assert!(before.is_some());
 
-        for (summary, posts, first_id) in [
-            (
-                "Feed details updated",
-                vec![first.clone(), second.clone(), hidden.clone()],
-                "armenia",
-            ),
-            (
-                "Feed details updated",
-                vec![second.clone(), first.clone(), hidden.clone()],
-                "other",
-            ),
-            ("New posts", vec![new, second, first, hidden], "new"),
+        for ids in [
+            [
+                "p0", "m", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9",
+            ]
+            .as_slice(),
+            &["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"],
         ] {
-            screen(&mut app, 100, 20);
-            let previous = app.active_tab().feed.posts.clone();
-            app.load_feed(0, false);
-            app.on_msg(answer(app.active_tab().feed.generation, posts));
-            let pending = screen(&mut app, 100, 20);
+            app.load_feed(app.active, false);
+            app.on_msg(answer(app.active_tab().feed.generation, ids));
+            let shown = screen(&mut app, 100, 30);
+
+            assert_eq!(app.current_post().unwrap().id, "p2");
+            assert_eq!(row(&shown), before, "{shown}");
+        }
+    }
+
+    #[test]
+    fn shrinking_the_terminal_keeps_a_low_selected_card_selected_and_visible() {
+        let mut app = app(&["rust"]);
+        if app.state.list_view() != crate::state::ListView::Card {
+            app.state.toggle_list_view();
+        }
+        app.toggle_sidebar();
+        app.switch_tab(4);
+        let tab = app.active_tab().id;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Ok(crate::model::Listing {
+                posts: (0..10)
+                    .map(|n| {
+                        let mut post = post_with(&format!("p{n}"), Media::None);
+                        post.title = format!("Post p{n}");
+                        post
+                    })
+                    .collect(),
+                after: None,
+            }),
+        });
+        screen(&mut app, 100, 40);
+        app.move_selection(6);
+
+        for height in [29, 14] {
+            assert!(screen(&mut app, 100, 40).contains("Post p6"));
+            let shown = screen(&mut app, 100, height);
+
+            assert_eq!(app.current_post().unwrap().id, "p6");
+            let lines: Vec<_> = shown.lines().collect();
+            let title = lines.iter().position(|line| line.contains("Post p6"));
             assert!(
-                pending.contains(&format!("{summary} · r refresh")),
-                "{pending}"
+                title.is_some_and(|title| lines[title + 1].contains("comments")),
+                "{height}: {shown}"
             );
-            assert_eq!(app.active_tab().feed.posts, previous);
+        }
+    }
+
+    #[test]
+    fn a_redraw_without_input_leaves_the_card_list_in_place() {
+        let mut app = app(&["rust"]);
+        if app.state.list_view() != crate::state::ListView::Card {
+            app.state.toggle_list_view();
+        }
+        app.toggle_sidebar();
+        app.switch_tab(4);
+        let tab = app.active_tab().id;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Ok(crate::model::Listing {
+                posts: (0..10)
+                    .map(|n| {
+                        let mut post = post_with(&format!("p{n}"), Media::None);
+                        post.title = format!("Post p{n}");
+                        post
+                    })
+                    .collect(),
+                after: None,
+            }),
+        });
+        screen(&mut app, 100, 20);
+        app.move_selection(5);
+        screen(&mut app, 100, 20);
+        app.scroll_card(-2);
+        let shown = screen(&mut app, 100, 20);
+
+        assert_eq!(screen(&mut app, 100, 20), shown);
+    }
+
+    #[test]
+    fn narrowing_the_list_keeps_a_rewrapped_selected_card_whole() {
+        let mut app = app(&["rust"]);
+        if app.state.list_view() != crate::state::ListView::Card {
+            app.state.toggle_list_view();
+        }
+        app.toggle_sidebar();
+        app.switch_tab(4);
+        let tab = app.active_tab().id;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Ok(crate::model::Listing {
+                posts: (0..10)
+                    .map(|n| {
+                        let mut post = post_with(&format!("p{n}"), Media::None);
+                        post.title = format!(
+                            "Post p{n} alpha beta gamma delta epsilon zeta eta theta iota kappa end{n}"
+                        );
+                        post
+                    })
+                    .collect(),
+                after: None,
+            }),
+        });
+        screen(&mut app, 160, 30);
+        app.move_selection(6);
+        screen(&mut app, 160, 30);
+        app.scroll_card(-3);
+        assert!(screen(&mut app, 160, 30).contains("end6"));
+
+        let shown = screen(&mut app, 40, 30);
+
+        assert_eq!(app.current_post().unwrap().id, "p6");
+        let lines: Vec<_> = shown.lines().collect();
+        let title = lines.iter().position(|line| line.contains("end6"));
+        assert!(
+            title.is_some_and(|title| lines[title + 1].contains("comments")),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn existing_feed_updates_apply_while_only_new_posts_require_refresh() {
+        for view in [
+            crate::state::ListView::Card,
+            crate::state::ListView::Compact,
+        ] {
+            let mut app = app(&["AcademicUAP"]);
+            if app.state.list_view() != view {
+                app.state.toggle_list_view();
+            }
+            app.toggle_sidebar();
+            app.switch_tab(4);
+            app.config.filters.authors.push("blocked".into());
+            let tab = app.active_tab().id;
+            let answer = |generation, posts| Msg::Feed {
+                tab,
+                generation,
+                append: false,
+                result: Ok(crate::model::Listing { posts, after: None }),
+            };
+            let mut first = post_with(
+                "first",
+                Media::Video {
+                    url: Some("https://v.redd.it/video/HLSPlaylist.m3u8?a=old".into()),
+                    poster: None,
+                    gif: false,
+                },
+            );
+            first.title = "Existing post".into();
+            let second = post_with("second", Media::None);
+            let mut hidden = post_with("known-hidden", Media::None);
+            hidden.author = "blocked".into();
+            app.on_msg(answer(
+                app.active_tab().feed.generation,
+                vec![first.clone(), second.clone(), hidden.clone()],
+            ));
+            screen(&mut app, 100, 20);
+
+            first.title = "Updated existing post".into();
+            first.score = Some(42);
+            first.comments = 12;
+            first.media = Media::Video {
+                url: Some("https://v.redd.it/video/HLSPlaylist.m3u8?a=new".into()),
+                poster: None,
+                gif: false,
+            };
+            hidden.author = "visible".into();
+            let mut filtered_new = post_with("filtered-new", Media::None);
+            filtered_new.author = "blocked".into();
+            app.load_feed(4, false);
+            app.on_msg(answer(
+                app.active_tab().feed.generation,
+                vec![
+                    second.clone(),
+                    first.clone(),
+                    hidden.clone(),
+                    filtered_new.clone(),
+                ],
+            ));
+            let updated = screen(&mut app, 100, 20);
+
+            assert!(updated.contains("Updated existing post"), "{updated}");
+            assert!(!updated.contains("r refresh"), "{updated}");
+            // The untouched top stays the top as the list reorders.
+            assert_eq!(app.current_post().unwrap().id, "second");
+            assert_eq!(app.active_tab().feed.posts[0].id, "second");
+            let updated_first = &app.active_tab().feed.posts[1];
+            assert_eq!(updated_first.id, "first");
+            assert_eq!(updated_first.score, Some(42));
+            assert_eq!(updated_first.comments, 12);
+            assert_eq!(updated_first.media, first.media);
+            assert!(
+                app.config
+                    .visible(&app.active_tab().feed.posts)
+                    .any(|post| post.id == "known-hidden")
+            );
+
+            first.title = "Live existing edit".into();
+            first.score = Some(84);
+            let mut incoming = post_with("new", Media::None);
+            incoming.title = "Incoming post".into();
+            app.load_feed(4, false);
+            app.on_msg(answer(
+                app.active_tab().feed.generation,
+                vec![
+                    incoming.clone(),
+                    second.clone(),
+                    first.clone(),
+                    hidden.clone(),
+                    filtered_new,
+                ],
+            ));
+            let pending = screen(&mut app, 100, 20);
+
+            assert!(pending.contains("New posts · r refresh"), "{pending}");
+            assert!(pending.contains("Live existing edit"), "{pending}");
+            assert!(!pending.contains("Incoming post"), "{pending}");
+            assert_eq!(app.current_post().unwrap().id, "second");
+            assert!(
+                app.active_tab()
+                    .feed
+                    .posts
+                    .iter()
+                    .any(|post| post.id == "first" && post.score == Some(84))
+            );
+
+            let mut filtered_next = post_with("filtered-next", Media::None);
+            filtered_next.author = "blocked".into();
+            app.load_feed(4, false);
+            app.on_msg(answer(
+                app.active_tab().feed.generation,
+                vec![incoming, second, first.clone(), hidden, filtered_next],
+            ));
+            assert!(
+                !app.active_tab()
+                    .feed
+                    .posts
+                    .iter()
+                    .any(|post| post.id == "filtered-new")
+            );
 
             press_keys(&mut app, "r");
             let refreshed = screen(&mut app, 100, 20);
             assert!(!refreshed.contains("r refresh"), "{refreshed}");
-            assert_eq!(app.current_post().unwrap().id, first_id);
+            assert!(refreshed.contains("Incoming post"), "{refreshed}");
+            assert_eq!(app.current_post().unwrap().id, "new");
+
+            app.load_feed(4, false);
+            app.on_msg(answer(app.active_tab().feed.generation, vec![first]));
+            let removed = screen(&mut app, 100, 20);
+            assert!(!removed.contains("r refresh"), "{removed}");
+            assert_eq!(app.current_post().unwrap().id, "first");
+            assert_eq!(app.active_tab().feed.posts.len(), 1);
         }
-        assert_eq!(app.active_tab().feed.posts[2].score, Some(42));
-        assert_eq!(app.active_tab().feed.posts[2].comments, 12);
     }
 
     #[test]
-    fn when_a_refresh_inserts_posts_above_the_viewport_its_post_and_row_should_stay_anchored() {
+    fn manual_refresh_reveals_arrival_headers_after_fetch_or_buffered_updates() {
         let mut app = two_tall_media_cards();
+        let initial = screen(&mut app, 100, 20);
+        let title_row = initial
+            .lines()
+            .position(|line| line.contains("Full width image"))
+            .unwrap();
         app.scroll_card(8);
         screen(&mut app, 100, 20);
-        let mut posts = app.tabs[3].feed.posts.clone();
-        posts.insert(0, post_with("inserted", Media::None));
+        let mut posts = app.tabs[4].feed.posts.clone();
+        let mut fetched = post_with(
+            "inserted",
+            Media::Image {
+                url: "https://i.redd.it/fetched.jpeg".into(),
+                preview: None,
+            },
+        );
+        fetched.title = "Fetched arrival".into();
+        posts.insert(0, fetched);
         app.reload();
 
         app.on_msg(Msg::Feed {
@@ -11613,11 +13437,37 @@ pub(crate) mod tests {
             append: false,
             result: Ok(crate::model::Listing { posts, after: None }),
         });
-        screen(&mut app, 100, 20);
+        let refreshed = screen(&mut app, 100, 20);
 
-        assert_eq!(app.active_tab().feed.cards.post.as_deref(), Some("p1"));
-        assert_eq!(app.active_tab().feed.offset, 1);
-        assert_eq!(app.active_tab().feed.cards.line, 8);
+        assert_eq!(app.current_post().unwrap().id, "inserted");
+        assert_eq!(
+            app.active_tab().feed.cards.post.as_deref(),
+            Some("inserted")
+        );
+        assert_eq!(app.active_tab().feed.cards.line, 0);
+        assert_eq!(
+            refreshed
+                .lines()
+                .position(|line| line.contains("Fetched arrival")),
+            Some(title_row)
+        );
+        app.on_msg(Msg::Image {
+            url: "https://i.redd.it/fetched.jpeg".into(),
+            result: Ok(image::DynamicImage::new_rgb8(320, 640).into()),
+        });
+        let loaded = screen(&mut app, 100, 20);
+        assert_eq!(app.active_tab().feed.cards.line, 0);
+        assert_eq!(
+            loaded
+                .lines()
+                .position(|line| line.contains("Fetched arrival")),
+            Some(title_row)
+        );
+
+        app.move_selection(1);
+        screen(&mut app, 100, 20);
+        app.scroll_card(8);
+        screen(&mut app, 100, 20);
 
         let mut posts = app.active_tab().feed.posts.clone();
         let mut incoming = post_with("newer", Media::None);
@@ -11640,7 +13490,12 @@ pub(crate) mod tests {
         assert_eq!(app.current_post().unwrap().id, "newer");
         assert_eq!(app.active_tab().feed.cards.post.as_deref(), Some("newer"));
         assert_eq!(app.active_tab().feed.cards.line, 0);
-        assert!(refreshed.contains("Newest post"), "{refreshed}");
+        assert_eq!(
+            refreshed
+                .lines()
+                .position(|line| line.contains("Newest post")),
+            Some(title_row)
+        );
     }
 
     #[test]
@@ -11648,7 +13503,7 @@ pub(crate) mod tests {
         let mut app = two_tall_media_cards();
         app.scroll_card(82);
         screen(&mut app, 100, 20);
-        let posts = vec![app.tabs[3].feed.posts[0].clone()];
+        let posts = vec![app.tabs[4].feed.posts[0].clone()];
         app.reload();
 
         app.on_msg(Msg::Feed {
@@ -11673,14 +13528,14 @@ pub(crate) mod tests {
         screen(&mut app, 80, 12);
 
         assert_eq!(app.active_tab().feed.cards.post.as_deref(), Some("p1"));
-        assert_eq!(app.active_tab().feed.cards.line, 6);
+        assert_eq!(app.active_tab().feed.cards.line, 5);
         assert_eq!(app.current_post().unwrap().id, "p1");
     }
 
     #[test]
     fn when_scrolling_a_short_loaded_feed_it_should_prefetch_at_the_visible_end() {
         let mut app = card_feed_app(kitty());
-        app.tabs[3].feed.posts = (0..20)
+        app.tabs[4].feed.posts = (0..20)
             .map(|i| {
                 let mut post = post_with(&format!("short{i}"), Media::None);
                 post.title = post.id.clone();
@@ -11688,11 +13543,14 @@ pub(crate) mod tests {
             })
             .collect();
         screen(&mut app, 100, 100);
-        app.tabs[3].feed.after = Some("next".into());
+        app.tabs[4].feed.after = Some("next".into());
 
         app.scroll_card(1);
         screen(&mut app, 100, 100);
 
+        assert!(!app.active_tab().feed.loading());
+        std::thread::sleep(crate::app::NAV_SETTLE);
+        app.tick();
         assert!(app.active_tab().feed.loading());
         assert_eq!(app.active_tab().feed.selected, 0);
         assert_eq!(app.active_tab().feed.cards.line, 0);
@@ -11721,8 +13579,8 @@ pub(crate) mod tests {
     fn when_scrolling_up_a_card_by_control_y_it_should_move_one_line_without_copying() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = card_with_image(320, 640);
-        app.tabs[3].feed.posts.push(post_with("tail", Media::None));
-        app.tabs[3].feed.posts.push(post_with("tail2", Media::None));
+        app.tabs[4].feed.posts.push(post_with("tail", Media::None));
+        app.tabs[4].feed.posts.push(post_with("tail2", Media::None));
         screen(&mut app, 100, 20);
         app.scroll_card(5);
 
@@ -11756,11 +13614,11 @@ pub(crate) mod tests {
 
         let cells = placeholder_cells(&mut app, 80, 20);
 
-        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(33));
-        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(68));
+        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(35));
+        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(66));
         assert!(matches!(app.card_images.get("https://i.redd.it/p1.jpeg"),
             Some(CardImageSlot::Ready { protocol: Some(protocol), .. })
-                if protocol.size == Size::new(36, 9)));
+                if protocol.size == Size::new(32, 8)));
     }
 
     #[test]
@@ -11793,8 +13651,8 @@ pub(crate) mod tests {
     #[test]
     fn when_returning_from_fullscreen_detail_a_reloading_card_should_keep_its_scroll() {
         let mut app = card_with_image(320, 640);
-        app.tabs[3].feed.posts.push(post_with("tail", Media::None));
-        app.tabs[3].feed.posts.push(post_with("tail2", Media::None));
+        app.tabs[4].feed.posts.push(post_with("tail", Media::None));
+        app.tabs[4].feed.posts.push(post_with("tail2", Media::None));
         screen(&mut app, 100, 20);
         app.scroll_card(3);
         screen(&mut app, 100, 20);
@@ -11817,7 +13675,7 @@ pub(crate) mod tests {
     #[test]
     fn when_scrolling_below_kittys_row_limit_image_tiles_should_use_local_coordinates() {
         let mut app = card_with_image(100, 1000);
-        app.tabs[3]
+        app.tabs[4]
             .feed
             .posts
             .extend((0..200).map(|i| post_with(&format!("tail{i}"), Media::None)));
@@ -11835,12 +13693,12 @@ pub(crate) mod tests {
         else {
             panic!("card protocol");
         };
-        assert_eq!(protocol.size, Size::new(68, 340));
-        assert!(protocol.tiles.contains_key(&(298, 0, 6, 68)));
-        assert_eq!(protocol.tiles.len(), 4);
-        assert_eq!(protocol.tiles[&(298, 0, 6, 68)].size(), Size::new(68, 16));
-        assert_eq!(protocol.tiles[&(336, 0, 4, 68)].size(), Size::new(68, 4));
-        let row = terminal.backend().buffer()[(27, 3)]
+        assert_eq!(protocol.size, Size::new(66, 330));
+        assert!(protocol.tiles.contains_key(&(298, 0, 6, 66)));
+        assert_eq!(protocol.tiles.len(), 3);
+        assert_eq!(protocol.tiles[&(298, 0, 6, 66)].size(), Size::new(66, 16));
+        assert_eq!(protocol.tiles[&(320, 0, 10, 66)].size(), Size::new(66, 10));
+        let row = terminal.backend().buffer()[(28, 4)]
             .symbol()
             .split_once('\u{10EEEE}')
             .unwrap()
@@ -11856,18 +13714,20 @@ pub(crate) mod tests {
 
         let cells = placeholder_cells(&mut app, 340, 150);
 
-        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(33));
-        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(334));
+        assert_eq!(cells.iter().map(|cell| cell.0).min(), Some(34));
+        assert_eq!(cells.iter().map(|cell| cell.0).max(), Some(333));
     }
 
     #[test]
     fn when_scrolling_an_iterm2_card_it_should_encode_only_the_visible_image_rows() {
         let mut app = card_with_image(320, 640);
-        app.tabs[3].feed.posts.push(post_with("tail", Media::None));
-        app.tabs[3].feed.posts.push(post_with("tail2", Media::None));
+        app.tabs[4].feed.posts.push(post_with("tail", Media::None));
+        app.tabs[4].feed.posts.push(post_with("tail2", Media::None));
         app.image_picker.set_protocol_type(ProtocolType::Iterm2);
         screen(&mut app, 100, 20);
         app.scroll_card(3);
+        std::thread::sleep(crate::app::NAV_SETTLE);
+        app.tick();
 
         screen(&mut app, 100, 20);
 
@@ -11879,9 +13739,9 @@ pub(crate) mod tests {
             panic!("card protocol");
         };
         assert_eq!(protocol.tiles.len(), 1);
-        assert_eq!(protocol.tiles[&(1, 0, 8, 9)].size(), Size::new(9, 8));
+        assert_eq!(protocol.tiles[&(1, 0, 7, 8)].size(), Size::new(8, 7));
         assert!(matches!(
-            *protocol.tiles[&(1, 0, 8, 9)],
+            *protocol.tiles[&(1, 0, 7, 8)],
             crate::card_image::Tile::Image(ratatui_image::protocol::Protocol::ITerm2(_))
         ));
     }
@@ -11889,11 +13749,13 @@ pub(crate) mod tests {
     #[test]
     fn when_scrolling_a_sixel_card_it_should_encode_only_the_visible_image_rows() {
         let mut app = card_with_image(320, 640);
-        app.tabs[3].feed.posts.push(post_with("tail", Media::None));
-        app.tabs[3].feed.posts.push(post_with("tail2", Media::None));
+        app.tabs[4].feed.posts.push(post_with("tail", Media::None));
+        app.tabs[4].feed.posts.push(post_with("tail2", Media::None));
         app.image_picker.set_protocol_type(ProtocolType::Sixel);
         screen(&mut app, 100, 20);
         app.scroll_card(3);
+        std::thread::sleep(crate::app::NAV_SETTLE);
+        app.tick();
 
         screen(&mut app, 100, 20);
 
@@ -11905,9 +13767,9 @@ pub(crate) mod tests {
             panic!("card protocol");
         };
         assert_eq!(protocol.tiles.len(), 1);
-        assert_eq!(protocol.tiles[&(1, 0, 8, 9)].size(), Size::new(9, 8));
+        assert_eq!(protocol.tiles[&(1, 0, 7, 8)].size(), Size::new(8, 7));
         assert!(matches!(
-            *protocol.tiles[&(1, 0, 8, 9)],
+            *protocol.tiles[&(1, 0, 7, 8)],
             crate::card_image::Tile::Image(ratatui_image::protocol::Protocol::Sixel(_))
         ));
     }
@@ -11934,7 +13796,7 @@ pub(crate) mod tests {
     fn when_paging_back_from_a_short_card_it_should_keep_the_full_row_distance() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = card_with_image(320, 640);
-        app.tabs[3].feed.posts.push(post_with("p2", Media::None));
+        app.tabs[4].feed.posts.push(post_with("p2", Media::None));
         screen(&mut app, 100, 12);
         app.move_selection(1);
         screen(&mut app, 100, 12);
@@ -11947,7 +13809,7 @@ pub(crate) mod tests {
     #[test]
     fn when_a_card_is_a_spoiler_it_should_show_the_tag_without_loading_its_image() {
         let mut app = card_feed_app(kitty());
-        app.tabs[3].feed.posts[0].spoiler = true;
+        app.tabs[4].feed.posts[0].spoiler = true;
 
         let actual = screen(&mut app, 100, 20);
 
@@ -11972,7 +13834,7 @@ pub(crate) mod tests {
         screen(&mut app, 100, 20);
         assert!(!app.card_images.is_empty());
 
-        press_keys(&mut app, " vi");
+        press_keys(&mut app, "zi");
         screen(&mut app, 100, 20);
 
         assert!(app.card_images.is_empty());
@@ -11981,7 +13843,7 @@ pub(crate) mod tests {
     #[test]
     fn when_a_card_is_a_gallery_it_should_preview_the_first_image_instead_of_its_thumbnail() {
         let mut app = card_feed_app(kitty());
-        app.tabs[3].feed.posts[0].media = Media::Gallery {
+        app.tabs[4].feed.posts[0].media = Media::Gallery {
             images: vec!["https://i.redd.it/full.jpeg".into()],
             previews: Vec::new(),
             thumb: Some("https://i.redd.it/small.jpeg".into()),
@@ -12002,7 +13864,7 @@ pub(crate) mod tests {
 
         let actual = screen(&mut app, 100, 20);
 
-        assert!(actual.contains("SPC v c Card"), "{actual}");
+        assert!(actual.contains("zc Card"), "{actual}");
         assert!(actual.contains("saved"), "{actual}");
         assert!(actual.contains("comments"), "{actual}");
     }
@@ -12144,14 +14006,8 @@ pub(crate) mod tests {
     #[test]
     fn empty_nsfw_disabled_content_tools_should_fit_the_setting_guidance() {
         use crate::app::experience::Screen;
-        use crate::reddit::experience::{Page, Query, SearchKind, SearchSort, UserFeed};
+        use crate::reddit::experience::{Page, Query, UserFeed};
         for query in [
-            Query::Search {
-                text: "something".into(),
-                kind: SearchKind::Posts,
-                sort: SearchSort::Relevance,
-                time: crate::model::TimeRange::Day,
-            },
             Query::User {
                 name: "someone".into(),
                 feed: UserFeed::Posts,
@@ -12232,8 +14088,8 @@ pub(crate) mod tests {
     fn an_empty_feed_says_whether_the_config_hid_the_posts_or_a_search_found_none() {
         let mut app = feed_app(Picker::halfblocks());
         let answer = |app: &mut App, posts: Vec<Post>| {
-            let tab = app.tabs[3].id;
-            let generation = app.tabs[3].feed.generation;
+            let tab = app.tabs[4].id;
+            let generation = app.tabs[4].feed.generation;
             app.on_msg(Msg::Feed {
                 tab,
                 generation,
@@ -12261,6 +14117,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn partial_bottom_posts_should_render_without_hiding_selected_metadata() {
+        for bookmarks in [false, true] {
+            for (height, selected, offset, bottom) in [
+                (8, 0, 0, "Second post"),
+                (9, 1, 0, "author2"),
+                (8, 1, 1, "Third post"),
+                (8, 2, 2, "┃"),
+            ] {
+                let mut app = feed_app(Picker::halfblocks());
+                app.show_sidebar = false;
+                app.tabs[4].feed.posts.truncate(3);
+                for (index, post) in app.tabs[4].feed.posts.iter_mut().enumerate() {
+                    post.title = ["First post", "Second post", "Third post"][index].into();
+                    post.author = format!("author{}", index + 1);
+                }
+                if bookmarks {
+                    for post in app.tabs[4].feed.posts.clone().iter().rev() {
+                        app.state.toggle_bookmark(post, 1);
+                    }
+                    app.switch_tab(1);
+                }
+                app.tabs[app.active].feed.selected = selected;
+
+                let actual = screen(&mut app, 100, height);
+
+                assert!(
+                    actual
+                        .lines()
+                        .nth((height - 2) as usize)
+                        .unwrap()
+                        .contains(bottom),
+                    "{actual}"
+                );
+                assert!(
+                    actual.contains(&format!("author{}", selected + 1)),
+                    "{actual}"
+                );
+                assert_eq!(app.active_tab().feed.offset, offset, "{actual}");
+            }
+        }
+    }
+
+    #[test]
     fn feed_rows_load_and_place_thumbnails_only_for_visible_image_posts() {
         let mut app = feed_app(kitty());
 
@@ -12268,7 +14167,6 @@ pub(crate) mod tests {
 
         let mut requested: Vec<&str> = app.thumbs.keys().map(String::as_str).collect();
         requested.sort();
-        // Five rows fit; p2 has no image and p6-p8 are below the fold.
         assert_eq!(
             requested,
             [
@@ -12293,6 +14191,11 @@ pub(crate) mod tests {
         };
         assert_eq!(title_col(&s, "p1"), title_col(&s, "p2"));
 
+        let taller = screen(&mut app, 100, 23);
+        assert!(taller.contains("p6 x"), "{taller}");
+        assert!(app.thumbs.contains_key("https://i.redd.it/p6.jpeg"));
+        assert!(!app.thumbs.contains_key("https://i.redd.it/p7.jpeg"));
+
         let p1_row = s.lines().position(|l| l.contains("p1 x")).unwrap() as u16;
         let image = image::DynamicImage::new_rgb8(256, 256);
         let protocol = app.image_picker.new_resize_protocol(image);
@@ -12306,10 +14209,10 @@ pub(crate) mod tests {
         );
         let cells = placeholder_cells(&mut app, 100, 20);
 
-        // Sidebar 24 + margin 1: the list starts at x 25 with the selection bar,
-        // so the 4×2 thumbnail fills x 26..=29 on the row's two lines only.
+        // Sidebar 24 + inset 2: the list starts at x 26 with the selection bar,
+        // so the 4×2 thumbnail fills x 27..=30 on the row's two lines only.
         let expected: Vec<(u16, u16)> = (p1_row..p1_row + 2)
-            .flat_map(|y| (26..=29).map(move |x| (x, y)))
+            .flat_map(|y| (27..=30).map(move |x| (x, y)))
             .collect();
         let mut cells = cells;
         cells.sort_by_key(|&(x, y)| (y, x));
@@ -12334,9 +14237,9 @@ pub(crate) mod tests {
             result: Ok(Some("/icon/s.png".into())),
         });
         // A later load of the subreddit keeps the known icon.
-        app.switch_tab(3);
-        let generation = app.tabs[3].feed.generation;
-        let id = app.tabs[3].id;
+        app.switch_tab(4);
+        let generation = app.tabs[4].feed.generation;
+        let id = app.tabs[4].id;
         app.on_msg(Msg::Feed {
             tab: id,
             generation,
@@ -12375,10 +14278,13 @@ pub(crate) mod tests {
                     .any(|word| word == "s")
             })
             .unwrap() as u16;
+        // Row 0 holds the focus outline's top edge.
         let card_row = s
             .lines()
+            .skip(1)
             .position(|l| l.contains('╭') || l.contains('╔'))
-            .unwrap() as u16;
+            .unwrap() as u16
+            + 1;
         let card_x = s
             .lines()
             .nth(card_row as usize)
@@ -12386,10 +14292,10 @@ pub(crate) mod tests {
             .chars()
             .position(|c| c == '╭' || c == '╔')
             .unwrap() as u16;
-        // Sidebar: x 1 + bar + number = 3; card title: corner + space = 2.
+        // Sidebar: inset 2 + bar + number = 4; card title: corner + space = 2.
         let mut expected = vec![
-            (4, sidebar_row),
             (5, sidebar_row),
+            (6, sidebar_row),
             (card_x + 2, card_row),
             (card_x + 3, card_row),
         ];
@@ -12437,7 +14343,8 @@ pub(crate) mod tests {
 
     #[test]
     fn popup_media_jump_should_preserve_iterm2_card_fragments() {
-        let mut app = card_with_image(640, 320);
+        // 528×256 fills the 66-column card in exactly 16 rows, so no tile holds padding.
+        let mut app = card_with_image(528, 256);
         app.image_picker.set_protocol_type(ProtocolType::Iterm2);
         let CardImageSlot::Ready { image, .. } = app
             .card_images
@@ -12447,9 +14354,9 @@ pub(crate) mod tests {
             panic!("loaded card")
         };
         *image = std::sync::Arc::new(image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(
-            640,
-            320,
-            |x, _| image::Rgb([if x < 320 { 0 } else { 255 }, 0, 0]),
+            528,
+            256,
+            |x, _| image::Rgb([if x < 264 { 0 } else { 255 }, 0, 0]),
         )));
         screen(&mut app, 100, 40);
         press_keys(&mut app, " bb");
@@ -12468,7 +14375,7 @@ pub(crate) mod tests {
         let right: Vec<_> = protocol
             .tiles
             .iter()
-            .filter(|(key, _)| key.1 == 51)
+            .filter(|(key, _)| key.1 == 50)
             .collect();
         assert!(!right.is_empty());
         assert!(
@@ -12533,7 +14440,7 @@ pub(crate) mod tests {
         let mut player = video::Player::showing(&url, frame);
         player.area = app.video_area.unwrap().as_size();
         app.video = Some(player);
-        press_keys(&mut app, " mp");
+        press_keys(&mut app, "p");
         press_keys(&mut app, " bb");
         app.tick();
 
@@ -12684,6 +14591,8 @@ pub(crate) mod tests {
         let mut top: Vec<String> = app.thumbs.keys().cloned().collect();
         top.sort();
         app.move_selection(2);
+        std::thread::sleep(crate::app::NAV_SETTLE);
+        app.tick();
         screen(&mut app, 100, 12);
 
         assert_eq!(top, ["https://i.redd.it/p1.jpeg"]);
@@ -12978,6 +14887,2185 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn search_tab_post_results_should_name_each_posts_community() {
+        let mut app = app(&[]);
+        app.open_search(None);
+        crate::keys::paste(&mut app, "editor");
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let mut post = post_with("found", Media::None);
+        post.subreddit = "vim".into();
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Ok(crate::model::Listing {
+                posts: vec![post],
+                after: None,
+            }),
+        });
+
+        let shown = screen(&mut app, 100, 20);
+
+        assert!(shown.contains("r/vim"), "{shown}");
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(
+            help::entries(&app)
+                .iter()
+                .any(|(key, text)| key == "Tab / S-Tab"
+                    && text == "Switch Posts / Communities / People"),
+            "list help names the kind keys"
+        );
+        app.tabs[crate::app::SEARCH_TAB].feed.after = Some("next".into());
+        app.load_feed(crate::app::SEARCH_TAB, true);
+        app.overlay = Some(Overlay::Picker(crate::app::PickerState::default()));
+        let covered = screen(&mut app, 100, 20);
+        assert!(
+            covered.lines().last().unwrap().contains("more posts"),
+            "a covered results loader moves to the footer: {covered}"
+        );
+        app.overlay = None;
+        assert!(shown.contains("Posts  matching “editor”"), "{shown}");
+        assert_eq!(
+            shown.matches("editor").count(),
+            2,
+            "query bar and title only"
+        );
+    }
+
+    #[test]
+    fn reported_search_reverse_navigation_should_keep_the_viewport() {
+        let mut app = app(&[]);
+        app.open_search(None);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        app.search.discovered.loading = false;
+        app.search.discovered.entries = (0..60)
+            .map(|i| crate::app::search::Row {
+                profile: None,
+                label: format!("r/community{i:02}"),
+                detail: String::new(),
+                target: crate::worker::FeedTarget::Subreddit(format!("community{i:02}")),
+            })
+            .collect();
+        for _ in 0..35 {
+            press(&mut app, 'j');
+            screen(&mut app, 100, 24);
+        }
+        let before = screen(&mut app, 100, 24);
+        let first = before
+            .lines()
+            .find(|line| line.contains("r/community"))
+            .unwrap()
+            .trim()
+            .to_owned();
+        press(&mut app, 'k');
+        let after = screen(&mut app, 100, 24);
+        assert!(
+            after.lines().any(|line| line.trim() == first),
+            "reverse navigation moved the viewport: {after}"
+        );
+    }
+
+    #[test]
+    fn long_explore_descriptions_should_show_visible_summaries_and_later_entries() {
+        let mut app = app(&[]);
+        app.open_search(None);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        app.search.discovered.loading = false;
+        app.search.discovered.entries = vec![
+            crate::app::search::Row {
+                profile: None,
+                label: "r/long_description".into(),
+                detail: "A descriptive word ".repeat(60),
+                target: crate::worker::FeedTarget::Subreddit("long_description".into()),
+            },
+            crate::app::search::Row {
+                profile: None,
+                label: "r/second".into(),
+                detail: "A short description".into(),
+                target: crate::worker::FeedTarget::Subreddit("second".into()),
+            },
+        ];
+        app.search.selected = 2;
+        let actual = screen(&mut app, 70, 20);
+        assert!(
+            actual.contains("r/second"),
+            "long summaries must leave room for later entries: {actual}"
+        );
+        assert!(
+            actual
+                .lines()
+                .any(|line| line.contains("descriptive") && line.contains('…')),
+            "a shortened description needs a visible ellipsis: {actual}"
+        );
+    }
+
+    #[test]
+    fn search_revision_should_prefetch_from_the_visible_window_before_the_last_rows() {
+        use crate::reddit::experience::{Entry, Page, Query, Response};
+        let mut app = app(&[]);
+        app.open_search(None);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        app.on_msg(Msg::Search {
+            generation: app.search.discovered_generation(),
+            result: Ok(Response::Page(Page {
+                title: "Discover".into(),
+                text: String::new(),
+                url: "/".into(),
+                after: Some("next".into()),
+                entries: (0..50)
+                    .map(|i| Entry {
+                        title: format!("r/community{i}"),
+                        body: String::new(),
+                        query: Some(Query::Community(format!("community{i}"))),
+                        icon: Default::default(),
+                        target: None,
+                        post: None,
+                    })
+                    .collect(),
+            })),
+        });
+        app.search.selected = 0;
+        screen(&mut app, 160, 30);
+        assert!(
+            app.search.discovered.loading,
+            "keep another API page ready while the first page is being read"
+        );
+        let generation = app.search.discovered_generation();
+        screen(&mut app, 160, 30);
+        assert_eq!(
+            app.search.discovered_generation(),
+            generation,
+            "one continuation at a time"
+        );
+    }
+
+    #[test]
+    fn post_notice_preview_should_announce_only_new_leading_posts() {
+        for (ids, new_posts) in [
+            (vec!["a", "b"], false),
+            (vec!["a", "tail", "b"], false),
+            (vec!["b", "a"], false),
+            (vec!["leader", "b", "a"], true),
+        ] {
+            let mut app = app(&[]);
+            app.open_search(None);
+            app.search.discovered.loading = false;
+            app.search.preview.target = Some(app.search.selected_row().unwrap().target);
+            app.search.preview.posts =
+                vec![post_with("a", Media::None), post_with("b", Media::None)];
+            app.search.preview.update = Some(
+                ids.iter()
+                    .map(|id| {
+                        let mut post = post_with(id, Media::None);
+                        post.score = Some(123);
+                        post.comments = 42;
+                        post
+                    })
+                    .collect(),
+            );
+            let shown = screen(&mut app, 200, 30);
+            assert_eq!(shown.contains("New posts"), new_posts, "{ids:?}: {shown}");
+        }
+    }
+
+    #[test]
+    fn post_notice_preview_status_should_belong_to_the_selected_source() {
+        let mut app = app(&[]);
+        app.open_search(None);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        app.search.discovered.loading = false;
+        app.search.preview.target = Some(app.search.selected_row().unwrap().target);
+        app.search.preview.posts = vec![post_with("a", Media::None)];
+        app.search.preview.update = Some(vec![post_with("leader", Media::None)]);
+        app.search.preview.error = Some("previous source failed".into());
+        let current = screen(&mut app, 200, 30);
+        assert!(
+            current.contains("New posts") && current.contains("refresh failed"),
+            "{current}"
+        );
+
+        press(&mut app, 'j');
+        let next = screen(&mut app, 200, 30);
+        assert!(
+            next.contains("r/all") && next.contains("Loading preview"),
+            "{next}"
+        );
+        assert!(
+            !next.contains("New posts") && !next.contains("refresh failed"),
+            "{next}"
+        );
+    }
+
+    #[test]
+    fn search_key_audit_rows_should_use_row_motions_after_post_cards() {
+        for viewport in [0, 35] {
+            let mut app = app(&[]);
+            app.open_search(None);
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            app.search.discovered.entries = (0..30)
+                .map(|i| crate::app::search::Row {
+                    profile: None,
+                    label: format!("r/source{i}"),
+                    detail: String::new(),
+                    target: crate::worker::FeedTarget::Subreddit(format!("source{i}")),
+                })
+                .collect();
+            app.tabs[crate::app::SEARCH_TAB].feed.cards.viewport = viewport;
+            for (code, modifiers, selected) in [
+                (KeyCode::Char('e'), KeyModifiers::CONTROL, 1),
+                (KeyCode::Char('y'), KeyModifiers::CONTROL, 0),
+                (KeyCode::Char('f'), KeyModifiers::CONTROL, 10),
+                (KeyCode::Char('d'), KeyModifiers::CONTROL, 15),
+                (KeyCode::Char('u'), KeyModifiers::CONTROL, 10),
+                (KeyCode::Char('b'), KeyModifiers::CONTROL, 0),
+                (KeyCode::PageDown, KeyModifiers::NONE, 10),
+                (KeyCode::PageUp, KeyModifiers::NONE, 0),
+            ] {
+                key(&mut app, code, modifiers);
+                assert_eq!(
+                    app.search.selected, selected,
+                    "{code:?} with card viewport{viewport}"
+                );
+            }
+            press(&mut app, 'G');
+            assert_eq!(app.search.selected, 31);
+            press_keys(&mut app, "gg");
+            assert_eq!(app.search.selected, 0);
+        }
+    }
+
+    #[test]
+    fn search_key_audit_query_should_share_editor_modifier_filtering() {
+        let mut app = app(&[]);
+        app.open_search(None);
+        crate::keys::paste(&mut app, "alpha rust");
+        app.search.selected = 1;
+        for (code, modifiers) in [
+            (KeyCode::Enter, KeyModifiers::CONTROL),
+            (KeyCode::Tab, KeyModifiers::CONTROL),
+            (KeyCode::Esc, KeyModifiers::ALT),
+            (KeyCode::Left, KeyModifiers::ALT),
+            (KeyCode::Delete, KeyModifiers::CONTROL),
+            (KeyCode::Down, KeyModifiers::ALT),
+        ] {
+            let expected = (
+                app.active,
+                app.active_tab().feed.generation,
+                app.search.kind,
+                app.search.selected,
+                app.search.query.value.clone(),
+                app.search.query.cursor,
+                app.search.editing,
+            );
+            key(&mut app, code, modifiers);
+            assert_eq!(
+                (
+                    app.active,
+                    app.active_tab().feed.generation,
+                    app.search.kind,
+                    app.search.selected,
+                    app.search.query.value.clone(),
+                    app.search.query.cursor,
+                    app.search.editing
+                ),
+                expected,
+                "unsupported editor chord {modifiers:?}+{code:?}"
+            );
+        }
+        key(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(app.search.query.cursor, 0);
+        key(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        key(&mut app, KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(app.search.query.value, "alpha ");
+        key(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert!(app.search.query.value.is_empty());
+    }
+
+    #[test]
+    fn key_context_audit_open_and_media_keys_should_require_a_usable_target() {
+        use crate::keys::map::{self, Action};
+        use crate::reddit::experience::Query;
+        let mut empty = app(&[]);
+        empty.active = 0;
+        empty.focus_main();
+        assert!(!map::available(&empty, Action::Right));
+        assert!(!map::available(&empty, Action::Browser));
+        empty.active = crate::app::ALL_SUBS_TAB;
+        assert!(!map::available(&empty, Action::NextCommunity));
+        let mut rules = description_popup(Query::Rules("rust".into()), "Rules", &[]);
+        assert!(!map::available(&rules, Action::Right));
+        let before = rules.experience.screens.len();
+        press(&mut rules, 'l');
+        assert_eq!(rules.experience.screens.len(), before);
+
+        let (mut post, _) = open_long_post(|_| {});
+        post.post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .comments = vec![reply("leaf".into())];
+        screen(&mut post, 100, 24);
+        press(&mut post, 'G');
+        assert!(!map::available(&post, Action::Right));
+        let gallery = Media::Gallery {
+            images: vec![],
+            previews: vec![],
+            thumb: None,
+        };
+        post.post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .post
+            .media = gallery;
+        assert!(!map::available(&post, Action::NextImage));
+        let video = Media::Video {
+            gif: false,
+            url: Some(VIDEO.into()),
+            poster: None,
+        };
+        post.post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .post
+            .media = video;
+        post.show_images = true;
+        post.config.media.image_preview = true;
+        assert!(map::available(&post, Action::Pause));
+        for action in [Action::Mute, Action::SeekBack, Action::SeekForward] {
+            assert!(!map::available(&post, action));
+        }
+        post.focus_sidebar();
+        assert!(!map::available(&post, Action::Media));
+        post.close_post();
+        post.active = crate::app::SEARCH_TAB;
+        post.search.query.insert("video");
+        post.search.editing = true;
+        post.focus_main();
+        let mut video_post = post_with("typing", Media::None);
+        video_post.media = Media::Video {
+            gif: false,
+            url: Some(VIDEO.into()),
+            poster: None,
+        };
+        post.tabs[crate::app::SEARCH_TAB].feed.posts = vec![video_post];
+        assert!(!map::available(&post, Action::Pause));
+    }
+
+    #[test]
+    fn key_context_audit_end_should_reach_the_last_visible_content() {
+        let (mut post, _) = open_long_post(|_| {});
+        post.post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .comments
+            .clear();
+        screen(&mut post, 100, 24);
+        press(&mut post, 'G');
+        let bottom = screen(&mut post, 100, 24);
+        assert!(bottom.contains("paragraph 60"), "{bottom}");
+        assert!(post.post_view.as_ref().unwrap().scroll > 0);
+        press_keys(&mut post, "gg");
+        assert_eq!(post.post_view.as_ref().unwrap().scroll, 0);
+
+        let text = (1..=60)
+            .map(|index| format!("Rule {index}\n"))
+            .collect::<String>();
+        let mut rules = description_popup(
+            crate::reddit::experience::Query::Rules("rust".into()),
+            &text,
+            &[],
+        );
+        popup_snapshot(&mut rules, 80, 24);
+        press(&mut rules, 'G');
+        let (_, bottom) = popup_snapshot(&mut rules, 80, 24);
+        assert!(bottom.contains("Rule 60"), "{bottom}");
+        let scroll = match rules.experience.screens.last().unwrap() {
+            crate::app::experience::Screen::Browse { scroll, .. } => *scroll,
+            _ => unreachable!(),
+        };
+        key(&mut rules, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        popup_snapshot(&mut rules, 80, 24);
+        key(&mut rules, KeyCode::Char('y'), KeyModifiers::CONTROL);
+        popup_snapshot(&mut rules, 80, 24);
+        assert!(matches!(rules.experience.screens.last(),
+            Some(crate::app::experience::Screen::Browse { scroll: actual, .. }) if *actual == scroll - 1));
+
+        let mut islands = app(&["first", "last"]);
+        islands.all_subs.groups[1].posts = ["one", "two", "three"]
+            .into_iter()
+            .map(|id| post_with(id, Media::None))
+            .collect();
+        press(&mut islands, 'G');
+        assert_eq!(islands.current_post().unwrap().id, "three");
+        press_keys(&mut islands, "gg");
+        assert_eq!((islands.all_subs.group, islands.all_subs.post), (0, 0));
+    }
+
+    #[test]
+    fn key_context_audit_narrow_confirmation_should_keep_its_explicit_enter_control() {
+        use crate::app::experience::Screen;
+        use crate::reddit::experience::{Action, Target};
+        let mut app = app(&[]);
+        app.overlay = Some(Overlay::Experience);
+        app.experience.screens = vec![Screen::Confirm {
+            label: "Delete this post?".into(),
+            action: Action::Delete {
+                target: Target::from_post(&post_with("delete", Media::None)),
+            },
+            native: "/r/s/comments/delete/x/".into(),
+        }];
+        let (_, shown) = popup_snapshot(&mut app, 24, 12);
+        assert!(shown.contains("Enter") || shown.contains('⏎'), "{shown}");
+        press(&mut app, 'l');
+        assert!(matches!(
+            app.experience.screens.last(),
+            Some(Screen::Confirm { .. })
+        ));
+        assert!(app.experience.pending.is_none());
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn key_context_audit_empty_picker_should_keep_the_query_until_a_target_exists() {
+        let mut app = app(&[]);
+        press_keys(&mut app, " bb");
+        crate::keys::paste(&mut app, "???");
+        assert!(app.picker_entries("???").is_empty());
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(&app.overlay, Some(Overlay::Picker(picker)) if picker.input == "???"));
+        key(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        crate::keys::paste(&mut app, "Home");
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn key_context_audit_go_commands_should_focus_the_destination_feed() {
+        for width in [100, 200] {
+            for command in ["gh", "ga", "gp", "gc"] {
+                let (mut app, _) = open_long_post(|_| {});
+                let view = app.post_view.take();
+                match command {
+                    "gh" => app.active = 0,
+                    "ga" => app.active = crate::app::ALL_SUBS_TAB,
+                    "gp" => app.open_subreddit("popular"),
+                    _ => app.open_subreddit("s"),
+                }
+                let destination = app.active_tab().id;
+                app.post_view = view;
+                app.focus = Focus::Post;
+                screen(&mut app, width, 24);
+
+                press_keys(&mut app, command);
+
+                assert_eq!(app.active_tab().id, destination, "{command}");
+                assert!(app.post_view.is_none(), "{width}: {command}");
+                assert_eq!(app.focus, Focus::List);
+            }
+        }
+    }
+
+    #[test]
+    fn key_context_audit_invalid_terminal_keys_should_cancel_only_the_prefix() {
+        for invalid in [
+            KeyCode::Tab,
+            KeyCode::Left,
+            KeyCode::Home,
+            KeyCode::Backspace,
+            KeyCode::F(3),
+        ] {
+            let mut app = app(&["first", "second"]);
+            app.active = 4;
+            app.focus_main();
+            press(&mut app, ']');
+            assert_eq!(app.keymap.prefix, "]");
+            key(&mut app, invalid, KeyModifiers::NONE);
+            assert!(app.keymap.prefix.is_empty(), "{invalid:?}");
+            assert_eq!(app.active, 4, "consume the invalid key without navigating");
+            assert_eq!(app.focus, Focus::List);
+        }
+    }
+
+    #[test]
+    fn key_context_audit_auth_confirmation_should_only_accept_its_own_verbs() {
+        for phase in [
+            crate::auth::Phase::Confirm,
+            crate::auth::Phase::DisconnectConfirm,
+        ] {
+            let mut app = app(&[]);
+            app.auth.phase = phase;
+            app.auth.active_id = Some("reader".into());
+            app.auth.selected = 1;
+            app.overlay = Some(Overlay::Auth);
+            for code in [
+                KeyCode::Char('j'),
+                KeyCode::Char('d'),
+                KeyCode::Char('r'),
+                KeyCode::Home,
+            ] {
+                key(&mut app, code, KeyModifiers::NONE);
+                assert_eq!(app.auth.phase, phase, "{code:?}");
+                assert_eq!(app.auth.selected, 1, "{code:?}");
+            }
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.overlay.is_none());
+        }
+    }
+
+    #[test]
+    fn key_context_audit_local_find_reload_should_keep_the_local_results() {
+        use crate::app::experience::Screen;
+        let (mut app, _) = open_long_post(|_| {});
+        let generation = app.post_view.as_ref().unwrap().generation;
+        press(&mut app, '/');
+        crate::keys::paste(&mut app, "reply");
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        app.post_view
+            .as_mut()
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .comments
+            .insert(0, reply("new".into()));
+        press(&mut app, 'r');
+        assert!(
+            app.experience.pending.is_none(),
+            "Find must not read a remote thread"
+        );
+        assert!(
+            matches!(app.experience.screens.last(), Some(Screen::Browse { page, .. }) if page.entries.len() == 2)
+        );
+        assert!(
+            matches!(app.experience.screens.last(), Some(Screen::Browse { page, selected, .. })
+            if page.entries[*selected].target.as_ref().unwrap().id == "t1_c")
+        );
+        assert_eq!(app.post_view.as_ref().unwrap().generation, generation);
+        assert!(matches!(app.overlay, Some(Overlay::Experience)));
+    }
+
+    #[test]
+    fn key_context_audit_opened_multi_post_should_regain_content_actions() {
+        use crate::app::experience::Screen;
+        use crate::keys::map::{self, Action};
+        use crate::reddit::experience::{Entry, Page, Query, Request, Target};
+        let mut app = app(&[]);
+        let post = post_with("selected", Media::None);
+        let target = Target::from_post(&post);
+        app.overlay = Some(Overlay::Experience);
+        app.experience.screens = vec![Screen::Browse {
+            query: Query::Multi {
+                owner: "reader".into(),
+                name: "feed".into(),
+            },
+            page: Page {
+                title: "Feed".into(),
+                text: String::new(),
+                entries: vec![Entry {
+                    icon: Default::default(),
+                    title: "Selected".into(),
+                    body: String::new(),
+                    query: None,
+                    target: Some(target.clone()),
+                    post: Some(post),
+                }],
+                after: None,
+                url: "/user/reader/m/feed".into(),
+            },
+            selected: 0,
+            scroll: 0,
+            pagination: Default::default(),
+        }];
+        for action in [Action::Upvote, Action::Save, Action::Reply] {
+            assert!(
+                map::available(&app, action),
+                "nonconflicting verb {action:?}"
+            );
+        }
+        assert!(!map::available(&app, Action::Downvote));
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.post_focused());
+        for action in [
+            Action::Upvote,
+            Action::Downvote,
+            Action::Save,
+            Action::Reply,
+        ] {
+            assert!(map::available(&app, action), "{action:?}");
+        }
+        press(&mut app, 'd');
+        assert!(
+            matches!(&app.experience.pending, Some((_, Request::Read { query: Query::Inspect(actual), .. })) if actual == &target)
+        );
+    }
+
+    #[test]
+    fn key_context_audit_messages_should_offer_message_actions_instead_of_post_verbs() {
+        use crate::app::experience::Screen;
+        use crate::keys::map::{self, Action};
+        use crate::reddit::experience::{Inbox, Query, Target};
+        let mut app = description_popup(Query::Inbox(Inbox::All), "", &["Message"]);
+        if let Some(Screen::Browse { page, .. }) = app.experience.screens.last_mut() {
+            page.entries[0].query = None;
+            page.entries[0].target = Some(Target {
+                id: "t4_message".into(),
+                author: "sender".into(),
+                subreddit: String::new(),
+                permalink: String::new(),
+            });
+        }
+        for action in [
+            Action::Upvote,
+            Action::Downvote,
+            Action::Save,
+            Action::Reply,
+        ] {
+            assert!(!map::available(&app, action), "{action:?}");
+        }
+        press_keys(&mut app, " a");
+        assert!(
+            matches!(app.experience.screens.last(), Some(Screen::Menu { title, .. }) if title == "Message actions")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_context_audit_browser_should_follow_the_item_and_keep_the_parent_shortcut() {
+        use crate::app::experience::Screen;
+        use crate::keys::map::{self, Action};
+        use crate::reddit::experience::{Entry, Page, Query, Target};
+        let mut app = app(&[]);
+        let post = post_with("selected", Media::None);
+        let item_url = post.reddit_url();
+        app.overlay = Some(Overlay::Experience);
+        app.experience.screens = vec![Screen::Browse {
+            query: Query::Profile("reader".into()),
+            page: Page {
+                title: "Profile".into(),
+                text: String::new(),
+                entries: vec![Entry {
+                    icon: Default::default(),
+                    title: "Selected".into(),
+                    body: String::new(),
+                    query: None,
+                    target: Some(Target::from_post(&post)),
+                    post: Some(post),
+                }],
+                after: None,
+                url: "/user/reader/".into(),
+            },
+            selected: 0,
+            scroll: 0,
+            pagination: Default::default(),
+        }];
+        assert_eq!(opened_browser_url(&mut app, "o"), item_url);
+        assert_eq!(
+            opened_browser_url(&mut app, "\u{f}"),
+            "https://www.reddit.com/user/reader/"
+        );
+        app.overlay = None;
+        for name in ["popular", "all"] {
+            app.open_subreddit(name);
+            assert!(map::available(&app, Action::SourceBrowser));
+            assert_eq!(
+                opened_browser_url(&mut app, "o"),
+                format!("https://www.reddit.com/r/{name}/")
+            );
+            app.focus_sidebar();
+            assert_eq!(
+                opened_browser_url(&mut app, "o"),
+                format!("https://www.reddit.com/r/{name}/")
+            );
+            app.focus_main();
+        }
+    }
+
+    #[test]
+    fn search_source_motions_should_lift_details_to_the_parent_rows() {
+        use crate::reddit::experience::{Entry, Page, Query, Response};
+        use crate::worker::FeedTarget;
+        for width in [100, 200] {
+            for (command, expected) in [("]s", 4), ("[s", 2)] {
+                let mut app = app(&["sidebar_only"]);
+                app.open_search(None);
+                key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                app.on_msg(Msg::Search {
+                    generation: app.search.discovered_generation(),
+                    result: Ok(Response::Page(Page {
+                        title: "Discover".into(),
+                        text: String::new(),
+                        url: "/".into(),
+                        after: None,
+                        entries: ["alpha", "beta", "gamma"]
+                            .into_iter()
+                            .map(|name| Entry {
+                                title: format!("r/{name}"),
+                                body: String::new(),
+                                query: Some(Query::Community(name.into())),
+                                icon: Default::default(),
+                                target: None,
+                                post: None,
+                            })
+                            .collect(),
+                    })),
+                });
+                app.search.selected = 3;
+                screen(&mut app, width, 24);
+                press(&mut app, 'l');
+                let source = app.active;
+                let mut post = post_with("nested", Media::None);
+                post.subreddit = "beta".into();
+                app.on_msg(Msg::Feed {
+                    tab: app.active_tab().id,
+                    generation: app.active_tab().feed.generation,
+                    append: false,
+                    result: Ok(crate::model::Listing {
+                        posts: vec![post.clone()],
+                        after: None,
+                    }),
+                });
+                press(&mut app, 'l');
+                let mut root = reply("root".into());
+                root.replies.push(reply("deep".into()));
+                app.on_msg(Msg::Post {
+                    generation: app.post_view.as_ref().unwrap().generation,
+                    result: Ok(Box::new(PostPage {
+                        post,
+                        body: "A long passage before the replies.\n".repeat(35),
+                        comments: vec![root],
+                    })),
+                });
+                screen(&mut app, width, 24);
+                press(&mut app, 'G');
+                screen(&mut app, width, 24);
+                assert!(app.post_view.as_ref().unwrap().scroll > 0);
+                if app.detail_fits() && command == "[s" {
+                    press(&mut app, 'h');
+                    assert_eq!(app.focus, Focus::List);
+                    assert!(app.post_view.is_some());
+                }
+
+                press_keys(&mut app, command);
+
+                assert_eq!(app.active, crate::app::SEARCH_TAB, "{width}: {command}");
+                assert_eq!(app.search.selected, expected);
+                assert_eq!(app.focus, Focus::List);
+                assert!(!app.search_editing());
+                assert!(app.post_view.is_none());
+                assert!(!app.ancestor_following());
+                assert_eq!(app.tabs[source].feed.posts[0].id, "nested");
+                let destination = app.search.selected_row().unwrap().target;
+                press(&mut app, 'l');
+                assert!(app.search_feed_open());
+                let FeedTarget::Subreddit(name) = destination else {
+                    unreachable!()
+                };
+                assert_eq!(app.active_tab().subreddit(), Some(name.as_str()));
+                if app.detail_fits() {
+                    key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+                    press(&mut app, 'h');
+                }
+                press_keys(&mut app, command);
+                assert_eq!(app.active, crate::app::SEARCH_TAB);
+                assert_eq!(app.search.selected, if command == "]s" { 4 } else { 1 });
+            }
+        }
+    }
+
+    #[test]
+    fn search_source_motions_should_use_shown_sources_without_opened_subreddit_tabs() {
+        use crate::keys::map::{self, Action};
+        use crate::reddit::experience::SearchKind;
+        use crate::worker::FeedTarget;
+        let mut explore = app(&[]);
+        explore.open_search(None);
+        key(&mut explore, KeyCode::Esc, KeyModifiers::NONE);
+        for action in [Action::NextCommunity, Action::PreviousCommunity] {
+            assert!(map::available(&explore, action));
+        }
+        press_keys(&mut explore, "]s");
+        assert_eq!(explore.search.selected, 1);
+        press_keys(&mut explore, "[s");
+        assert_eq!(explore.search.selected, 0);
+        press_keys(&mut explore, "[s");
+        assert_eq!(explore.search.selected, 0);
+
+        for kind in [SearchKind::Communities, SearchKind::People] {
+            let mut app = app(&["unrelated"]);
+            app.open_search(Some(kind));
+            app.search.query.insert("topic");
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            app.search.results.entries = ["first", "second"]
+                .into_iter()
+                .map(|name| crate::app::search::Row {
+                    profile: None,
+                    label: name.into(),
+                    detail: String::new(),
+                    target: if kind == SearchKind::People {
+                        FeedTarget::User(name.into())
+                    } else {
+                        FeedTarget::Subreddit(name.into())
+                    },
+                })
+                .collect();
+            let help = help::entries(&app);
+            assert!(
+                help.iter()
+                    .any(|(keys, text)| keys == "]s / [s" && text.contains("Search source"))
+            );
+            press(&mut app, 'l');
+            press_keys(&mut app, "]s");
+            assert_eq!(app.active, crate::app::SEARCH_TAB);
+            assert_eq!(app.search.selected, 1);
+            press(&mut app, 'l');
+            press_keys(&mut app, "]s");
+            assert_eq!(app.active, crate::app::SEARCH_TAB);
+            assert_eq!(app.search.selected, 1, "lift even at the last source");
+            press_keys(&mut app, "[s");
+            assert_eq!(app.search.selected, 0);
+            assert_eq!(app.search.query.value, "topic");
+            assert_eq!(app.search.kind, kind);
+            press(&mut app, '/');
+            assert!(!map::available(&app, Action::FocusLeft));
+            assert!(!map::available(&app, Action::FocusRight));
+            press_keys(&mut app, "]s[s");
+            assert_eq!(app.search.query.value, "topic]s[s");
+            assert_eq!(app.search.selected, 0);
+            app.show_auth();
+            assert!(!map::available(&app, Action::NextCommunity));
+            assert!(!map::available(&app, Action::PreviousCommunity));
+        }
+    }
+
+    #[test]
+    fn search_source_motions_should_hide_unreachable_post_and_pane_branches() {
+        use crate::keys::map::{self, Action};
+        let mut app = app(&[]);
+        app.open_search(None);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        screen(&mut app, 100, 24);
+        assert!(!map::available(&app, Action::FocusRight));
+        assert!(
+            !help::entries(&app)
+                .iter()
+                .any(|(keys, _)| keys.contains("C-w l"))
+        );
+        screen(&mut app, 200, 24);
+        assert!(map::available(&app, Action::FocusRight));
+        press_keys(&mut app, "\u{17}l");
+        assert!(app.search_feed_open());
+        let post = post_with("parent", Media::None);
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Ok(crate::model::Listing {
+                posts: vec![post],
+                after: None,
+            }),
+        });
+        press(&mut app, 'l');
+        assert!(map::available(&app, Action::NextPost));
+        assert!(map::available(&app, Action::PreviousPost));
+        assert!(!map::available(&app, Action::FocusRight));
+        assert!(map::available(&app, Action::FocusLeft));
+        app.tabs[app.active].feed.posts.clear();
+        assert!(!map::available(&app, Action::NextPost));
+        assert!(!map::available(&app, Action::PreviousPost));
+        assert!(
+            !help::entries(&app)
+                .iter()
+                .any(|(keys, _)| keys.contains("]p"))
+        );
+        press_keys(&mut app, "[s");
+        assert_eq!(app.active, crate::app::SEARCH_TAB);
+        assert_eq!(app.search.selected, 0);
+        app.focus_sidebar();
+        assert!(!map::available(&app, Action::FocusLeft));
+        assert!(map::available(&app, Action::FocusRight));
+        assert!(!map::available(&app, Action::NextCommunity));
+        press_keys(&mut app, "\u{17}l");
+        assert_eq!(app.focus, Focus::List);
+
+        app.open_search(Some(crate::reddit::experience::SearchKind::People));
+        crate::keys::paste(&mut app, "missing");
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        screen(&mut app, 200, 24);
+        assert!(app.search.rows_loading());
+        assert!(!map::available(&app, Action::FocusRight));
+        press_keys(&mut app, "\u{17}l");
+        assert_eq!(app.active, crate::app::SEARCH_TAB);
+        app.on_msg(Msg::Search {
+            generation: app.search.results_generation(),
+            result: Err("offline".into()),
+        });
+        screen(&mut app, 200, 24);
+        assert!(app.search.rows_error().is_some());
+        assert!(!map::available(&app, Action::FocusRight));
+        press(&mut app, 'r');
+        app.on_msg(Msg::Search {
+            generation: app.search.results_generation(),
+            result: Ok(crate::reddit::experience::Response::Page(
+                crate::reddit::experience::Page {
+                    title: "People".into(),
+                    text: String::new(),
+                    entries: vec![],
+                    after: None,
+                    url: "/search".into(),
+                },
+            )),
+        });
+        screen(&mut app, 200, 24);
+        assert!(!app.search.rows_loading());
+        assert!(!map::available(&app, Action::FocusRight));
+        assert!(
+            !help::entries(&app)
+                .iter()
+                .any(|(keys, _)| keys.contains("C-w l"))
+        );
+        press(&mut app, 'r');
+        app.on_msg(Msg::Search {
+            generation: app.search.results_generation(),
+            result: Ok(crate::reddit::experience::Response::Page(
+                crate::reddit::experience::Page {
+                    title: "People".into(),
+                    text: String::new(),
+                    after: None,
+                    url: "/search".into(),
+                    entries: vec![crate::reddit::experience::Entry {
+                        title: "writer".into(),
+                        body: String::new(),
+                        icon: Default::default(),
+                        target: None,
+                        post: None,
+                        query: Some(crate::reddit::experience::Query::Profile("writer".into())),
+                    }],
+                },
+            )),
+        });
+        screen(&mut app, 200, 24);
+        assert!(map::available(&app, Action::FocusRight));
+        press_keys(&mut app, "\u{17}l");
+        assert!(app.search_feed_open());
+        assert!(matches!(&app.active_tab().kind, TabKind::User { name, .. } if name == "writer"));
+    }
+
+    #[test]
+    fn search_key_audit_source_commands_should_keep_the_parent() {
+        use crate::worker::FeedTarget;
+        for target in [
+            FeedTarget::Subreddit("rust".into()),
+            FeedTarget::User("writer".into()),
+        ] {
+            for command in ["l", "gc", " cf"] {
+                let mut app = app(&[]);
+                app.open_search(None);
+                key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                app.search.discovered.entries.push(crate::app::search::Row {
+                    profile: None,
+                    label: "selected source".into(),
+                    detail: String::new(),
+                    target: target.clone(),
+                });
+                app.search.selected = 2;
+                screen(&mut app, 200, 24);
+                press_keys(&mut app, command);
+                match &target {
+                    FeedTarget::Subreddit(name) => {
+                        assert_eq!(app.active_tab().subreddit(), Some(name.as_str()))
+                    }
+                    FeedTarget::User(name) => assert!(
+                        matches!(&app.active_tab().kind, TabKind::User { name: actual, .. } if actual == name)
+                    ),
+                    FeedTarget::Home => unreachable!(),
+                }
+                assert!(
+                    app.search_feed_open(),
+                    "{command:?} should keep the same parent as Enter"
+                );
+                press(&mut app, 'h');
+                assert_eq!(app.active, crate::app::SEARCH_TAB);
+                assert_eq!(app.search.selected, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn search_key_audit_source_links_should_include_explore_feeds() {
+        use crate::keys::map::{self, Action};
+        use crate::worker::FeedTarget;
+        for (target, path, membership) in [
+            (
+                FeedTarget::Subreddit("popular".into()),
+                "/r/popular/",
+                false,
+            ),
+            (FeedTarget::Subreddit("all".into()), "/r/all/", false),
+            (FeedTarget::Subreddit("rust".into()), "/r/rust/", true),
+            (FeedTarget::User("writer".into()), "/user/writer/", true),
+        ] {
+            let mut app = app(&[]);
+            app.open_search(None);
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            app.search.discovered.entries.push(crate::app::search::Row {
+                profile: None,
+                label: "selected source".into(),
+                detail: String::new(),
+                target,
+            });
+            app.search.selected = 2;
+            assert!(
+                map::available(&app, Action::CopyLink),
+                "selected row has a Reddit URL"
+            );
+            assert!(map::available(&app, Action::CommunityFeed));
+            assert!(map::available(&app, Action::SourceBrowser));
+            assert_eq!(map::available(&app, Action::Membership), membership);
+            assert_eq!(
+                app.copy_link_target().unwrap(),
+                (format!("https://www.reddit.com{path}"), false)
+            );
+            press(&mut app, 'y');
+            assert!(map::hints(&app).iter().any(|(key, _)| key == "y"));
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("browser.sh");
+            std::fs::write(&script, "printf '%s' \"$2\" > \"$1\"\n").unwrap();
+            for (index, command) in ["o", " oc"].into_iter().enumerate() {
+                let output = dir.path().join(format!("url{index}"));
+                app.config.commands.browser = vec![
+                    "/bin/sh".into(),
+                    script.to_string_lossy().into(),
+                    output.to_string_lossy().into(),
+                ];
+                press_keys(&mut app, command);
+                let expected = format!("https://www.reddit.com{path}");
+                let deadline = Instant::now() + std::time::Duration::from_secs(2);
+                while std::fs::read_to_string(&output).ok().as_deref() != Some(&expected) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{command:?} did not open {expected}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_key_audit_focus_and_back_should_follow_visible_parent_panes() {
+        for width in [100, 200] {
+            let mut app = app(&[]);
+            app.open_search(None);
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            screen(&mut app, width, 24);
+            press_keys(&mut app, "\u{17}l");
+            if app.detail_fits() {
+                assert!(app.search_feed_open(), "focus the visible post preview");
+                press_keys(&mut app, "\u{17}h");
+                assert_eq!(app.active, crate::app::SEARCH_TAB);
+            } else {
+                assert_eq!(app.active, crate::app::SEARCH_TAB, "there is no right pane");
+            }
+            press(&mut app, 'l');
+            let feed = app.active;
+            app.focus_sidebar();
+            key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+            if app.detail_fits() {
+                assert_eq!(
+                    app.active,
+                    crate::app::SEARCH_TAB,
+                    "the visible middle pane is Search"
+                );
+                press(&mut app, 'l');
+            } else {
+                assert_eq!(app.active, feed);
+            }
+            app.search("local filter".into());
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(
+                app.active, feed,
+                "clear the local filter before leaving its feed"
+            );
+            assert!(app.active_tab().feed.search.is_none());
+            key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            assert_eq!(app.active, crate::app::SEARCH_TAB);
+            assert_eq!(app.focus, Focus::List);
+        }
+    }
+
+    #[test]
+    fn search_key_audit_parent_retry_guidance_should_not_target_the_child_feed() {
+        let mut app = app(&[]);
+        app.open_search(None);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        app.search.discovered.loading = false;
+        app.search.discovered.error = Some("parent failed".into());
+        screen(&mut app, 200, 24);
+        press(&mut app, 'l');
+        let actual = screen(&mut app, 200, 24);
+        assert!(actual.contains("parent failed"), "{actual}");
+        assert!(
+            !actual.contains("r retries"),
+            "r reloads the focused child feed: {actual}"
+        );
+    }
+
+    #[test]
+    fn search_key_audit_kind_hints_should_follow_list_focus_and_ancestor_navigation() {
+        let mut app = app(&[]);
+        app.open_search(None);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        app.search.query.value = "query".into();
+        app.tabs[crate::app::SEARCH_TAB].feed.search = Some("query".into());
+        app.tabs[crate::app::SEARCH_TAB].feed.posts = vec![post_with("result", Media::None)];
+        screen(&mut app, 200, 24);
+        press(&mut app, 'l');
+        press(&mut app, 'h');
+        assert!(app.post_view.is_some());
+        assert!(
+            crate::keys::footer_hints(&app)
+                .iter()
+                .any(|(key, label)| key == "Tab" && label == "kind")
+        );
+        let before = app.search.kind;
+        key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_ne!(app.search.kind, before);
+
+        let mut app = self::app(&[]);
+        app.switch_tab(0);
+        app.tabs[0].feed.posts = vec![post_with("origin", Media::None)];
+        app.open_current_post();
+        press_keys(&mut app, "gtgtgt");
+        assert_eq!(app.active, crate::app::SEARCH_TAB);
+        assert!(app.ancestor_following());
+        assert!(
+            !help::entries(&app).iter().any(
+                |(key, description)| key.contains("Tab") && description.contains("Communities")
+            ),
+            "Tab keeps navigating buffers while following post depth"
+        );
+        let before = app.search.kind;
+        key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_ne!(app.active, crate::app::SEARCH_TAB);
+        assert_eq!(app.search.kind, before);
+    }
+
+    #[test]
+    fn search_key_audit_other_row_views_should_keep_motion_parity() {
+        for all_subs in [false, true] {
+            let mut app = app(&["rust", "zig"]);
+            let mut posts = (0..20)
+                .map(|index| post_with(&format!("item{index}"), Media::None))
+                .collect::<Vec<_>>();
+            if all_subs {
+                app.switch_tab(crate::app::ALL_SUBS_TAB);
+                app.config.all_subs_posts_per_group = 10;
+                app.all_subs.groups[1].posts = posts.split_off(10);
+                app.all_subs.groups[0].posts = posts;
+            } else {
+                app.switch_tab(0);
+                if app.state.list_view() != ListView::Compact {
+                    app.state.toggle_list_view();
+                }
+                app.tabs[0].feed.posts = posts;
+            }
+            app.focus_main();
+            assert_eq!(app.current_post().unwrap().id, "item0");
+            key(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+            assert_eq!(app.current_post().unwrap().id, "item1");
+            key(&mut app, KeyCode::Char('y'), KeyModifiers::CONTROL);
+            assert_eq!(app.current_post().unwrap().id, "item0");
+            key(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert_eq!(app.current_post().unwrap().id, "item5");
+            key(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+            assert_eq!(app.current_post().unwrap().id, "item15");
+            key(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+            assert_eq!(app.current_post().unwrap().id, "item10");
+            key(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            assert_eq!(app.current_post().unwrap().id, "item0");
+        }
+    }
+
+    #[test]
+    fn search_key_audit_ownership_sidebar_should_keep_the_active_nested_feed() {
+        let mut app = app(&["rust"]);
+        app.config.show_nsfw = true;
+        app.open_search(None);
+        app.search.discovered.loading = false;
+        app.search.discovered.entries.push(crate::app::search::Row {
+            profile: None,
+            label: "r/rust".into(),
+            detail: String::new(),
+            target: crate::worker::FeedTarget::Subreddit("rust".into()),
+        });
+        app.search.selected = 2;
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, 'l');
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Ok(crate::model::Listing {
+                posts: vec![post_with("readable", Media::None)],
+                after: None,
+            }),
+        });
+        app.load_feed(app.active, false);
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Err("offline".into()),
+        });
+        screen(&mut app, 80, 30);
+        key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        press(&mut app, 'h');
+        assert_eq!(app.focus, Focus::Sidebar);
+        let child = app.active;
+        let failed = screen(&mut app, 200, 30);
+        assert!(app.search_feed_open() && app.post_view.is_none());
+        assert!(
+            failed.contains("r retry") && !failed.contains("C-w l then r"),
+            "{failed}"
+        );
+        let generation = app.active_tab().feed.generation;
+        press(&mut app, 'r');
+        assert_eq!(app.active, child);
+        assert_ne!(app.active_tab().feed.generation, generation);
+        app.search("empty".into());
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Ok(crate::model::Listing {
+                posts: vec![],
+                after: None,
+            }),
+        });
+        let empty = screen(&mut app, 200, 30);
+        assert!(empty.contains("Esc then Esc clears it"), "{empty}");
+        press(&mut app, '/');
+        assert!(matches!(app.overlay, Some(Overlay::Search { .. })));
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.focus, Focus::List);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.active, child);
+        assert!(app.active_tab().feed.search.is_none() && app.search_feed_open());
+    }
+
+    #[test]
+    fn search_key_audit_ownership_empty_feeds_should_focus_list_for_local_controls() {
+        let mut app = app(&["rust"]);
+        app.config.show_nsfw = true;
+        app.open_search(None);
+        app.search.discovered.loading = false;
+        app.search.discovered.entries.push(crate::app::search::Row {
+            profile: None,
+            label: "r/rust".into(),
+            detail: String::new(),
+            target: crate::worker::FeedTarget::Subreddit("rust".into()),
+        });
+        app.search.selected = 2;
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, 'l');
+        let post = post_with("retained", Media::None);
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Ok(crate::model::Listing {
+                posts: vec![post.clone()],
+                after: None,
+            }),
+        });
+        screen(&mut app, 200, 30);
+        press(&mut app, 'l');
+        let detail = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(Msg::Post {
+            generation: detail,
+            result: Ok(Box::new(PostPage {
+                post,
+                body: "Retained detail".into(),
+                comments: vec![],
+            })),
+        });
+        key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        press(&mut app, 'h');
+        app.search("empty".into());
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Ok(crate::model::Listing {
+                posts: vec![],
+                after: None,
+            }),
+        });
+        key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        press(&mut app, 'l');
+        let empty = screen(&mut app, 200, 30);
+        assert!(
+            empty.contains("C-w h then / edits") && empty.contains("C-w h then Esc clears"),
+            "{empty}"
+        );
+        key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        press(&mut app, 'h');
+        press(&mut app, '/');
+        assert!(matches!(app.overlay, Some(Overlay::Search { .. })));
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.active_tab().feed.search.is_none());
+        assert_eq!(app.post_view.as_ref().unwrap().generation, detail);
+        app.on_msg(Msg::Feed {
+            tab: app.active_tab().id,
+            generation: app.active_tab().feed.generation,
+            append: false,
+            result: Ok(crate::model::Listing {
+                posts: vec![],
+                after: None,
+            }),
+        });
+        key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        press(&mut app, 'l');
+        let empty = screen(&mut app, 200, 30);
+        assert!(empty.contains("C-w h then SPC f s"), "{empty}");
+        key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        press(&mut app, 'h');
+        press_keys(&mut app, " fs");
+        assert!(matches!(app.overlay, Some(Overlay::Sort { .. })));
+    }
+
+    #[test]
+    fn search_key_audit_ownership_retained_detail_should_update_its_cached_controls() {
+        for kind in [
+            "error",
+            "spoiler",
+            "more",
+            "gallery",
+            "media",
+            "spoiler_gallery",
+        ] {
+            let (mut app, _) = open_long_post(|_| {});
+            let mut page = app
+                .post_view
+                .as_ref()
+                .unwrap()
+                .page
+                .as_ref()
+                .unwrap()
+                .clone();
+            page.body = "Reading the retained post".into();
+            page.comments[0].body = "Reading its comment".into();
+            page.comments[0].more = Some(crate::model::MoreReplies {
+                cursor: "/next".into(),
+                count: Some(2),
+            });
+            page.post.spoiler = matches!(kind, "spoiler" | "spoiler_gallery");
+            page.post.media = match kind {
+                "gallery" | "spoiler_gallery" => Media::Gallery {
+                    images: vec![
+                        "https://i.redd.it/one.jpg".into(),
+                        "https://i.redd.it/two.jpg".into(),
+                    ],
+                    previews: vec![],
+                    thumb: None,
+                },
+                "media" => Media::Image {
+                    url: "https://i.redd.it/one.jpg".into(),
+                    preview: None,
+                },
+                _ => Media::None,
+            };
+            app.open_search(None);
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            press(&mut app, 'l');
+            app.on_msg(Msg::Feed {
+                tab: app.active_tab().id,
+                generation: app.active_tab().feed.generation,
+                append: false,
+                result: Ok(crate::model::Listing {
+                    posts: vec![page.post.clone()],
+                    after: None,
+                }),
+            });
+            screen(&mut app, 200, 40);
+            press(&mut app, 'l');
+            let generation = app.post_view.as_ref().unwrap().generation;
+            app.on_msg(Msg::Post {
+                generation,
+                result: if kind == "error" {
+                    Err("offline".into())
+                } else {
+                    Ok(Box::new(page))
+                },
+            });
+            let cue = match kind {
+                "error" => "press r to retry",
+                "spoiler" | "spoiler_gallery" => "zs reveals the post",
+                "more" => "more replies · Enter",
+                "gallery" => "[i ]i browse",
+                _ => "O opens",
+            };
+            let focused = screen(&mut app, 200, 40);
+            assert!(focused.contains(cue), "{kind}: {focused}");
+            if kind == "spoiler_gallery" {
+                assert!(!focused.contains("[i ]i browse"), "{focused}");
+                press_keys(&mut app, "]i");
+                assert_eq!(app.post_view.as_ref().unwrap().gallery_index, 0);
+                press_keys(&mut app, "zs");
+                let revealed = screen(&mut app, 200, 40);
+                assert!(revealed.contains("[i ]i browse"), "{revealed}");
+                press_keys(&mut app, "]i");
+                assert_eq!(app.post_view.as_ref().unwrap().gallery_index, 1);
+                press_keys(&mut app, "zs");
+                assert!(!screen(&mut app, 200, 40).contains("[i ]i browse"));
+            }
+            for sidebar in [false, true] {
+                key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+                press(&mut app, 'h');
+                if sidebar {
+                    key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+                    press(&mut app, 'h');
+                }
+                let background = screen(&mut app, 200, 40);
+                assert!(
+                    !background.contains(cue),
+                    "{kind}: another pane owns these keys: {background}"
+                );
+                if sidebar {
+                    key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+                    press(&mut app, 'l');
+                }
+                key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+                press(&mut app, 'l');
+                let restored = screen(&mut app, 200, 40);
+                assert!(
+                    restored.contains(cue),
+                    "{kind}: cached controls must return with focus: {restored}"
+                );
+                assert_eq!(app.post_view.as_ref().unwrap().generation, generation);
+            }
+        }
+    }
+
+    #[test]
+    fn search_key_audit_ownership_shared_island_keys_should_name_the_selected_group() {
+        let mut app = app(&["rust", "vim"]);
+        app.switch_tab(crate::app::ALL_SUBS_TAB);
+        for group in &mut app.all_subs.groups {
+            group.error = Some("offline".into());
+            group.posts = vec![post_with("readable", Media::None)];
+        }
+        app.focus_main();
+        let rows = screen(&mut app, 200, 30);
+        assert_eq!(rows.matches("✗ r retry").count(), 1, "{rows}");
+        press(&mut app, 'l');
+        let detail = screen(&mut app, 200, 30);
+        assert!(
+            !detail.contains("✗ r retry") && !detail.contains("zc Card"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn search_key_audit_feed_retry_should_leave_focused_detail_before_reloading() {
+        for nested in [false, true] {
+            for append in [false, true] {
+                let mut app = app(&[]);
+                app.open_search(Some(crate::reddit::experience::SearchKind::Posts));
+                if !nested {
+                    crate::keys::paste(&mut app, "query");
+                    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+                }
+                key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                if nested {
+                    press(&mut app, 'l');
+                }
+                app.on_msg(Msg::Feed {
+                    tab: app.active_tab().id,
+                    generation: app.active_tab().feed.generation,
+                    append: false,
+                    result: Ok(crate::model::Listing {
+                        posts: vec![post_with("readable", Media::None)],
+                        after: Some("next".into()),
+                    }),
+                });
+                screen(&mut app, 200, 30);
+                app.load_feed(app.active, append);
+                app.on_msg(Msg::Feed {
+                    tab: app.active_tab().id,
+                    generation: app.active_tab().feed.generation,
+                    append,
+                    result: Err("offline".into()),
+                });
+                press(&mut app, 'l');
+                assert_eq!(app.focus, Focus::Post);
+                let failed = screen(&mut app, 200, 30);
+                assert!(
+                    failed.contains("C-w h then r retry"),
+                    "feed retry must first focus the visible list: {failed}"
+                );
+                if append {
+                    assert!(
+                        failed.contains("Next page failed · C-w h then r retries"),
+                        "{failed}"
+                    );
+                }
+                let feed = app.active_tab().feed.generation;
+                let detail = app.post_view.as_ref().unwrap().generation;
+                key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+                press(&mut app, 'h');
+                assert_eq!(app.focus, Focus::List);
+                assert!(app.post_view.is_some());
+                press(&mut app, 'r');
+                assert_ne!(app.active_tab().feed.generation, feed);
+                assert_eq!(app.post_view.as_ref().unwrap().generation, detail);
+            }
+        }
+    }
+
+    #[test]
+    fn search_key_audit_posts_guidance_should_follow_editor_sidebar_and_auth_ownership() {
+        for cached in [false, true] {
+            let mut app = app(&[]);
+            app.open_search(Some(crate::reddit::experience::SearchKind::Posts));
+            crate::keys::paste(&mut app, "query");
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            press(&mut app, '/');
+            if cached {
+                app.tabs[crate::app::SEARCH_TAB].feed.posts =
+                    vec![post_with("cached", Media::None)];
+            }
+            app.on_msg(Msg::Feed {
+                tab: app.active_tab().id,
+                generation: app.active_tab().feed.generation,
+                append: false,
+                result: Err("offline".into()),
+            });
+            let failed = screen(&mut app, 200, 24);
+            assert!(
+                failed.contains("Esc then r"),
+                "retry must leave the editor first: {failed}"
+            );
+            let generation = app.active_tab().feed.generation;
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            press(&mut app, 'r');
+            assert_ne!(app.active_tab().feed.generation, generation);
+            assert_eq!(app.search.query.value, "query");
+            if !cached {
+                app.on_msg(Msg::Feed {
+                    tab: app.active_tab().id,
+                    generation: app.active_tab().feed.generation,
+                    append: false,
+                    result: Ok(crate::model::Listing {
+                        posts: vec![],
+                        after: None,
+                    }),
+                });
+                app.focus_sidebar();
+                let empty = screen(&mut app, 200, 24);
+                assert!(empty.contains("No results"), "{empty}");
+                assert!(
+                    !empty.contains("Tab for another kind"),
+                    "Sidebar Tab switches buffers: {empty}"
+                );
+                let kind = app.search.kind;
+                key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+                assert_ne!(app.active, crate::app::SEARCH_TAB);
+                assert_eq!(app.search.kind, kind);
+            }
+        }
+        for view in [ListView::Card, ListView::Compact] {
+            let mut app = app(&[]);
+            app.open_search(Some(crate::reddit::experience::SearchKind::Posts));
+            crate::keys::paste(&mut app, "query");
+            key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            press(&mut app, '/');
+            if app.state.list_view() != view {
+                app.state.toggle_list_view();
+            }
+            app.on_msg(Msg::Feed {
+                tab: app.active_tab().id,
+                generation: app.active_tab().feed.generation,
+                append: false,
+                result: Ok(crate::model::Listing {
+                    posts: vec![post_with("existing", Media::None)],
+                    after: Some("next".into()),
+                }),
+            });
+            app.load_feed(crate::app::SEARCH_TAB, true);
+            app.on_msg(Msg::Feed {
+                tab: app.active_tab().id,
+                generation: app.active_tab().feed.generation,
+                append: true,
+                result: Err("offline".into()),
+            });
+            let failed = screen(&mut app, 200, 30);
+            assert!(
+                failed.contains("Next page failed · Esc then r retries"),
+                "the continuation boundary must agree with the query editor: {failed}"
+            );
+            let generation = app.active_tab().feed.generation;
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            press(&mut app, 'r');
+            assert_ne!(app.active_tab().feed.generation, generation);
+            assert_eq!(app.search.query.value, "query");
+        }
+        for preview in [false, true] {
+            let mut app = app(&[]);
+            app.open_search(Some(crate::reddit::experience::SearchKind::Posts));
+            let old = post_with("existing", Media::None);
+            let incoming = post_with("incoming", Media::None);
+            if preview {
+                app.search.discovered.loading = false;
+                app.search.preview.target = Some(app.search.selected_row().unwrap().target);
+                app.search.preview.posts = vec![old.clone()];
+                app.search.preview.update = Some(vec![incoming, old]);
+                app.search.preview.loading = false;
+            } else {
+                crate::keys::paste(&mut app, "query");
+                key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+                press(&mut app, '/');
+                app.on_msg(Msg::Feed {
+                    tab: app.active_tab().id,
+                    generation: app.active_tab().feed.generation,
+                    append: false,
+                    result: Ok(crate::model::Listing {
+                        posts: vec![old.clone()],
+                        after: None,
+                    }),
+                });
+                screen(&mut app, 200, 30);
+                app.load_feed(crate::app::SEARCH_TAB, false);
+                app.on_msg(Msg::Feed {
+                    tab: app.active_tab().id,
+                    generation: app.active_tab().feed.generation,
+                    append: false,
+                    result: Ok(crate::model::Listing {
+                        posts: vec![incoming, old],
+                        after: None,
+                    }),
+                });
+            }
+            let pending = screen(&mut app, 200, 30);
+            assert!(
+                pending.contains("New posts · Esc then r refresh"),
+                "{pending}"
+            );
+            let query = app.search.query.value.clone();
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            press(&mut app, 'r');
+            let refreshed = screen(&mut app, 200, 30);
+            assert!(refreshed.contains("incoming"), "{refreshed}");
+            assert!(!refreshed.contains("New posts"), "{refreshed}");
+            assert_eq!(app.search.query.value, query);
+        }
+        let mut app = app(&[]);
+        app.reddit = Reddit::disconnected(false).unwrap();
+        app.health = Health::SignedOut;
+        app.open_search(Some(crate::reddit::experience::SearchKind::Posts));
+        crate::keys::paste(&mut app, "query");
+        let connect = screen(&mut app, 200, 24);
+        let brand = connect.lines().nth(2).unwrap();
+        assert!(
+            brand.contains("list keys") && brand.contains("F1"),
+            "{connect}"
+        );
+        assert!(connect.contains("Press Esc then SPC p a"), "{connect}");
+        assert!(
+            connect.lines().last().unwrap().contains("Esc then SPC p a"),
+            "{connect}"
+        );
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(crate::keys::map::available(
+            &app,
+            crate::keys::map::Action::Accounts
+        ));
+    }
+
+    #[test]
+    fn search_revision_should_keep_incremental_panes_and_restore_parent_lists() {
+        for width in [100, 160, 200] {
+            let mut app = app(&[]);
+            app.open_search(None);
+            key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            app.search.discovered.loading = false;
+            app.search.discovered.entries.push(crate::app::search::Row {
+                profile: None,
+                label: "r/zig".into(),
+                detail: "Community summary marker".into(),
+                target: crate::worker::FeedTarget::Subreddit("zig".into()),
+            });
+            app.search.selected = 2;
+            screen(&mut app, width, 30);
+            let split = app.detail_fits();
+            press(&mut app, 'l');
+            let mut first = post_with("nested_first", Media::None);
+            first.subreddit = "zig".into();
+            let mut second = post_with("nested_second", Media::None);
+            second.subreddit = "zig".into();
+            app.on_msg(Msg::Feed {
+                tab: app.active_tab().id,
+                generation: app.active_tab().feed.generation,
+                append: false,
+                result: Ok(crate::model::Listing {
+                    posts: vec![first, second],
+                    after: None,
+                }),
+            });
+            press(&mut app, 'j');
+            let feed = screen(&mut app, width, 30);
+            assert_eq!(
+                feed.contains("Community summary marker"),
+                split,
+                "community rows should remain beside the active feed: {feed}"
+            );
+            assert_eq!(app.current_post().unwrap().id, "nested_second");
+            press(&mut app, 'l');
+            let post = screen(&mut app, width, 30);
+            assert!(app.post_view.is_some());
+            assert!(
+                !post.contains("Community summary marker"),
+                "the feed replaces communities beside post detail: {post}"
+            );
+            press(&mut app, 'h');
+            let back = screen(&mut app, width, 30);
+            assert_eq!(app.focus, crate::app::Focus::List);
+            if split {
+                let generation = app
+                    .post_view
+                    .as_ref()
+                    .expect("first h keeps detail")
+                    .generation;
+                assert!(
+                    !back.contains("Community summary marker"),
+                    "first h focuses posts without shifting the panes: {back}"
+                );
+                press(&mut app, 'l');
+                assert_eq!(app.focus, crate::app::Focus::Post);
+                assert_eq!(app.post_view.as_ref().unwrap().generation, generation);
+                press(&mut app, 'h');
+                press(&mut app, 'h');
+            }
+            let back = screen(&mut app, width, 30);
+            assert!(
+                app.post_view.is_none(),
+                "leaving the post list restores the community/feed pair"
+            );
+            assert_eq!(app.focus, crate::app::Focus::List);
+            assert_eq!(back.contains("Community summary marker"), split, "{back}");
+            assert_eq!(app.current_post().unwrap().id, "nested_second");
+            press(&mut app, 'h');
+            assert_eq!(app.active, crate::app::SEARCH_TAB);
+            assert_eq!(app.search.selected, 2);
+        }
+    }
+
+    #[test]
+    fn reported_explore_should_fill_its_pane_and_wrap_descriptions() {
+        use crate::reddit::experience::{Entry, Page, Query, Response};
+        let mut app = app(&[]);
+        app.open_search(None);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        app.on_msg(Msg::Search {
+            generation: app.search.discovered_generation(),
+            result: Ok(Response::Page(Page {
+                title: "Discover".into(), text: String::new(), url: "/".into(),
+                entries: vec![Entry {
+                    title: "r/community_with_a_long_name".into(),
+                    body: "A description with enough words to wrap across several lines ending in papaya".into(),
+                    query: Some(Query::Community("community_with_a_long_name".into())),
+                    target: None, post: None, icon: Default::default(),
+                }],
+                after: Some("next".into()),
+            })),
+        });
+        let actual = screen(&mut app, 62, 36);
+        assert!(
+            app.search.discovered.loading,
+            "an underfilled Explore pane should load the next page"
+        );
+        assert!(
+            actual.contains("papaya"),
+            "the description must fit by wrapping: {actual}"
+        );
+        let generation = app.search.discovered_generation();
+        screen(&mut app, 62, 36);
+        assert_eq!(
+            app.search.discovered_generation(),
+            generation,
+            "one page at a time"
+        );
+        app.on_msg(Msg::Search {
+            generation,
+            result: Ok(Response::Page(Page {
+                title: "Discover".into(),
+                text: String::new(),
+                url: "/".into(),
+                entries: Vec::new(),
+                after: Some("next".into()),
+            })),
+        });
+        screen(&mut app, 62, 36);
+        assert!(
+            !app.search.discovered.loading,
+            "a repeated cursor must stop automatic paging"
+        );
+    }
+
+    #[test]
+    fn reported_failed_video_card_should_compact_and_retry_without_resizing() {
+        let mut app = card_feed_app(kitty());
+        app.tabs[4].feed.posts[0].media = Media::Video {
+            gif: false,
+            url: Some(VIDEO.into()),
+            poster: None,
+        };
+        screen(&mut app, 100, 30);
+        let url = app.reddit.media_url(VIDEO).unwrap();
+        app.video = Some(video::Player::unavailable(
+            &url,
+            app.video_area.unwrap().as_size(),
+        ));
+        let actual = screen(&mut app, 100, 30);
+        assert!(
+            app.active_tab().feed.cards.height <= 7,
+            "failed media reserved empty rows: {actual}"
+        );
+        assert!(
+            app.video_area.is_none(),
+            "compaction must not schedule a decoder resize"
+        );
+        assert!(actual.contains("p retry"), "{actual}");
+        app.toggle_video_pause();
+        screen(&mut app, 100, 30);
+        assert!(app.video_area.is_some(), "retry restores media geometry");
+    }
+
+    #[test]
+    fn search_revision_icons_should_leave_a_gap_before_the_title() {
+        use crate::reddit::experience::{Entry, Page, Query, Response};
+        let mut app = app(&[]);
+        app.image_picker = kitty();
+        app.show_images = true;
+        app.open_search(None);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        app.on_msg(Msg::Search {
+            generation: app.search.discovered_generation(),
+            result: Ok(Response::Page(Page {
+                title: "Discover".into(),
+                text: String::new(),
+                entries: vec![Entry {
+                    icon: Default::default(),
+                    title: "r/zig".into(),
+                    body: String::new(),
+                    query: Some(Query::Community("zig".into())),
+                    target: None,
+                    post: None,
+                }],
+                after: None,
+                url: "/".into(),
+            })),
+        });
+        app.on_msg(Msg::Icon {
+            subreddit: "zig".into(),
+            result: Ok(Some("/icon/zig.png".into())),
+        });
+        let actual = screen(&mut app, 120, 24);
+        let row = actual.lines().find(|line| line.contains("r/zig")).unwrap();
+        let label = row[..row.find("r/zig").unwrap()].width();
+        let icon_right = usize::from(app.sidebar_width() + PANE_MARGIN.horizontal + 2 + ICON_COLS);
+        assert_eq!(
+            label.saturating_sub(icon_right),
+            1,
+            "icon and title need a clear gap: {actual}"
+        );
+        assert!(
+            app.thumbs.contains_key("/icon/zig.png"),
+            "a community row draws its icon"
+        );
+    }
+
+    #[test]
+    fn search_tab_should_say_what_it_shows_and_which_keys_act() {
+        let mut app = app(&[]);
+        app.open_search(None);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let lit = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+            terminal.draw(|f| draw(f, app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..120).any(|x| {
+                buffer[(x, 0)].symbol() == "P"
+                    && buffer[(x, 0)].modifier.contains(Modifier::UNDERLINED)
+            })
+        };
+
+        let explore = screen(&mut app, 120, 20);
+        assert!(
+            !lit(&mut app) && explore.contains("Search posts (/ to type)"),
+            "Explore lights no kind as the shown view: {explore}"
+        );
+        let footer: Vec<_> = crate::keys::footer_hints(&app)
+            .into_iter()
+            .map(|(key, label)| format!("{key} {label}"))
+            .collect();
+        assert_eq!(footer[..2], ["/ type", "Tab kind"]);
+        let narrow = screen(&mut app, 70, 30);
+        let title = narrow.lines().find(|l| l.contains("Explore")).unwrap();
+        assert!(
+            !title.contains('…'),
+            "the title drops, not cuts, its subtitle: {narrow}"
+        );
+
+        press(&mut app, 'h');
+        let hints = crate::keys::footer_hints(&app);
+        assert_eq!(hints[0], ("j/k".into(), "tabs".into()));
+        let kind = app.search.kind;
+        key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_ne!(app.active, crate::app::SEARCH_TAB);
+        assert_eq!(app.search.kind, kind);
+
+        app.open_search(None);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        app.resize(200);
+        press_keys(&mut app, "\u{17}h");
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert_eq!(
+            crate::keys::footer_hints(&app)[0],
+            ("j/k".into(), "tabs".into())
+        );
+        assert!(
+            !screen(&mut app, 200, 24).contains("Enter opens"),
+            "the sidebar's Enter only returns focus to the list"
+        );
+        press(&mut app, 'h');
+        assert_eq!(app.focus, Focus::Sidebar);
+        press(&mut app, 'l');
+        assert!(screen(&mut app, 200, 24).contains("Enter opens"));
+        key(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        assert!(matches!(app.overlay, Some(Overlay::Settings)));
+        let hints = crate::keys::footer_hints(&app);
+        assert_eq!(hints[0], ("j/k".into(), "move".into()));
+        assert!(
+            !hints.iter().any(|(_, label)| matches!(
+                label.as_str(),
+                "type" | "kind" | "open feed" | "rows" | "next row"
+            )),
+            "Settings owns the keys: {hints:?}"
+        );
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        press(&mut app, '/');
+        assert_eq!(
+            crate::keys::footer_hints(&app)[0],
+            ("↑↓".into(), "choose".into())
+        );
+        crate::keys::paste(&mut app, "rust");
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(lit(&mut app), "a searched kind is lit");
+    }
+
+    #[test]
+    fn search_tab_reload_should_show_loading_failures_and_empty_results() {
+        use crate::reddit::experience::{Entry, Page, Query, Response, SearchKind};
+        let page = |entries| {
+            Ok(Response::Page(Page {
+                title: "Communities".into(),
+                text: String::new(),
+                entries,
+                after: None,
+                url: "/".into(),
+            }))
+        };
+        let mut app = app(&[]);
+        app.resize(130);
+        app.open_search(Some(SearchKind::Communities));
+        for editing in [false, true] {
+            if editing {
+                app.edit_search();
+            } else {
+                key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            }
+            app.on_msg(Msg::Search {
+                generation: app.search.discovered_generation(),
+                result: Err("Reddit request timed out; retry when ready".into()),
+            });
+            for width in [70, 130] {
+                let failed = screen(&mut app, width, 24);
+                assert!(failed.contains("timed out"), "{failed}");
+                assert!(failed.contains("r retries"), "{failed}");
+                if editing {
+                    assert!(failed.contains("Esc then r"), "{failed}");
+                }
+            }
+            if editing {
+                key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            }
+            let failed = app.search.discovered_generation();
+            press(&mut app, 'r');
+            assert!(app.search.discovered.loading);
+            assert_ne!(app.search.discovered_generation(), failed);
+            assert!(
+                app.search.text().is_empty(),
+                "retry must not type into the query"
+            );
+        }
+        app.edit_search();
+        crate::keys::paste(&mut app, "rust");
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let entries = vec![Entry {
+            icon: Default::default(),
+            title: "r/rust".into(),
+            body: String::new(),
+            query: Some(Query::Community("rust".into())),
+            target: None,
+            post: None,
+        }];
+        app.on_msg(Msg::Search {
+            generation: app.search.results_generation(),
+            result: page(entries.clone()),
+        });
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(screen(&mut app, 130, 24).contains("r/rust"));
+
+        press(&mut app, 'r');
+        let loading = screen(&mut app, 130, 24);
+        assert!(loading.contains("Searching Reddit"), "{loading}");
+        app.on_msg(Msg::Search {
+            generation: app.search.results_generation(),
+            result: Err("offline".into()),
+        });
+        let failed = screen(&mut app, 130, 24);
+        assert!(
+            failed.contains("Search failed") && failed.contains("r to retry"),
+            "{failed}"
+        );
+
+        press(&mut app, 'r');
+        app.on_msg(Msg::Search {
+            generation: app.search.results_generation(),
+            result: page(Vec::new()),
+        });
+        let empty = screen(&mut app, 130, 24);
+        assert!(empty.contains("No matches"), "{empty}");
+
+        press(&mut app, 'r');
+        app.on_msg(Msg::Search {
+            generation: app.search.results_generation(),
+            result: page(entries),
+        });
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let rows = screen(&mut app, 130, 24);
+        assert!(
+            rows.contains("r/rust") && !rows.contains("Enter opens"),
+            "{rows}"
+        );
+    }
+
+    #[test]
+    fn search_tab_preview_should_draw_feed_cards_with_pictures() {
+        let mut app = app(&[]);
+        app.image_picker = kitty();
+        app.show_images = true;
+        app.open_search(None);
+        app.resize(160);
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        app.search.preview.target = Some(app.search.selected_row().unwrap().target);
+        app.search.preview.loading = false;
+        app.search.preview.posts = vec![post_with(
+            "pic",
+            Media::Image {
+                url: "https://i.redd.it/pic.jpeg".into(),
+                preview: None,
+            },
+        )];
+
+        let shown = screen(&mut app, 160, 24);
+
+        assert!(
+            app.card_images.contains_key("https://i.redd.it/pic.jpeg"),
+            "the preview loads the card's picture"
+        );
+        assert!(shown.contains("comments"), "{shown}");
+        assert_eq!(
+            shown.matches('▌').count(),
+            1,
+            "only the rows mark a selection, not the preview's cards: {shown}"
+        );
+    }
+
+    #[test]
+    fn search_tab_rows_should_keep_the_preview_beside_them_at_common_widths() {
+        let mut app = app(&[]);
+        app.open_search(None);
+        app.resize(160);
+        assert!(
+            help::entries(&app)
+                .iter()
+                .any(|(_, text)| text == "Move the cursor"),
+            "typing help lists cursor keys"
+        );
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        let shown = screen(&mut app, 160, 20);
+
+        assert!(shown.contains("Enter opens"), "{shown}");
+        let bar = shown
+            .lines()
+            .find(|line| line.contains("Search posts"))
+            .unwrap();
+        assert!(
+            bar.contains("Posts │ Communities │ People"),
+            "query and kinds share one bar above the list and preview: {shown}"
+        );
+
+        let target = app.search.selected_row().unwrap().target;
+        app.search.preview.target = Some(target);
+        app.search.preview.loading = false;
+        let mut hidden = post_with("hidden", Media::None);
+        hidden.title = "spoilers ahead".into();
+        app.config.filters.keywords = vec!["spoilers".into()];
+        app.search.preview.posts = vec![hidden, post_with("kept", Media::None)];
+        app.search.preview.error = Some("offline".into());
+        let shown = screen(&mut app, 160, 20);
+        assert!(
+            shown.contains("refresh failed") && shown.contains("kept"),
+            "a failed refresh keeps the cached posts: {shown}"
+        );
+
+        press(&mut app, '/');
+        key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        crate::keys::paste(&mut app, "zzzz");
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let searching = screen(&mut app, 160, 20);
+        assert!(
+            searching.contains("Searching Reddit") && !searching.contains("j/k choose"),
+            "no rows, no row hint beside them: {searching}"
+        );
+        assert!(
+            !shown.contains("spoilers ahead"),
+            "hide filters apply to the preview: {shown}"
+        );
+    }
+
+    #[test]
     fn sidebar_j_k_switch_tabs_in_sidebar_order_and_stop_at_the_ends() {
         let mut app = app(&["a", "b"]);
         app.open_subreddit("c");
@@ -12986,7 +17074,7 @@ pub(crate) mod tests {
 
         press(&mut app, 'h');
         let mut seen = vec![name(&app)];
-        for _ in 0..6 {
+        for _ in 0..7 {
             press(&mut app, 'j');
             seen.push(name(&app));
         }
@@ -12994,10 +17082,21 @@ pub(crate) mod tests {
         let after_k = name(&app);
         press_keys(&mut app, "gg");
         let first = name(&app);
+        let shown = screen(&mut app, 100, 20);
+        assert!(shown.contains("⌕ Search"), "{shown}");
 
         assert_eq!(
             seen,
-            ["Home", "Bookmarks", "All subs", "r/a", "r/b", "r/c", "r/c"]
+            [
+                "Home",
+                "Bookmarks",
+                "All subs",
+                "Search",
+                "r/a",
+                "r/b",
+                "r/c",
+                "r/c"
+            ]
         );
         assert_eq!(after_k, "r/b");
         assert_eq!(first, "Home");
@@ -13130,7 +17229,7 @@ pub(crate) mod tests {
         key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         press(&mut app, ' ');
         press(&mut app, 'p');
-        app.switch_tab(3);
+        app.switch_tab(4);
         press(&mut app, 's');
         assert!(
             app.overlay.is_none(),
@@ -13264,7 +17363,7 @@ pub(crate) mod tests {
     fn search_input_takes_ctrl_h_as_backspace_and_pastes_as_text() {
         use crossterm::event::{KeyCode, KeyModifiers};
         let mut app = app(&["s"]);
-        app.switch_tab(3);
+        app.switch_tab(4);
         let tabs = app.tabs.len();
         app.overlay = Some(Overlay::Search { input: "ab".into() });
         let input = |app: &App| match &app.overlay {
@@ -13321,14 +17420,18 @@ pub(crate) mod tests {
 
         let shown = screen(&mut app, 100, 24);
 
-        assert!(shown.contains("Next comment"));
+        assert!(shown.contains("Next / previous comment"));
         let entries = help::entries(&app);
-        for motion in ["]]", "]p", "]s", "gt"] {
+        for motion in ["]] / [[", "]p / [p", "]s / [s", "gt / gT"] {
             assert!(
                 entries.iter().any(|(key, _)| key == motion),
                 "missing {motion}"
             );
         }
+        let position = |wanted: &str| entries.iter().position(|(key, _)| key == wanted).unwrap();
+        assert!(position("Here") < position("Move"));
+        assert!(position("Move") < position("C-d / C-u"));
+        assert!(position("Space leader") < position("SPC b b"));
     }
 
     #[test]
@@ -13349,12 +17452,12 @@ pub(crate) mod tests {
         for (tab, compact, title, expected_key) in [
             (0, false, "Feed", "Toggle Card / Compact"),
             (1, true, "Feed", "Remove the local bookmark"),
-            (2, false, "Feed", "Next community group"),
-            (3, false, "Feed", "Search this community"),
+            (2, false, "Feed", "Next / previous community group"),
+            (4, false, "Feed", "Search this community"),
         ] {
             let mut app = card_feed_app(Picker::halfblocks());
             if tab == 1 {
-                let post = app.tabs[3].feed.posts[0].clone();
+                let post = app.tabs[4].feed.posts[0].clone();
                 app.state.toggle_bookmark(&post, 0);
             }
             app.active = tab;
@@ -13379,7 +17482,7 @@ pub(crate) mod tests {
         let shown = screen(&mut app, 100, 12);
 
         assert!(shown.contains("Sidebar and buffers"));
-        assert!(shown.contains("Next sidebar tab"));
+        assert!(shown.contains("Next / previous sidebar tab"));
         assert!(!shown.contains("Reddit: saved"));
     }
 
@@ -13432,7 +17535,7 @@ pub(crate) mod tests {
         let shown = screen(&mut app, 100, 12);
 
         assert!(shown.contains("Post and comments"));
-        assert!(shown.contains("Next comment"));
+        assert!(shown.contains("Next / previous comment"));
         assert!(!shown.contains("video: pause"));
     }
 
@@ -13456,7 +17559,7 @@ pub(crate) mod tests {
         let shown = screen(&mut app, 100, 12);
 
         assert!(shown.contains("Post and comments"));
-        assert!(shown.contains("Next gallery image"));
+        assert!(shown.contains("Next / previous gallery image"));
         assert!(!shown.contains("Reddit: saved"));
     }
 
@@ -13480,7 +17583,7 @@ pub(crate) mod tests {
         assert!(!shown.contains("video: pause"));
         assert!(!help::entries(&app).iter().any(|(key, _)| key == "/"));
         key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        press_keys(&mut app, " vs");
+        press_keys(&mut app, "zs");
         press(&mut app, '/');
         assert!(
             matches!(app.experience.screens.last(), Some(crate::app::experience::Screen::Input(form)) if form.title == "Find in loaded comments")
@@ -13551,11 +17654,7 @@ pub(crate) mod tests {
                 "Text entry",
                 "Accept a single-line",
             ),
-            (
-                Overlay::Sort { selected: 0 },
-                "Choose sort",
-                "Open / focus right",
-            ),
+            (Overlay::Sort { selected: 0 }, "Choose sort", "Back / open"),
             (
                 Overlay::Membership {
                     target: crate::model::MembershipTarget::Community("rust".into()),
@@ -13564,7 +17663,7 @@ pub(crate) mod tests {
                 "Confirmation",
                 "Confirm the displayed action",
             ),
-            (Overlay::Auth, "Accounts", "Open / focus right"),
+            (Overlay::Auth, "Accounts", "Back / open"),
         ] {
             let mut app = app(&[]);
             app.auth.phase = crate::auth::Phase::Accounts;
@@ -13580,11 +17679,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ui_audit_read_forms_should_name_the_read_action_in_narrow_footers() {
+    fn ui_audit_a_narrow_search_tab_should_keep_the_query_above_its_kinds() {
         let mut app = form_app("Search posts across Reddit");
+        assert_eq!(app.active, crate::app::SEARCH_TAB);
         let actual = screen(&mut app, 32, 12);
-        assert!(!actual.contains("send"), "{actual}");
-        assert!(actual.contains("Enter search"), "{actual}");
+        let field = actual.find("Search posts").expect("query field");
+        assert!(field < actual.find("Posts").expect("kinds"), "{actual}");
     }
 
     #[test]
@@ -13646,7 +17746,7 @@ pub(crate) mod tests {
 
     #[test]
     fn ui_audit_single_field_help_should_not_advertise_field_navigation() {
-        let app = form_app("Search people");
+        let app = form_app("Open a user profile");
         let actual = help::entries(&app);
         assert!(
             !actual
@@ -13796,6 +17896,10 @@ pub(crate) mod tests {
                 after: None,
                 url: "/api/multi/mine".into(),
             })),
+            crate::cache::Freshness {
+                fetched_at: crate::app::now(),
+                source: Default::default(),
+            },
         );
         let shown = screen(&mut app, 100, 14);
         key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
@@ -13831,7 +17935,14 @@ pub(crate) mod tests {
         ));
         key(&mut app, KeyCode::F(1), KeyModifiers::NONE);
         let shown = screen(&mut app, 100, 14);
-        app.on_experience(91, Ok(Response::Written { url: None }));
+        app.on_experience(
+            91,
+            Ok(Response::Written { url: None }),
+            crate::cache::Freshness {
+                fetched_at: crate::app::now(),
+                source: Default::default(),
+            },
+        );
         key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
         assert!(shown.contains("Sending to Reddit"));
@@ -13971,9 +18082,9 @@ pub(crate) mod tests {
         assert_eq!(step(&mut app), Some(true), "waits while scrolled away");
         press_keys(&mut app, "gg");
         assert_eq!(step(&mut app), Some(false));
-        press_keys(&mut app, " vi");
+        press_keys(&mut app, "zi");
         assert_eq!(step(&mut app), None, "images off stops it");
-        press_keys(&mut app, " vi");
+        press_keys(&mut app, "zi");
         assert_eq!(step(&mut app), Some(false));
         press(&mut app, 'q');
         assert_eq!(step(&mut app), None, "leaving the post stops it");
@@ -14029,14 +18140,14 @@ pub(crate) mod tests {
         app.video = Some(video::Player::silent(&url, area));
 
         // A video without sound: `a` still turns the setting over; this one stays silent.
-        press_keys(&mut app, " mm");
+        press_keys(&mut app, "m");
         assert!(app.video_sound_wanted());
         assert!(!app.video.as_ref().unwrap().sound());
-        press_keys(&mut app, " mm");
+        press_keys(&mut app, "m");
         assert!(!app.video_sound_wanted(), "and back off");
 
         // ffplay failing, even at a later frame, leaves later videos silent too.
-        press_keys(&mut app, " mm");
+        press_keys(&mut app, "m");
         app.video.as_mut().unwrap().fail_sound();
         app.tick();
         assert!(!app.video_sound_wanted());
@@ -14053,7 +18164,7 @@ pub(crate) mod tests {
         let first = app.video.as_ref().unwrap().area;
         let url = app.reddit.media_url(VIDEO).unwrap();
         app.video = Some(video::Player::silent(&url, first));
-        press_keys(&mut app, " mp");
+        press_keys(&mut app, "p");
 
         // Two draws at once at the new size: it has not held still yet.
         step(&mut app, 40);
@@ -14252,8 +18363,8 @@ pub(crate) mod tests {
             (app.post_view.as_ref().unwrap().scroll, passage)
         };
         for (before, after) in [
-            (&[][..], &[" vs", "\u{6}"][..]),
-            (&[" vs"][..], &[][..]),
+            (&[][..], &["zs", "\u{6}"][..]),
+            (&["zs"][..], &[][..]),
             (&[][..], &["gg"][..]),
         ] {
             let batched = run(true, false, before, after);
@@ -14375,7 +18486,7 @@ pub(crate) mod tests {
             };
             let before = passage(screen(&mut app, 100, 30));
             assert!(before.is_some());
-            press_keys(&mut app, " vs");
+            press_keys(&mut app, "zs");
             let view = app.post_view.as_ref().unwrap();
             let generation = view.generation;
             let mut page = view.page.as_ref().unwrap().clone();
@@ -14542,7 +18653,7 @@ pub(crate) mod tests {
         };
         let before = passage(screen(&mut app, 100, 30));
         assert!(before.is_some());
-        press_keys(&mut app, " vs");
+        press_keys(&mut app, "zs");
         let view = app.post_view.as_ref().unwrap();
         let generation = view.generation;
         let mut page = view.page.as_ref().unwrap().clone();
@@ -14577,7 +18688,7 @@ pub(crate) mod tests {
                 press(&mut app, 'l');
                 screen(&mut app, 100, 30);
             }
-            press_keys(&mut app, " vs");
+            press_keys(&mut app, "zs");
             key(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
             if edited {
                 let view = app.post_view.as_ref().unwrap();
@@ -14640,7 +18751,7 @@ pub(crate) mod tests {
             press(&mut app, 'h');
             screen(&mut app, 100, 30);
             if toggle {
-                press_keys(&mut app, " vs");
+                press_keys(&mut app, "zs");
             }
             let view = app.post_view.as_ref().unwrap();
             let generation = view.generation;
@@ -14772,7 +18883,7 @@ pub(crate) mod tests {
         let mut app = feed_app(Picker::halfblocks());
         app.show_sidebar = false;
         app.config.show_nsfw = true;
-        for post in &mut app.tabs[3].feed.posts {
+        for post in &mut app.tabs[4].feed.posts {
             post.author = "an_author_name_that_is_long_enough_to_fill_the_metadata_row".into();
             post.nsfw = true;
             post.spoiler = true;
@@ -14902,11 +19013,7 @@ pub(crate) mod tests {
 
     #[test]
     fn ui_audit_failed_forms_should_keep_correction_visible() {
-        use crate::app::experience::Screen;
         for label in [
-            "Search posts across Reddit",
-            "Search communities",
-            "Search people",
             "Open a user profile",
             "Create text post",
             "Create link post",
@@ -14914,9 +19021,7 @@ pub(crate) mod tests {
         ] {
             for (width, height) in [(20, 6), (24, 8), (40, 12), (64, 18)] {
                 let mut app = form_app(label);
-                let Screen::Input(form) = app.experience.screens.last_mut().unwrap() else {
-                    panic!("form missing")
-                };
+                let form = app.experience.input().expect("form missing");
                 let missing = form
                     .fields
                     .iter()
@@ -14993,7 +19098,7 @@ pub(crate) mod tests {
         for append in [false, true] {
             let mut feed = feed_with_next_page(ListView::Compact);
             feed.show_sidebar = false;
-            feed.load_feed(3, append);
+            feed.load_feed(4, append);
             feed.on_msg(Msg::Feed {
                 tab: feed.active_tab().id,
                 generation: feed.active_tab().feed.generation,
@@ -15027,7 +19132,7 @@ pub(crate) mod tests {
                     }
                     "sort" => app.overlay = Some(Overlay::Sort { selected: 0 }),
                     "help" => app.help_scroll = Some(0),
-                    "form" => app = form_app("Search people"),
+                    "form" => app = form_app("Open a user profile"),
                     "composer" => app = form_app("Create text post"),
                     _ => unreachable!(),
                 }
@@ -15152,7 +19257,7 @@ pub(crate) mod tests {
         for width in [24, 31, 32, 33, 40, 100] {
             for (key, label, value) in [
                 ("media.image_preview", "Image previews", "Off"),
-                ("commands.image", "Image command", "[\"viewer\"]"),
+                ("commands.image", "Image command", "viewer"),
             ] {
                 app.settings.selected = crate::config::schema::SETTINGS
                     .iter()
@@ -15434,7 +19539,7 @@ pub(crate) mod tests {
     #[test]
     fn sidebar_distinguishes_unknown_from_zero_and_keeps_badges_aligned() {
         let mut app = app(&["longcommunityname"]);
-        let i = 3;
+        let i = 4;
         for width in [24, 30] {
             let unknown = sidebar_item(&app, i, width);
             assert_eq!(line_width(&unknown.spans), width);
@@ -15531,11 +19636,11 @@ pub(crate) mod tests {
                 comments: vec![],
             })),
         });
-        assert_eq!(app.badge(&app.tabs[3]), UnreadBadge::Count(2));
+        assert_eq!(app.badge(&app.tabs[4]), UnreadBadge::Count(2));
 
         let buffer = screen_buffer(&mut app, 100, 30);
 
-        assert_eq!(app.badge(&app.tabs[3]), UnreadBadge::Count(1));
+        assert_eq!(app.badge(&app.tabs[4]), UnreadBadge::Count(1));
         let rows: Vec<_> = (0..30)
             .map(|y| {
                 (0..app.sidebar_width())
@@ -15550,7 +19655,7 @@ pub(crate) mod tests {
     #[test]
     fn empty_community_browser_key_should_open_the_community_without_a_post() {
         let mut app = app(&["s"]);
-        app.active = 3;
+        app.active = 4;
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("opened-url");
         app.config.commands.browser = vec![
@@ -15559,7 +19664,7 @@ pub(crate) mod tests {
             "printf '%s' \"$1\" > \"$0\"".into(),
             file.to_string_lossy().into_owned(),
         ];
-        press_keys(&mut app, " or");
+        press_keys(&mut app, "o");
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         let actual = loop {
             if let Ok(text) = std::fs::read_to_string(&file)
@@ -15630,10 +19735,10 @@ pub(crate) mod tests {
     #[test]
     fn community_browser_key_in_detail_should_open_the_shown_posts_community() {
         let mut app = app(&["underlying"]);
-        app.active = 3;
+        app.active = 4;
         let mut post = post_with("p", Media::None);
         post.subreddit = "detail".into();
-        app.tabs[3].feed.posts = vec![post];
+        app.tabs[4].feed.posts = vec![post];
         app.open_current_post();
         app.focus = Focus::Post;
 
@@ -15646,10 +19751,10 @@ pub(crate) mod tests {
     #[test]
     fn lowercase_browser_key_in_a_list_should_keep_opening_the_selected_post() {
         let mut app = feed_with_next_page(ListView::Card);
-        app.tabs[3].feed.posts[0].permalink = "/r/s/comments/existing/title/".into();
+        app.tabs[4].feed.posts[0].permalink = "/r/s/comments/existing/title/".into();
         app.focus = Focus::List;
 
-        let actual = opened_browser_url(&mut app, " or");
+        let actual = opened_browser_url(&mut app, "o");
 
         assert_eq!(
             actual,
@@ -15747,7 +19852,7 @@ pub(crate) mod tests {
         assert!(
             app.status
                 .as_ref()
-                .is_some_and(|status| status.text.contains("SPC a m to unfollow"))
+                .is_some_and(|status| status.text.contains("SPC m to unfollow"))
         );
     }
 
@@ -15760,7 +19865,7 @@ pub(crate) mod tests {
         let shown = screen(&mut app, 120, 24);
 
         assert!(
-            shown.contains("Following unknown") && shown.contains("SPC a m check"),
+            shown.contains("Following unknown") && shown.contains("SPC m check"),
             "{shown}"
         );
         assert!(!shown.contains("Not following"), "{shown}");
@@ -15781,7 +19886,7 @@ pub(crate) mod tests {
         let shown = screen(&mut app, 120, 24);
 
         assert!(
-            shown.contains("Following") && shown.contains("SPC a m unfollow"),
+            shown.contains("Following") && shown.contains("SPC m unfollow"),
             "{shown}"
         );
         assert!(
@@ -15796,7 +19901,7 @@ pub(crate) mod tests {
         app.open_user("blackvault");
         app.focus = Focus::Sidebar;
         assert_eq!(
-            opened_browser_url(&mut app, " or"),
+            opened_browser_url(&mut app, "o"),
             "https://www.reddit.com/user/blackvault/"
         );
         app.focus = Focus::List;
@@ -15805,7 +19910,7 @@ pub(crate) mod tests {
             "https://www.reddit.com/user/blackvault/"
         );
         assert_eq!(
-            opened_browser_url(&mut app, " or"),
+            opened_browser_url(&mut app, "o"),
             "https://www.reddit.com/user/blackvault/"
         );
     }

@@ -1,5 +1,6 @@
 //! Compact preferences dialog using the same gutters and selection style as other menus.
 use super::*;
+use crate::app::settings::PreferenceAccess;
 use crate::config::{
     schema::{Kind, SETTINGS, Scope},
     store::Persistence,
@@ -9,6 +10,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) -> Rect {
     if app.settings.managed.is_some() {
         return draw_managed(f, app);
     }
+    let visible = app.settings_rows();
     let field = &SETTINGS[app.settings.selected];
     let account = app.reddit.account();
     let area = popup(f.area(), 84, 29);
@@ -25,16 +27,19 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) -> Rect {
         Persistence::Temporary => "File: Temporary · session only",
         Persistence::Unsaved => "File: Unsaved · retry or revert",
     };
+    let access = app.preference_access();
     let reddit_status = if app.settings.writing() {
         "Reddit: Saving…"
+    } else if access == PreferenceAccess::SignIn {
+        "Reddit: Sign in to configure"
+    } else if access == PreferenceAccess::Reconnect {
+        "Reddit: Reconnect to identify this account"
     } else if app.settings.account.pending() {
         "Reddit: Loading…"
-    } else if app.settings.account.error.is_some() {
-        "Reddit: Unavailable · r reloads"
-    } else if app.settings.account.values.is_some() {
+    } else if app.shown_preferences().is_some() && app.settings.account.error.is_none() {
         "Reddit: Saved on account"
     } else {
-        "Reddit: Sign in to configure"
+        "Reddit: Unavailable · r reloads"
     };
     let editing = app.settings.editing.as_ref();
     let action = if editing.is_some() {
@@ -46,6 +51,12 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) -> Rect {
     };
     let controls = if editing.is_some() {
         "Enter apply · Esc cancel · F1 help".into()
+    } else if field.scope == Scope::Reddit && access == PreferenceAccess::SignIn {
+        "Sign in with SPC p a · Esc close · F1 help".into()
+    } else if field.scope == Scope::Reddit && access == PreferenceAccess::Reconnect {
+        "Reconnect with SPC p a · Esc close · F1 help".into()
+    } else if field.scope == Scope::Reddit && app.settings.account.error.is_some() {
+        "r refresh Reddit · Esc close · F1 help".into()
     } else if field.scope == Scope::Reddit {
         "Enter toggle · r refresh Reddit · Esc close · F1 help".into()
     } else {
@@ -124,13 +135,12 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) -> Rect {
         let mut rows = Vec::new();
         let mut selected_row = 0;
         let mut selected_end = 0;
-        for (index, setting) in SETTINGS.iter().enumerate() {
-            if index == 0 || setting.scope != SETTINGS[index - 1].scope {
+        for (position, &index) in visible.iter().enumerate() {
+            let setting = &SETTINGS[index];
+            let scope = setting.scope;
+            if position == 0 || scope != SETTINGS[visible[position - 1]].scope {
                 rows.push(Line::styled(
-                    truncate(
-                        &app.settings.scope_label(setting.scope, account.as_ref()),
-                        width,
-                    ),
+                    truncate(&app.settings.scope_label(scope, account.as_ref()), width),
                     Style::new().fg(ACCENT).bold(),
                 ));
             }
@@ -139,19 +149,44 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) -> Rect {
                 selected_row = rows.len();
             }
             let value = setting.value(&app.config);
-            let shown = if setting.scope == Scope::Reddit && app.settings.account.values.is_none() {
-                if app.settings.account.pending() {
-                    "Loading…".into()
-                } else if account.is_some() {
-                    "Unavailable".into()
-                } else {
-                    "Sign in".into()
+            let shown = if scope == Scope::Reddit && app.shown_preferences().is_none() {
+                match access {
+                    PreferenceAccess::SignIn => "Sign in",
+                    PreferenceAccess::Reconnect => "Reconnect",
+                    PreferenceAccess::Readable if app.settings.account.pending() => "Loading…",
+                    PreferenceAccess::Readable => "Unavailable",
                 }
+                .into()
             } else if setting.kind == Kind::Boolean {
                 if value.as_bool().unwrap() {
                     "On".into()
                 } else {
                     "Off".into()
+                }
+            } else if let Some(items) = value.as_array() {
+                // The list reads as plain words; the editor keeps the TOML array.
+                // A word that would read ambiguously is quoted, with its own quotes escaped.
+                let words: Vec<String> = items
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(|word| {
+                        if word.is_empty()
+                            || word.contains(|c: char| {
+                                c.is_whitespace() || matches!(c, '"' | '\\' | ',')
+                            })
+                        {
+                            format!("\"{}\"", word.replace('\\', "\\\\").replace('"', "\\\""))
+                        } else {
+                            word.to_string()
+                        }
+                    })
+                    .collect();
+                if words.is_empty() {
+                    "None".into()
+                } else if setting.kind == Kind::Command {
+                    words.join(" ")
+                } else {
+                    words.join(", ")
                 }
             } else {
                 value.to_string()

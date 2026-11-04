@@ -146,6 +146,13 @@ impl Settings {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PreferenceAccess {
+    SignIn,
+    Reconnect,
+    Readable,
+}
+
 impl App {
     pub fn install_settings_store(&mut self, mut store: Store) {
         let account = self.reddit.account();
@@ -158,11 +165,40 @@ impl App {
         self.apply_settings();
     }
 
+    /// Whether Reddit preferences can be read now, or which connection step comes first.
+    pub fn preference_access(&self) -> PreferenceAccess {
+        if self.reddit.needs_sign_in() {
+            PreferenceAccess::SignIn
+        } else if self.reddit.account().is_none() {
+            PreferenceAccess::Reconnect
+        } else {
+            PreferenceAccess::Readable
+        }
+    }
+
+    /// What to do before Reddit preferences can change, or None when they can be read now.
+    fn preference_access_message(&self) -> Option<&'static str> {
+        match self.preference_access() {
+            PreferenceAccess::SignIn => Some("Sign in with SPC p a to change Reddit preferences"),
+            PreferenceAccess::Reconnect => Some("Reconnect with SPC p a to identify this account"),
+            PreferenceAccess::Readable => None,
+        }
+    }
+
+    /// Loaded Reddit preferences F2 may show and change: none once the connection cannot read them.
+    pub fn shown_preferences(&self) -> Option<&crate::reddit::Preferences> {
+        self.settings
+            .account
+            .values
+            .as_ref()
+            .filter(|_| self.preference_access() == PreferenceAccess::Readable)
+    }
+
     pub(super) fn load_account_preferences(&mut self, refresh: bool) {
         let Some(account) = self
             .reddit
             .account()
-            .filter(|_| !self.reddit.needs_sign_in())
+            .filter(|_| self.preference_access() == PreferenceAccess::Readable)
         else {
             return;
         };
@@ -179,6 +215,10 @@ impl App {
     }
 
     fn change_account_preference(&mut self, key: &str, value: toml::Value) {
+        if let Some(message) = self.preference_access_message() {
+            self.settings.message = Some(message.into());
+            return;
+        }
         if self.settings.account.task.is_some() {
             return;
         }
@@ -193,10 +233,7 @@ impl App {
             return;
         }
         let Some(current) = self
-            .settings
-            .account
-            .values
-            .as_ref()
+            .shown_preferences()
             .filter(|_| self.settings.account.error.is_none())
         else {
             self.settings.message =
@@ -472,21 +509,7 @@ impl App {
                 tab.feed.offset = tab.feed.offset.min(tab.feed.selected);
                 tab.feed.cards = CardScroll::default();
             }
-            let count = self
-                .all_subs
-                .groups
-                .get(self.all_subs.group)
-                .map_or(0, |g| self.group_posts(g).count());
-            self.all_subs.post = self
-                .all_subs
-                .groups
-                .get(self.all_subs.group)
-                .and_then(|g| {
-                    group_selected.and_then(|id| self.group_posts(g).position(|p| p.id == id))
-                })
-                .unwrap_or(self.all_subs.post)
-                .min(count.saturating_sub(1));
-            self.all_subs.offset = 0;
+            self.settle_keeping_island_post(group_selected.as_deref());
             if self
                 .post_view
                 .as_ref()
@@ -504,7 +527,9 @@ impl App {
     }
 
     fn reset_experience_reads(&mut self) {
+        self.collections.clear();
         self.experience.reset_reads(self.post_view.is_some());
+        self.pool.want_experience(None);
         if self.experience.screens.is_empty() {
             if matches!(self.overlay, Some(Overlay::Experience)) {
                 self.overlay = None;
@@ -540,6 +565,10 @@ impl App {
         self.pending_media.clear();
         self.queued_images.clear();
         self.icon_lookups.clear();
+        // Profiles were read under the old policy; shown tabs ask again.
+        self.profiles.clear();
+        self.profile_loading.clear();
+        self.profile_failed.clear();
         self.icon_demands.clear();
         self.images.clear();
         self.thumbs.clear();
@@ -554,6 +583,8 @@ impl App {
                 sort: old.sort,
                 time: old.time,
                 search: old.search.take(),
+                search_sort: old.search_sort,
+                search_time: old.search_time,
                 ..Feed::default()
             };
         }
@@ -566,6 +597,7 @@ impl App {
         self.all_subs.loading = false;
         self.all_subs.error = None;
         self.all_subs.generation += 1;
+        self.reset_search_loads();
         self.post_settle = super::Settle::default();
         self.feed_settle = super::Settle::default();
         if !self.reddit.needs_sign_in() {
@@ -577,6 +609,22 @@ impl App {
                 self.ensure_feed_loaded(self.active);
             }
         }
+    }
+
+    /// The settings F2 lists, keeping the selection on one of them.
+    pub fn settings_rows(&mut self) -> Vec<usize> {
+        let rows: Vec<usize> = (0..SETTINGS.len())
+            .filter(|&index| SETTINGS[index].available(&self.settings.store.current))
+            .collect();
+        if !rows.contains(&self.settings.selected) {
+            self.settings.selected = rows
+                .iter()
+                .copied()
+                .find(|&index| index > self.settings.selected)
+                .or_else(|| rows.last().copied())
+                .unwrap_or(0);
+        }
+        rows
     }
 
     pub fn settings_key(&mut self, key: KeyEvent) {
@@ -591,18 +639,23 @@ impl App {
         if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
             return;
         }
+        let rows = self.settings_rows();
+        let position = rows
+            .iter()
+            .position(|&index| index == self.settings.selected)
+            .unwrap_or(0);
         match key.code {
             KeyCode::Esc | KeyCode::F(2) | KeyCode::Char('q') => {
                 self.overlay = self.settings.return_overlay.take()
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.settings.selected = (self.settings.selected + 1).min(SETTINGS.len() - 1)
+                self.settings.selected = rows[(position + 1).min(rows.len() - 1)]
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.settings.selected = self.settings.selected.saturating_sub(1)
+                self.settings.selected = rows[position.saturating_sub(1)]
             }
-            KeyCode::Home => self.settings.selected = 0,
-            KeyCode::End | KeyCode::Char('G') => self.settings.selected = SETTINGS.len() - 1,
+            KeyCode::Home => self.settings.selected = rows[0],
+            KeyCode::End | KeyCode::Char('G') => self.settings.selected = rows[rows.len() - 1],
             KeyCode::Enter => {
                 let field = &SETTINGS[self.settings.selected];
                 let value = field.value(&self.config);
@@ -633,7 +686,11 @@ impl App {
             }
             KeyCode::Char('u') if self.settings_allowed() => {
                 if SETTINGS[self.settings.selected].scope == Scope::Reddit {
-                    self.settings.message = Some("Reddit saves immediately. Toggle the preference to change it; r reloads account values.".into());
+                    self.settings.message = Some(
+                        self.preference_access_message()
+                            .unwrap_or("Reddit saves immediately. Toggle the preference to change it; r reloads account values.")
+                            .into(),
+                    );
                     return;
                 }
                 self.settings.store.revert();
@@ -782,6 +839,28 @@ mod tests {
             directory.join("accounts/first/state.json"),
             Picker::halfblocks(),
         )
+    }
+
+    #[test]
+    fn a_content_policy_restart_should_ask_the_search_tab_again() {
+        let fixture = fixture();
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app(&fixture, Config::default(), directory.path());
+        app.open_search(None);
+        let asked = app.search.discovered.loading;
+        app.search_preview_drawn(true);
+        let _ = app.tick_at(std::time::Instant::now() + crate::app::search::PREVIEW_SETTLE);
+        assert!(asked && app.search.preview.loading);
+
+        app.reload_content_policy();
+
+        assert!(
+            app.search.discovered.loading,
+            "discovery is asked of the new pool"
+        );
+        assert!(!app.search.preview.loading && app.search.preview.target.is_none());
+        let _ = app.tick_at(std::time::Instant::now() + crate::app::search::PREVIEW_SETTLE);
+        assert!(app.search.preview.loading, "the preview is asked again");
     }
 
     fn finish(app: &mut App) {
@@ -964,12 +1043,11 @@ mod tests {
     }
 
     #[test]
-    fn scoped_settings_unidentified_session_should_not_use_or_edit_signed_out_rules() {
+    fn scoped_settings_unidentified_session_should_not_edit_reader_rules() {
         let directory = tempfile::tempdir().unwrap();
         let reddit = crate::reddit::Reddit::test_at("http://127.0.0.1:9", false);
         let (pool, _) = Pool::start(reddit.clone(), 1, None);
-        let config: Config =
-            toml::from_str("[signed_out.filters]\nkeywords=[\"signed out\"]\n").unwrap();
+        let config = Config::default();
         let mut app = App::new(
             config.clone(),
             pool,
@@ -982,10 +1060,28 @@ mod tests {
         app.change_setting("filters.keywords", toml::Value::Array(vec!["wrong".into()]));
         assert!(app.settings.message.as_ref().unwrap().contains("identify"));
         assert!(!app.settings.store.dirty());
-        assert_eq!(
-            app.settings.store.current.signed_out.filters.keywords,
-            ["signed out"]
+    }
+
+    #[test]
+    fn settings_without_an_identified_account_should_skip_reader_rows() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let directory = tempfile::tempdir().unwrap();
+        let reddit = crate::reddit::Reddit::disconnected(false).unwrap();
+        let (pool, _) = Pool::start(reddit.clone(), 1, None);
+        let mut app = App::new(
+            Config::default(),
+            pool,
+            reddit,
+            directory.path().join("state.json"),
+            Picker::halfblocks(),
         );
+        app.install_settings_store(Store::memory(Config::default()));
+        app.settings.selected = SETTINGS
+            .iter()
+            .rposition(|f| f.scope == Scope::Reddit)
+            .unwrap();
+        app.settings_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(SETTINGS[app.settings.selected].scope, Scope::Device);
     }
 
     #[test]

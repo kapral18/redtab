@@ -137,7 +137,17 @@ fn parse_args_from(mut it: impl Iterator<Item = std::ffi::OsString>) -> Result<O
     Ok(Some(args))
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            terminal_output::diagnostic(format_args!("Error: {error:?}"));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
     if std::env::args_os()
         .nth(1)
         .is_some_and(|a| a == auth_browser::HELPER)
@@ -234,6 +244,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    install_panic_hook();
+    let mut tmux_passthrough = terminal_output::TmuxPane::for_stdout().and_then(|pane| {
+        terminal_output::TmuxPassthrough::capture(move |args| pane.command_for_pane(args))
+    });
     // Download folders of exited redtabs; off the UI thread, as $TMPDIR can be large.
     std::thread::spawn(worker::remove_stale_media_dirs);
 
@@ -242,7 +256,15 @@ fn main() -> Result<()> {
     // probe makes exit restore the original, not what a killed probe left.
     crossterm::terminal::enable_raw_mode()?;
     let guard = TerminalGuard;
-    let image_picker = detect_image_picker();
+    let mut image_picker = detect_image_picker();
+    if image_picker.tmux_detected()
+        && image_picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty
+        && !tmux_passthrough
+            .as_mut()
+            .is_some_and(|passthrough| passthrough.enable_native())
+    {
+        image_picker.set_protocol_type(ratatui_image::picker::ProtocolType::Halfblocks);
+    }
     let cache = cache::Cache::new(config::cache_dir());
     let (pool, mut messages) = Pool::start(reddit.clone(), WORKER_THREADS, Some(cache));
     // The terminal may have closed during the probe.
@@ -251,29 +273,15 @@ fn main() -> Result<()> {
     }
     let input_reader = spawn_input_reader();
     let queries = input_reader.queries.clone();
-    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
-    // The input thread writes cursor queries through stdout, so keep it unlocked here.
+    let mut terminal_writer = terminal_output::TerminalWriter::open(Duration::from_secs(2))?;
+    terminal_writer.enter_screen()?;
     let (output_writer, output) = terminal_output::AsyncWriter::new(terminal_output::Writer::new(
-        std::io::stdout(),
+        terminal_writer,
         move || cursor_barrier(&queries),
     ));
     terminal_output::install_output(output.clone());
     let backend = ratatui::backend::CrosstermBackend::new(output_writer);
     let mut terminal = ratatui::Terminal::new(backend)?;
-    // Restore quietly on main; worker panics become job errors.
-    let default_hook = std::panic::take_hook();
-    let panic_output = output.clone();
-    std::panic::set_hook(Box::new(move |info| {
-        if std::thread::current().name() == Some("main") {
-            let _ = panic_output.wait();
-            let _ = ratatui::try_restore();
-            default_hook(info);
-        } else {
-            // The panicking thread catches it and reports this text.
-            worker::note_panic(info.to_string());
-        }
-    }));
-    crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
     // NO_COLOR is applied per frame (`ui::strip_colors`): crossterm's version also
     // drops bold and the colors kitty placeholders use as image ids.
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
@@ -374,11 +382,11 @@ fn main() -> Result<()> {
     app.save_state();
     let output_result = output.wait();
     drop(guard);
+    drop(tmux_passthrough);
     // The guard restored the terminal; Terminal's drop would only error on a dead tty.
     std::mem::forget(terminal);
     if let Some(status) = app.status.as_ref().filter(|s| s.error) {
-        use std::io::Write;
-        let _ = writeln!(std::io::stderr(), "redtab: {}", status.text);
+        terminal_output::diagnostic(format_args!("redtab: {}", status.text));
     }
     match run {
         Ok(result) => result.and(output_result.map_err(Into::into)),
@@ -443,20 +451,50 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stdout(), EndSynchronizedUpdate);
-        if Picker::halfblocks().tmux_detected() {
-            let _ = crossterm::execute!(
-                std::io::stdout(),
-                crossterm::style::Print(terminal_output::TMUX_END)
-            );
-        }
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::event::DisableBracketedPaste,
-            crossterm::cursor::Show
-        );
-        let _ = ratatui::try_restore();
+        restore_terminal();
     }
+}
+
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().name() == Some("main") {
+            let _ = terminal_output::drain_output();
+            restore_terminal();
+            let backtrace = std::backtrace::Backtrace::capture();
+            if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+                terminal_output::diagnostic(format_args!("thread 'main' {info}\n{backtrace}"));
+            } else {
+                terminal_output::diagnostic(format_args!("thread 'main' {info}"));
+            }
+        } else {
+            // The panicking thread catches it and reports this text.
+            worker::note_panic(info.to_string());
+        }
+    }));
+}
+
+fn restore_terminal() {
+    let _ = crossterm::terminal::disable_raw_mode();
+    let Ok(mut output) = terminal_output::TerminalWriter::open(Duration::from_millis(100)) else {
+        return;
+    };
+    let _ = crossterm::execute!(output, EndSynchronizedUpdate);
+    if terminal_output::inside_tmux() {
+        let _ = crossterm::execute!(output, crossterm::style::Print(terminal_output::TMUX_END));
+    }
+    if terminal_output::modify_other_keys() {
+        let _ = crossterm::execute!(
+            output,
+            crossterm::style::Print(terminal_output::MODIFY_OTHER_KEYS_OFF)
+        );
+    }
+    let _ = crossterm::execute!(
+        output,
+        crossterm::event::PopKeyboardEnhancementFlags,
+        crossterm::event::DisableBracketedPaste,
+        crossterm::cursor::Show,
+        crossterm::terminal::LeaveAlternateScreen
+    );
 }
 
 type CursorQuery = std::sync::mpsc::SyncSender<std::io::Result<()>>;
@@ -676,7 +714,7 @@ fn query_image_protocol(
 /// blocked stdin reader in redtab that swallows the first key.
 fn detect_image_picker() -> Picker {
     let report = image_protocol_report();
-    let (native_tmux, font) = if Picker::halfblocks().tmux_detected() {
+    let (native_tmux, font) = if terminal_output::inside_tmux() {
         tmux_graphics()
     } else {
         (false, None)
@@ -747,8 +785,9 @@ fn image_protocol_choice(
             .then_some((protocol, FontSize::new(width, height)))
     });
     match reported {
-        // tmux's own sixel answer does not mean Ghostty can display sixel.
-        Some((ProtocolType::Sixel, font)) if native_tmux => Some((ProtocolType::Kitty, font)),
+        Some((protocol, font)) if native_tmux && protocol != ProtocolType::Halfblocks => {
+            Some((ProtocolType::Kitty, font))
+        }
         Some((protocol, font)) if protocol != ProtocolType::Halfblocks => Some((protocol, font)),
         _ if native_tmux => tmux_font
             .filter(|font| font.width > 0 && font.height > 0)
@@ -759,47 +798,16 @@ fn image_protocol_choice(
 
 /// In tmux the probe may get no kitty reply even when the outer terminal supports it.
 /// Use kitty only if redtab draws straight into its pane (a nested terminal drops
-/// passthrough). Unattached windows require agreement across all attached clients.
+/// passthrough). Clients must belong to a session containing this window.
 fn tmux_graphics() -> (bool, Option<ratatui_image::FontSize>) {
-    use std::os::unix::fs::MetadataExt;
-    use std::process::{Command, Stdio};
-
-    let Some(pane) = std::env::var("TMUX_PANE").ok() else {
+    let Some(pane) = terminal_output::TmuxPane::for_stdout() else {
         return (false, None);
     };
-    let tmux = |args: &[&str]| {
-        Command::new("tmux")
-            .args(args)
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-    };
-    let Some(info) = tmux(&[
-        "display-message",
-        "-p",
-        "-t",
-        &pane,
-        "#{pane_tty} #{window_id}",
-    ]) else {
+    let Some(window) = pane.command_for_pane(&["display-message", "-p", "#{window_id}"]) else {
         return (false, None);
     };
-    let [pane_tty, window] = info.split_whitespace().collect::<Vec<_>>()[..] else {
-        return (false, None);
-    };
-    let same_tty = match (
-        std::fs::metadata(pane_tty),
-        std::fs::metadata("/dev/stdout"),
-    ) {
-        (Ok(pane), Ok(stdout)) => pane.rdev() == stdout.rdev(),
-        _ => false,
-    };
-    if !same_tty {
-        return (false, None);
-    }
-    let Some(windows) = tmux(&["list-windows", "-a", "-F", "#{window_id} #{session_id}"]) else {
+    let Some(windows) = pane.command(&["list-windows", "-a", "-F", "#{window_id} #{session_id}"])
+    else {
         return (false, None);
     };
     let sessions: Vec<&str> = windows
@@ -808,7 +816,7 @@ fn tmux_graphics() -> (bool, Option<ratatui_image::FontSize>) {
         .filter(|(w, _)| *w == window)
         .map(|(_, s)| s)
         .collect();
-    let Some(clients) = tmux(&[
+    let Some(clients) = pane.command(&[
         "list-clients",
         "-F",
         "#{session_id} #{client_termname} #{client_cell_width} #{client_cell_height}",
@@ -834,9 +842,7 @@ fn tmux_client_graphics(
             .first()
             .is_some_and(|session| sessions.contains(session))
     };
-    if clients.iter().any(on_window) {
-        clients.retain(on_window);
-    }
+    clients.retain(on_window);
     if clients.is_empty()
         || !clients.iter().all(|fields| {
             fields
@@ -861,6 +867,23 @@ fn tmux_client_graphics(
 }
 
 #[cfg(test)]
+mod test_support {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    thread_local! {
+        static DIR: tempfile::TempDir = tempfile::tempdir().unwrap();
+    }
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    /// A state file path no other test uses, in a directory removed when the test's thread ends.
+    pub fn state_path() -> PathBuf {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        DIR.with(|dir| dir.path().join(format!("state-{n}.json")))
+    }
+}
+
+#[cfg(test)]
 mod auth_cli_tests {
     use super::*;
 
@@ -881,14 +904,14 @@ mod auth_cli_tests {
         let mut app = make_app(Reddit::disconnected(false).unwrap());
         let mut pending = Some("rust".into());
         assert!(!open_startup_subreddit(&mut app, &mut pending));
-        assert_eq!(app.tabs.len(), 3);
+        assert_eq!(app.tabs.len(), 4);
         // Initial sign-in installs a new account-owned App. The CLI intent outlives it.
         app = make_app(Reddit::test_at("http://127.0.0.1:9", false));
         assert!(open_startup_subreddit(&mut app, &mut pending));
         assert_eq!(app.active_tab().subreddit(), Some("rust"));
         assert!(pending.is_none());
         assert!(!open_startup_subreddit(&mut app, &mut pending));
-        assert_eq!(app.tabs.len(), 4);
+        assert_eq!(app.tabs.len(), 5);
     }
 
     #[test]
@@ -1019,6 +1042,105 @@ mod event_loop_tests {
     }
 
     #[test]
+    fn startup_panics_restore_raw_mode_before_output_exists() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::process::{Command, Stdio};
+        const CHILD: &str = "REDTAB_TEST_EARLY_PANIC";
+        if std::env::var_os(CHILD).is_some() {
+            install_panic_hook();
+            let result = std::thread::Builder::new()
+                .name("main".into())
+                .spawn(|| {
+                    crossterm::terminal::enable_raw_mode().unwrap();
+                    panic!("early startup fixture");
+                })
+                .unwrap()
+                .join();
+            assert!(result.is_err());
+            return;
+        }
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let _master = unsafe { OwnedFd::from_raw_fd(master) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        let mut before = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(
+            unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut before) },
+            0
+        );
+        let mut pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let _reader = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let bytes = [b'x'; 4096];
+        loop {
+            if unsafe { libc::write(writer.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) } < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                break;
+            }
+        }
+        assert_eq!(
+            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags) },
+            0
+        );
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "event_loop_tests::startup_panics_restore_raw_mode_before_output_exists",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("RUST_BACKTRACE", "0")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(writer))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            let status = child.try_wait().unwrap();
+            if status.is_some() || Instant::now() >= deadline {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let mut after = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut after) }, 0);
+        if status.is_none() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "panic handling must finish with blocked stderr"
+        );
+        assert_eq!(
+            after.c_lflag & (libc::ICANON | libc::ECHO),
+            before.c_lflag & (libc::ICANON | libc::ECHO)
+        );
+    }
+
+    #[test]
     fn when_status_precedes_graphics_replies_the_probe_should_keep_the_native_protocol() {
         use ratatui_image::picker::{ProtocolType, cap_parser::QueryStdioOptions};
         use std::io::Write;
@@ -1115,6 +1237,7 @@ mod event_loop_tests {
         for (report, native_tmux, expected) in [
             ("kitty 9 18", true, ProtocolType::Kitty),
             ("iterm2 9 18", false, ProtocolType::Iterm2),
+            ("iterm2 9 18", true, ProtocolType::Kitty),
             ("sixel 9 18", false, ProtocolType::Sixel),
             ("sixel 9 18", true, ProtocolType::Kitty),
         ] {
@@ -1169,16 +1292,10 @@ mod event_loop_tests {
     }
 
     #[test]
-    fn when_a_tmux_window_is_unattached_it_should_keep_native_pixels_for_matching_clients() {
-        use ratatui_image::picker::ProtocolType;
+    fn when_no_client_can_receive_a_tmux_windows_uploads_it_should_not_force_native_pixels() {
         let (native, font) = tmux_client_graphics("$1 xterm-ghostty 8 18\n", &["$12"]);
 
-        let actual = image_protocol_choice(None, native, font);
-
-        assert_eq!(
-            actual.map(|(protocol, font)| (protocol, font.width, font.height)),
-            Some((ProtocolType::Kitty, 8, 18))
-        );
+        assert!(image_protocol_choice(None, native, font).is_none());
         for clients in [
             "$1 xterm-ghostty 8 18\n$2 xterm-256color 8 18\n",
             "$1 xterm-ghostty 8 18\n$2 xterm-kitty 10 20\n",
@@ -1194,11 +1311,12 @@ mod event_loop_tests {
     fn when_worker_results_arrive_in_a_burst_input_should_get_another_turn() {
         let reddit = Reddit::test_at("http://127.0.0.1:9", false);
         let (pool, _worker_messages) = Pool::start(reddit.clone(), 3, None);
+        let dir = tempfile::tempdir().unwrap();
         let mut app = App::new(
             Config::default(),
             pool,
             reddit,
-            std::env::temp_dir().join("redtab-event-loop-test.json"),
+            dir.path().join("state.json"),
             Picker::halfblocks(),
         );
         let (sender, messages) = std::sync::mpsc::channel();

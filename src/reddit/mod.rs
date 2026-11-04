@@ -2,6 +2,7 @@
 
 mod accounts;
 mod credentials;
+mod dash;
 pub mod experience;
 mod home;
 mod membership;
@@ -17,6 +18,7 @@ mod transport;
 
 pub use accounts::SavedAccount;
 pub(crate) use accounts::saved_revision;
+pub(crate) use dash::Manifest as VideoManifest;
 pub(crate) use membership::is_community;
 pub(crate) use parse::merge_reply_continuations;
 pub use preferences::{Preference, Preferences};
@@ -94,6 +96,16 @@ pub(crate) enum ListingEvent<'a> {
 }
 
 const API: &str = "https://www.reddit.com/";
+/// Reddit answers every `search.json` on www.reddit.com with HTTP 403, even signed in;
+/// api.reddit.com serves the same search listings as JSON.
+const CLASSIC_API: &str = "https://api.reddit.com/";
+/// www.reddit.com answers `r/all` with 403 and api.reddit.com with an empty listing;
+/// old.reddit.com still serves it.
+const OLD_API: &str = "https://old.reddit.com/";
+const CLASSIC_SESSION: &str =
+    "This Reddit API request needs a reddit.com-wide session cookie; reconnect through Accounts";
+const CLASSIC_REFUSED: &str =
+    "Reddit refused this API request's session (HTTP 401); reconnect through Accounts";
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 const IMAGE_LIMIT: u64 = 64 * 1024 * 1024;
 const DECODE_LIMIT: u64 = 512 * 1024 * 1024;
@@ -115,6 +127,10 @@ struct RequestContext {
 struct Inner {
     transport: Transport,
     api: Url,
+    /// Search origin: `CLASSIC_API` beside the real `API`, otherwise the fixture `api`.
+    classic: Url,
+    /// r/all origin: `OLD_API` beside the real `API`, otherwise the fixture `api`.
+    old: Url,
     session: session::Session,
     account: Mutex<Option<Account>>,
     source: Mutex<Option<crate::auth::Source>>,
@@ -360,6 +376,8 @@ impl Reddit {
             Arc::new(Inner {
                 transport,
                 api: Url::parse(api)?,
+                classic: Url::parse(if api == API { CLASSIC_API } else { api })?,
+                old: Url::parse(if api == API { OLD_API } else { api })?,
                 session,
                 account,
                 source,
@@ -441,8 +459,15 @@ impl Reddit {
         if sort == Sort::Best {
             bail!("Best is available on Home only");
         }
-        let url = self.subreddit_url(subreddit, &format!("{}.json", sort.as_str()))?;
+        let url = self.listing_url(subreddit, sort)?;
         self.fetch_listing(url, sort, time, after, progress)
+    }
+
+    fn listing_url(&self, subreddit: &str, sort: Sort) -> Result<Url> {
+        if subreddit.eq_ignore_ascii_case("all") {
+            return self.subreddit_at(&self.0.old, subreddit, &format!("{}.json", sort.as_str()));
+        }
+        self.subreddit_at(&self.0.classic, subreddit, sort.as_str())
     }
 
     pub fn home(&self, sort: Sort, time: TimeRange, after: Option<&str>) -> Result<Listing> {
@@ -631,27 +656,52 @@ impl Reddit {
 
     #[cfg(test)]
     pub fn search(&self, subreddit: &str, query: &str, after: Option<&str>) -> Result<Listing> {
-        self.search_progress(subreddit, query, after, &mut |_| {})
+        self.search_progress(
+            subreddit,
+            query,
+            experience::SearchSort::Relevance,
+            TimeRange::All,
+            after,
+            &mut |_| {},
+        )
     }
 
     pub(crate) fn search_progress(
         &self,
         subreddit: &str,
         query: &str,
+        sort: experience::SearchSort,
+        time: TimeRange,
         after: Option<&str>,
         progress: &mut dyn FnMut(ListingEvent<'_>),
     ) -> Result<Listing> {
-        let mut url = self.subreddit_url(subreddit, "search.json")?;
+        let url = self.search_url(subreddit, query, sort, time, after)?;
+        self.listing_response(url, progress)
+    }
+
+    fn search_url(
+        &self,
+        subreddit: &str,
+        query: &str,
+        sort: experience::SearchSort,
+        time: TimeRange,
+        after: Option<&str>,
+    ) -> Result<Url> {
+        let mut url = self.subreddit_at(&self.0.classic, subreddit, "search")?;
         self.listing_params(&mut url, after);
         url.query_pairs_mut()
             .append_pair("q", query)
             .append_pair("restrict_sr", "on")
-            .append_pair("sort", "relevance")
-            .append_pair("t", "all");
-        self.listing_response(url, progress)
+            .append_pair("sort", sort.as_str())
+            .append_pair("t", time.as_str());
+        Ok(url)
     }
 
     fn subreddit_url(&self, subreddit: &str, suffix: &str) -> Result<Url> {
+        self.subreddit_at(&self.0.api, subreddit, suffix)
+    }
+
+    fn subreddit_at(&self, base: &Url, subreddit: &str, suffix: &str) -> Result<Url> {
         if subreddit.is_empty()
             || !subreddit
                 .bytes()
@@ -659,7 +709,7 @@ impl Reddit {
         {
             bail!("invalid subreddit name");
         }
-        Ok(self.0.api.join(&format!("r/{subreddit}/{suffix}"))?)
+        Ok(base.join(&format!("r/{subreddit}/{suffix}"))?)
     }
 
     fn listing_params(&self, url: &mut Url, after: Option<&str>) {
@@ -805,6 +855,31 @@ impl Reddit {
         ))
     }
 
+    pub(crate) fn video_fallback(
+        &self,
+        url: &str,
+        cancelled: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Result<VideoManifest> {
+        let mut manifest = Url::parse(url).context("invalid video URL")?;
+        let folder = manifest
+            .path()
+            .strip_suffix("HLSPlaylist.m3u8")
+            .filter(|folder| folder.ends_with('/'))
+            .context("video has no native DASH alternative")?;
+        let path = format!("{folder}DASHPlaylist.mpd");
+        manifest.set_path(&path);
+        let connection = self.read_cancellation();
+        let cancelled: transport::Cancellation = Arc::new(move || connection() || cancelled());
+        let response = self
+            .0
+            .transport
+            .media(manifest.as_str(), None, Some(&cancelled))?;
+        let final_url = Url::parse(&response.uri().to_string()).context("invalid DASH location")?;
+        let mut text = String::new();
+        Reader::new(response, 1024 * 1024, Some(cancelled)).read_to_string(&mut text)?;
+        dash::parse(&text, &final_url, |url| self.media_url(url))
+    }
+
     pub fn media_url(&self, url: &str) -> Result<String> {
         if self.0.retired.load(Ordering::Acquire) {
             bail!("This Reddit connection was replaced");
@@ -859,6 +934,23 @@ impl Reddit {
         )
     }
 
+    /// Non-www hosts (search, r/all) get only `.reddit.com` cookies; when those are missing
+    /// from a live session, only that request fails.
+    fn cookie(&self, url: &Url, www: bool) -> Result<wreq::header::HeaderValue> {
+        let header = self.0.session.header(url.path(), www, session::now());
+        if www {
+            header
+        } else {
+            header.map_err(|error| {
+                if self.0.session.valid() {
+                    anyhow::anyhow!(CLASSIC_SESSION)
+                } else {
+                    error
+                }
+            })
+        }
+    }
+
     fn request(&self, url: Url, accept: &str) -> Result<wreq::Response> {
         self.send(url, accept, |client, url| client.get(url))
     }
@@ -883,7 +975,8 @@ impl Reddit {
         if self.0.retired.load(Ordering::Acquire) {
             bail!("This Reddit connection was replaced");
         }
-        if url.origin() != self.0.api.origin() {
+        let www = url.origin() == self.0.api.origin();
+        if !www && url.origin() != self.0.classic.origin() && url.origin() != self.0.old.origin() {
             bail!("refusing to send Reddit cookies to another origin");
         }
         {
@@ -892,13 +985,11 @@ impl Reddit {
                 bail!(session::SIGN_IN);
             }
         }
-        let cookie = self
-            .0
-            .session
-            .header(url.path(), session::now())
-            .inspect_err(|_| {
+        let cookie = self.cookie(&url, www).inspect_err(|_| {
+            if www {
                 self.record(false);
-            })?;
+            }
+        })?;
         let mut request = request(&self.0.transport.client, url.as_str())
             .header("Cookie", cookie)
             .header("Accept", accept)
@@ -932,7 +1023,7 @@ impl Reddit {
             .context("Cannot repeat this Reddit request")?;
             outgoing
                 .headers_mut()
-                .insert("Cookie", self.0.session.header(url.path(), session::now())?);
+                .insert("Cookie", self.cookie(&url, www)?);
             let available = timeout.saturating_sub(network);
             if available.is_zero() {
                 bail!("Reddit request timed out; retry when ready");
@@ -952,7 +1043,10 @@ impl Reddit {
             self.0
                 .rate
                 .observe(&response, &url, sent, admission.sequence, admission.older);
-            self.record(!matches!(response.status().as_u16(), 401 | 500..));
+            let code = response.status().as_u16();
+            if www || code != 401 {
+                self.record(!matches!(code, 401 | 500..));
+            }
             if response.status().as_u16() == 429 && retry {
                 continue;
             }
@@ -961,15 +1055,16 @@ impl Reddit {
         let status = response.status().as_u16();
         match status {
             200..=299 => Ok((response, waited)),
-            401 => {
+            401 if www => {
                 self.0.status.lock().rejected = true;
                 bail!(session::SIGN_IN);
             }
+            401 => bail!(CLASSIC_REFUSED),
             403 => Err(transport::access_denied(response, cancelled)?.into()),
             404 => Err(NotFound.into()),
             429 => bail!("Reddit rate limit reached; wait before retrying"),
             300..=399 => bail!(
-                "Reddit redirected the request (HTTP {status}); reconnect with A or redtab --signin"
+                "Reddit redirected the request (HTTP {status}); reconnect through Accounts or redtab --signin"
             ),
             _ => bail!("Reddit: HTTP {status}"),
         }
@@ -990,7 +1085,7 @@ fn decode_still(mut r: impl Read) -> Result<DynamicImage> {
     reader.limits(limits);
     reader.decode().map_err(|error| match error {
         image::ImageError::Limits(_) => {
-            anyhow::anyhow!("Image too large for inline preview; o opens Reddit")
+            anyhow::anyhow!("Image too large for inline preview; open the original on Reddit")
         }
         error => error.into(),
     })
@@ -1068,7 +1163,10 @@ mod image_tests {
 
         let error = decode_still(png.as_slice()).unwrap_err().to_string();
 
-        assert_eq!(error, "Image too large for inline preview; o opens Reddit");
+        assert_eq!(
+            error,
+            "Image too large for inline preview; open the original on Reddit"
+        );
     }
 
     #[test]

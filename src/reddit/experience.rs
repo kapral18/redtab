@@ -8,12 +8,13 @@ use wreq::header::HeaderValue;
 use super::{Reddit, parse, text, transport};
 use crate::model::{Post, PostPage, TimeRange};
 
+pub(crate) const PAGE_LIMIT: usize = 50;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Query {
     Search {
         text: String,
-        kind: SearchKind,
-        sort: SearchSort,
+        kind: ListSearch,
         time: TimeRange,
     },
     User {
@@ -39,6 +40,13 @@ pub enum Query {
     Thread(String),
 }
 
+/// Searches whose results list in the popup; post searches open as feeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListSearch {
+    Communities,
+    People,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchKind {
     Posts,
@@ -46,8 +54,9 @@ pub enum SearchKind {
     People,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub enum SearchSort {
+    #[default]
     Relevance,
     Hot,
     Top,
@@ -184,6 +193,7 @@ pub struct Entry {
     pub target: Option<Target>,
     pub query: Option<Query>,
     pub post: Option<Post>,
+    pub icon: crate::model::SubscriptionIcon,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +281,22 @@ pub enum Request {
     Write(Action),
 }
 
+impl Action {
+    pub fn changes_reader_content(&self) -> bool {
+        matches!(
+            self,
+            Self::Vote { .. }
+                | Self::Save { .. }
+                | Self::Hide { .. }
+                | Self::Reply { .. }
+                | Self::Submit { .. }
+                | Self::Edit { .. }
+                | Self::Delete { .. }
+                | Self::Report { .. }
+        )
+    }
+}
+
 #[derive(Debug)]
 pub enum Response {
     Page(Page),
@@ -322,22 +348,15 @@ impl Query {
     fn route(&self) -> Result<(String, Vec<(&'static str, String)>)> {
         let mut params = Vec::new();
         let path = match self {
-            Self::Search {
-                text,
-                kind,
-                sort,
-                time,
-            } => {
+            Self::Search { text, kind, time } => {
                 if text.trim().is_empty() {
                     bail!("Enter a search query");
                 }
                 params.push(("q", text.clone()));
-                params.push(("sort", sort.as_str().into()));
                 params.push(("t", time.as_str().into()));
                 match kind {
-                    SearchKind::Posts => "search.json".into(),
-                    SearchKind::Communities => "subreddits/search.json".into(),
-                    SearchKind::People => "users/search.json".into(),
+                    ListSearch::Communities => "subreddits/search".into(),
+                    ListSearch::People => "users/search".into(),
                 }
             }
             Self::User { name: user, feed } => {
@@ -388,6 +407,31 @@ impl Query {
 }
 
 impl Reddit {
+    /// A person's avatar and profile page summary, for the top of their feed.
+    /// Hiding NSFW keeps an NSFW profile to its karma, as People results leave it out.
+    pub fn user_profile(&self, user: &str) -> Result<crate::model::UserProfile> {
+        let mut url = self
+            .0
+            .api
+            .join(&format!("user/{}/about.json", name(user)?))?;
+        url.query_pairs_mut().append_pair("raw_json", "1");
+        let value = self.get(url)?;
+        let data = &value["data"];
+        if value["kind"] != "t2" || data["name"].as_str().is_none() {
+            bail!("Invalid Reddit profile");
+        }
+        let text = profile_text(data);
+        if !self.1 && nsfw(data) {
+            let karma = text.lines().next().unwrap_or_default();
+            return Ok(crate::model::UserProfile::new(None, karma));
+        }
+        let icon = match parse::user_icon(data) {
+            crate::model::SubscriptionIcon::Url(url) => Some(url),
+            _ => None,
+        };
+        Ok(crate::model::UserProfile::new(icon, &text))
+    }
+
     pub fn experience(&self, request: &Request) -> Result<Response> {
         match request {
             Request::Read {
@@ -403,21 +447,30 @@ impl Reddit {
         }
     }
 
+    pub(super) fn read_url(&self, query: &Query, after: Option<&str>) -> Result<Url> {
+        let (path, params) = query.route()?;
+        let base = if matches!(query, Query::Search { .. }) {
+            &self.0.classic
+        } else {
+            &self.0.api
+        };
+        let mut url = base.join(&path)?;
+        url.query_pairs_mut()
+            .extend_pairs(params)
+            .append_pair("raw_json", "1")
+            .append_pair("limit", &PAGE_LIMIT.to_string());
+        if let Some(after) = after {
+            url.query_pairs_mut().append_pair("after", after);
+        }
+        Ok(url)
+    }
+
     fn experience_read(&self, query: &Query, after: Option<&str>) -> Result<Response> {
         if let Query::Inspect(target) = query {
             let value = self.thread_json(&target.inspection_permalink()?, "", target.comment())?;
             return inspect(value, target).map(Response::Details);
         }
-        let (path, params) = query.route()?;
-        let mut url = self.0.api.join(&path)?;
-        url.query_pairs_mut()
-            .extend_pairs(params)
-            .append_pair("raw_json", "1")
-            .append_pair("limit", "50");
-        if let Some(after) = after {
-            url.query_pairs_mut().append_pair("after", after);
-        }
-        let value = match self.get(url) {
+        let value = match self.get(self.read_url(query, after)?) {
             Ok(value) => value,
             Err(error) if error.is::<super::NotFound>() && matches!(query, Query::Wiki { .. }) => {
                 let Query::Wiki { subreddit, page } = query else {
@@ -449,7 +502,7 @@ impl Reddit {
         let token = me["data"]["modhash"]
             .as_str()
             .filter(|s| !s.is_empty())
-            .context("Reddit did not supply a CSRF token; reconnect with A")?;
+            .context("Reddit did not supply a CSRF token; reconnect through Accounts")?;
         let mut header = HeaderValue::from_str(token)
             .map_err(|_| anyhow::anyhow!("Invalid Reddit CSRF token"))?;
         header.set_sensitive(true);
@@ -832,17 +885,7 @@ fn read_page(query: &Query, value: Value, show_nsfw: bool) -> Result<Page> {
                 bail!("Invalid Reddit profile");
             }
             page.title = format!("u/{user}");
-            page.text = format!(
-                "Post karma: {}    Comment karma: {}\n{}",
-                data["link_karma"].as_i64().unwrap_or(0),
-                data["comment_karma"].as_i64().unwrap_or(0),
-                text::body(
-                    "",
-                    data["subreddit"]["public_description"]
-                        .as_str()
-                        .unwrap_or_default()
-                )
-            );
+            page.text = profile_text(data);
             page.entries = [UserFeed::Overview, UserFeed::Posts, UserFeed::Comments]
                 .into_iter()
                 .map(|feed| {
@@ -948,6 +991,7 @@ fn read_page(query: &Query, value: Value, show_nsfw: bool) -> Result<Page> {
                 name(segments[1])?;
                 name(segments[3])?;
                 page.entries.push(Entry {
+                    icon: Default::default(),
                     title: data["display_name"].as_str().unwrap_or(segments[3]).into(),
                     body: text::body("", data["description_md"].as_str().unwrap_or_default()),
                     target: None,
@@ -967,19 +1011,12 @@ fn read_page(query: &Query, value: Value, show_nsfw: bool) -> Result<Page> {
                 .as_array()
                 .context("Listing has no children")?;
             page.title = match query {
-                Query::Search {
-                    text,
-                    kind,
-                    sort,
-                    time,
-                } => format!(
-                    "{}: {text} · {} · {}",
+                Query::Search { text, kind, time } => format!(
+                    "{}: {text} · {}",
                     match kind {
-                        SearchKind::Posts => "Posts",
-                        SearchKind::Communities => "Communities",
-                        SearchKind::People => "People",
+                        ListSearch::Communities => "Communities",
+                        ListSearch::People => "People",
                     },
-                    sort.as_str(),
                     time.as_str()
                 ),
                 Query::User { name, feed } => format!("u/{name} · {}", feed.label()),
@@ -995,9 +1032,7 @@ fn read_page(query: &Query, value: Value, show_nsfw: bool) -> Result<Page> {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
             for thing in children {
-                if !show_nsfw
-                    && (thing["data"]["over_18"] == true || thing["data"]["over18"] == true)
-                {
+                if !show_nsfw && nsfw(&thing["data"]) {
                     continue;
                 }
                 if let Some(entry) = entry(thing)? {
@@ -1009,8 +1044,35 @@ fn read_page(query: &Query, value: Value, show_nsfw: bool) -> Result<Page> {
     Ok(page)
 }
 
+/// A t2 account carries its NSFW flag on its profile subreddit.
+fn nsfw(data: &Value) -> bool {
+    data["over_18"] == true || data["over18"] == true || data["subreddit"]["over_18"] == true
+}
+
+/// The profile page's summary; a People search result is the same account object.
+fn profile_text(data: &Value) -> String {
+    if data["is_suspended"] == true {
+        return "Suspended account".into();
+    }
+    let karma = [("Post", "link_karma"), ("Comment", "comment_karma")]
+        .into_iter()
+        .filter_map(|(label, key)| Some(format!("{label} karma: {}", data[key].as_i64()?)))
+        .collect::<Vec<_>>()
+        .join("    ");
+    format!(
+        "{karma}\n{}",
+        text::body(
+            "",
+            data["subreddit"]["public_description"]
+                .as_str()
+                .unwrap_or_default()
+        )
+    )
+}
+
 fn navigation(label: &str, query: Query) -> Entry {
     Entry {
+        icon: Default::default(),
         title: label.into(),
         body: String::new(),
         target: None,
@@ -1022,6 +1084,7 @@ fn navigation(label: &str, query: Query) -> Entry {
 fn entry(thing: &Value) -> Result<Option<Entry>> {
     let data = &thing["data"];
     let mut entry = Entry {
+        icon: Default::default(),
         title: String::new(),
         body: String::new(),
         target: None,
@@ -1077,12 +1140,15 @@ fn entry(thing: &Value) -> Result<Option<Entry>> {
             entry.title = format!("r/{sub}");
             entry.body = text::body("", data["public_description"].as_str().unwrap_or_default());
             entry.query = Some(Query::Community(sub.into()));
+            entry.icon = parse::community_icon(data);
         }
         Some("t2") => {
             let user = data["name"].as_str().context("User has no name")?;
             name(user)?;
             entry.title = format!("u/{user}");
+            entry.body = profile_text(data);
             entry.query = Some(Query::Profile(user.into()));
+            entry.icon = parse::user_icon(data);
         }
         _ => return Ok(None),
     }
@@ -1375,6 +1441,64 @@ mod tests {
                 "/r/comments/comments/post/title/reply/".into(),
                 Some("reply".into())
             )
+        );
+    }
+
+    #[test]
+    fn when_people_search_returns_accounts_rows_should_carry_avatar_and_profile_and_hide_nsfw() {
+        let fixture = Fixture::new(|_| {
+            Reply::json(json!({"kind":"Listing","data":{"after":null,"children":[
+                {"kind":"t2","data":{"name":"writer","icon_img":"https://styles.redditmedia.com/a.png?s=1","link_karma":5,"comment_karma":7,"subreddit":{"public_description":"Hello","over_18":false}}},
+                {"kind":"t2","data":{"name":"gone","is_suspended":true}},
+                {"kind":"t2","data":{"name":"adult","subreddit":{"over_18":true}}}
+            ]}}))
+        });
+        let query = Query::Search {
+            text: "w".into(),
+            kind: ListSearch::People,
+            time: crate::model::TimeRange::All,
+        };
+        let Response::Page(actual) = read(&fixture.reddit(), query) else {
+            panic!("Expected people");
+        };
+        let shown: Vec<_> = actual
+            .entries
+            .iter()
+            .map(|entry| (entry.title.as_str(), entry.body.as_str(), &entry.icon))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (
+                    "u/writer",
+                    "Post karma: 5    Comment karma: 7\nHello",
+                    &crate::model::SubscriptionIcon::Url(
+                        "https://styles.redditmedia.com/a.png?s=1".into()
+                    )
+                ),
+                (
+                    "u/gone",
+                    "Suspended account",
+                    &crate::model::SubscriptionIcon::Unknown
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn when_nsfw_is_hidden_an_nsfw_profile_should_keep_only_its_karma() {
+        let fixture = Fixture::new(|request| {
+            assert!(request.url.starts_with("/user/adult/about.json?"));
+            Reply::json(
+                json!({"kind":"t2","data":{"name":"adult","icon_img":"https://styles.redditmedia.com/a.png","link_karma":1,"comment_karma":2,"subreddit":{"public_description":"Hidden","over_18":true}}}),
+            )
+        });
+        assert_eq!(
+            fixture.reddit().user_profile("adult").unwrap(),
+            crate::model::UserProfile {
+                icon: None,
+                lines: vec!["Post karma: 1    Comment karma: 2".into()],
+            }
         );
     }
 
@@ -1915,33 +2039,38 @@ mod tests {
     }
 
     #[test]
-    fn when_searching_globally_the_query_sort_time_and_cursor_should_be_encoded() {
+    fn when_searching_communities_the_query_time_and_cursor_should_be_encoded() {
         let fixture = Fixture::new(|request| {
             let url = Url::parse(&format!("http://fixture{}", request.url)).unwrap();
-            assert_eq!(url.path(), "/search.json");
+            assert_eq!(url.path(), "/subreddits/search");
             let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
             assert_eq!(params["q"], "Հայերեն & rust");
-            assert_eq!(params["sort"], "comments");
             assert_eq!(params["t"], "week");
             assert_eq!(params["after"], "cursor&next");
             assert!(!params.contains_key("restrict_sr"));
-            Reply::json(json!({"kind":"Listing","data":{"children":[],"after":null}}))
+            Reply::json(json!({"kind":"Listing","data":{"children":[
+                {"kind":"t5","data":{"display_name":"rust","community_icon":"https://styles.redditmedia.com/rust.png"}}
+            ],"after":null}}))
         });
-        assert!(matches!(
-            fixture
-                .reddit()
-                .experience(&Request::Read {
-                    query: Query::Search {
-                        text: "Հայերեն & rust".into(),
-                        kind: SearchKind::Posts,
-                        sort: SearchSort::Comments,
-                        time: TimeRange::Week
-                    },
-                    after: Some("cursor&next".into())
-                })
-                .unwrap(),
-            Response::Page(_)
-        ));
+        let Response::Page(page) = fixture
+            .reddit()
+            .experience(&Request::Read {
+                query: Query::Search {
+                    text: "Հայերեն & rust".into(),
+                    kind: ListSearch::Communities,
+                    time: TimeRange::Week,
+                },
+                after: Some("cursor&next".into()),
+            })
+            .unwrap()
+        else {
+            panic!("expected a page");
+        };
+        assert_eq!(
+            page.entries[0].icon,
+            crate::model::SubscriptionIcon::Url("https://styles.redditmedia.com/rust.png".into()),
+            "a community result carries its listing icon"
+        );
     }
 
     #[test]

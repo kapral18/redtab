@@ -1,6 +1,8 @@
 //! Application state and key actions; rendering is in `ui`, dispatch in `keys`.
 
 pub mod experience;
+pub mod jumps;
+pub mod search;
 pub mod settings;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -25,13 +27,15 @@ use crate::worker::{FeedError, FeedQuery, FeedTarget, ImageMetadata, Job, Msg, P
 
 const SAVE_INTERVAL: Duration = Duration::from_secs(60);
 const STATUS_TTL: Duration = Duration::from_secs(6);
-/// Load the next page when the selection gets this close to the end.
+/// How often the shown feed or islands check whether their posts passed `CONTENT_TTL`.
+const FEED_POLL: Duration = Duration::from_secs(60);
 const PREFETCH_MARGIN: usize = 5;
 /// Bound automatic Home fill when filters or missing post details leave pages empty.
 const HOME_AUTO_PAGES: usize = 4;
 /// Built-in tabs stay before account subscriptions and tabs opened with the picker.
 const BOOKMARKS_TAB: usize = 1;
 pub const ALL_SUBS_TAB: usize = 2;
+pub const SEARCH_TAB: usize = 3;
 /// Past this many cached thumbnails, those not on screen are dropped.
 const THUMB_CACHE_MAX: usize = 400;
 /// Recent decoded card previews; visible images are not part of this offscreen budget.
@@ -41,11 +45,10 @@ const CARD_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const CARD_PREVIEW_MAX: usize = 256;
 /// Last frames for recent videos; decoders independently bound each frame's pixels.
 const VIDEO_PREVIEW_MAX: usize = 8;
+const VIDEO_PLAYER_MAX: usize = 3;
 const VIDEO_PREVIEW_BYTES: usize = 32 * 1024 * 1024;
 /// A video area that changed size restarts the video once the size holds this long.
 const VIDEO_RESIZE_SETTLE: Duration = Duration::from_millis(250);
-/// Moves through lists, tabs and posts closer together than this count as one quick run.
-/// A move after a pause loads at once; later moves in a quick run load only where it stops.
 pub(crate) const NAV_SETTLE: Duration = Duration::from_millis(200);
 pub const CARD_MIN_WIDTH: u16 = 54;
 /// Pane widths include horizontal margins.
@@ -149,6 +152,9 @@ pub struct CardScroll {
     pub height: usize,
     pub viewport: usize,
     pub pending: isize,
+    /// Selected card, the row it was drawn at, and whether all of it fitted there:
+    /// data and size changes keep it there, and keep a card that fitted fitting.
+    pub selected: Option<(String, isize, bool)>,
 }
 
 #[derive(Debug, Default)]
@@ -158,6 +164,8 @@ pub struct Feed {
     pub sort: Sort,
     pub time: TimeRange,
     pub search: Option<String>,
+    pub search_sort: crate::reddit::experience::SearchSort,
+    pub search_time: TimeRange,
     failures: HashMap<Option<String>, FeedFailure>,
     pub generation: u64,
     pub selected: usize,
@@ -175,15 +183,19 @@ pub struct Feed {
     pending: HashSet<u64>,
     refreshing: HashSet<u64>,
     forced: HashSet<u64>,
+    /// Requests from `r`: their arrivals show at once, from the list top.
+    manual: HashSet<u64>,
     deferred: HashMap<Option<String>, bool>,
-    updates: Vec<FeedUpdate>,
+    /// A first-page answer waiting behind the notice.
+    update: Option<FeedUpdate>,
+    displaced_sources: HashMap<String, Source>,
 }
 
 #[derive(Debug)]
 struct FeedUpdate {
-    cursor: Option<String>,
     listing: Listing,
     freshness: Freshness,
+    stable: bool,
 }
 
 #[derive(Debug)]
@@ -208,9 +220,26 @@ struct FeedPage {
 }
 
 impl Feed {
+    /// A new query starts at relevance over all time and drops a held answer to the old
+    /// query; the same query keeps its sort and time.
+    fn set_search(&mut self, query: String) {
+        if self.search.as_deref() != Some(query.as_str()) {
+            self.search_sort = Default::default();
+            self.search_time = TimeRange::All;
+            self.update = None;
+        }
+        self.search = Some(query);
+        self.selected = 0;
+        self.cards = CardScroll::default();
+    }
+
     fn query(&self) -> FeedQuery {
         match &self.search {
-            Some(q) => FeedQuery::Search { query: q.clone() },
+            Some(q) => FeedQuery::Search {
+                query: q.clone(),
+                sort: self.search_sort,
+                time: self.search_time,
+            },
             // Sorts without a time range send none; the kept range must not split them.
             None => FeedQuery::Listing {
                 sort: self.sort,
@@ -227,26 +256,42 @@ impl Feed {
         !self.refreshing.is_empty()
     }
 
-    pub fn has_updates(&self) -> bool {
-        !self.updates.is_empty()
+    fn leads_with_new(&self, posts: &[Post], config: &Config) -> bool {
+        feed_has_new(config, &self.posts, posts)
     }
 
-    pub fn update_summary(&self, config: &Config) -> Option<&'static str> {
-        if !self.has_updates() {
-            return None;
-        }
-        let shown: HashSet<_> = config
-            .visible(&self.posts)
-            .map(|post| post.id.as_str())
-            .collect();
-        if self.updates.iter().any(|update| {
-            config
-                .visible(&update.listing.posts)
-                .any(|post| !shown.contains(post.id.as_str()))
-        }) {
-            return Some("New posts");
-        }
-        Some("Feed details updated")
+    fn first_page_changed(&self, incoming: &[Post], config: &Config) -> bool {
+        let len = self.pages.first().map_or(self.posts.len(), |page| page.len);
+        !config
+            .visible(&self.posts[..len])
+            .map(|post| &post.id)
+            .eq(config.visible(incoming).map(|post| &post.id))
+    }
+
+    pub fn has_new_posts(&self, config: &Config) -> bool {
+        self.update
+            .as_ref()
+            .is_some_and(|update| self.leads_with_new(&update.listing.posts, config))
+    }
+
+    /// Selects the first post, shown from its first row; scroll keys before the next
+    /// draw scroll from it.
+    fn show_top(&mut self, first: Option<String>) {
+        self.selected = 0;
+        self.offset = 0;
+        self.cards = CardScroll {
+            post: first,
+            viewport: self.cards.viewport,
+            ..CardScroll::default()
+        };
+    }
+
+    /// The first row, not scrolled into in card view, whose post is not open from this
+    /// list: updates leave it on the list's first post.
+    fn untouched_top(&self, card_view: bool, open_here: bool) -> bool {
+        let scrolled =
+            card_view && (self.cards.line as isize).saturating_add(self.cards.pending) > 0;
+        self.selected == 0 && !scrolled && !open_here
     }
 
     /// `posts` answer the current sort, time range or search, not an earlier one still
@@ -261,7 +306,9 @@ impl Feed {
 
     pub fn loading_more(&self) -> bool {
         self.requests.iter().any(|(id, cursor)| {
-            cursor.is_some() && (self.pending.contains(id) || self.refreshing.contains(id))
+            cursor.is_some()
+                && *cursor == self.after
+                && (self.pending.contains(id) || self.refreshing.contains(id))
         })
     }
 
@@ -287,11 +334,9 @@ impl Feed {
     }
 
     pub fn access_denied(&self) -> Option<AccessDenied> {
-        // Access restrictions apply to the community, not just one pagination cursor.
         self.failures
             .values()
-            .filter_map(|failure| failure.error.access())
-            .max_by_key(|access| matches!(access, AccessDenied::PrivateCommunity))
+            .find_map(|failure| failure.error.access())
     }
 
     pub fn page_failed(&self) -> bool {
@@ -312,6 +357,7 @@ impl Feed {
             return;
         };
         self.posts.remove(index);
+        self.displaced_sources.remove(id);
         let mut start = 0;
         for page in &mut self.pages {
             if index < start + page.len {
@@ -345,22 +391,29 @@ impl Feed {
         let mut protected = HashSet::new();
         let mut start = 0;
         for (i, page) in self.pages.iter().enumerate() {
-            if i != index
-                && (!source.may_replace(page.source)
-                    || (page.source.compare(source) == Some(std::cmp::Ordering::Equal)
-                        && source.cached
-                        && i < index))
-            {
-                protected.extend(
-                    self.posts[start..start + page.len]
-                        .iter()
-                        .map(|post| post.id.as_str()),
-                );
+            if i != index {
+                for post in &self.posts[start..start + page.len] {
+                    let previous = self
+                        .displaced_sources
+                        .get(&post.id)
+                        .copied()
+                        .unwrap_or(page.source);
+                    if !source.may_replace(previous)
+                        || (previous.compare(source) == Some(std::cmp::Ordering::Equal)
+                            && source.cached
+                            && i < index)
+                    {
+                        protected.insert(post.id.as_str());
+                    }
+                }
             }
             start += page.len;
         }
         posts.retain(|post| !protected.contains(post.id.as_str()));
         let incoming_ids: HashSet<_> = posts.iter().map(|post| post.id.as_str()).collect();
+        for id in &incoming_ids {
+            self.displaced_sources.remove(*id);
+        }
         // Newer refreshed records own their positions; older cached pages cannot move them back.
         let mut pages = self.pages.iter_mut().enumerate();
         let mut current = pages.next();
@@ -394,6 +447,11 @@ impl Feed {
             self.pages[index] = page;
         }
         self.after = self.pages.last().and_then(|page| page.after.clone());
+        if !self.displaced_sources.is_empty() {
+            let known: HashSet<_> = self.posts.iter().map(|post| post.id.as_str()).collect();
+            self.displaced_sources
+                .retain(|id, _| known.contains(id.as_str()));
+        }
         true
     }
 
@@ -446,6 +504,8 @@ pub enum TabKind {
     Home,
     Bookmarks,
     AllSubs,
+    /// Live search over posts, communities and people; Explore when the query is empty.
+    Search,
     /// `pinned` tabs come from subscriptions; others were opened with the picker.
     Subreddit {
         name: String,
@@ -466,6 +526,12 @@ impl Tab {
             TabKind::Home => Some(FeedTarget::Home),
             TabKind::User { name, .. } => Some(FeedTarget::User(name.clone())),
             TabKind::Subreddit { name, .. } => Some(FeedTarget::Subreddit(name.clone())),
+            // Post results search all of Reddit; no query, no feed.
+            TabKind::Search => self
+                .feed
+                .search
+                .as_ref()
+                .map(|_| FeedTarget::Subreddit("all".into())),
             _ => None,
         }
     }
@@ -493,6 +559,7 @@ impl Tab {
             TabKind::Home => "Home".into(),
             TabKind::AllSubs => "All subs".into(),
             TabKind::Bookmarks => "Bookmarks".into(),
+            TabKind::Search => "Search".into(),
             TabKind::Subreddit { name, .. } => format!("r/{name}"),
         }
     }
@@ -508,6 +575,86 @@ pub struct Group {
     pub freshness: Option<Freshness>,
     pub generation: u64,
     pub needs_refresh: bool,
+    pub(crate) stream: Option<Source>,
+    /// The latest first page while it ranks unseen posts above shown ones; `r` applies it.
+    pub arrivals: Option<Vec<Post>>,
+    pub(crate) stable_arrivals: bool,
+    /// `r` asked for this group: its next live answer applies whole.
+    pub manual: bool,
+}
+
+impl Group {
+    /// Shows the waiting first page, if any.
+    fn apply_arrivals(&mut self) -> bool {
+        let Some(posts) = self.arrivals.take() else {
+            return false;
+        };
+        self.posts = posts;
+        self.stable_arrivals = false;
+        true
+    }
+}
+
+/// What counts as new everywhere: an unseen item ranked before every seen item, pinned
+/// items aside. Unseen items lower down entered by ranking, like a reorder.
+fn unseen_leads<'a>(
+    items: impl IntoIterator<Item = (&'a str, bool)>,
+    seen: impl Fn(&str) -> bool,
+) -> bool {
+    for (id, pinned) in items {
+        if !seen(id) {
+            return true;
+        }
+        if !pinned {
+            return false;
+        }
+    }
+    false
+}
+
+fn feed_has_new(config: &Config, shown: &[Post], incoming: &[Post]) -> bool {
+    if config.visible(shown).next().is_none() {
+        return false;
+    }
+    let known: HashSet<_> = shown.iter().map(|post| post.id.as_str()).collect();
+    unseen_leads(
+        config
+            .visible(incoming)
+            .map(|post| (post.id.as_str(), post.stickied)),
+        |id| known.contains(id),
+    )
+}
+
+/// A thread's top-level comments, which the parser keeps under one logical root.
+fn thread_roots(comments: &[Comment]) -> &[Comment] {
+    match comments {
+        [root] if root.id.starts_with(THREAD_ROOT) => &root.replies,
+        _ => comments,
+    }
+}
+
+fn island_changed(config: &Config, shown: &[Post], incoming: &[Post]) -> bool {
+    let ids = |posts: &[Post]| {
+        config
+            .visible(posts)
+            .filter(|post| !post.stickied)
+            .take(config.all_subs_posts_per_group)
+            .map(|post| post.id.clone())
+            .collect::<Vec<_>>()
+    };
+    ids(shown) != ids(incoming)
+}
+
+/// Islands never show pinned posts, so they lead with their first unpinned one.
+fn island_has_new(config: &Config, shown: &[Post], incoming: &[Post]) -> bool {
+    let known: HashSet<_> = shown.iter().map(|post| post.id.as_str()).collect();
+    unseen_leads(
+        config
+            .visible(incoming)
+            .filter(|post| !post.stickied)
+            .map(|post| (post.id.as_str(), false)),
+        |id| known.contains(id),
+    )
 }
 
 #[derive(Debug, Default)]
@@ -522,6 +669,29 @@ pub struct AllSubs {
     pub post: usize,
     /// First visible row of groups; kept in sync by the UI.
     pub offset: usize,
+    /// Selected island and how many grid rows were drawn above it: data changes keep it there.
+    pub drawn: Option<(String, usize)>,
+    waiting_for_rows: bool,
+    /// Islands the last draw showed.
+    shown: Vec<usize>,
+}
+
+impl AllSubs {
+    pub fn has_new_posts(&self, config: &Config) -> bool {
+        self.groups.iter().any(|group| {
+            group
+                .arrivals
+                .as_ref()
+                .is_some_and(|incoming| island_has_new(config, &group.posts, incoming))
+        })
+    }
+
+    fn show_top(&mut self) {
+        self.group = 0;
+        self.post = 0;
+        self.offset = 0;
+        self.drawn = None;
+    }
 }
 
 #[derive(Clone)]
@@ -534,7 +704,7 @@ struct AncestorFollow {
 #[derive(Debug)]
 pub struct PostView {
     pub post: Post,
-    pub page: Option<PostPage>,
+    pub page: PostContent,
     pub loading: bool,
     pub error: Option<String>,
     pub freshness: Option<Freshness>,
@@ -556,6 +726,11 @@ pub struct PostView {
     /// Row at the top line, offset into it and scroll, taken before the document changed
     /// above it; the next draw restores it (see `take_reading_anchor`).
     keep_reading: Option<(RowKey, isize, usize)>,
+    /// The reading position the last draw showed, for loads that land after a fold or
+    /// reveal made row positions stale.
+    drawn_anchor: Option<(RowKey, isize, usize)>,
+    /// `r` waits for its answer: unseen comments show the page from the top.
+    reveal: bool,
     /// The selected row the last draw placed on screen; None while reading.
     pub drawn_cursor: Option<usize>,
     /// Spoiler changes while reading: spoiler state and scroll of the last draw, to find the top line
@@ -597,6 +772,35 @@ pub enum RowKind<'a> {
     },
 }
 
+#[derive(Debug, Default)]
+pub struct PostContent {
+    page: Option<PostPage>,
+    pub(crate) document_cache: Option<crate::ui::CachedDocument>,
+}
+
+impl From<Option<PostPage>> for PostContent {
+    fn from(page: Option<PostPage>) -> Self {
+        Self {
+            page,
+            document_cache: None,
+        }
+    }
+}
+
+impl std::ops::Deref for PostContent {
+    type Target = Option<PostPage>;
+    fn deref(&self) -> &Self::Target {
+        &self.page
+    }
+}
+
+impl std::ops::DerefMut for PostContent {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.document_cache = None;
+        &mut self.page
+    }
+}
+
 pub struct Row<'a> {
     pub depth: usize,
     pub kind: RowKind<'a>,
@@ -633,7 +837,7 @@ impl PostView {
     /// comments discuss what the body hides.
     pub fn rows(&self) -> Vec<Row<'_>> {
         let mut rows = Vec::new();
-        if let Some(page) = &self.page
+        if let Some(page) = self.page.as_ref()
             && !self.spoiler_hidden()
         {
             for c in &page.comments {
@@ -742,6 +946,13 @@ impl PostView {
         self.free_scroll = true;
     }
 
+    fn show_top(&mut self) {
+        self.cursor = 0;
+        self.hold_view = None;
+        self.keep_reading = None;
+        self.go_to_top();
+    }
+
     /// Hold row `i` where the last draw showed it.
     fn hold(&self, i: usize) -> Hold {
         Hold {
@@ -763,22 +974,10 @@ impl PostView {
             return;
         }
         if self.keep_reading.is_none() {
-            self.keep_reading = if self.free_scroll {
-                self.reading_position()
-                    .map(|(key, offset)| (key, offset, self.scroll))
+            self.keep_reading = if self.positions_current() {
+                self.reading_anchor()
             } else {
-                // The selection the last draw placed; if a key moved it since, the draw
-                // shows the new one.
-                self.drawn_cursor
-                    .filter(|&d| self.positions_current() && d < self.row_starts.len())
-                    .map(|d| {
-                        let row = RowKey::of(&self.rows()[d]);
-                        (
-                            row,
-                            self.scroll as isize - self.row_starts[d] as isize,
-                            self.scroll,
-                        )
-                    })
+                self.drawn_anchor.clone()
             };
         }
         // A selection the last draw placed also holds its text over the next draws.
@@ -788,6 +987,30 @@ impl PostView {
             && self.drawn_cursor == Some(self.cursor)
         {
             self.hold_view = Some(self.hold(self.cursor));
+        }
+    }
+
+    /// What the next load keeps in place: the top line while reading, else the selection
+    /// the last draw placed (if a key moved it since, the draw shows the new one).
+    pub fn record_drawn_anchor(&mut self) {
+        self.drawn_anchor = self.reading_anchor();
+    }
+
+    fn reading_anchor(&self) -> Option<(RowKey, isize, usize)> {
+        if self.free_scroll {
+            self.reading_position()
+                .map(|(key, offset)| (key, offset, self.scroll))
+        } else {
+            self.drawn_cursor
+                .filter(|&d| self.positions_current() && d < self.row_starts.len())
+                .map(|d| {
+                    let row = RowKey::of(&self.rows()[d]);
+                    (
+                        row,
+                        self.scroll as isize - self.row_starts[d] as isize,
+                        self.scroll,
+                    )
+                })
         }
     }
 
@@ -1033,6 +1256,8 @@ struct VideoPreview {
     url: String,
     resume: video::Resume,
     frame: Option<video::Frame>,
+    player: Option<Player>,
+    card: bool,
 }
 
 impl VideoPreview {
@@ -1053,6 +1278,9 @@ struct IconMetadata {
 pub struct App {
     pub keymap: crate::keys::State,
     pub experience: experience::Experience,
+    pub search: search::Search,
+    jumps: jumps::Jumps,
+    collections: VecDeque<experience::CachedCollection>,
     pub config: Config,
     pub settings: settings::Settings,
     pub reddit: Reddit,
@@ -1072,15 +1300,19 @@ pub struct App {
     membership: Option<MembershipChange>,
     pub post_view: Option<PostView>,
     ancestor_follow: Option<AncestorFollow>,
+    /// Posts hidden, reported or deleted here: listings that still carry them leave them out.
+    removed_posts: HashSet<String>,
     pub overlay: Option<Overlay>,
     /// Help covers the current dialog without replacing its state.
     pub help_scroll: Option<usize>,
     pub status: Option<Status>,
+    clipboard: Option<(media::CopyTask, &'static str)>,
     pub health: Health,
     pause: Option<crate::reddit::Pause>,
     pub loading_frame: usize,
     loading_since: Option<Instant>,
     last_save: Instant,
+    feed_poll: Instant,
     pub show_images: bool,
     pub show_sidebar: bool,
     /// NO_COLOR is set: half-block images, which are only colors, are not drawn.
@@ -1112,6 +1344,11 @@ pub struct App {
     /// Subreddits whose icon lookup has not answered yet.
     icon_lookups: HashSet<String>,
     icon_demands: HashSet<String>,
+    /// People's avatars and profile summaries, keyed by lowercase username.
+    profiles: HashMap<String, crate::model::UserProfile>,
+    /// Profiles on their way; a failed one waits for `r` on its tab.
+    profile_loading: HashSet<String>,
+    profile_failed: HashSet<String>,
     pending_media: HashSet<String>,
     /// Cache warnings a draw has shown; a broken or busy cache repeats them per job.
     cache_warnings: HashSet<String>,
@@ -1134,6 +1371,7 @@ pub struct App {
     feed_settle: Settle,
     /// Thumbnails, icons and pictures in post text that moves bring on screen.
     picture_settle: Settle<()>,
+    list_prefetch: Option<(u64, usize)>,
     pub quit: bool,
 }
 
@@ -1155,6 +1393,8 @@ impl App {
         let mut app = Self {
             keymap: crate::keys::State::default(),
             experience: experience::Experience::default(),
+            search: search::Search::default(),
+            collections: VecDeque::new(),
             settings: settings::Settings::new(crate::config::store::Store::memory(config.clone())),
             config,
             reddit,
@@ -1175,11 +1415,13 @@ impl App {
             overlay: None,
             help_scroll: None,
             status: None,
+            clipboard: None,
             health: Health::Unknown,
             pause: None,
             loading_frame: 0,
             loading_since: None,
             last_save: Instant::now(),
+            feed_poll: Instant::now(),
             show_images,
             show_sidebar: true,
             no_color: false,
@@ -1200,6 +1442,9 @@ impl App {
             icons: HashMap::new(),
             icon_lookups: HashSet::new(),
             icon_demands: HashSet::new(),
+            profiles: HashMap::new(),
+            profile_loading: HashSet::new(),
+            profile_failed: HashSet::new(),
             pending_media: HashSet::new(),
             cache_warnings: HashSet::new(),
             video: None,
@@ -1213,14 +1458,18 @@ impl App {
             video_resize: None,
             post_settle: Settle::default(),
             ancestor_follow: None,
+            removed_posts: HashSet::new(),
             membership: None,
             feed_settle: Settle::default(),
             picture_settle: Settle::default(),
+            list_prefetch: None,
+            jumps: jumps::Jumps::default(),
             quit: false,
         };
         app.push_tab(TabKind::Home);
         app.push_tab(TabKind::Bookmarks);
         app.push_tab(TabKind::AllSubs);
+        app.push_tab(TabKind::Search);
         app.tabs[0].feed.sort = Sort::Best;
         if let Some(w) = warning {
             app.error(w);
@@ -1351,12 +1600,19 @@ impl App {
             self.settings.message =
                 Some("Account changed; the previous account's draft was not applied".into());
         }
-        self.settings
-            .store
-            .select_account(account.as_ref().map(|a| a.name.as_str()));
+        self.settings.store.select_account(
+            account
+                .as_ref()
+                .map(|a| a.name.as_str())
+                .or_else(|| (!disconnected).then_some("")),
+        );
         let mut config = self.settings.store.current.clone();
         config.show_nsfw = show_nsfw;
-        config.media.video_autoplay = same_settings_scope && self.config.media.video_autoplay;
+        config.media.video_autoplay = if account.is_none() {
+            crate::config::MediaSettings::default().video_autoplay
+        } else {
+            same_settings_scope && self.config.media.video_autoplay
+        };
         self.pool.stop();
         self.reddit.retire();
         let (pool, messages) = self.pool.restart(reddit.clone());
@@ -1419,6 +1675,7 @@ impl App {
             self.reddit = reddit;
             self.state_path = state_path;
             self.reset_pending_loads();
+            self.reset_search_loads();
             self.overlay = None;
             self.start();
             self.ensure_feed_loaded(self.active);
@@ -1426,7 +1683,7 @@ impl App {
                 self.refresh_post();
             }
         } else {
-            let image_picker = std::mem::replace(&mut self.image_picker, Picker::halfblocks());
+            let image_picker = self.image_picker.clone();
             let mut next = Self::new(config, pool, reddit, state_path, image_picker);
             state_warning = state_warning.or_else(|| {
                 next.status
@@ -1462,7 +1719,8 @@ impl App {
     }
 
     fn reset_pending_loads(&mut self) {
-        self.experience = experience::Experience::default();
+        self.collections.clear();
+        self.clear_experience();
         self.membership = None;
         self.all_subs.loading = false;
         self.all_subs.error = None;
@@ -1493,8 +1751,9 @@ impl App {
             tab.feed.refreshing.clear();
             tab.feed.requests.clear();
             tab.feed.forced.clear();
+            tab.feed.manual.clear();
             tab.feed.deferred.clear();
-            tab.feed.updates.clear();
+            tab.feed.update = None;
             tab.feed
                 .failures
                 .retain(|_, failure| community && failure.error.access().is_some());
@@ -1514,6 +1773,8 @@ impl App {
         self.queued_images.clear();
         self.icon_lookups.clear();
         self.icon_demands.clear();
+        self.profile_loading.clear();
+        self.profile_failed.clear();
         self.images
             .retain(|_, slot| matches!(slot, ImageSlot::Ready { .. }));
         self.thumbs
@@ -1537,6 +1798,7 @@ impl App {
         self.post_settle = Settle::default();
         self.feed_settle = Settle::default();
         self.picture_settle = Settle::default();
+        self.list_prefetch = None;
     }
 
     fn load_subscriptions(&mut self, force: bool) {
@@ -1625,15 +1887,16 @@ impl App {
             TabKind::Home => (0, 0),
             TabKind::Bookmarks => (1, 0),
             TabKind::AllSubs => (2, 0),
+            TabKind::Search => (3, 0),
             TabKind::Subreddit { name, pinned: true } => {
-                (3, communities[&name.to_ascii_lowercase()])
+                (4, communities[&name.to_ascii_lowercase()])
             }
             TabKind::User {
                 name,
                 followed: true,
                 ..
-            } => (4, follows[&name.to_ascii_lowercase()].0),
-            _ => (5, 0),
+            } => (5, follows[&name.to_ascii_lowercase()].0),
+            _ => (6, 0),
         });
         self.active = self
             .tabs
@@ -1848,6 +2111,21 @@ impl App {
         let was_visible = self.keymap.hint_visible();
         crate::keys::map::sync(self);
         let mut changed = std::mem::take(&mut self.read_redraw);
+        if let Some((result, label)) = self
+            .clipboard
+            .as_ref()
+            .and_then(|(task, label)| task.poll().map(|result| (result, *label)))
+        {
+            self.clipboard = None;
+            match result {
+                Ok(media::CopyStatus::Copied(tool)) => {
+                    self.info(format!("Copied {label} ({tool})"))
+                }
+                Ok(media::CopyStatus::Queued) => self.info(format!("Copy queued: {label}")),
+                Err(error) => self.error(format!("copy failed: {error}")),
+            }
+            changed = true;
+        }
         changed |= was_visible && !self.keymap.hint_visible();
         changed |= self.keymap.tick(now);
         changed |= self.poll_settings(now);
@@ -1860,11 +2138,22 @@ impl App {
             changed = true;
         }
         changed |= self.load_settled(now);
+        changed |= self.poll_shown_feed(now);
         changed |= self.follow_ancestor();
         changed |= self.card_renderer.poll();
-        // Pictures a quick run of moves held back: the redraw fetches what it shows.
-        changed |= self.picture_settle.due(now).is_some();
+        if self.picture_settle.due(now).is_some() {
+            if let Some((tab, last)) = self.list_prefetch {
+                if self.active_tab().id == tab && !self.popup_open() {
+                    self.prefetch_list(last);
+                } else {
+                    self.list_prefetch = None;
+                }
+            }
+            self.prefetch_short_home();
+            changed = true;
+        }
         changed |= self.sync_video(now);
+        changed |= self.search_tick(now);
         if self
             .status
             .as_ref()
@@ -1943,9 +2232,7 @@ impl App {
             || (self.sidebar_width() > 0 && self.all_subs.loading)
             || self.membership.is_some()
             || self.images_loading()
-            || self.selected_video().is_some_and(|p| {
-                (p.frame().is_none() || p.waiting_for_audio()) && p.error().is_none()
-            })
+            || self.video_loading().is_some()
         {
             return true;
         }
@@ -1960,7 +2247,10 @@ impl App {
             return false;
         }
         match self.active_tab().kind {
-            TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. } => {
+            TabKind::Search if self.search.shows_rows() => {
+                self.search.rows_loading() || self.search.preview.loading
+            }
+            TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. } | TabKind::Search => {
                 let feed = &self.active_tab().feed;
                 feed.loading()
                     || feed.refreshing()
@@ -1983,6 +2273,31 @@ impl App {
 
     /// Start the load a quick run of moves held back, once the moves paused and only if
     /// its post or tab is still the one shown.
+    /// Refetches the shown feed or islands once stale, so new posts reach the notice
+    /// without `r`.
+    fn poll_shown_feed(&mut self, now: Instant) -> bool {
+        if now.saturating_duration_since(self.feed_poll) < FEED_POLL
+            || self.feed_settle.holding(now)
+        {
+            return false;
+        }
+        self.feed_poll = now;
+        if matches!(self.active_tab().kind, TabKind::AllSubs) {
+            let loading = self.all_subs.groups.iter().filter(|g| g.loading).count();
+            for index in self.all_subs.shown.clone() {
+                self.ensure_group_content(index, false);
+            }
+            self.all_subs.groups.iter().filter(|g| g.loading).count() != loading
+        } else if self.active_tab().feed.failures.contains_key(&None) {
+            // A failed first page waits for `r`, as a failed island does.
+            false
+        } else {
+            let generation = self.active_tab().feed.generation;
+            self.ensure_feed_loaded(self.active);
+            self.active_tab().feed.generation != generation
+        }
+    }
+
     fn load_settled(&mut self, now: Instant) -> bool {
         let mut changed = false;
         if let Some(generation) = self.post_settle.due(now)
@@ -1999,6 +2314,7 @@ impl App {
             self.ensure_feed_loaded(self.active);
             changed = true;
         }
+        changed |= self.load_settled_collection(now);
         changed
     }
 
@@ -2025,11 +2341,19 @@ impl App {
             })
             .into_iter()
             .chain(settle)
+            .chain(self.card_renderer.video_wake_in(now))
             .chain(self.read_redraw.then_some(Duration::ZERO))
             .chain(media)
             .chain(self.post_settle.wake_in(now))
             .chain(self.feed_settle.wake_in(now))
             .chain(self.picture_settle.wake_in(now))
+            .chain(self.search_wake_in(now))
+            .chain(
+                self.experience
+                    .prefetch
+                    .as_ref()
+                    .map(|(_, at)| at.saturating_duration_since(now)),
+            )
             .chain(self.keymap.wake_in(now))
             .chain(self.card_video.as_ref().and_then(|card| {
                 let left = NAV_SETTLE.saturating_sub(now.saturating_duration_since(card.since));
@@ -2106,9 +2430,46 @@ impl App {
     }
 
     pub fn selected_video(&self) -> Option<&Player> {
-        self.video_matches_selection()
-            .then_some(self.video.as_ref())
-            .flatten()
+        if self.video_matches_selection() && self.video.is_some() {
+            return self.video.as_ref();
+        }
+        let post = self.video_control_post()?;
+        let url = self.playback_url(post.media.video_url()?)?;
+        self.video_previews
+            .iter()
+            .rev()
+            .find(|preview| {
+                preview.post == post.id
+                    && preview.url == url
+                    && preview.card == self.post_view.is_none()
+            })
+            .and_then(|preview| preview.player.as_ref())
+    }
+
+    pub fn video_loading(&self) -> Option<&'static str> {
+        let post = self.video_control_post()?;
+        post.media.video_url()?;
+        if self
+            .post_view
+            .as_ref()
+            .is_some_and(|view| view.page.is_none() && view.error.is_some())
+        {
+            return None;
+        }
+        if self.post_view.is_none() && !self.card_video.as_ref().is_some_and(|card| card.shown) {
+            return None;
+        }
+        match self.selected_video() {
+            Some(player) if player.loading() => Some(if player.waiting_for_audio() {
+                "starting audio…"
+            } else {
+                "loading video…"
+            }),
+            Some(_) => None,
+            None => (self.config.media.video_autoplay
+                || self.video_requested.as_deref() == Some(&post.id))
+            .then_some("loading video…"),
+        }
     }
 
     #[cfg(test)]
@@ -2143,6 +2504,54 @@ impl App {
         preview.frame.as_ref().map(|frame| (frame, playing))
     }
 
+    pub fn inactive_card_frame(&self, post: &str, source: &str) -> Option<&video::Frame> {
+        if !self.inline_images_on() {
+            return None;
+        }
+        let url = self.playback_url(source)?;
+        self.video
+            .as_ref()
+            .filter(|player| {
+                self.video_is_card
+                    && self.video_post_id.as_deref() == Some(post)
+                    && player.url == url
+            })
+            .and_then(Player::frame)
+            .or_else(|| {
+                self.video_previews
+                    .iter()
+                    .rev()
+                    .find(|preview| preview.card && preview.post == post && preview.url == url)
+                    .and_then(|preview| preview.frame.as_ref())
+            })
+    }
+
+    pub fn video_failed_without_frame(&self, post: &Post) -> bool {
+        let Some(url) = post
+            .media
+            .video_url()
+            .and_then(|url| self.playback_url(url))
+        else {
+            return false;
+        };
+        if let Some(player) = self.video.as_ref().filter(|player| {
+            player.url == url && self.video_post_id.as_ref().is_none_or(|id| *id == post.id)
+        }) {
+            return player.error().is_some() && player.frame().is_none();
+        }
+        self.video_previews
+            .iter()
+            .rev()
+            .find(|preview| preview.post == post.id && preview.url == url)
+            .is_some_and(|preview| {
+                preview.frame.is_none()
+                    && preview
+                        .player
+                        .as_ref()
+                        .is_some_and(|player| player.error().is_some())
+            })
+    }
+
     pub fn playback_url(&self, url: &str) -> Option<String> {
         if let Some(id) = crate::model::youtube_id(url) {
             Some(format!("https://www.youtube.com/watch?v={id}"))
@@ -2153,7 +2562,7 @@ impl App {
 
     fn retire_video(&mut self, now: Instant) -> bool {
         let post = self.video_post_id.take();
-        let Some(player) = self.video.take() else {
+        let Some(mut player) = self.video.take() else {
             return false;
         };
         if let Some(post) = post
@@ -2170,14 +2579,36 @@ impl App {
                 .filter(|preview| preview.post != post || preview.url != player.url);
             self.video_previews
                 .retain(|preview| preview.post != post || preview.url != player.url);
-            self.video_previews.push_back(VideoPreview {
+            player.set_hidden(true, now);
+            let mut preview = VideoPreview {
                 post,
                 url: player.url.clone(),
                 resume: player.resume(now),
                 frame: player.frame().cloned(),
-            });
+                player: None,
+                card: self.video_is_card,
+            };
+            if !player.resolving() && (player.frame().is_some() || player.error().is_some()) {
+                preview.player = Some(player);
+            }
+            self.video_previews.push_back(preview);
             if let Some(protected) = protected {
                 self.video_previews.push_back(protected);
+            }
+            while self
+                .video_previews
+                .iter()
+                .filter(|preview| preview.player.is_some())
+                .count()
+                > VIDEO_PLAYER_MAX
+            {
+                if let Some(oldest) = self
+                    .video_previews
+                    .iter_mut()
+                    .find(|preview| preview.player.is_some())
+                {
+                    oldest.player = None;
+                }
             }
             while self.video_previews.len() > VIDEO_PREVIEW_MAX
                 || self
@@ -2211,9 +2642,16 @@ impl App {
             self.playback_url(view.page.as_ref()?.post.media.video_url()?)
         } else {
             let card = self.card_video.as_ref()?;
+            let playing = self.video_post_id.as_deref() == Some(card.id.as_str())
+                && self
+                    .video
+                    .as_ref()
+                    .is_some_and(|player| player.url == card.url);
             if card.id != post.id
                 || (!card.shown && self.video.is_none())
-                || (!requested && now.saturating_duration_since(card.since) < NAV_SETTLE)
+                || (!requested
+                    && (now.saturating_duration_since(card.since) < NAV_SETTLE
+                        || (!playing && self.picture_settle.holding(now))))
             {
                 return None;
             }
@@ -2226,8 +2664,18 @@ impl App {
     /// pauses while off screen or under an overlay. True when something visible changed.
     fn sync_video(&mut self, now: Instant) -> bool {
         let font = self.image_picker.font_size();
-        self.sync_video_with(now, |url, area, resume| {
-            Player::start(url, area, font, resume, now)
+        let reddit = self.reddit.clone();
+        let upstream = self
+            .video_control_post()
+            .and_then(|post| post.media.video_url().map(str::to_owned));
+        self.sync_video_with(now, move |url, area, resume| {
+            Player::start(url, area, font, resume, now, move |cancelled| {
+                reddit
+                    .video_fallback(upstream.as_deref().ok_or("No video source")?, move || {
+                        cancelled()
+                    })
+                    .map_err(|_| "Video alternative unavailable".into())
+            })
         })
     }
 
@@ -2299,7 +2747,12 @@ impl App {
                 // Protect the destination before retirement can evict an old entry.
                 let previous = self.take_video_preview(&id, &url);
                 self.retire_video(now);
-                let previous = self.take_video_preview(&id, &url).or(previous);
+                let mut previous = self.take_video_preview(&id, &url).or(previous);
+                let parked = previous
+                    .as_mut()
+                    .filter(|preview| preview.card == card)
+                    .and_then(|preview| preview.player.take())
+                    .filter(|player| player.area == area);
                 let mut resume =
                     previous
                         .as_ref()
@@ -2311,7 +2764,10 @@ impl App {
                 if !card && !continuing {
                     resume.sound = self.video_sound_on;
                 }
-                let mut player = start_player(url, area, resume);
+                let mut player = parked.unwrap_or_else(|| start_player(url, area, resume));
+                if !card && !continuing && player.sound() != self.video_sound_on {
+                    player.toggle_sound(now);
+                }
                 player.retain_frame(previous.and_then(|preview| preview.frame));
                 self.video = Some(player);
                 self.video_post_id = Some(id);
@@ -2336,6 +2792,7 @@ impl App {
             player.set_hidden(!shown, now);
             // Keep audio-clock catch-up independent of tile preparation.
             changed |= player.tick(now) && !rendering;
+            self.card_renderer.set_video_rate(player.rate());
             if let Some((text, error)) = player.take_notice() {
                 if error {
                     // No ffplay: no later video can play sound either.
@@ -2350,10 +2807,55 @@ impl App {
         changed
     }
 
+    fn restore_selected_video(&mut self, now: Instant) {
+        let Some(post) = self.video_control_post() else {
+            return;
+        };
+        let Some(url) = post
+            .media
+            .video_url()
+            .and_then(|url| self.playback_url(url))
+        else {
+            return;
+        };
+        let card = self.post_view.is_none();
+        if self.video_post_id.as_deref() == Some(&post.id)
+            && self.video_is_card == card
+            && self.video.as_ref().is_some_and(|player| player.url == url)
+        {
+            return;
+        }
+        let Some(index) = self.video_previews.iter().position(|preview| {
+            preview.post == post.id
+                && preview.url == url
+                && preview.card == card
+                && preview.player.is_some()
+        }) else {
+            return;
+        };
+        let mut previous = self.video_previews.remove(index).unwrap();
+        self.retire_video(now);
+        let mut player = previous.player.take().unwrap();
+        player.set_hidden(true, now);
+        if card {
+            self.video_sound_on = player.sound();
+        } else if player.sound() != self.video_sound_on {
+            player.toggle_sound(now);
+        }
+        self.video = Some(player);
+        self.video_post_id = Some(post.id);
+        self.video_is_card = card;
+        self.video_resize = None;
+    }
+
     pub fn toggle_video_pause(&mut self) {
+        self.restore_selected_video(Instant::now());
         let post = self
             .video_control_post()
             .filter(|p| p.media.video_url().is_some());
+        if let Some(post) = &post {
+            self.video_requested = Some(post.id.clone());
+        }
         if self
             .video_post_id
             .as_ref()
@@ -2385,6 +2887,13 @@ impl App {
                     for preview in &mut self.video_previews {
                         if preview.post == post.id && Some(&preview.url) == url.as_ref() {
                             preview.resume.paused = false;
+                            if let Some(player) = &mut preview.player {
+                                if player.error().is_some() {
+                                    preview.player = None;
+                                } else if player.paused() {
+                                    player.toggle_pause(Instant::now());
+                                }
+                            }
                         }
                     }
                     self.video_requested = Some(post.id);
@@ -2397,6 +2906,7 @@ impl App {
 
     /// The mute action toggles this video's sound; fresh cards start muted.
     pub fn toggle_video_sound(&mut self) {
+        self.restore_selected_video(Instant::now());
         if !self.video_matches_selection() {
             self.info("No video plays here");
             return;
@@ -2426,6 +2936,7 @@ impl App {
     }
 
     pub fn seek_video(&mut self, forward: bool) {
+        self.restore_selected_video(Instant::now());
         if !self.video_matches_selection() {
             self.info("No video plays here");
             return;
@@ -2504,16 +3015,32 @@ impl App {
     /// Keep the Bookmarks selection on its post after the list changed, else clamp it.
     fn reselect_bookmark(&mut self, id: Option<String>) {
         let bookmarks = self.bookmark_ids();
+        let cards = self.state.list_view() == ListView::Card;
+        let open_here = self.active == BOOKMARKS_TAB
+            && id.is_some()
+            && self.post_view.as_ref().map(|view| &view.shown_post().id) == id.as_ref();
         let feed = &mut self.tabs[BOOKMARKS_TAB].feed;
+        if feed.untouched_top(cards, open_here) {
+            feed.show_top(bookmarks.first().cloned());
+            self.preview_selection();
+            return;
+        }
+        let screen_row = feed.selected.saturating_sub(feed.offset);
         feed.selected = id
             .and_then(|id| bookmarks.iter().position(|b| *b == id))
             .unwrap_or(feed.selected)
             .min(bookmarks.len().saturating_sub(1));
+        feed.offset = feed.selected.saturating_sub(screen_row);
         self.preview_selection();
     }
 
     pub fn save_state(&mut self) {
         self.persist();
+    }
+
+    #[cfg(test)]
+    pub fn state_path(&self) -> &std::path::Path {
+        &self.state_path
     }
 
     // ----- tabs -------------------------------------------------------------
@@ -2530,19 +3057,49 @@ impl App {
     }
 
     fn enter_tab(&mut self, index: usize, keep_post: bool) {
+        if self.active == SEARCH_TAB && index != SEARCH_TAB {
+            self.search_departed();
+        }
+        self.search.opened_feed = None;
+        self.cancel_reveal();
+        self.list_prefetch = None;
+        let open = self
+            .post_view
+            .as_ref()
+            .filter(|_| keep_post)
+            .map(|view| view.shown_post().id.clone());
+        let open_here = open.is_some() && open == self.list_post(index).map(|post| post.id);
+        let arriving = !open_here && !matches!(self.tabs[index].kind, TabKind::Bookmarks);
         self.active = index;
         self.sync_feed_demand();
         if !keep_post {
             self.close_post();
         }
+        if arriving && let Some(update) = self.tabs[index].feed.update.take() {
+            self.apply_update(index, update, true);
+        }
         let now = Instant::now();
         if self.focus == Focus::Sidebar {
+            self.arrive(index, arriving);
             self.feed_settle.defer(self.tabs[index].id, now);
             self.picture_settle.defer((), now);
         } else {
-            self.moving();
+            self.picture_settle.arrive((), now);
+            self.arrive(index, arriving);
             if self.feed_settle.arrive(self.tabs[index].id, now) {
                 self.ensure_feed_loaded(index);
+            }
+        }
+    }
+
+    fn arrive(&mut self, index: usize, arriving: bool) {
+        if arriving && matches!(self.tabs[index].kind, TabKind::AllSubs) {
+            let mut applied = false;
+            for group in &mut self.all_subs.groups {
+                applied |= group.apply_arrivals();
+            }
+            if applied {
+                self.all_subs.show_top();
             }
         }
     }
@@ -2570,9 +3127,17 @@ impl App {
             self.error("Invalid Reddit username");
             return;
         }
+        let from_search = matches!(self.search_row_target(), Some(FeedTarget::User(row)) if row.eq_ignore_ascii_case(name));
         let index = self.tabs.iter().position(|tab| matches!(&tab.kind, TabKind::User { name: existing, .. } if existing.eq_ignore_ascii_case(name)))
             .unwrap_or_else(|| self.push_tab(TabKind::User { name: name.to_string(), followed: false, icon: None }));
+        if from_search {
+            self.apply_search_preview(index);
+        }
         self.switch_tab(index);
+        if from_search {
+            self.search.editing = false;
+            self.search.opened_feed = Some(self.active_tab().id);
+        }
         self.ensure_feed_loaded(index);
     }
 
@@ -2583,6 +3148,12 @@ impl App {
             }
             if self.focus == Focus::Sidebar {
                 return None;
+            }
+            if let Some(target) = self.search_row_target() {
+                return match target {
+                    FeedTarget::User(name) => Some(name),
+                    _ => None,
+                };
             }
         }
         self.current_post()
@@ -2596,6 +3167,7 @@ impl App {
             self.error(format!("{name:?} is not a subreddit name"));
             return;
         }
+        let from_search = matches!(self.search_row_target(), Some(FeedTarget::Subreddit(row)) if normalize_subreddit(&row).eq_ignore_ascii_case(name));
         let existing = self
             .tabs
             .iter()
@@ -2606,7 +3178,14 @@ impl App {
                 pinned: false,
             })
         });
+        if from_search {
+            self.apply_search_preview(index);
+        }
         self.switch_tab(index);
+        if from_search {
+            self.search.editing = false;
+            self.search.opened_feed = Some(self.active_tab().id);
+        }
         self.ensure_feed_loaded(index);
     }
 
@@ -2620,12 +3199,12 @@ impl App {
                 self.enter_tab(self.active.min(self.tabs.len() - 1), false);
             }
             TabKind::User { followed: true, .. } => {
-                self.info("Following this user — press SPC a m to unfollow")
+                self.info("Following this user — press SPC m to unfollow")
             }
             TabKind::Subreddit { pinned: true, .. } => {
-                self.info("Joined this community — press SPC a m to leave")
+                self.info("Joined this community — press SPC m to leave")
             }
-            _ => self.info("Home, Bookmarks and All subs stay open"),
+            _ => self.info("Home, Bookmarks, All subs and Search stay open"),
         }
     }
 
@@ -2657,7 +3236,7 @@ impl App {
         let Some(view) = &self.post_view else {
             return;
         };
-        let Some(page) = &view.page else {
+        let Some(page) = view.page.as_ref() else {
             return;
         };
         if view.spoiler_hidden() {
@@ -2672,6 +3251,9 @@ impl App {
 
     fn ensure_feed_loaded(&mut self, index: usize) {
         if index == self.active && !self.feed_settle.holding(Instant::now()) {
+            if index == SEARCH_TAB {
+                self.search_arrived();
+            }
             let deferred = std::mem::take(&mut self.tabs[index].feed.deferred);
             for (cursor, force) in deferred {
                 let feed = &self.tabs[index].feed;
@@ -2688,6 +3270,12 @@ impl App {
         {
             self.demand_icon(&name);
         }
+        if index == self.active
+            && let TabKind::User { name, .. } = &self.tabs[index].kind
+        {
+            let name = name.clone();
+            self.request_profile(&name, false);
+        }
         let tab = &self.tabs[index];
         if tab.feed_target().is_some()
             && !tab.feed.loading()
@@ -2700,9 +3288,8 @@ impl App {
             && (!tab.feed.loaded
                 || tab
                     .feed
-                    .updates
-                    .iter()
-                    .find(|update| update.cursor.is_none())
+                    .update
+                    .as_ref()
                     .map(|update| update.freshness)
                     .or(tab.feed.freshness)
                     .is_some_and(|f| {
@@ -2721,6 +3308,7 @@ impl App {
         let feed = &tab.feed;
         if !matches!(tab.kind, TabKind::Home)
             || self.feed_settle.holding(Instant::now())
+            || self.picture_settle.holding(Instant::now())
             || !feed.loaded
             || !feed.shows_current_query()
             || feed.loading()
@@ -2744,6 +3332,15 @@ impl App {
         self.fetch_feed(index, after, false);
     }
 
+    fn fetch_manual(&mut self, after: Option<String>) {
+        let before = self.tabs[self.active].feed.generation;
+        self.fetch_feed(self.active, after, true);
+        let feed = &mut self.tabs[self.active].feed;
+        if feed.generation != before {
+            feed.manual.insert(feed.generation);
+        }
+    }
+
     fn fetch_feed(&mut self, index: usize, after: Option<String>, force: bool) {
         if self.reddit.needs_sign_in() {
             return;
@@ -2752,6 +3349,9 @@ impl App {
         // A first-page load ends the wait of a tab switch to this tab: once it fails, that
         // wait would ask again.
         if after.is_none() {
+            if index == self.active {
+                self.list_prefetch = None;
+            }
             self.feed_settle.forget(self.tabs[index].id);
         }
         let tab = &mut self.tabs[index];
@@ -2766,8 +3366,9 @@ impl App {
             feed.pending.clear();
             feed.refreshing.clear();
             feed.forced.clear();
+            feed.manual.clear();
             feed.deferred.clear();
-            feed.updates.clear();
+            feed.update = None;
             feed.failures
                 .retain(|_, failure| community && failure.error.access().is_some());
             feed.request_query = Some(query.clone());
@@ -2784,6 +3385,7 @@ impl App {
         feed.pending.retain(|id| feed.requests.contains_key(id));
         feed.refreshing.retain(|id| feed.requests.contains_key(id));
         feed.forced.retain(|id| feed.requests.contains_key(id));
+        feed.manual.retain(|id| feed.requests.contains_key(id));
         feed.requests.insert(generation, after.clone());
         feed.pending.insert(generation);
         feed.deferred.remove(&after);
@@ -2810,11 +3412,17 @@ impl App {
             .active_tab()
             .feed_target()
             .map(|_| self.active_tab().id);
-        let requests = self
+        let mut requests: HashMap<u64, HashSet<u64>> = self
             .tabs
             .iter()
             .map(|tab| (tab.id, tab.feed.requests.keys().copied().collect()))
             .collect();
+        if self.search.preview.loading {
+            requests.insert(
+                crate::worker::PREVIEW_FEED,
+                HashSet::from([self.search.preview.generation]),
+            );
+        }
         self.pool.want_feeds(active, requests);
     }
 
@@ -2834,12 +3442,41 @@ impl App {
             self.show_auth();
             return;
         }
+        self.picture_settle.take();
+        self.list_prefetch = None;
+        if !self.post_focused()
+            && matches!(self.active_tab().kind, TabKind::AllSubs)
+            && self
+                .all_subs
+                .groups
+                .iter()
+                .any(|group| group.arrivals.is_some())
+        {
+            let new_posts = self.all_subs.has_new_posts(&self.config);
+            for group in &mut self.all_subs.groups {
+                group.apply_arrivals();
+            }
+            if new_posts {
+                self.all_subs.show_top();
+            }
+            self.preview_selection();
+            return;
+        }
         self.icon_demands.clear();
+        if let TabKind::User { name, .. } = &self.active_tab().kind
+            && !self.post_focused()
+        {
+            let name = name.clone();
+            self.request_profile(&name, true);
+        }
         self.retry_failed_thumbs();
         // Only the open post's pictures are kept: its failed ones load anew.
         self.retry_failed_pictures();
         if self.post_focused() && self.post_view.is_some() {
             self.refresh_post();
+            if let Some(view) = &mut self.post_view {
+                view.reveal = true;
+            }
             return;
         }
         match self.active_tab().kind {
@@ -2850,33 +3487,15 @@ impl App {
                 for g in &mut self.all_subs.groups {
                     g.loading = false;
                     g.needs_refresh = true;
+                    g.manual = true;
                     g.generation = generation;
                 }
             }
             TabKind::Bookmarks => {}
-            TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. } => {
-                let updates = std::mem::take(&mut self.tabs[self.active].feed.updates);
-                if !updates.is_empty() {
-                    let tab_id = self.tabs[self.active].id;
-                    for update in updates {
-                        let generation = self.generation();
-                        let feed = &mut self.tabs[self.active].feed;
-                        feed.requests.insert(generation, update.cursor.clone());
-                        feed.forced.insert(generation);
-                        self.on_feed(
-                            tab_id,
-                            generation,
-                            update.cursor.is_some(),
-                            Ok(update.listing),
-                            update.freshness,
-                            false,
-                        );
-                        self.tabs[self.active].feed.requests.remove(&generation);
-                    }
-                    let feed = &mut self.tabs[self.active].feed;
-                    feed.selected = 0;
-                    feed.offset = 0;
-                    feed.cards = CardScroll::default();
+            TabKind::Search if self.search.shows_rows() => self.reload_search(),
+            TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. } | TabKind::Search => {
+                if let Some(update) = self.tabs[self.active].feed.update.take() {
+                    self.apply_update(self.active, update, true);
                     self.prefetch_short_home();
                     self.preview_selection();
                     self.sync_feed_demand();
@@ -2891,7 +3510,7 @@ impl App {
                 }
                 if feed.page_failed() {
                     let after = feed.after.clone();
-                    self.fetch_feed(self.active, after, true);
+                    self.fetch_manual(after);
                     return;
                 }
                 let failed_pages: Vec<_> = feed
@@ -2902,9 +3521,9 @@ impl App {
                     })
                     .map(|page| page.cursor.clone())
                     .collect();
-                self.fetch_feed(self.active, None, true);
+                self.fetch_manual(None);
                 for cursor in failed_pages {
-                    self.fetch_feed(self.active, cursor, true);
+                    self.fetch_manual(cursor);
                 }
             }
         }
@@ -2922,18 +3541,47 @@ impl App {
         });
     }
 
-    pub fn groups_drawn(&mut self, indices: &[usize], sidebar_icons: &[String]) {
+    pub fn groups_drawn(
+        &mut self,
+        indices: &[usize],
+        sidebar_icons: &[String],
+        lookahead: &[usize],
+    ) {
+        self.all_subs.waiting_for_rows = !indices.is_empty();
+        self.all_subs.shown = indices.to_vec();
+        let lookahead: Vec<_> = lookahead
+            .iter()
+            .copied()
+            .filter(|&index| {
+                !indices.is_empty()
+                    && self.all_subs.groups.get(index).is_some_and(|group| {
+                        group.freshness.is_none()
+                            && group.error.is_none()
+                            && !group.needs_refresh
+                            && (group.posts.is_empty() || group.stream.is_some())
+                    })
+            })
+            .collect();
         let names: Vec<_> = indices
             .iter()
+            .chain(&lookahead)
             .filter_map(|&i| self.all_subs.groups.get(i).map(|g| g.subreddit.as_str()))
             .collect();
-        self.pool.set_visible_groups(&names);
-        for &index in indices {
+        self.pool.set_group_demand(&names);
+        for &index in indices.iter().chain(&lookahead) {
             if let Some(group) = self.all_subs.groups.get(index) {
                 self.pool.want_group(&group.subreddit, group.generation);
             }
         }
-        let mut icons = names;
+        let mut icons: Vec<_> = indices
+            .iter()
+            .filter_map(|&index| {
+                self.all_subs
+                    .groups
+                    .get(index)
+                    .map(|group| group.subreddit.as_str())
+            })
+            .collect();
         icons.extend(sidebar_icons.iter().map(String::as_str));
         if let Some(name) = self.active_tab().subreddit() {
             icons.push(name);
@@ -2941,18 +3589,35 @@ impl App {
         self.pool.set_visible_icons(&icons);
         let visible: HashSet<_> = icons.iter().map(|name| name.to_ascii_lowercase()).collect();
         self.icon_demands.retain(|name| visible.contains(name));
-        for name in sidebar_icons {
-            self.demand_icon(name);
-        }
         for &index in indices {
             self.ensure_group_loaded(index);
+        }
+        let visible_ready = indices.iter().all(|&index| {
+            self.all_subs.groups.get(index).is_some_and(|group| {
+                self.group_posts(group).next().is_some()
+                    || (!group.loading && (group.freshness.is_some() || group.error.is_some()))
+            })
+        });
+        self.all_subs.waiting_for_rows = !indices.is_empty() && !visible_ready;
+        if visible_ready {
+            for name in sidebar_icons {
+                self.demand_icon(name);
+            }
+            for &index in indices {
+                self.demand_group_icon(index);
+            }
+            for index in lookahead {
+                self.ensure_group_content(index, true);
+            }
         }
     }
 
     pub fn ensure_group_loaded(&mut self, index: usize) {
-        if self.popup_open() || self.picture_settle.holding(Instant::now()) {
-            return;
-        }
+        self.ensure_group_content(index, false);
+        self.demand_group_icon(index);
+    }
+
+    fn demand_group_icon(&mut self, index: usize) {
         if let Some(name) = self
             .all_subs
             .groups
@@ -2961,6 +3626,12 @@ impl App {
             .map(|g| g.subreddit.clone())
         {
             self.demand_icon(&name);
+        }
+    }
+
+    fn ensure_group_content(&mut self, index: usize, prefetch: bool) {
+        if self.popup_open() || self.picture_settle.holding(Instant::now()) {
+            return;
         }
         let Some(group) = self.all_subs.groups.get_mut(index) else {
             return;
@@ -2977,15 +3648,23 @@ impl App {
         }
         let generation = self.all_subs.next_group_generation;
         self.all_subs.next_group_generation += 1;
+        if group.stream.take().is_some() {
+            group.posts.clear();
+        }
         if group.needs_refresh {
             Self::refresh_group(&self.pool, group, generation);
         } else {
             group.loading = true;
             group.generation = generation;
-            self.pool.submit(Job::Group {
-                subreddit: group.subreddit.clone(),
-                generation,
-            });
+            if prefetch {
+                self.pool
+                    .prefetch_group(group.subreddit.clone(), generation);
+            } else {
+                self.pool.submit(Job::Group {
+                    subreddit: group.subreddit.clone(),
+                    generation,
+                });
+            }
         }
     }
 
@@ -3064,7 +3743,14 @@ impl App {
 
     pub fn cycle_time(&mut self) {
         let feed = &mut self.tabs[self.active].feed;
-        if !feed.sort.takes_time() || feed.search.is_some() {
+        if feed.search.is_some() {
+            feed.search_time = feed.search_time.next();
+            feed.selected = 0;
+            feed.cards = CardScroll::default();
+            self.load_feed(self.active, false);
+            return;
+        }
+        if !feed.sort.takes_time() {
             self.info("Time range applies to Top and Controversial (press SPC f s)");
             return;
         }
@@ -3083,8 +3769,14 @@ impl App {
             self.info("Search runs inside a subreddit tab");
             return;
         }
+        self.tabs[self.active].feed.set_search(query);
+        self.load_feed(self.active, false);
+    }
+
+    /// Only for a search feed; the `SPC f s` binding checks that.
+    pub fn cycle_search_sort(&mut self) {
         let feed = &mut self.tabs[self.active].feed;
-        feed.search = Some(query);
+        feed.search_sort = feed.search_sort.next();
         feed.selected = 0;
         feed.cards = CardScroll::default();
         self.load_feed(self.active, false);
@@ -3109,12 +3801,13 @@ impl App {
         let before = self.active_tab().feed.selected;
         match self.active_tab().kind {
             TabKind::AllSubs => self.move_all_subs(delta),
+            TabKind::Search if self.search.shows_rows() => self.move_search(delta),
             TabKind::Bookmarks => {
                 let len = self.visible_bookmarks().count();
                 let feed = &mut self.tabs[self.active].feed;
                 feed.selected = step(feed.selected, delta, len);
             }
-            TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. } => {
+            TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. } | TabKind::Search => {
                 let len = self
                     .config
                     .visible(&self.tabs[self.active].feed.posts)
@@ -3123,20 +3816,23 @@ impl App {
                 feed.selected = step(feed.selected, delta, len);
             }
         }
+        self.moving();
         self.prefetch_list(self.active_tab().feed.selected);
         if self.active_tab().feed.selected != before {
             self.tabs[self.active].feed.cards = CardScroll::default();
         }
-        self.moving();
         self.preview_selection();
     }
 
-    pub fn page_list(&mut self, direction: isize, divisor: usize) {
-        if self.state.list_view() != ListView::Card
+    pub(crate) fn list_uses_rows(&self) -> bool {
+        self.search_shows_rows()
+            || self.state.list_view() != ListView::Card
             || matches!(self.active_tab().kind, TabKind::AllSubs)
-            || self.active_tab().feed.cards.viewport < 3
-        {
-            self.move_selection(direction * 10);
+    }
+
+    pub fn page_list(&mut self, direction: isize, divisor: usize) {
+        if self.list_uses_rows() || self.active_tab().feed.cards.viewport < 3 {
+            self.move_selection(direction * (10 / divisor.max(1)).max(1) as isize);
             return;
         }
         let rows = (self.active_tab().feed.cards.viewport / divisor).max(1);
@@ -3144,14 +3840,15 @@ impl App {
     }
 
     pub fn scroll_card(&mut self, delta: isize) {
+        if self.list_uses_rows() {
+            self.move_selection(delta);
+            return;
+        }
+        self.moving();
         if delta > 0 && self.current_post().is_none() {
             self.prefetch_list(self.active_tab().feed.selected);
         }
-        if self.state.list_view() != ListView::Card
-            || matches!(self.active_tab().kind, TabKind::AllSubs)
-            || self.current_post().is_none()
-            || self.active_tab().feed.cards.post.is_none()
-        {
+        if self.current_post().is_none() || self.active_tab().feed.cards.post.is_none() {
             return;
         }
         let cards = &mut self.tabs[self.active].feed.cards;
@@ -3160,24 +3857,36 @@ impl App {
 
     fn prefetch_list(&mut self, last_visible: usize) {
         let tab = self.active_tab();
-        if !matches!(
-            tab.kind,
-            TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. }
-        ) || (tab.subreddit().is_some() && tab.feed.access_denied().is_some())
+        let search_feed = matches!(tab.kind, TabKind::Search) && !self.search.shows_rows();
+        if !(search_feed
+            || matches!(
+                tab.kind,
+                TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. }
+            ))
+            || (tab.subreddit().is_some() && tab.feed.access_denied().is_some())
         {
+            self.list_prefetch = None;
+            return;
+        }
+        if self.picture_settle.holding(Instant::now()) {
+            self.list_prefetch = Some((tab.id, last_visible));
             return;
         }
         let feed = &tab.feed;
         let len = self.config.visible(&feed.posts).count();
-        if last_visible.saturating_add(PREFETCH_MARGIN) >= len
-            && feed.after.is_some()
-            && !feed.loading()
-            && !feed.loading_more()
-            && !feed.receiving()
-            && feed.shows_current_query()
-            && !feed.pages.iter().any(|page| page.cursor == feed.after)
-            && !feed.page_failed()
+        if feed.after.is_none()
+            || feed.loading()
+            || feed.loading_more()
+            || feed.receiving()
+            || !feed.shows_current_query()
+            || feed.pages.iter().any(|page| page.cursor == feed.after)
+            || feed.page_failed()
         {
+            self.list_prefetch = None;
+            return;
+        }
+        if last_visible.saturating_add(PREFETCH_MARGIN) >= len {
+            self.list_prefetch = None;
             self.load_feed(self.active, true);
         }
     }
@@ -3187,8 +3896,9 @@ impl App {
         selected: usize,
         offset: usize,
         scroll: CardScroll,
-        scrolled_end: Option<usize>,
+        last_visible: Option<usize>,
     ) {
+        let scrolling = self.active_tab().feed.cards.pending != 0;
         let before = self.active_tab().feed.selected;
         if selected != before {
             self.move_selection(selected as isize - before as isize);
@@ -3196,8 +3906,16 @@ impl App {
         let feed = &mut self.tabs[self.active].feed;
         feed.offset = offset;
         feed.cards = scroll;
-        if let Some(last) = scrolled_end {
-            self.prefetch_list(last);
+        if let Some(last) = last_visible
+            && (scrolling
+                || self
+                    .list_prefetch
+                    .is_some_and(|(tab, _)| tab == self.active_tab().id))
+        {
+            self.list_prefetch = None;
+            if !self.popup_open() {
+                self.prefetch_list(last);
+            }
         }
     }
 
@@ -3209,7 +3927,14 @@ impl App {
                 } else {
                     0
                 };
-                self.all_subs.post = 0;
+                self.all_subs.post = if end {
+                    self.all_subs
+                        .groups
+                        .get(self.all_subs.group)
+                        .map_or(0, |group| self.group_posts(group).count().saturating_sub(1))
+                } else {
+                    0
+                };
                 self.moving();
                 self.preview_selection();
             }
@@ -3278,6 +4003,14 @@ impl App {
     }
 
     pub fn move_community(&mut self, forward: bool) {
+        if self.search_source_context() {
+            self.return_to_search();
+            self.close_post();
+            self.focus_main();
+            self.search.editing = false;
+            self.move_search(if forward { 1 } else { -1 });
+            return;
+        }
         let follow = self.post_focused() || self.ancestor_follow.is_some();
         if matches!(self.active_tab().kind, TabKind::AllSubs) {
             if self.post_focused()
@@ -3410,9 +4143,7 @@ impl App {
             self.moving();
             if let Some(generation) = self.show_post(post, &permalink) {
                 self.focus = Focus::Post;
-                if self.post_settle.arrive(generation, Instant::now()) {
-                    self.load_post(permalink);
-                }
+                self.post_settle.defer(generation, Instant::now());
             }
             return true;
         }
@@ -3458,6 +4189,12 @@ impl App {
                 .as_ref()
                 .and_then(|view| view.shown_post().community().map(str::to_string));
         }
+        if let Some(target) = self.search_row_target() {
+            return match target {
+                FeedTarget::Subreddit(name) if is_community(&name) => Some(name),
+                _ => None,
+            };
+        }
         match &self.active_tab().kind {
             TabKind::AllSubs => self
                 .all_subs
@@ -3472,12 +4209,18 @@ impl App {
     }
 
     pub fn open_current_community(&mut self) {
+        let search_row = self.search_row_path().is_some();
         let target = self.membership_target();
         if matches!(self.overlay, Some(Overlay::Experience)) {
-            self.experience = experience::Experience::default();
+            self.clear_experience();
             self.overlay = None;
         }
+        self.close_post();
         self.focus_main();
+        if search_row {
+            self.open_search_row();
+            return;
+        }
         match target {
             Some(MembershipTarget::Community(name)) => self.open_subreddit(&name),
             Some(MembershipTarget::User(name)) => self.open_user(&name),
@@ -3495,12 +4238,28 @@ impl App {
         self.persist();
     }
 
-    pub fn open_source_in_browser(&mut self) {
+    pub(crate) fn source_browser_path(&self) -> Option<String> {
+        if let Some(path) = self.search_row_path() {
+            return Some(path);
+        }
         match self.membership_target() {
-            Some(MembershipTarget::User(name)) => self.open_reddit_link(&format!("/user/{name}/")),
-            Some(MembershipTarget::Community(name)) => {
-                self.open_reddit_link(&format!("/r/{name}/"))
-            }
+            Some(MembershipTarget::User(name)) => Some(format!("/user/{name}/")),
+            Some(MembershipTarget::Community(name)) => Some(format!("/r/{name}/")),
+            None if self.overlay.is_none() => match &self.active_tab().kind {
+                TabKind::Subreddit { name, .. }
+                    if name.eq_ignore_ascii_case("popular") || name.eq_ignore_ascii_case("all") =>
+                {
+                    Some(format!("/r/{name}/"))
+                }
+                _ => None,
+            },
+            None => None,
+        }
+    }
+
+    pub fn open_source_in_browser(&mut self) {
+        match self.source_browser_path() {
+            Some(path) => self.open_reddit_link(&path),
             None => self.info("No community or profile selected"),
         }
     }
@@ -3574,7 +4333,7 @@ impl App {
         }
         let Some(joined) = self.subscribed(&target) else {
             self.load_subscriptions(true);
-            self.info("Loading account subscriptions; press SPC a m again when ready");
+            self.info("Loading account subscriptions; press SPC m again when ready");
             return;
         };
         self.overlay = Some(Overlay::Membership {
@@ -3634,24 +4393,54 @@ impl App {
                 .visible_bookmarks()
                 .nth(tab.feed.selected)
                 .map(|b| b.post.clone()),
-            TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. } => self
-                .config
-                .visible(&tab.feed.posts)
-                .nth(tab.feed.selected)
-                .cloned(),
+            TabKind::Search if self.search.shows_rows() => None,
+            TabKind::Home | TabKind::Subreddit { .. } | TabKind::User { .. } | TabKind::Search => {
+                self.config
+                    .visible(&tab.feed.posts)
+                    .nth(tab.feed.selected)
+                    .cloned()
+            }
         }
     }
 
     // ----- post view --------------------------------------------------------
 
+    pub(crate) fn post_parent_position(&self) -> Option<(usize, usize)> {
+        let view = self.post_view.as_ref()?;
+        let tab = self.active_tab();
+        if tab.subreddit().is_some() && tab.feed.access_denied().is_some() {
+            return None;
+        }
+        match tab.kind {
+            TabKind::AllSubs => {
+                self.all_subs
+                    .groups
+                    .iter()
+                    .enumerate()
+                    .find_map(|(group, entry)| {
+                        self.group_posts(entry)
+                            .position(|post| post.id == view.post.id)
+                            .map(|index| (group, index))
+                    })
+            }
+            TabKind::Bookmarks => self
+                .visible_bookmarks()
+                .position(|bookmark| bookmark.post.id == view.post.id)
+                .map(|index| (0, index)),
+            TabKind::Search if self.search.shows_rows() => None,
+            _ => self
+                .config
+                .visible(&tab.feed.posts)
+                .position(|post| post.id == view.post.id)
+                .map(|index| (0, index)),
+        }
+    }
+
     pub fn move_post(&mut self, forward: bool) {
-        if self.focus != Focus::Post
-            || (self.active_tab().subreddit().is_some()
-                && self.active_tab().feed.access_denied().is_some())
-        {
+        if self.focus != Focus::Post {
             return;
         }
-        let Some(view) = &self.post_view else {
+        let Some(anchor) = self.post_parent_position() else {
             return;
         };
         let posts: Vec<_> = match self.active_tab().kind {
@@ -3678,12 +4467,13 @@ impl App {
                 .map(|(index, post)| ((0, index), post))
                 .collect(),
         };
-        let Some(at) = posts.iter().position(|(_, post)| post.id == view.post.id) else {
+        let Some(at) = posts.iter().position(|(position, _)| *position == anchor) else {
             return;
         };
         let next = step(at, if forward { 1 } else { -1 }, posts.len());
         let ((group, index), post) = posts[next];
         if next == at {
+            self.moving();
             self.prefetch_list(index);
             return;
         }
@@ -3696,18 +4486,18 @@ impl App {
             feed.selected = index;
             feed.cards = CardScroll::default();
         }
-        self.prefetch_list(index);
         self.moving();
+        self.prefetch_list(index);
         let permalink = post.permalink.clone();
         if let Some(generation) = self.show_post(post, &permalink) {
             self.focus = Focus::Post;
-            if self.post_settle.arrive(generation, Instant::now()) {
-                self.load_post(permalink);
-            }
+            self.post_settle.defer(generation, Instant::now());
         }
     }
 
     pub fn open_current_post(&mut self) {
+        // The list must not jump to `r`'s answer away from the post being opened.
+        self.cancel_reveal();
         if let Some(post) = self.current_post() {
             let permalink = post.permalink.clone();
             if let Some(generation) = self
@@ -3730,16 +4520,154 @@ impl App {
     }
 
     fn open_post_permalink(&mut self, post: Post, permalink: String) {
+        self.cancel_reveal();
         if self.show_post(post, &permalink).is_some() {
             self.focus = Focus::Post;
             self.load_post(permalink);
         }
     }
 
-    /// A move through a list, tab or post: pictures it brings on screen are not fetched
-    /// while moves keep coming quickly; the redraw once they stop fetches them.
     fn moving(&mut self) {
-        self.picture_settle.arrive((), Instant::now());
+        let now = Instant::now();
+        self.picture_settle.defer((), now);
+        self.list_prefetch = None;
+        if let Some((generation, _)) = self.post_settle.waiting {
+            self.post_settle.defer(generation, now);
+        }
+        self.cancel_reveal();
+    }
+
+    /// Applies a held first-page answer as a fresh one; a manual one shows the list top.
+    fn apply_update(&mut self, index: usize, update: FeedUpdate, manual: bool) {
+        let generation = self.generation();
+        let feed = &mut self.tabs[index].feed;
+        feed.requests.insert(generation, None);
+        if manual {
+            feed.manual.insert(generation);
+        }
+        let tab_id = self.tabs[index].id;
+        self.on_feed(
+            tab_id,
+            generation,
+            false,
+            Ok(update.listing),
+            update.freshness,
+            false,
+        );
+        self.tabs[index].feed.requests.remove(&generation);
+    }
+
+    /// Settles held answers; settling pins the island post at the selected index, so the
+    /// post being read is first found by id under the current filters.
+    fn settle_keeping_island_post(&mut self, id: Option<&str>) {
+        self.select_island_post(id);
+        let at_top = self.island_at_top(id);
+        self.settle_arrivals();
+        self.select_island_post(id.filter(|_| !at_top));
+    }
+
+    /// An untouched island top, not open while All subs is shown, stays the island's top
+    /// whatever an answer ranks.
+    fn island_at_top(&self, selected: Option<&str>) -> bool {
+        let open = self
+            .post_view
+            .as_ref()
+            .map(|view| view.shown_post().id.as_str());
+        self.all_subs.post == 0
+            && !(matches!(self.active_tab().kind, TabKind::AllSubs) && open == selected)
+    }
+
+    /// Held answers whose posts no longer lead the list apply as any other update; runs
+    /// after every change to what a list shows.
+    fn settle_arrivals(&mut self) {
+        for index in 0..self.tabs.len() {
+            let feed = &mut self.tabs[index].feed;
+            if feed.update.as_ref().is_some_and(|update| {
+                !feed.leads_with_new(&update.listing.posts, &self.config)
+                    && (!update.stable
+                        || !feed.first_page_changed(&update.listing.posts, &self.config))
+            }) && let Some(update) = feed.update.take()
+            {
+                self.apply_update(index, update, false);
+            }
+        }
+        for index in 0..self.all_subs.groups.len() {
+            // An island showing nothing has nothing to hold its posts behind.
+            let displayed = self
+                .group_posts(&self.all_subs.groups[index])
+                .next()
+                .is_some();
+            let read = (index == self.all_subs.group)
+                .then(|| {
+                    self.group_posts(&self.all_subs.groups[index])
+                        .nth(self.all_subs.post)
+                        .cloned()
+                })
+                .flatten();
+            let group = &mut self.all_subs.groups[index];
+            let settled = group.arrivals.as_ref().is_some_and(|arrivals| {
+                !displayed
+                    || (!island_has_new(&self.config, &group.posts, arrivals)
+                        && (!group.stable_arrivals
+                            || !island_changed(&self.config, &group.posts, arrivals)))
+            });
+            if settled {
+                group.posts = group.arrivals.take().unwrap_or_default();
+                self.keep_read_post_in_slot(index, read);
+            }
+        }
+    }
+
+    /// Selects the post with this id in the selected island, else keeps the index
+    /// within the island's shown posts.
+    fn select_island_post(&mut self, id: Option<&str>) {
+        let Some(group) = self.all_subs.groups.get(self.all_subs.group) else {
+            return;
+        };
+        let shown: Vec<_> = self.group_posts(group).collect();
+        self.all_subs.post = id
+            .and_then(|id| shown.iter().position(|post| post.id == id))
+            .unwrap_or(self.all_subs.post)
+            .min(shown.len().saturating_sub(1));
+    }
+
+    /// The post being read keeps its island slot until you move, as a list keeps the
+    /// selected row; the others update around it.
+    fn keep_read_post_in_slot(&mut self, index: usize, read: Option<Post>) {
+        let Some(read) = read.filter(|read| {
+            matches!(self.active_tab().kind, TabKind::AllSubs)
+                && !self.island_at_top(Some(&read.id))
+        }) else {
+            return;
+        };
+        let group = &mut self.all_subs.groups[index];
+        let read = group
+            .posts
+            .iter()
+            .position(|post| post.id == read.id)
+            .map_or(read, |at| group.posts.remove(at));
+        let at = group
+            .posts
+            .iter()
+            .enumerate()
+            .filter(|(_, post)| !self.config.hides(post) && !post.stickied)
+            .map(|(at, _)| at)
+            .nth(self.all_subs.post)
+            .unwrap_or(group.posts.len());
+        group.posts.insert(at, read);
+    }
+
+    /// Moving ends what `r` was waiting to show: later answers keep the new position.
+    fn cancel_reveal(&mut self) {
+        for tab in &mut self.tabs {
+            tab.feed.manual.clear();
+        }
+        if let Some(view) = &mut self.post_view {
+            view.reveal = false;
+        }
+        for group in &mut self.all_subs.groups {
+            group.manual = false;
+        }
     }
 
     /// Beside an open post, the list selection takes its place as the list moves.
@@ -3754,10 +4682,13 @@ impl App {
             return;
         }
         let permalink = post.permalink.clone();
-        if let Some(generation) = self.show_post(post, &permalink)
-            && self.post_settle.arrive(generation, Instant::now())
-        {
-            self.load_post(permalink);
+        if let Some(generation) = self.show_post(post, &permalink) {
+            let now = Instant::now();
+            if self.picture_settle.holding(now) {
+                self.post_settle.defer(generation, now);
+            } else if self.post_settle.arrive(generation, now) {
+                self.load_post(permalink);
+            }
         }
     }
 
@@ -3772,7 +4703,7 @@ impl App {
         let generation = self.generation();
         self.post_view = Some(PostView {
             post,
-            page: None,
+            page: None.into(),
             loading: true,
             error: None,
             freshness: None,
@@ -3787,6 +4718,8 @@ impl App {
             left: None,
             hold_view: None,
             keep_reading: None,
+            drawn_anchor: None,
+            reveal: false,
             drawn_cursor: None,
             rewrapped: None,
             rendered_document: Vec::new(),
@@ -3942,6 +4875,11 @@ impl App {
                 // this batch don't count.
                 let inside = view.row_starts.len() == len && view.row_starts[len - 1] < view.scroll;
                 view.hold_view = inside.then(|| view.hold(len - 1));
+            } else if view.page.is_some() && !view.spoiler_hidden() {
+                view.scroll = usize::MAX;
+                view.free_scroll = true;
+                view.left = None;
+                view.hold_view = None;
             }
         }
     }
@@ -4147,7 +5085,7 @@ impl App {
         }
         if self.inline_images_on()
             && let Some(view) = &mut self.post_view
-            && let Some(page) = &view.page
+            && let Some(page) = view.page.as_ref()
         {
             // Turned on at the post's top: show the image now; same-pass changes treat the
             // top as showing it.
@@ -4253,7 +5191,7 @@ impl App {
 
     fn sidebar_order(&self) -> Vec<usize> {
         let (pinned, following, opened) = self.sidebar_tabs();
-        [0, BOOKMARKS_TAB, ALL_SUBS_TAB]
+        [0, BOOKMARKS_TAB, ALL_SUBS_TAB, SEARCH_TAB]
             .into_iter()
             .chain(pinned)
             .chain(following)
@@ -4450,6 +5388,7 @@ impl App {
             .iter()
             .flat_map(|tab| &tab.feed.posts)
             .chain(self.post_view.iter().map(|view| view.shown_post()))
+            .chain(&self.search.preview.posts)
             .chain(self.state.bookmarks().iter().map(|bookmark| &bookmark.post))
             .chain(self.all_subs.groups.iter().flat_map(|group| &group.posts))
             .any(|post| post.media.video_url() == Some(url) && !video::plain_gif(url))
@@ -4536,6 +5475,33 @@ impl App {
         self.usable_thumb(icon.and_then(|metadata| metadata.url.as_deref()))
     }
 
+    pub fn user_profile(&self, user: &str) -> Option<&crate::model::UserProfile> {
+        self.profiles.get(&user.to_ascii_lowercase())
+    }
+
+    /// Asks once per session for a shown person's profile; `r` on their tab asks again.
+    fn request_profile(&mut self, user: &str, again: bool) {
+        let key = user.to_ascii_lowercase();
+        if self.profile_loading.contains(&key)
+            || (!again && (self.profiles.contains_key(&key) || self.profile_failed.contains(&key)))
+        {
+            return;
+        }
+        self.profile_failed.remove(&key);
+        self.profile_loading.insert(key);
+        self.pool.submit(Job::Profile {
+            user: user.to_string(),
+        });
+    }
+
+    pub fn profile_failed(&self, user: &str) -> bool {
+        self.profile_failed.contains(&user.to_ascii_lowercase())
+    }
+
+    pub(super) fn observe_profile(&mut self, user: &str, profile: crate::model::UserProfile) {
+        self.profiles.insert(user.to_ascii_lowercase(), profile);
+    }
+
     fn observe_icon(&mut self, name: &str, url: Option<String>, source: Source) {
         let key = name.to_ascii_lowercase();
         if self
@@ -4550,7 +5516,12 @@ impl App {
     /// Request missing icon metadata once per visible demand. Leaving the view or
     /// explicitly reloading permits another attempt; redraws do not retry failures.
     pub fn demand_icon(&mut self, subreddit: &str) {
-        if !self.thumbnails_on() || self.popup_open() || self.picture_settle.holding(Instant::now())
+        if !self.thumbnails_on()
+            || self.popup_open()
+            || self.picture_settle.holding(Instant::now())
+            || !self.pool.icon_wanted(subreddit)
+            || (matches!(self.active_tab().kind, TabKind::AllSubs)
+                && self.all_subs.waiting_for_rows)
         {
             return;
         }
@@ -4667,21 +5638,30 @@ impl App {
 
     fn copy_url(&mut self, url: &str, comment: bool) {
         let label = if comment { "comment link" } else { "link" };
-        match media::copy(url) {
-            Ok(media::CopyStatus::Copied(tool)) => self.info(format!("Copied {label} ({tool})")),
-            Ok(media::CopyStatus::Queued) => self.info(format!("Copy queued: {label}")),
-            Err(error) => self.error(format!("copy failed: {error:#}")),
+        if self.clipboard.is_some() {
+            self.info("Wait for the pending copy");
+            return;
+        }
+        self.clipboard = Some((media::CopyTask::start(url.to_string()), label));
+        self.info(format!("Copying {label}…"));
+    }
+
+    pub(crate) fn copy_link_target(&self) -> anyhow::Result<(String, bool)> {
+        if let Some(target) = self.comment_target() {
+            Ok((target.url()?, true))
+        } else if let Some(post) = self.current_post() {
+            Ok((post.reddit_url(), false))
+        } else if let Some(path) = self.search_row_path() {
+            Ok((format!("https://www.reddit.com{path}"), false))
+        } else {
+            anyhow::bail!("No link selected")
         }
     }
 
     pub fn copy_link(&mut self) {
-        if let Some(target) = self.comment_target() {
-            match target.url() {
-                Ok(url) => self.copy_url(&url, true),
-                Err(error) => self.error(format!("copy failed: {error:#}")),
-            }
-        } else if let Some(post) = self.current_post() {
-            self.copy_url(&post.reddit_url(), false);
+        match self.copy_link_target() {
+            Ok((url, comment)) => self.copy_url(&url, comment),
+            Err(error) => self.error(format!("copy failed: {error:#}")),
         }
     }
 
@@ -4894,6 +5874,7 @@ impl App {
                     **message,
                     Msg::Feed { .. }
                         | Msg::FeedProgress { .. }
+                        | Msg::GroupProgress { .. }
                         | Msg::FeedFallback { .. }
                         | Msg::Group { .. }
                         | Msg::Subscriptions { .. }
@@ -4903,6 +5884,7 @@ impl App {
                 message,
                 Msg::Feed { .. }
                     | Msg::FeedProgress { .. }
+                    | Msg::GroupProgress { .. }
                     | Msg::FeedFallback { .. }
                     | Msg::Group { .. }
                     | Msg::Subscriptions { .. }
@@ -4942,6 +5924,12 @@ impl App {
                 post,
                 source,
             } => self.on_feed_progress(tab, generation, *post, source),
+            Msg::GroupProgress {
+                subreddit,
+                generation,
+                post,
+                source,
+            } => self.on_group_progress(&subreddit, generation, *post, source),
             Msg::SortedPost {
                 generation,
                 sort,
@@ -4955,7 +5943,15 @@ impl App {
                     self.on_result(Msg::Post { generation, result }, source, refreshing);
                 }
             }
-            Msg::Experience { generation, result } => self.on_experience(generation, result),
+            Msg::Search { generation, result } => self.on_search(generation, result),
+            Msg::Experience { generation, result } => self.on_experience(
+                generation,
+                result,
+                Freshness {
+                    fetched_at: now(),
+                    source,
+                },
+            ),
             Msg::Membership { generation, result } => self.on_membership(generation, result),
             Msg::Subscriptions { generation, result } => self.on_subscriptions(
                 generation,
@@ -5010,6 +6006,7 @@ impl App {
                     fetched_at: now(),
                     source,
                 },
+                refreshing,
             ),
             Msg::Post { generation, result } => {
                 if !refreshing {
@@ -5067,10 +6064,16 @@ impl App {
                     Ok(page) => {
                         let mut page = *page;
                         filter_removed_comments(&mut page.comments, source, &view.removed_comments);
+                        let known: Option<HashSet<String>> = view.page.as_ref().map(|old| {
+                            thread_roots(&old.comments)
+                                .iter()
+                                .map(|comment| comment.id.clone())
+                                .collect()
+                        });
                         let selected = view.cursor_key();
                         view.content_changed = true;
                         view.pin_view();
-                        if let Some(old) = &mut view.page {
+                        if let Some(old) = view.page.as_mut() {
                             merge_comments(
                                 &mut page.comments,
                                 &mut old.comments,
@@ -5131,17 +6134,36 @@ impl App {
                             }
                             self.state.mark_original_deleted(&page.post.id, now());
                         }
-                        view.page = Some(page);
+                        let arrived = known.as_ref().is_some_and(|known| {
+                            unseen_leads(
+                                thread_roots(&page.comments)
+                                    .iter()
+                                    .map(|comment| (comment.id.as_str(), comment.stickied)),
+                                |id| known.contains(id),
+                            )
+                        });
+                        view.page = Some(page).into();
                         view.error = None;
                         view.reselect(selected);
                         view.row_starts.clear();
+                        if view.reveal && !source.cached {
+                            view.reveal = false;
+                            if arrived {
+                                view.show_top();
+                            }
+                        }
                         if self.inline_images_on()
                             && let Some(url) = image
                         {
                             self.request_image(&url);
                         }
                     }
-                    Err(e) => view.error = Some(e),
+                    Err(e) => {
+                        if !source.cached {
+                            view.reveal = false;
+                        }
+                        view.error = Some(e);
+                    }
                 }
             }
             Msg::MoreReplies {
@@ -5187,7 +6209,7 @@ impl App {
                             matches!(&selected, Some(RowKey::More(id)) if *id == comment_id);
                         let reading_more = matches!(&view.keep_reading, Some((RowKey::More(id), _, _)) if *id == comment_id);
                         let mut first_added = None;
-                        if let Some(page) = &mut view.page
+                        if let Some(page) = view.page.as_mut()
                             && let Some(c) = find_comment_mut(&mut page.comments, &comment_id)
                         {
                             let allow_new = !replies_superseded(c, source);
@@ -5398,6 +6420,17 @@ impl App {
                 };
                 self.thumbs.insert(url, slot);
             }
+            Msg::Profile { user, result } => {
+                let key = user.to_ascii_lowercase();
+                self.profile_loading.remove(&key);
+                match result {
+                    Ok(profile) => self.observe_profile(&user, profile),
+                    Err(error) if error == crate::reddit::REQUEST_CANCELLED => {}
+                    Err(_) => {
+                        self.profile_failed.insert(key);
+                    }
+                }
+            }
             Msg::Icon { subreddit, result } => {
                 let key = subreddit.to_ascii_lowercase();
                 self.icon_lookups.remove(&key);
@@ -5456,6 +6489,10 @@ impl App {
 
     fn on_snapshot(&mut self, message: Msg, freshness: Freshness, refreshing: bool) {
         match message {
+            Msg::Experience { generation, result } => {
+                self.on_experience(generation, result, freshness)
+            }
+            Msg::Search { generation, result } => self.on_search(generation, result),
             Msg::FeedFallback {
                 tab,
                 generation,
@@ -5493,21 +6530,10 @@ impl App {
                 {
                     return;
                 }
-                let succeeded = result.is_ok();
-                self.on_group(&subreddit, generation, result, freshness);
-                if let Some(group) = self
-                    .all_subs
-                    .groups
-                    .iter_mut()
-                    .find(|g| g.subreddit == subreddit)
-                {
-                    if succeeded {
-                        group.freshness = Some(freshness);
-                    }
-                    group.loading = refreshing;
-                }
+                self.on_group(&subreddit, generation, result, freshness, refreshing);
             }
             Msg::Post { generation, result } => {
+                let succeeded = result.is_ok();
                 self.on_result(
                     Msg::Post { generation, result },
                     freshness.source,
@@ -5516,7 +6542,9 @@ impl App {
                 if let Some(view) = &mut self.post_view
                     && view.generation == generation
                 {
-                    view.freshness = Some(freshness);
+                    if succeeded {
+                        view.freshness = Some(freshness);
+                    }
                     view.loading = refreshing;
                 }
             }
@@ -5626,6 +6654,7 @@ impl App {
                 group.error = None;
             }
         }
+        self.settle_arrivals();
     }
 
     fn on_feed_fallback(
@@ -5689,6 +6718,9 @@ impl App {
     }
 
     fn on_feed_progress(&mut self, tab_id: u64, generation: u64, post: Post, source: Source) {
+        if self.removed_posts.contains(&post.id) {
+            return;
+        }
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
             return;
         };
@@ -5708,6 +6740,7 @@ impl App {
         let screen_row = feed.selected.saturating_sub(feed.offset);
         if !same_query {
             feed.posts.clear();
+            feed.displaced_sources.clear();
             feed.pages.clear();
             feed.after = None;
             feed.freshness = None;
@@ -5745,7 +6778,18 @@ impl App {
         freshness: Freshness,
         refreshing: bool,
     ) {
+        if tab_id == crate::worker::PREVIEW_FEED {
+            self.on_preview(generation, result, freshness, refreshing);
+            return;
+        }
         let active = self.tabs[self.active].id == tab_id;
+        let open = self
+            .post_view
+            .as_ref()
+            .map(|view| view.shown_post().id.clone());
+        let cards = self.state.list_view() == ListView::Card;
+        let mut restitch = None;
+        let mut next_page = None;
         let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) else {
             return;
         };
@@ -5755,15 +6799,22 @@ impl App {
             Err(error) => error.access().map(Some),
         };
         let community = tab.subreddit().is_some();
+        // Home pages are personalized batches, not ranks after a post.
+        let ranked = !matches!(tab.kind, TabKind::Home);
         let feed = &mut tab.feed;
         if !feed.accepts(generation) {
             return;
         }
         feed.pending.remove(&generation);
-        feed.refreshing.remove(&generation);
+        let cached_refresh = feed.refreshing.remove(&generation)
+            || (!append
+                && !freshness.source.cached
+                && feed.pages.first().is_some_and(|page| page.source.cached));
         let forced = feed.forced.contains(&generation);
+        let manual = feed.manual.contains(&generation);
         if !refreshing {
             feed.forced.remove(&generation);
+            feed.manual.remove(&generation);
         }
         let cursor = if append {
             feed.requests
@@ -5790,44 +6841,28 @@ impl App {
             return;
         }
         match result {
-            Ok(listing) => {
-                if feed.updates.iter().any(|update| {
-                    update.cursor == cursor
-                        && !freshness.source.may_replace(update.freshness.source)
-                }) {
+            Ok(mut listing) => {
+                listing
+                    .posts
+                    .retain(|post| !self.removed_posts.contains(&post.id));
+                let mut displaced_sources = HashMap::new();
+                if (cursor.is_none()
+                    && feed.update.as_ref().is_some_and(|update| {
+                        !freshness.source.may_replace(update.freshness.source)
+                    }))
+                    || (feed.shows_current_query()
+                        && feed.pages.iter().any(|page| {
+                            page.cursor == cursor && !freshness.source.may_replace(page.source)
+                        }))
+                {
                     return;
                 }
-                feed.updates.retain(|update| update.cursor != cursor);
-                if feed.shows_current_query()
-                    && !forced
-                    && feed.access_denied().is_none()
-                    && let Some(index) = feed
-                        .pages
-                        .iter()
-                        .position(|page| page.cursor == cursor && page.complete)
-                {
-                    let page = &feed.pages[index];
-                    if !freshness.source.may_replace(page.source) {
-                        return;
-                    }
-                    let start: usize = feed.pages[..index].iter().map(|page| page.len).sum();
-                    if feed.posts[start..start + page.len] != listing.posts
-                        || page.after != listing.after
-                    {
-                        self.state
-                            .observe(name.as_deref(), &listing.posts, freshness, now());
-                        feed.updates.push(FeedUpdate {
-                            cursor,
-                            listing,
-                            freshness,
-                        });
-                        if let Some(name) = name {
-                            self.observe_community_access(&name, None, freshness.source);
-                        }
-                        return;
-                    }
+                if cursor.is_none() {
+                    feed.update = None;
                 }
-                let failed_next = feed.page_failed().then(|| feed.after.clone()).flatten();
+                self.state
+                    .observe(name.as_deref(), &listing.posts, freshness, now());
+                let leads = feed.leads_with_new(&listing.posts, &self.config);
                 let same_query = feed.shown_query.as_ref() == Some(&feed.query());
                 let selected = same_query
                     .then(|| {
@@ -5838,10 +6873,127 @@ impl App {
                     })
                     .flatten();
                 let screen_row = feed.selected.saturating_sub(feed.offset);
+                // An untouched list top stays the top, whatever the answer ranks there; a
+                // post open beside it or a card scrolled into is being read.
+                let at_top = feed.untouched_top(cards, active && open == selected);
+                // The post being read, any selection but the untouched top, keeps its row when a
+                // background answer drops it; `r` shows the list as Reddit returns it.
+                let read = selected.clone().filter(|_| active && !manual && !at_top);
+                let mut lost = false;
+                if feed.shows_current_query()
+                    && feed.access_denied().is_none()
+                    && let Some(index) = feed
+                        .pages
+                        .iter()
+                        .position(|page| page.cursor == cursor && page.complete)
+                {
+                    let page = &feed.pages[index];
+                    let start: usize = feed.pages[..index].iter().map(|page| page.len).sum();
+                    let hold = !manual
+                        && cursor.is_none()
+                        && (leads
+                            || cached_refresh
+                                && self.config.visible(&feed.posts).next().is_some()
+                                && feed.first_page_changed(&listing.posts, &self.config));
+                    let stable = hold && cached_refresh;
+                    let known: HashSet<_> = feed.posts.iter().map(|post| post.id.clone()).collect();
+                    let lost_at = selected
+                        .as_ref()
+                        .filter(|id| !listing.posts.iter().any(|post| &post.id == *id))
+                        .and_then(|id| {
+                            feed.posts[start..start + page.len]
+                                .iter()
+                                .position(|post| &post.id == id)
+                        });
+                    lost = lost_at.is_some();
+                    let dropped = lost_at
+                        .filter(|_| !stable && read.is_some())
+                        .map(|at| (at, feed.posts[start + at].clone()));
+                    // Rows missing from a page may have moved onto the next one, loaded or
+                    // requested before they did: they stay until that page answers again.
+                    let next = match feed.pages.get(index + 1) {
+                        Some(next) => Some(next.cursor.clone()),
+                        None => page
+                            .after
+                            .clone()
+                            .filter(|after| {
+                                feed.requests
+                                    .values()
+                                    .any(|requested| requested.as_ref() == Some(after))
+                            })
+                            .map(Some),
+                    };
+                    let later = !stable
+                        && ranked
+                        && listing.after.is_some()
+                        && (cursor.is_some() || next.is_some());
+                    if hold || later {
+                        let incoming: HashSet<_> =
+                            listing.posts.iter().map(|post| post.id.as_str()).collect();
+                        // Missing rows may have moved past the page boundary.
+                        let displaced: Vec<_> = feed.posts[start..start + page.len]
+                            .iter()
+                            .filter(|post| {
+                                !self.config.hides(post) && !incoming.contains(post.id.as_str())
+                            })
+                            .map(|post| {
+                                let source = feed
+                                    .displaced_sources
+                                    .get(&post.id)
+                                    .copied()
+                                    .unwrap_or(page.source);
+                                displaced_sources.insert(post.id.clone(), source);
+                                post.clone()
+                            })
+                            .filter(|post| Some(&post.id) != read.as_ref())
+                            .collect();
+                        if hold {
+                            feed.update = Some(FeedUpdate {
+                                listing: listing.clone(),
+                                freshness,
+                                stable,
+                            });
+                            // Everything unseen waits with them, so nothing new shows
+                            // above the rows kept below.
+                            if stable {
+                                let fresh: HashMap<_, _> = listing
+                                    .posts
+                                    .iter()
+                                    .map(|post| (post.id.as_str(), post))
+                                    .collect();
+                                listing.posts = feed.posts[start..start + page.len]
+                                    .iter()
+                                    .map(|post| {
+                                        fresh
+                                            .get(post.id.as_str())
+                                            .map_or_else(|| post.clone(), |post| (*post).clone())
+                                    })
+                                    .collect();
+                                listing.after = page.after.clone();
+                            } else {
+                                listing.posts.retain(|post| known.contains(&post.id));
+                            }
+                        }
+                        if later {
+                            next_page = next.map(|next| (next, !displaced.is_empty()));
+                        }
+                        if !stable {
+                            listing.posts.extend(displaced);
+                        }
+                    }
+                    if let Some((at, post)) = dropped {
+                        listing.posts.insert(at.min(listing.posts.len()), post);
+                    }
+                }
+                let failed_next = feed.page_failed().then(|| feed.after.clone()).flatten();
                 if !same_query {
                     feed.posts.clear();
+                    feed.displaced_sources.clear();
                     feed.pages.clear();
                 }
+                // A newer kept copy may stand in for a post this answer lists.
+                let answered: HashSet<String> =
+                    listing.posts.iter().map(|post| post.id.clone()).collect();
                 if !feed.replace_page(
                     cursor.clone(),
                     listing.posts,
@@ -5850,18 +7002,51 @@ impl App {
                 ) {
                     return;
                 }
-                let page_index = feed
-                    .pages
-                    .iter()
-                    .position(|page| page.cursor == cursor)
-                    .unwrap();
-                let start: usize = feed.pages[..page_index].iter().map(|page| page.len).sum();
-                self.state.observe(
-                    name.as_deref(),
-                    &feed.posts[start..start + feed.pages[page_index].len],
-                    freshness,
-                    now(),
-                );
+                feed.displaced_sources.extend(displaced_sources);
+                if ranked
+                    && let Some(index) = feed.pages.iter().position(|page| page.cursor == cursor)
+                {
+                    // The page before kept rows awaiting this answer: those not in it left.
+                    if index > 0 && feed.pages[index - 1].after == cursor {
+                        let start: usize =
+                            feed.pages[..index - 1].iter().map(|page| page.len).sum();
+                        let end = start + feed.pages[index - 1].len;
+                        let left: Vec<_> = feed.posts[start..end]
+                            .iter()
+                            .filter(|post| {
+                                feed.displaced_sources.contains_key(&post.id)
+                                    && !answered.contains(&post.id)
+                                    && Some(&post.id) != read.as_ref()
+                            })
+                            .map(|post| post.id.clone())
+                            .collect();
+                        for id in left {
+                            feed.remove_post(&id);
+                        }
+                    }
+                    // The next page, loaded or requested after this page's old end, may hold
+                    // the rows kept here or no longer follow it: fetch it again from the new end.
+                    if let Some((next, kept)) = next_page.take()
+                        && let Some(after) = feed.pages[index].after.clone()
+                        && (kept || next.as_ref() != Some(&after))
+                    {
+                        let after = Some(after);
+                        if let Some(page) = feed.pages.get_mut(index + 1) {
+                            page.cursor = after.clone();
+                        }
+                        feed.requests.retain(|_, requested| *requested != next);
+                        feed.pending.retain(|id| feed.requests.contains_key(id));
+                        feed.refreshing.retain(|id| feed.requests.contains_key(id));
+                        feed.forced.retain(|id| feed.requests.contains_key(id));
+                        if let Some(failure) = feed.failures.remove(&next) {
+                            feed.failures.insert(after.clone(), failure);
+                        }
+                        if let Some(deferred) = feed.deferred.remove(&next) {
+                            feed.deferred.insert(after.clone(), deferred);
+                        }
+                        restitch = Some(after);
+                    }
+                }
                 // Any provably newer successful page can establish access again.
                 feed.failures.retain(|_, failure| {
                     !community
@@ -5891,11 +7076,19 @@ impl App {
                     feed.freshness = Some(freshness);
                 }
                 let visible: Vec<_> = self.config.visible(&feed.posts).collect();
+                // A selection nobody reads keeps its row when its post leaves.
+                let keep_row = at_top || (lost && read.is_none());
                 feed.selected = selected
+                    .filter(|_| !keep_row)
                     .and_then(|id| visible.iter().position(|p| p.id == id))
                     .unwrap_or(if same_query { feed.selected } else { 0 })
                     .min(visible.len().saturating_sub(1));
                 feed.offset = feed.selected.saturating_sub(screen_row);
+                // An untouched top, or `r` bringing new posts, shows the list from its first
+                // post's first row.
+                if at_top || (manual && same_query && !append && leads) {
+                    feed.show_top(visible.first().map(|post| post.id.clone()));
+                }
                 feed.loaded = true;
                 feed.shown_query = Some(feed.query());
                 if !append && let Some(name) = tab.subreddit().map(str::to_string) {
@@ -5942,6 +7135,7 @@ impl App {
                 // (a continuation would append to them); a failed reload of the same query keeps them.
                 if !append && feed.shown_query.as_ref() != Some(&feed.query()) {
                     feed.posts.clear();
+                    feed.displaced_sources.clear();
                     feed.after = None;
                     feed.selected = 0;
                     feed.offset = 0;
@@ -5960,6 +7154,56 @@ impl App {
         if let (Some(name), Some(denied)) = (name, access) {
             self.observe_community_access(&name, denied, freshness.source);
         }
+        // The new end's cached page may predate the page shown and would be refused.
+        if let Some(after) = restitch
+            && let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id)
+        {
+            self.fetch_feed(index, after, true);
+        }
+        // This answer may have made a held answer's new posts known.
+        self.settle_arrivals();
+    }
+
+    fn on_group_progress(&mut self, subreddit: &str, generation: u64, post: Post, source: Source) {
+        if self.removed_posts.contains(&post.id) {
+            return;
+        }
+        let Some(group) = self
+            .all_subs
+            .groups
+            .iter_mut()
+            .find(|group| group.subreddit == subreddit && group.generation == generation)
+        else {
+            return;
+        };
+        if !group.loading
+            || group.freshness.is_some()
+            || (group.stream.is_none() && !group.posts.is_empty())
+            || group
+                .stream
+                .is_some_and(|previous| !source.may_replace(previous))
+        {
+            return;
+        }
+        self.state.observe(
+            None,
+            std::slice::from_ref(&post),
+            Freshness {
+                fetched_at: now(),
+                source,
+            },
+            now(),
+        );
+        group.stream = Some(source);
+        if let Some(previous) = group
+            .posts
+            .iter_mut()
+            .find(|previous| previous.id == post.id)
+        {
+            *previous = post;
+        } else {
+            group.posts.push(post);
+        }
     }
 
     fn on_group(
@@ -5968,6 +7212,7 @@ impl App {
         generation: u64,
         result: Result<Listing, FeedError>,
         freshness: Freshness,
+        refreshing: bool,
     ) {
         let Some(index) = self
             .all_subs
@@ -5989,18 +7234,42 @@ impl App {
             Ok(_) => Some(None),
             Err(error) => error.access().map(Some),
         };
-        let selected = (index == self.all_subs.group)
+        // An island showing nothing, empty or refused, has nothing new to hold back.
+        let displayed = self
+            .group_posts(&self.all_subs.groups[index])
+            .next()
+            .is_some();
+        let selected_post = (index == self.all_subs.group)
             .then(|| {
                 self.group_posts(&self.all_subs.groups[index])
                     .nth(self.all_subs.post)
-                    .map(|p| p.id.clone())
+                    .cloned()
             })
             .flatten();
+        let selected = selected_post.as_ref().map(|post| post.id.clone());
+        let at_top = self.island_at_top(selected.as_deref());
         let group = &mut self.all_subs.groups[index];
-        group.loading = false;
+        let cached_refresh = group.loading
+            && group.freshness.is_some_and(|shown| shown.source.cached)
+            && !freshness.source.cached;
+        group.loading = refreshing;
+        let manual = group.manual;
+        if !freshness.source.cached {
+            group.manual = false;
+        }
+        if result.is_ok()
+            && group
+                .freshness
+                .map(|shown| shown.source)
+                .or(group.stream)
+                .is_some_and(|shown| !freshness.source.may_replace(shown))
+        {
+            return;
+        }
         match result {
             Ok(mut listing) => {
                 group.freshness = Some(freshness);
+                group.stream = None;
                 if !freshness.source.cached {
                     group.needs_refresh = false;
                 }
@@ -6017,14 +7286,43 @@ impl App {
                                 .is_none_or(|page| freshness.source.may_replace(page.source)))
                 });
                 // Only a seeded tab needs its own copy of the first page.
-                group.posts = if seeded_tab.is_some() {
+                listing
+                    .posts
+                    .retain(|post| !self.removed_posts.contains(&post.id));
+                let incoming = if seeded_tab.is_some() {
                     listing.posts.clone()
                 } else {
                     std::mem::take(&mut listing.posts)
                 };
+                let held = displayed
+                    && (island_has_new(&self.config, &group.posts, &incoming)
+                        || cached_refresh && island_changed(&self.config, &group.posts, &incoming));
+                let revealed = manual && held;
+                if !held || manual {
+                    group.posts = incoming;
+                    group.arrivals = None;
+                    group.stable_arrivals = false;
+                } else {
+                    // The island keeps its posts and order until `r`; content still updates.
+                    let fresh: HashMap<_, _> = incoming
+                        .iter()
+                        .map(|post| (post.id.as_str(), post))
+                        .collect();
+                    for post in &mut group.posts {
+                        if let Some(fresh) = fresh.get(post.id.as_str()) {
+                            *post = (*fresh).clone();
+                        }
+                    }
+                    group.arrivals = Some(incoming);
+                    group.stable_arrivals = cached_refresh;
+                }
                 group.error = None;
-                self.state
-                    .observe(Some(subreddit), &group.posts, freshness, now());
+                self.state.observe(
+                    Some(subreddit),
+                    group.arrivals.as_ref().unwrap_or(&group.posts),
+                    freshness,
+                    now(),
+                );
                 if freshness.source.cached {
                     self.pool.cached(Job::Icon {
                         subreddit: subreddit.to_ascii_lowercase(),
@@ -6032,13 +7330,14 @@ impl App {
                 } else {
                     self.demand_icon(subreddit);
                 }
-                // A refresh can return fewer posts: keep the selection on one.
-                if index == self.all_subs.group {
-                    let shown: Vec<_> = self.group_posts(&self.all_subs.groups[index]).collect();
-                    self.all_subs.post = selected
-                        .and_then(|id| shown.iter().position(|p| p.id == id))
-                        .unwrap_or(self.all_subs.post)
-                        .min(shown.len().saturating_sub(1));
+                if !held && !manual {
+                    self.keep_read_post_in_slot(index, selected_post);
+                }
+                if revealed {
+                    self.all_subs.show_top();
+                } else if index == self.all_subs.group {
+                    // A refresh can return fewer posts: keep the selection on one.
+                    self.select_island_post(selected.as_deref().filter(|_| !at_top));
                 }
                 if let Some(i) = seeded_tab {
                     let generation = self.generation();
@@ -6414,6 +7713,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hiding_the_last_selected_post_keeps_a_visible_target() {
+        let mut app = app_with(&["s"]);
+        app.all_subs.groups[0].posts = vec![post("a", "s"), post("b", "s"), post("filtered", "s")];
+        app.config.filters.keywords = vec!["filtered".into()];
+        app.all_subs.post = 1;
+        app.experience.pending = Some((
+            123,
+            crate::reddit::experience::Request::Write(crate::reddit::experience::Action::Hide {
+                id: "t3_b".into(),
+                hide: true,
+            }),
+        ));
+        app.on_experience(
+            123,
+            Ok(crate::reddit::experience::Response::Written { url: None }),
+            crate::cache::Freshness {
+                fetched_at: crate::app::now(),
+                source: Default::default(),
+            },
+        );
+        assert_eq!(app.current_post().map(|post| post.id), Some("a".into()));
+        let generation = app.all_subs.groups[0].generation;
+        app.on_msg(Msg::Group {
+            subreddit: "s".into(),
+            generation,
+            result: Err("offline".into()),
+        });
+        assert_eq!(app.current_post().map(|post| post.id), Some("a".into()));
+    }
+
+    #[test]
     fn a_waiting_prefix_should_wake_and_redraw_once_then_cancel_on_context_change() {
         let mut app = app_with(&["rust", "vim"]);
         let before = Instant::now();
@@ -6430,6 +7760,186 @@ mod tests {
         let _ = app.tick_at(due + Duration::from_secs(1));
         assert!(!app.popup_open());
         assert!(app.keymap.prefix.is_empty());
+    }
+
+    #[test]
+    fn scrolling_islands_should_fetch_only_the_settled_view_and_accept_incoming_rows() {
+        let mut app = app_with(&["a", "b", "c"]);
+        app.groups_drawn(&[0], &[], &[]);
+        assert!(
+            app.all_subs.groups[0].loading,
+            "initial entry loads immediately"
+        );
+        let generation = app.all_subs.groups[0].generation;
+
+        app.move_all_subs_group(1);
+        app.groups_drawn(&[1], &[], &[]);
+        assert!(!app.all_subs.groups[1].loading, "the first scroll waits");
+        app.on_msg(Msg::GroupProgress {
+            subreddit: "a".into(),
+            generation,
+            post: Box::new(post("a1", "a")),
+            source: Source::default(),
+        });
+        assert_eq!(app.all_subs.groups[0].posts[0].id, "a1");
+        app.move_all_subs_group(1);
+        app.groups_drawn(&[2], &[], &[]);
+        assert!(!app.all_subs.groups[2].loading);
+        app.tick_at(Instant::now() + NAV_SETTLE);
+        app.groups_drawn(&[2], &[], &[]);
+
+        assert!(
+            !app.all_subs.groups[1].loading,
+            "passed islands stay unfetched"
+        );
+        assert!(app.all_subs.groups[2].loading);
+        assert_eq!(app.all_subs.groups[0].posts[0].id, "a1");
+    }
+
+    #[test]
+    fn island_lookahead_should_wait_for_visible_titles_before_prefetch_and_icons() {
+        let mut app = app_with(&["a", "b", "c", "d", "side"]);
+        show_thumbnails(&mut app);
+        let draw = |app: &mut App| app.groups_drawn(&[0, 1, 2], &["side".into()], &[3]);
+        draw(&mut app);
+        assert!(app.icon_lookups.is_empty());
+        assert!(!app.all_subs.groups[3].loading);
+
+        let mut pinned = post("pin", "a");
+        pinned.stickied = true;
+        app.on_msg(Msg::GroupProgress {
+            subreddit: "a".into(),
+            generation: app.all_subs.groups[0].generation,
+            post: Box::new(pinned),
+            source: Source::default(),
+        });
+        draw(&mut app);
+        assert!(app.icon_lookups.is_empty());
+        assert!(!app.all_subs.groups[3].loading);
+
+        for (index, name) in ["a", "b", "c"].into_iter().enumerate() {
+            app.on_msg(Msg::GroupProgress {
+                subreddit: name.into(),
+                generation: app.all_subs.groups[index].generation,
+                post: Box::new(post(name, name)),
+                source: Source::default(),
+            });
+            draw(&mut app);
+            assert_eq!(app.all_subs.groups[3].loading, index == 2);
+            assert_eq!(app.icon_lookups.contains("side"), index == 2);
+        }
+        assert!(app.all_subs.groups[..3].iter().all(|group| group.loading));
+        app.groups_drawn(&[], &[], &[]);
+        app.active = 0;
+        app.pool.set_visible_icons(&["other"]);
+        app.demand_icon("other");
+        assert!(app.icon_lookups.contains("other"));
+    }
+
+    #[test]
+    fn restarting_empty_visible_islands_should_hold_prefetch_and_icons_until_ready() {
+        for recovery in ["cancelled stream", "failed retry", "stale empty cache"] {
+            let mut app = app_with(&["visible", "next", "side"]);
+            let draw = |app: &mut App| app.groups_drawn(&[0], &["side".into()], &[1]);
+            draw(&mut app);
+            let generation = app.all_subs.groups[0].generation;
+            match recovery {
+                "cancelled stream" => {
+                    app.on_msg(Msg::GroupProgress {
+                        subreddit: "visible".into(),
+                        generation,
+                        post: Box::new(post("partial", "visible")),
+                        source: Source::default(),
+                    });
+                    app.on_msg(Msg::Group {
+                        subreddit: "visible".into(),
+                        generation,
+                        result: Err(crate::reddit::REQUEST_CANCELLED.into()),
+                    });
+                }
+                "failed retry" => {
+                    app.on_msg(Msg::Group {
+                        subreddit: "visible".into(),
+                        generation,
+                        result: Err("offline".into()),
+                    });
+                    app.reload();
+                }
+                "stale empty cache" => app.on_group(
+                    "visible",
+                    generation,
+                    Ok(listing("visible", &[], None)),
+                    Freshness {
+                        fetched_at: now() - crate::cache::CONTENT_TTL - 1,
+                        source: Source {
+                            cached: true,
+                            ..Default::default()
+                        },
+                    },
+                    false,
+                ),
+                _ => unreachable!(),
+            }
+            show_thumbnails(&mut app);
+            draw(&mut app);
+            assert!(app.all_subs.groups[0].loading, "{recovery}");
+            assert!(app.group_posts(&app.all_subs.groups[0]).next().is_none());
+            assert!(app.icon_lookups.is_empty(), "{recovery}");
+            assert!(!app.all_subs.groups[1].loading, "{recovery}");
+
+            app.on_msg(Msg::Group {
+                subreddit: "visible".into(),
+                generation: app.all_subs.groups[0].generation,
+                result: if recovery == "cancelled stream" {
+                    Err("offline".into())
+                } else {
+                    Ok(listing("visible", &[], None))
+                },
+            });
+            draw(&mut app);
+            assert!(app.icon_lookups.contains("visible"), "{recovery}");
+            assert!(app.icon_lookups.contains("side"), "{recovery}");
+            assert_eq!(app.all_subs.groups[1].loading, recovery != "failed retry");
+        }
+    }
+
+    #[test]
+    fn island_lookahead_should_keep_refreshes_and_icons_tied_to_visible_demand() {
+        let mut app = app_with(&["visible", "cold", "stale", "forced"]);
+        app.active = ALL_SUBS_TAB;
+        show_thumbnails(&mut app);
+        let fresh = Freshness {
+            fetched_at: now(),
+            source: Source::default(),
+        };
+        app.all_subs.groups[0].freshness = Some(fresh);
+        app.all_subs.groups[2].freshness = Some(Freshness {
+            fetched_at: now() - 600,
+            ..fresh
+        });
+        app.all_subs.groups[3].needs_refresh = true;
+
+        app.groups_drawn(&[0], &[], &[1, 2, 3]);
+        let generation = app.all_subs.groups[1].generation;
+        app.groups_drawn(&[0], &[], &[1, 2, 3]);
+
+        assert!(app.all_subs.groups[1].loading);
+        assert_eq!(app.all_subs.groups[1].generation, generation);
+        assert!(!app.all_subs.groups[2].loading && !app.all_subs.groups[3].loading);
+        assert!(!app.icon_lookups.contains("cold"));
+        app.on_msg(Msg::Group {
+            subreddit: "cold".into(),
+            generation,
+            result: Ok(listing("cold", &["prefetched"], None)),
+        });
+        assert!(!app.icon_lookups.contains("cold"));
+        assert!(!app.all_subs.has_new_posts(&app.config));
+        assert!(!app.state.is_read("prefetched"));
+        app.groups_drawn(&[1], &[], &[]);
+        assert!(app.icon_lookups.contains("cold"));
+
+        app.groups_drawn(&[], &[], &[3]);
+        assert!(!app.all_subs.groups[3].loading);
     }
 
     #[test]
@@ -6474,7 +7984,7 @@ mod tests {
                     ..Default::default()
                 },
             };
-            let feed = &mut app.tabs[3].feed;
+            let feed = &mut app.tabs[4].feed;
             feed.posts = vec![post("cached", "s")];
             feed.loaded = true;
             feed.freshness = Some(freshness);
@@ -6484,13 +7994,13 @@ mod tests {
                 if group {
                     app.ensure_group_loaded(0);
                 } else {
-                    app.ensure_feed_loaded(3);
+                    app.ensure_feed_loaded(4);
                 }
             };
             if group {
                 app.active = ALL_SUBS_TAB;
             } else {
-                app.active = 3;
+                app.active = 4;
             }
             demand(&mut app);
             let icon = messages
@@ -6513,11 +8023,12 @@ mod tests {
                     app.all_subs.groups[0].generation,
                     Ok(listing("s", &["live"], None)),
                     live,
+                    false,
                 );
             } else {
                 app.on_feed(
-                    app.tabs[3].id,
-                    app.tabs[3].feed.generation,
+                    app.tabs[4].id,
+                    app.tabs[4].feed.generation,
                     false,
                     Ok(listing("s", &["live"], None)),
                     live,
@@ -6529,12 +8040,12 @@ mod tests {
                 "a successful listing must not retry its failed icon in the same demand"
             );
             app.active = 0;
-            app.groups_drawn(&[], &[]);
-            app.active = if group { ALL_SUBS_TAB } else { 3 };
+            app.groups_drawn(&[], &[], &[]);
+            app.active = if group { ALL_SUBS_TAB } else { 4 };
             if group {
-                app.groups_drawn(&[0], &[]);
+                app.groups_drawn(&[0], &[], &[]);
             } else {
-                app.groups_drawn(&[], &[]);
+                app.groups_drawn(&[], &[], &[]);
                 demand(&mut app);
             }
             assert!(
@@ -6599,14 +8110,14 @@ mod tests {
 
     fn app_with_pending_pagination() -> App {
         let mut app = app_with(&["s"]);
-        app.switch_tab(3);
+        app.switch_tab(4);
         app.on_msg(Msg::Feed {
-            tab: app.tabs[3].id,
-            generation: app.tabs[3].feed.generation,
+            tab: app.tabs[4].id,
+            generation: app.tabs[4].feed.generation,
             append: false,
             result: Ok(listing("s", &["existing"], Some("next"))),
         });
-        app.load_feed(3, true);
+        app.load_feed(4, true);
         app
     }
 
@@ -6671,6 +8182,7 @@ mod tests {
             append: false,
             result: Ok(listing("rust", &["existing"], None)),
         });
+        app.all_subs.freshness = None;
         app.all_subs.loading = true;
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
@@ -6780,8 +8292,8 @@ mod tests {
         let mut app = app_with_pending_pagination();
         app.loading_since = Some(Instant::now() - Duration::from_millis(100));
         app.on_msg(Msg::Feed {
-            tab: app.tabs[3].id,
-            generation: app.tabs[3].feed.generation,
+            tab: app.tabs[4].id,
+            generation: app.tabs[4].feed.generation,
             append: true,
             result: Ok(listing("s", &["next"], None)),
         });
@@ -6796,8 +8308,8 @@ mod tests {
         let mut app = app_with_pending_pagination();
         app.loading_since = Some(Instant::now() - Duration::from_millis(100));
         app.on_msg(Msg::Feed {
-            tab: app.tabs[3].id,
-            generation: app.tabs[3].feed.generation,
+            tab: app.tabs[4].id,
+            generation: app.tabs[4].feed.generation,
             append: true,
             result: Err("offline".into()),
         });
@@ -6887,6 +8399,76 @@ mod tests {
     }
 
     #[test]
+    fn a_video_frame_over_its_share_of_output_shows_late_rather_than_never() {
+        let mut app = card_playback_app();
+        #[allow(deprecated)]
+        let mut picker =
+            ratatui_image::picker::Picker::from_fontsize(ratatui_image::FontSize::new(8, 16));
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+        app.image_picker = picker;
+        let now = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+        app.sync_video_with(now, |url, area, _| {
+            let mut player = Player::showing(&url, playback_frame(1)).at_rate(30.0);
+            player.area = area;
+            player
+        });
+        // Noise compresses to a frame between a 30 fps and a 24 fps share of the budget.
+        let mut seed = 7u32;
+        let mut noise = || {
+            std::sync::Arc::new(image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+                344,
+                352,
+                |_, _| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    image::Rgb([(seed >> 16) as u8, (seed >> 8) as u8, seed as u8])
+                },
+            )))
+        };
+        let mut key = crate::card_image::Key::new(
+            "video",
+            &app.image_picker,
+            Size::new(43, 22),
+            (344, 352),
+            0,
+            22,
+            0,
+        );
+        key.video = true;
+        let draw = |app: &mut App, image: &std::sync::Arc<image::DynamicImage>| {
+            app.card_renderer.begin();
+            app.card_renderer.tile(
+                key.clone(),
+                image,
+                &app.image_picker,
+                crate::card_image::Preparation::Refresh,
+            );
+            app.card_renderer.finish();
+        };
+        draw(&mut app, &noise());
+        app.card_renderer.wait_for_completion();
+        app.card_renderer.poll();
+
+        let held = noise();
+        draw(&mut app, &held);
+        assert!(
+            !app.card_renderer.pending(),
+            "at 30 frames a second it waits for the output budget"
+        );
+
+        let wait = app.card_renderer.video_wake_in(Instant::now()).unwrap();
+        // The wait alone wakes the loop, even with no frame of the player's due sooner.
+        app.video = None;
+        app.card_video = None;
+        assert!(app.wake_in() <= wait);
+        std::thread::sleep(wait);
+        assert!(app.card_renderer.poll(), "the wait ends in a redraw");
+        draw(&mut app, &held);
+        assert!(app.card_renderer.pending(), "the frame goes out then");
+    }
+
+    #[test]
     fn when_a_loaded_video_is_revisited_after_an_image_it_should_keep_its_player() {
         let mut app = card_playback_app();
         app.tabs[0].feed.posts[1].media = Media::None;
@@ -6919,7 +8501,84 @@ mod tests {
     }
 
     #[test]
-    fn when_switching_between_videos_the_last_frame_should_cover_decoder_startup() {
+    fn when_a_loaded_video_is_deselected_its_frame_should_remain_visible() {
+        let mut app = card_playback_app();
+        app.show_sidebar = false;
+        app.image_picker = ratatui_image::picker::Picker::halfblocks();
+        for post in &mut app.tabs[0].feed.posts {
+            post.preview_size = Some((160, 90));
+        }
+        app.card_images.insert(
+            "https://i.redd.it/poster.jpg".into(),
+            CardImageSlot::Failed("The image format could not be determined".into()),
+        );
+        let start = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+        app.sync_video_with(start, |url, area, _| {
+            let mut player = Player::showing(
+                &url,
+                video::Frame {
+                    width: 160,
+                    height: 90,
+                    pixels: video::Pixels::Raw(std::sync::Arc::new(
+                        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                            160,
+                            90,
+                            image::Rgb([180, 80, 50]),
+                        )),
+                    )),
+                    same_as_first: false,
+                },
+            );
+            player.area = area;
+            player
+        });
+        let render = |app: &mut App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+            loop {
+                terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+                if !app.card_renderer.pending() {
+                    break;
+                }
+                app.card_renderer.wait_for_completion();
+                app.card_renderer.poll();
+            }
+            terminal.backend().buffer().clone()
+        };
+        let has_frame = |buffer: &ratatui::buffer::Buffer| {
+            buffer.content().iter().any(|cell| {
+                cell.fg == ratatui::style::Color::Rgb(180, 80, 50)
+                    || cell.bg == ratatui::style::Color::Rgb(180, 80, 50)
+            })
+        };
+        assert!(has_frame(&render(&mut app)), "selected frame must render");
+
+        app.config.media.video_autoplay = false;
+        app.move_selection(1);
+        assert!(
+            has_frame(&render(&mut app)),
+            "deselection must retain the frame before the next playback tick"
+        );
+        app.sync_video_with(start, |_, _, _| {
+            panic!("inactive previews must not start playback")
+        });
+        assert!(
+            has_frame(&render(&mut app)),
+            "the retired frame must replace the failed still preview"
+        );
+        assert!(app.video.is_none());
+
+        if let Media::Video { url, .. } = &mut app.tabs[0].feed.posts[0].media {
+            *url = Some("https://v.redd.it/changed.mp4".into());
+        }
+        assert!(
+            !has_frame(&render(&mut app)),
+            "a new source and another post must not borrow the old frame"
+        );
+    }
+
+    #[test]
+    fn reported_returning_between_loaded_videos_should_not_restart() {
         let mut app = card_playback_app();
         let start = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
         app.sync_video_with(start, |url, area, _| {
@@ -6938,7 +8597,9 @@ mod tests {
         app.tabs[0].feed.selected = 0;
         app.card_video_drawn(Some(Size::new(68, 68)));
         let returned = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
-        app.sync_video_with(returned, |url, area, _| Player::silent(&url, area));
+        app.sync_video_with(returned, |_, _, _| {
+            panic!("loaded video must resume without startup")
+        });
         let frame = app
             .card_player()
             .and_then(Player::frame)
@@ -6971,6 +8632,19 @@ mod tests {
                     player
                 });
             }
+            assert!(
+                app.video_previews
+                    .iter()
+                    .filter(|preview| preview.player.is_some())
+                    .count()
+                    <= VIDEO_PLAYER_MAX
+            );
+            assert!(
+                app.video_previews
+                    .iter()
+                    .filter_map(|preview| preview.player.as_ref())
+                    .all(Player::hidden)
+            );
             app.tabs[0].feed.selected = 1;
             app.card_video_drawn(Some(Size::new(68, 68)));
             let (frame, _) = app
@@ -7099,7 +8773,8 @@ mod tests {
                 post,
                 body: String::new(),
                 comments: vec![],
-            });
+            })
+            .into();
             app.video_area = Some(Rect::new(0, 0, 68, 38));
         };
         let showing = |url: String, area, resume: video::Resume| {
@@ -7199,7 +8874,8 @@ mod tests {
             post,
             body: String::new(),
             comments: vec![],
-        });
+        })
+        .into();
         app.video_area = Some(Rect::new(0, 0, 68, 68));
         app.sync_video_with(Instant::now(), |url, area, _| {
             let mut player = Player::showing(&url, playback_frame(1));
@@ -7304,7 +8980,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert_eq!(
-            actual.matches("unavailable · SPC o m opens media").count(),
+            actual.matches("unavailable · O opens media").count(),
             1,
             "{actual}"
         );
@@ -7326,7 +9002,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(actual.contains("SPC m p retry"), "{actual}");
+        assert!(actual.contains("p retry"), "{actual}");
         assert!(actual.contains("fixture decoder unavailable"), "{actual}");
         assert!(matches!(
             app.card_images.get("https://i.redd.it/poster.jpg"),
@@ -7354,7 +9030,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(!actual.contains("SPC m p play/pause"), "{actual}");
+        assert!(!actual.contains("p play/pause"), "{actual}");
         assert!(!app.video_controls_available());
     }
 
@@ -7372,7 +9048,7 @@ mod tests {
             .collect::<String>();
         let words = footer.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(words.contains("l list"), "{footer}");
-        assert!(!footer.contains("SPC m p retry"), "{footer}");
+        assert!(!footer.contains("p retry"), "{footer}");
     }
 
     #[test]
@@ -7391,7 +9067,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(actual.contains("SPC m p retry"), "{actual}");
+        assert!(actual.contains("p retry"), "{actual}");
         assert!(actual.contains("F1"), "{actual}");
     }
 
@@ -7450,6 +9126,29 @@ mod tests {
 
         assert!(app.wanted_video(since).is_none());
         assert!(app.wanted_video(since + NAV_SETTLE).is_some());
+    }
+
+    #[test]
+    fn scrolling_inside_a_video_card_should_defer_startup_and_keep_existing_playback() {
+        let mut app = card_playback_app();
+        app.card_video.as_mut().unwrap().since = Instant::now() - NAV_SETTLE;
+        app.tabs[0].feed.cards.post = Some("first".into());
+
+        app.scroll_card(1);
+        app.sync_video_with(Instant::now(), |_, _, _| {
+            panic!("scrolling must hold a new player")
+        });
+        assert!(app.video.is_none());
+        app.sync_video_with(Instant::now() + NAV_SETTLE, |url, area, _| {
+            Player::silent(&url, area)
+        });
+        assert!(app.card_player().is_some());
+        app.scroll_card(1);
+        app.sync_video_with(Instant::now(), |_, _, _| {
+            panic!("scrolling must keep the current player")
+        });
+        assert!(app.card_player().is_some());
+        assert!(!app.card_player().unwrap().hidden());
     }
 
     #[test]
@@ -7590,7 +9289,8 @@ mod tests {
             post,
             body: String::new(),
             comments: vec![],
-        });
+        })
+        .into();
         app.video_area = Some(Rect::new(0, 0, 40, 12));
         app.card_video_drawn(Some(Size::new(68, 68)));
         let mut actual = None;
@@ -8224,7 +9924,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bookmark_only_video_loads_its_first_frame_with_autoplay_off() {
+    fn bookmark_and_search_preview_videos_load_their_first_frame_with_autoplay_off() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("frame.mp4");
         let output = match std::process::Command::new("ffmpeg")
@@ -8270,11 +9970,15 @@ mod tests {
             }
         });
         let mut results = Vec::new();
-        for converted_gif in [false, true] {
+        for (search_preview, converted_gif) in [(false, false), (false, true), (true, false)] {
             let (mut app, messages) = app_at(&base, &[]);
             app.config.media.video_autoplay = false;
             show_thumbnails(&mut app);
-            app.active = BOOKMARKS_TAB;
+            app.active = if search_preview {
+                SEARCH_TAB
+            } else {
+                BOOKMARKS_TAB
+            };
             let url = if converted_gif {
                 format!("{base}frame.gif?format=mp4")
             } else {
@@ -8293,19 +9997,36 @@ mod tests {
                     poster: None,
                 }
             };
-            app.state.toggle_bookmark(&saved, 1);
+            if search_preview {
+                app.search.preview.posts = vec![saved];
+            } else {
+                app.state.toggle_bookmark(&saved, 1);
+            }
             app.card_pictures_drawn(&[&url]);
             app.thumbs_drawn(&[&url]);
             let replies = (0..2)
                 .map(|_| messages.recv_timeout(Duration::from_secs(5)))
                 .collect::<Vec<_>>();
-            results.push((app, url, replies));
+            results.push((search_preview, converted_gif, app, url, replies));
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         serving.join().unwrap();
-        for (mut app, url, replies) in results {
+        for (search_preview, converted_gif, mut app, url, replies) in results {
             for reply in replies {
-                app.on_msg(reply.unwrap());
+                let reply = reply.unwrap_or_else(|error| {
+                    let card_error = match app.card_images.get(&url) {
+                        Some(CardImageSlot::Failed(error)) => Some(error),
+                        _ => None,
+                    };
+                    let thumb_error = match app.thumbs.get(&url) {
+                        Some(ImageSlot::Failed(error)) => Some(error),
+                        _ => None,
+                    };
+                    panic!(
+                        "search_preview={search_preview}, converted_gif={converted_gif}: {error}; card={card_error:?}; thumb={thumb_error:?}"
+                    )
+                });
+                app.on_msg(reply);
             }
             assert!(
                 matches!(app.thumbs.get(&url), Some(ImageSlot::Ready { .. })),
@@ -9022,7 +10743,7 @@ mod tests {
     fn a_feed_looks_its_icon_up_on_its_first_page_only() {
         let (mut app, messages) = app_with_messages(&["s"]);
         show_thumbnails(&mut app);
-        let (tab, generation) = (app.tabs[3].id, app.tabs[3].feed.generation);
+        let (tab, generation) = (app.tabs[4].id, app.tabs[4].feed.generation);
         let load = |app: &mut App, append: bool| {
             app.icons.remove("s");
             app.on_msg(Msg::Feed {
@@ -9541,7 +11262,7 @@ mod tests {
             let urls = requested.lock().unwrap().clone();
             if urls
                 .iter()
-                .any(|url| url.contains("/r/rust/search.json") && url.contains("needle"))
+                .any(|url| url.contains("/r/rust/search?") && url.contains("needle"))
                 && urls.iter().any(|url| url.contains("/r/unfinished/"))
                 && urls.iter().any(|url| url.contains("/r/failed/"))
             {
@@ -9633,7 +11354,7 @@ mod tests {
                 "/svc/shreddit/feeds/home-feed" => {
                     "<shreddit-post id='t3_1x4v4sn' post-title='native' subreddit-name='rust' author='reader' permalink='/r/rust/comments/1x4v4sn/title/' post-type='text'></shreddit-post>"
                 }
-                "/r/rust/hot.json" => {
+                "/r/rust/hot" => {
                     include_str!("../tests/fixtures/sub.json")
                 }
                 "/r/rust/about.json" => r#"{"data":{}}"#,
@@ -9714,7 +11435,7 @@ mod tests {
                     "/svc/shreddit/feeds/home-feed" => {
                         "<shreddit-post id='t3_1x4v4sn' post-title='native' subreddit-name='rust' author='reader' permalink='/r/rust/comments/1x4v4sn/title/' post-type='text'></shreddit-post>"
                     }
-                    "/r/rust/hot.json" => {
+                    "/r/rust/hot" => {
                         include_str!("../tests/fixtures/sub.json")
                     }
                     "/subreddits/mine/subscriber.json" => {
@@ -10290,7 +12011,7 @@ mod tests {
         );
 
         app.switch_tab(0);
-        app.load_settled(Instant::now() + NAV_SETTLE);
+        app.tick_at(Instant::now() + NAV_SETTLE);
 
         assert!(
             app.tabs[0].feed.loading(),
@@ -10390,7 +12111,7 @@ mod tests {
             result: Ok(listing("armenia", &["a"], None)),
         });
 
-        sequence(&mut app, " gc");
+        sequence(&mut app, "gc");
 
         assert_eq!(app.active_tab().subreddit(), Some("armenia"));
         assert!(matches!(
@@ -10434,7 +12155,6 @@ mod tests {
         assert!(app.all_subs.groups[0].posts.is_empty());
         app.toggle_bookmark();
         assert!(app.state.is_bookmarked("a"));
-        remove_state(&app.state_path);
     }
 
     #[test]
@@ -10587,7 +12307,7 @@ mod tests {
         let tab = app.active_tab().id;
 
         for (expected_writes, join) in [(1, true), (2, false), (3, true)] {
-            sequence(&mut app, " am");
+            sequence(&mut app, " m");
             assert!(
                 matches!(&app.overlay, Some(Overlay::Membership { target: MembershipTarget::User(name), join: action }) if name == "blackvault" && *action == join)
             );
@@ -10625,7 +12345,6 @@ mod tests {
             assert_eq!(following.contains(&app.active), join);
             assert_eq!(opened.contains(&app.active), !join);
         }
-        remove_state(&app.state_path);
     }
 
     #[test]
@@ -10711,7 +12430,7 @@ mod tests {
                     }
                     Reply::json(json!({"kind":"Listing","data":{"children":children,"after":null}}))
                 }
-                path if path.ends_with("/hot.json") => {
+                path if path.ends_with("/hot") => {
                     let sub = path.split('/').nth(2).unwrap();
                     let children: Vec<_> = ["a","b","c","d"].into_iter().map(|id|
                         json!({"kind":"t3","data":{"id":id,"title":id,"subreddit":sub,"permalink":format!("/r/{sub}/comments/{id}/title/"),"author":"reader"}})).collect();
@@ -10733,7 +12452,7 @@ mod tests {
         app.tabs[app.active].feed.offset = 2;
         let tab = app.active_tab().id;
         for (expected_count, join) in [(1, true), (2, false), (3, true)] {
-            sequence(&mut app, " am");
+            sequence(&mut app, " m");
             assert!(
                 matches!(&app.overlay, Some(Overlay::Membership { target: MembershipTarget::Community(subreddit), join: action }) if subreddit == "armenia" && *action == join)
             );
@@ -10905,7 +12624,7 @@ mod tests {
             Some("rust"),
             "empty All subs island"
         );
-        sequence(&mut app, " am");
+        sequence(&mut app, " m");
         assert!(
             matches!(&app.overlay, Some(Overlay::Membership { target: MembershipTarget::Community(subreddit), join: false }) if subreddit == "rust")
         );
@@ -10914,7 +12633,7 @@ mod tests {
         app.open_subreddit("armenia");
         assert_eq!(app.community().as_deref(), Some("armenia"));
         app.focus = Focus::Sidebar;
-        sequence(&mut app, " am");
+        sequence(&mut app, " m");
         assert!(
             matches!(&app.overlay, Some(Overlay::Membership { target: MembershipTarget::Community(subreddit), join: true }) if subreddit == "armenia")
         );
@@ -10929,8 +12648,8 @@ mod tests {
         app.overlay = Some(Overlay::Search {
             input: String::new(),
         });
-        sequence(&mut app, " am");
-        assert!(matches!(&app.overlay, Some(Overlay::Search { input }) if input == " am"));
+        sequence(&mut app, " m");
+        assert!(matches!(&app.overlay, Some(Overlay::Search { input }) if input == " m"));
     }
 
     #[test]
@@ -10994,12 +12713,10 @@ mod tests {
         subscriptions: &[&str],
     ) -> (App, std::sync::mpsc::Receiver<Msg>) {
         let (pool, messages) = Pool::start(reddit.clone(), 3, None);
-        let state = std::env::temp_dir().join(format!(
-            "redtab-app-test-{}-{:?}.json",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let state = crate::test_support::state_path();
         let mut app = App::new(Config::default(), pool, reddit, state, Picker::halfblocks());
+        app.config.select_account(Some("tester"));
+        app.settings.store.select_account(Some("tester"));
         app.on_msg(Msg::Subscriptions {
             generation: 0,
             result: Ok((subscriptions
@@ -11053,6 +12770,7 @@ mod tests {
             flair: None,
             is_op: false,
             is_mod: false,
+            stickied: false,
             score: None,
             body: id.into(),
             replies,
@@ -11061,12 +12779,6 @@ mod tests {
                 count: Some(1),
             }),
         }
-    }
-
-    /// Remove a test's state file and the lock file saving leaves beside it.
-    fn remove_state(path: &std::path::Path) {
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(path.with_extension("json.lock"));
     }
 
     fn tab_index(app: &App, name: &str) -> usize {
@@ -11486,18 +13198,30 @@ mod tests {
         let pause = NAV_SETTLE + Duration::from_millis(50);
 
         app.move_selection(1);
-        std::thread::sleep(pause);
+        let until = Instant::now() + pause;
+        while Instant::now() < until {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
         app.move_selection(1);
-        std::thread::sleep(pause);
+        let until = Instant::now() + pause;
+        while Instant::now() < until {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
         app.move_selection(-1);
-        let waited = wait_for_page(&mut app, &messages);
+        wait_for_page(&mut app, &messages);
 
         assert_eq!(app.post_view.as_ref().unwrap().post.id, "fa");
         assert!(app.post_view.as_ref().unwrap().page.is_some());
-        assert_eq!(server.asked(), ["warm", "fa", "fb"]);
-        assert!(
-            waited < delay,
-            "returning should use the response already on its way"
+        // fb's fetch may be dropped as superseded before a busy worker starts it. A
+        // duplicate fa would start once a worker frees, within one more delay.
+        std::thread::sleep(delay);
+        let asked = server.asked();
+        assert_eq!(
+            asked.iter().filter(|id| *id == "fa").count(),
+            1,
+            "{asked:?}"
         );
     }
 
@@ -11510,11 +13234,22 @@ mod tests {
         let pause = NAV_SETTLE + Duration::from_millis(50);
 
         app.move_selection(1);
-        std::thread::sleep(pause);
+        let until = Instant::now() + pause;
+        while Instant::now() < until {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
         app.move_selection(1);
-        std::thread::sleep(pause);
+        let until = Instant::now() + pause;
+        while Instant::now() < until {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
         app.move_selection(-1);
-        let waited = wait_for_page(&mut app, &messages);
+        wait_for_page(&mut app, &messages);
+        // A duplicate fa would start once a worker frees and pacing allows, within one more
+        // second.
+        std::thread::sleep(Duration::from_secs(1));
 
         assert!(app.post_view.as_ref().unwrap().page.is_some());
         assert_eq!(app.post_view.as_ref().unwrap().post.id, "fa");
@@ -11525,10 +13260,6 @@ mod tests {
                 .filter(|id| id.as_str() == "fa")
                 .count(),
             1
-        );
-        assert!(
-            waited < Duration::from_secs(1),
-            "a return should join the already-admitted request"
         );
     }
 
@@ -11598,12 +13329,20 @@ mod tests {
         for _ in 0..4 {
             app.move_selection(1);
             std::thread::sleep(pause);
+            app.tick();
         }
         let waited = wait_for_page(&mut app, &messages);
 
         assert_eq!(app.post_view.as_ref().unwrap().post.id, "fd");
         assert!(app.post_view.as_ref().unwrap().page.is_some());
-        assert_eq!(server.asked().last().map(String::as_str), Some("fd"));
+        assert_eq!(
+            server
+                .asked()
+                .iter()
+                .filter(|id| id.as_str() == "fd")
+                .count(),
+            1
+        );
         assert!(
             waited < Duration::from_secs(2),
             "the current post must not wait for every obsolete response"
@@ -11611,20 +13350,52 @@ mod tests {
     }
 
     #[test]
+    fn scrolling_away_from_the_feed_end_should_cancel_deferred_pagination() {
+        let mut app = app_with(&["s"]);
+        let index = tab_index(&app, "s");
+        app.switch_tab(index);
+        let posts = (0..20).map(|i| post(&format!("p{i}"), "s")).collect();
+        app.on_msg(Msg::Feed {
+            tab: app.tabs[index].id,
+            generation: app.tabs[index].feed.generation,
+            append: false,
+            result: Ok(Listing {
+                posts,
+                after: Some("next".into()),
+            }),
+        });
+
+        app.select_edge(true);
+        assert!(!app.active_tab().feed.loading_more());
+        app.select_edge(false);
+        app.tick_at(Instant::now() + NAV_SETTLE);
+        assert!(
+            !app.active_tab().feed.loading_more(),
+            "the final viewport is far from the end"
+        );
+        app.select_edge(true);
+        assert!(!app.active_tab().feed.loading_more());
+        app.tick_at(Instant::now() + NAV_SETTLE);
+
+        assert!(app.active_tab().feed.loading_more());
+        assert_eq!(app.active_tab().feed.selected, 19);
+    }
+
+    #[test]
     fn beside_an_open_post_a_quick_run_of_list_moves_previews_each_and_loads_only_its_end() {
         let (mut app, _) = split_feed(&["run1", "run2", "run3", "run4"]);
 
         app.move_selection(1);
+        assert!(
+            !app.pending_posts.contains_key("/r/s/comments/run2/x/"),
+            "the first scroll preview must wait too"
+        );
         app.move_selection(1);
         assert_eq!(app.post_view.as_ref().unwrap().post.id, "run3");
         app.move_selection(1);
 
         assert_eq!(app.post_view.as_ref().unwrap().post.id, "run4");
         assert_eq!(app.focus, Focus::List, "the list keeps focus");
-        assert!(
-            app.pending_posts.contains_key("/r/s/comments/run2/x/"),
-            "a move after a pause loads at once"
-        );
         assert!(
             !app.state.is_read("run2"),
             "a request is not a displayed page"
@@ -11683,6 +13454,7 @@ mod tests {
     #[test]
     fn when_sidebar_navigation_starts_its_first_feed_and_images_should_wait_for_settling() {
         let mut app = app_with(&["a", "b"]);
+        app.active = SEARCH_TAB;
         app.focus_sidebar();
 
         app.move_sidebar(1);
@@ -11702,12 +13474,16 @@ mod tests {
         let mut app = app_with(&["a", "b", "c"]);
         app.focus_sidebar();
 
-        app.move_sidebar(1);
-        app.move_sidebar(1);
-        app.move_sidebar(1);
+        for _ in 0..4 {
+            app.move_sidebar(1);
+        }
 
         let [a, b, c] = ["a", "b", "c"].map(|name| tab_index(&app, name));
         assert_eq!(app.active, c);
+        assert!(
+            !app.search.discovered.loading,
+            "Search passed over asks for nothing"
+        );
         assert!(!app.tabs[a].feed.loading());
         assert!(!app.tabs[b].feed.loading());
         assert!(!app.tabs[c].feed.loading());
@@ -11720,6 +13496,7 @@ mod tests {
     #[test]
     fn when_sidebar_navigation_is_waiting_an_explicit_reload_should_load_immediately_once() {
         let mut app = app_with(&["a"]);
+        app.active = SEARCH_TAB;
         app.focus_sidebar();
         app.move_sidebar(1);
 
@@ -11872,17 +13649,12 @@ mod tests {
     }
 
     #[test]
-    fn pictures_a_quick_run_of_moves_passes_wait_until_it_stops() {
+    fn scroll_pictures_wait_from_the_first_movement_until_it_stops() {
         let mut app = app_with(&[]);
         let (thumb, picture) = (
             "https://i.redd.it/row.png",
             "https://preview.redd.it/text.png",
         );
-        app.move_selection(1);
-        app.thumbs_drawn(&[thumb]);
-        assert!(app.thumbs.contains_key(thumb), "a lone move loads at once");
-        app.thumbs.clear();
-
         app.move_selection(1);
         app.thumbs_drawn(&[thumb]);
         app.request_text_picture(picture);
@@ -12132,7 +13904,6 @@ mod tests {
     #[test]
     fn removing_a_bookmark_from_another_tab_keeps_the_bookmarks_selection_usable() {
         let mut app = app_with(&["s"]);
-        let _ = std::fs::remove_file(&app.state_path);
         for id in ["a", "b", "c"] {
             app.state.toggle_bookmark(&post(id, "s"), 1);
         }
@@ -12152,7 +13923,6 @@ mod tests {
         app.toggle_bookmark(); // removes "b" from the subreddit tab
         app.switch_tab(BOOKMARKS_TAB);
         let current = app.current_post().map(|p| p.id);
-        remove_state(&app.state_path);
 
         assert_eq!(current.as_deref(), Some("a"));
     }
@@ -12226,8 +13996,9 @@ mod tests {
     }
 
     #[test]
-    fn a_home_refresh_with_fewer_posts_keeps_a_post_selected() {
+    fn a_home_refresh_with_fewer_posts_keeps_the_post_being_read() {
         let mut app = app_with(&["a"]);
+        app.switch_tab(ALL_SUBS_TAB);
         app.on_msg(Msg::Group {
             generation: 0,
             subreddit: "a".into(),
@@ -12241,7 +14012,7 @@ mod tests {
             result: Ok(listing("a", &["a1"], None)),
         });
 
-        assert_eq!(app.current_post().map(|p| p.id).as_deref(), Some("a1"));
+        assert_eq!(app.current_post().map(|p| p.id).as_deref(), Some("a3"));
     }
 
     #[test]
@@ -12400,6 +14171,10 @@ mod tests {
             press(&mut app, crossterm::event::KeyCode::BackTab);
             assert_eq!(app.current_post().unwrap().id, "a2");
             app.all_subs.groups[0].posts = vec![post("a1", "a")];
+            for key in "gT".chars() {
+                press(&mut app, crossterm::event::KeyCode::Char(key));
+            }
+            assert_eq!(app.active, SEARCH_TAB);
             for key in "gT".chars() {
                 press(&mut app, crossterm::event::KeyCode::Char(key));
             }
@@ -12626,6 +14401,27 @@ mod tests {
     }
 
     #[test]
+    fn community_scrolling_from_all_subs_details_should_load_only_the_settled_post() {
+        let mut app = app_with(&["a", "b", "c"]);
+        for group in &mut app.all_subs.groups {
+            group.posts = vec![post(&format!("{}1", group.subreddit), &group.subreddit)];
+        }
+        app.open_current_post();
+
+        app.move_community(true);
+        assert_eq!(app.current_post().unwrap().id, "b1");
+        assert!(!app.pending_posts.contains_key("/r/b/comments/b1/x/"));
+        app.move_community(true);
+        assert_eq!(app.current_post().unwrap().id, "c1");
+        assert!(!app.pending_posts.contains_key("/r/c/comments/c1/x/"));
+        app.tick_at(Instant::now() + NAV_SETTLE);
+
+        assert!(!app.pending_posts.contains_key("/r/b/comments/b1/x/"));
+        assert!(app.pending_posts.contains_key("/r/c/comments/c1/x/"));
+        assert_eq!(app.focus, Focus::Post);
+    }
+
+    #[test]
     fn ancestor_navigation_should_follow_all_subs_groups_and_leave_empty_destinations_usable() {
         let mut app = app_with(&["a", "b", "c"]);
         app.resize(80);
@@ -12638,7 +14434,7 @@ mod tests {
         assert_eq!(app.all_subs.group, 1);
         assert!(app.post_view.is_none());
         app.picture_settle.due(Instant::now() + NAV_SETTLE);
-        app.groups_drawn(&[1], &[]);
+        app.groups_drawn(&[1], &[], &[]);
         let generation = app.all_subs.groups[1].generation;
         app.on_msg(Msg::Group {
             subreddit: "b".into(),
@@ -12709,7 +14505,7 @@ mod tests {
         }
         assert!(app.post_view.is_none());
         app.picture_settle.due(Instant::now() + NAV_SETTLE);
-        app.groups_drawn(&[2], &[]);
+        app.groups_drawn(&[2], &[], &[]);
         let generation = app.all_subs.groups[2].generation;
         app.on_msg(Msg::Group {
             subreddit: "c".into(),
@@ -13134,7 +14930,6 @@ mod tests {
     #[test]
     fn a_merge_from_another_instance_keeps_the_selected_bookmark() {
         let mut app = app_with(&[]);
-        let _ = std::fs::remove_file(&app.state_path);
         app.state.toggle_bookmark(&post("x", "s"), 50);
         app.state.toggle_bookmark(&post("y", "s"), 100);
         app.switch_tab(BOOKMARKS_TAB);
@@ -13144,7 +14939,6 @@ mod tests {
         other.save(&app.state_path, 200).unwrap();
 
         let redraw = app.persist();
-        remove_state(&app.state_path);
 
         assert!(redraw);
         assert_eq!(app.current_post().unwrap().id, "x");
@@ -13154,10 +14948,8 @@ mod tests {
     fn a_failed_write_after_a_merge_keeps_the_selection_and_reports_the_error() {
         use std::os::unix::fs::PermissionsExt;
         let mut app = app_with(&[]);
-        let dir = std::env::temp_dir().join(format!("redtab-failwrite-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
         app.state_path = path.clone();
         app.state.toggle_bookmark(&post("x", "s"), 50);
         app.state.toggle_bookmark(&post("y", "s"), 100);
@@ -13168,14 +14960,13 @@ mod tests {
         other.save(&path, 200).unwrap();
         // A read-only directory: the merge reads the file, then writing the
         // temp file fails.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
 
         let redraw = app.persist();
         let selected = app.current_post().map(|p| p.id);
         app.toggle_bookmark();
         let status = app.status.as_ref().map(|s| (s.error, s.text.clone()));
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
 
         assert!(redraw);
         assert_eq!(selected.as_deref(), Some("x"));
@@ -13212,33 +15003,39 @@ mod tests {
     }
 
     #[test]
-    fn background_feed_updates_wait_for_reload_and_keep_the_latest_result() {
+    fn background_arrivals_wait_while_existing_posts_keep_the_latest_updates() {
         let mut app = app_with(&["vim"]);
         let i = tab_index(&app, "vim");
         app.switch_tab(i);
         let tab = app.tabs[i].id;
-        let answer = |generation, ids: &[&str], order| {
+        let answer = |generation, ids: &[&str], order, score| {
+            let mut page = listing("vim", ids, Some("next"));
+            page.posts
+                .iter_mut()
+                .find(|post| post.id == "a")
+                .unwrap()
+                .score = Some(score);
             ordered_snapshot(
                 Msg::Feed {
                     tab,
                     generation,
                     append: false,
-                    result: Ok(listing("vim", ids, Some("next"))),
+                    result: Ok(page),
                 },
                 order,
                 false,
                 false,
             )
         };
-        app.on_msg(answer(app.tabs[i].feed.generation, &["a", "b", "c"], 1));
+        app.on_msg(answer(app.tabs[i].feed.generation, &["a", "b", "c"], 1, 1));
         app.tabs[i].feed.selected = 1;
         app.tabs[i].feed.offset = 1;
         app.fetch_feed(i, None, false);
         let generation = app.tabs[i].feed.generation;
 
-        app.on_msg(answer(generation, &["new", "a", "b", "c"], 2));
-        app.on_msg(answer(generation, &["latest", "new", "a", "b", "c"], 3));
-        app.on_msg(answer(generation, &["older", "a", "b", "c"], 2));
+        app.on_msg(answer(generation, &["new", "a", "b", "c"], 2, 42));
+        app.on_msg(answer(generation, &["latest", "new", "a", "b", "c"], 3, 43));
+        app.on_msg(answer(generation, &["older", "a", "b", "c"], 2, 99));
 
         assert_eq!(
             app.tabs[i]
@@ -13248,6 +15045,16 @@ mod tests {
                 .map(|p| p.id.as_str())
                 .collect::<Vec<_>>(),
             ["a", "b", "c"]
+        );
+        assert_eq!(
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .find(|post| post.id == "a")
+                .unwrap()
+                .score,
+            Some(43)
         );
         app.reload();
         assert_eq!(
@@ -13260,76 +15067,118 @@ mod tests {
             ["latest", "new", "a", "b", "c"]
         );
         assert_eq!(app.current_post().unwrap().id, "latest");
-        assert_eq!(app.tabs[i].feed.offset, 0);
-        assert_eq!(app.tabs[i].feed.after.as_deref(), Some("next"));
-    }
-
-    #[test]
-    fn applying_buffered_pages_reveals_the_top_and_retains_the_updated_suffix() {
-        let mut app = app_with(&["vim"]);
-        let i = tab_index(&app, "vim");
-        app.switch_tab(i);
-        let tab = app.tabs[i].id;
-        let answer = |generation, append, ids: &[&str], after, order| {
-            ordered_snapshot(
-                Msg::Feed {
-                    tab,
-                    generation,
-                    append,
-                    result: Ok(listing("vim", ids, after)),
-                },
-                order,
-                false,
-                false,
-            )
-        };
-        app.on_msg(answer(
-            app.tabs[i].feed.generation,
-            false,
-            &["a", "b"],
-            Some("next"),
-            1,
-        ));
-        app.load_feed(i, true);
-        app.on_msg(answer(
-            app.tabs[i].feed.generation,
-            true,
-            &["c", "d"],
-            None,
-            1,
-        ));
-        app.tabs[i].feed.selected = 1;
-        app.tabs[i].feed.offset = 1;
-        app.load_feed(i, false);
-        app.on_msg(answer(
-            app.tabs[i].feed.generation,
-            false,
-            &["a", "x"],
-            Some("next"),
-            2,
-        ));
-        app.fetch_feed(i, Some("next".into()), false);
-        app.on_msg(answer(
-            app.tabs[i].feed.generation,
-            true,
-            &["b", "c", "d"],
-            None,
-            3,
-        ));
-
-        app.reload();
-
-        assert_eq!(app.current_post().unwrap().id, "a");
-        assert_eq!(app.tabs[i].feed.offset, 0);
         assert_eq!(
             app.tabs[i]
                 .feed
                 .posts
                 .iter()
-                .map(|post| post.id.as_str())
-                .collect::<Vec<_>>(),
-            ["a", "x", "b", "c", "d"]
+                .find(|post| post.id == "a")
+                .unwrap()
+                .score,
+            Some(43)
         );
+        assert_eq!(app.tabs[i].feed.offset, 0);
+        assert_eq!(app.tabs[i].feed.after.as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn applying_buffered_pages_shows_the_list_top_and_retains_the_updated_suffix() {
+        for (head_order, suffix_order) in [(2, 3), (3, 2)] {
+            let mut app = app_with(&["vim"]);
+            let i = tab_index(&app, "vim");
+            app.switch_tab(i);
+            app.config.filters.authors.push("blocked".into());
+            let tab = app.tabs[i].id;
+            let answer = |generation, append, ids: &[&str], after, order| {
+                ordered_snapshot(
+                    Msg::Feed {
+                        tab,
+                        generation,
+                        append,
+                        result: Ok(listing("vim", ids, after)),
+                    },
+                    order,
+                    false,
+                    false,
+                )
+            };
+            app.on_msg(answer(
+                app.tabs[i].feed.generation,
+                false,
+                &["a", "b"],
+                Some("next"),
+                1,
+            ));
+            app.load_feed(i, true);
+            app.on_msg(answer(
+                app.tabs[i].feed.generation,
+                true,
+                &["c", "d"],
+                None,
+                1,
+            ));
+            app.tabs[i].feed.selected = 1;
+            app.tabs[i].feed.offset = 1;
+            app.load_feed(i, false);
+            app.on_msg(answer(
+                app.tabs[i].feed.generation,
+                false,
+                &["x", "a"],
+                Some("next"),
+                head_order,
+            ));
+            app.fetch_feed(i, Some("next".into()), false);
+            let mut suffix = listing("vim", &["b", "c", "d"], None);
+            suffix.posts[0].score = Some(42);
+            suffix.posts[0].author = "blocked".into();
+            app.on_msg(ordered_snapshot(
+                Msg::Feed {
+                    tab,
+                    generation: app.tabs[i].feed.generation,
+                    append: true,
+                    result: Ok(suffix),
+                },
+                suffix_order,
+                false,
+                false,
+            ));
+            assert_eq!(
+                app.tabs[i]
+                    .feed
+                    .posts
+                    .iter()
+                    .find(|post| post.id == "b")
+                    .unwrap()
+                    .score,
+                Some(42)
+            );
+
+            assert_eq!(app.state.unread("vim", &app.config), Some(4));
+            app.reload();
+
+            assert_eq!(app.current_post().unwrap().id, "x");
+            assert_eq!(app.state.unread("vim", &app.config), Some(4));
+            assert_eq!(
+                app.tabs[i]
+                    .feed
+                    .posts
+                    .iter()
+                    .find(|post| post.id == "b")
+                    .unwrap()
+                    .score,
+                Some(42)
+            );
+            assert_eq!(app.tabs[i].feed.offset, 0);
+            assert_eq!(
+                app.tabs[i]
+                    .feed
+                    .posts
+                    .iter()
+                    .map(|post| post.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["x", "a", "b", "c", "d"]
+            );
+        }
     }
 
     #[test]
@@ -13376,11 +15225,7 @@ mod tests {
             2,
         ));
 
-        assert_eq!(
-            app.tabs[i].feed.update_summary(&app.config),
-            Some("Feed details updated")
-        );
-        app.reload();
+        assert!(!app.tabs[i].feed.has_new_posts(&app.config));
         assert_eq!(
             app.tabs[i]
                 .feed
@@ -13438,7 +15283,7 @@ mod tests {
 
         assert_eq!(app.tabs[i].feed.access_denied(), None);
         assert_eq!(app.current_post().unwrap().id, "old");
-        assert!(app.tabs[i].feed.has_updates());
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
         assert!(
             app.all_subs
                 .groups
@@ -13462,19 +15307,19 @@ mod tests {
         app.on_msg(answer(app.tabs[i].feed.generation, "old"));
         app.load_feed(i, false);
         app.on_msg(answer(app.tabs[i].feed.generation, "buffered"));
-        assert!(app.tabs[i].feed.has_updates());
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
 
         app.set_sort(Sort::New);
         app.on_msg(answer(app.tabs[i].feed.generation, "sorted"));
         app.reload();
 
-        assert!(!app.tabs[i].feed.has_updates());
+        assert!(!app.tabs[i].feed.has_new_posts(&app.config));
         assert_eq!(app.current_post().unwrap().id, "sorted");
         assert!(app.tabs[i].feed.loading());
     }
 
     #[test]
-    fn cache_refresh_keeps_the_selected_post_and_screen_row() {
+    fn manual_metadata_refresh_keeps_the_selected_post_and_screen_row() {
         let mut app = app_with(&["vim"]);
         let i = tab_index(&app, "vim");
         app.switch_tab(i);
@@ -13489,6 +15334,2480 @@ mod tests {
         app.tabs[i].feed.offset = 1;
         app.reload();
 
+        let mut updated = listing("vim", &["a", "b", "c"], None);
+        updated.posts[1].score = Some(42);
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(updated),
+        });
+
+        assert_eq!(app.current_post().unwrap().id, "b");
+        assert_eq!(app.current_post().unwrap().score, Some(42));
+        assert_eq!(app.tabs[i].feed.selected - app.tabs[i].feed.offset, 0);
+    }
+
+    #[test]
+    fn unseen_posts_below_every_known_post_on_the_last_page_apply_without_a_notice() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        let answer = |app: &App, ids: &[&str]| Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", ids, Some("t3_end"))),
+        };
+        app.on_msg(answer(&app, &["a", "b", "c"]));
+
+        app.load_feed(i, false);
+        app.on_msg(answer(&app, &["a", "c", "t"]));
+
+        assert!(!app.tabs[i].feed.has_new_posts(&app.config));
+        let ids = |app: &App| {
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|post| post.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&app), ["a", "c", "t"]);
+        assert_eq!(app.current_post().unwrap().id, "a");
+
+        app.tabs[i].feed.selected = 1;
+        app.tabs[i].feed.offset = 1;
+        app.reload();
+        app.on_msg(answer(&app, &["a", "c", "t", "u"]));
+
+        assert_eq!(ids(&app), ["a", "c", "t", "u"]);
+        assert_eq!(app.current_post().unwrap().id, "c");
+        assert_eq!(app.tabs[i].feed.offset, 1);
+    }
+
+    #[test]
+    fn navigation_cache_island_progress_shows_cold_posts_but_keeps_established_refreshes_stable() {
+        let mut app = app_with(&["vim"]);
+        app.switch_tab(ALL_SUBS_TAB);
+        app.all_subs.groups[0].loading = true;
+        let generation = app.all_subs.groups[0].generation;
+        let progress = |id| Msg::GroupProgress {
+            subreddit: "vim".into(),
+            generation,
+            post: Box::new(post(id, "vim")),
+            source: Source::default(),
+        };
+        app.on_msg(progress("a"));
+        app.on_msg(progress("b"));
+        assert_eq!(app.current_post().unwrap().id, "a");
+        assert_eq!(island_ids(&app), ["a", "b"]);
+        assert!(app.all_subs.groups[0].loading);
+        assert!(!app.all_subs.has_new_posts(&app.config));
+        app.on_msg(island_answer(&app, &["a", "b"]));
+        app.all_subs.groups[0].loading = true;
+        app.on_msg(progress("new"));
+        assert_eq!(island_ids(&app), ["a", "b"]);
+        app.on_msg(island_answer(&app, &["new", "a", "b"]));
+        assert!(app.all_subs.has_new_posts(&app.config));
+    }
+
+    #[test]
+    fn an_older_island_listing_cannot_replace_a_newer_one() {
+        let mut app = app_with(&["vim"]);
+        let generation = app.all_subs.groups[0].generation;
+        let group = |ids: &[&str]| Msg::Group {
+            subreddit: "vim".into(),
+            generation,
+            result: Ok(listing("vim", ids, None)),
+        };
+        app.on_msg(ordered_snapshot(group(&["newer"]), 2, false, false));
+        let accepted = app.all_subs.groups[0].freshness.unwrap();
+        app.on_msg(ordered_snapshot(group(&["older"]), 1, true, false));
+
+        assert_eq!(app.all_subs.groups[0].posts[0].id, "newer");
+        assert_eq!(
+            app.all_subs.groups[0].freshness.unwrap().source,
+            accepted.source
+        );
+    }
+
+    fn island_ids(app: &App) -> Vec<String> {
+        app.group_posts(&app.all_subs.groups[0])
+            .map(|post| post.id.clone())
+            .collect()
+    }
+
+    fn island_answer(app: &App, ids: &[&str]) -> Msg {
+        Msg::Group {
+            subreddit: "vim".into(),
+            generation: app.all_subs.groups[0].generation,
+            result: Ok(listing("vim", ids, None)),
+        }
+    }
+
+    #[test]
+    fn an_island_holds_every_unseen_post_while_one_ranks_above_a_shown_post() {
+        let mut app = app_with(&["vim"]);
+        app.config.all_subs_posts_per_group = 3;
+        app.on_msg(island_answer(&app, &["a", "b", "c"]));
+
+        app.on_msg(island_answer(&app, &["n1", "a", "b", "n2", "c"]));
+
+        assert!(app.all_subs.has_new_posts(&app.config));
+        assert_eq!(island_ids(&app), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_filter_that_hides_waiting_posts_applies_the_held_answers_and_clears_the_notice() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        let tab = app.tabs[i].id;
+        let feed = |app: &App, ids: &[&str]| Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", ids, None)),
+        };
+        app.on_msg(feed(&app, &["a", "b"]));
+        app.load_feed(i, false);
+        app.on_msg(feed(&app, &["n", "b", "a"]));
+        app.on_msg(island_answer(&app, &["a", "b"]));
+        app.on_msg(island_answer(&app, &["n", "a", "b"]));
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+        assert!(app.all_subs.has_new_posts(&app.config));
+
+        app.change_setting(
+            "filters.keywords",
+            toml::Value::Array(vec!["title n".into()]),
+        );
+
+        assert!(!app.tabs[i].feed.has_new_posts(&app.config));
+        assert!(app.tabs[i].feed.update.is_none());
+        assert_eq!(
+            app.config
+                .visible(&app.tabs[i].feed.posts)
+                .map(|post| post.id.as_str())
+                .collect::<Vec<_>>(),
+            // The island answers seed this tab's first page too; the last one ranks a, b.
+            ["a", "b"]
+        );
+        assert!(!app.all_subs.has_new_posts(&app.config));
+    }
+
+    #[test]
+    fn a_filter_that_empties_an_island_shows_its_waiting_posts() {
+        let mut app = app_with(&["vim"]);
+        app.on_msg(island_answer(&app, &["a", "b"]));
+        app.on_msg(island_answer(&app, &["n", "a", "b"]));
+        assert!(app.all_subs.has_new_posts(&app.config));
+
+        app.change_setting(
+            "filters.keywords",
+            toml::Value::Array(vec!["title a".into(), "title b".into()]),
+        );
+
+        assert!(!app.all_subs.has_new_posts(&app.config));
+        assert_eq!(island_ids(&app), ["n"]);
+    }
+
+    #[test]
+    fn unseen_posts_below_the_top_enter_live_around_the_post_being_read() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &["a", "b"], Some("t3_b"))),
+        });
+        app.load_feed(i, true);
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: true,
+            result: Ok(listing("vim", &["c", "d"], None)),
+        });
+        app.tabs[i].feed.selected = 1;
+        app.tabs[i].feed.offset = 1;
+        app.load_feed(i, false);
+
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &["a", "t"], Some("t3_t"))),
+        });
+
+        assert!(!app.tabs[i].feed.has_new_posts(&app.config));
+        assert_eq!(
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|post| post.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "t", "c", "d"]
+        );
+        assert_eq!(app.current_post().unwrap().id, "b");
+    }
+
+    #[test]
+    fn rows_kept_below_the_first_page_stay_until_the_refetched_next_page_answers() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        let ids = |app: &App| {
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|post| post.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let answer = |app: &mut App, append: bool, posts: &[&str], after: Option<&str>| {
+            app.on_msg(Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append,
+                result: Ok(listing("vim", posts, after)),
+            });
+        };
+        answer(&mut app, false, &["a", "b"], Some("t3_b"));
+        app.load_feed(i, true);
+        answer(&mut app, true, &["c", "d"], None);
+
+        app.load_feed(i, false);
+        answer(&mut app, false, &["a", "t"], Some("t3_t"));
+        assert_eq!(ids(&app), ["a", "t", "b", "c", "d"]);
+        assert!(
+            app.tabs[i]
+                .feed
+                .requests
+                .values()
+                .any(|cursor| cursor.as_deref() == Some("t3_t"))
+        );
+        app.load_feed(i, false);
+        answer(&mut app, false, &["a", "u"], Some("t3_u"));
+        assert_eq!(ids(&app), ["a", "u", "t", "b", "c", "d"]);
+        let next: Vec<_> = app.tabs[i]
+            .feed
+            .requests
+            .values()
+            .filter_map(|cursor| cursor.as_deref())
+            .collect();
+        assert_eq!(next, ["t3_u"]);
+
+        answer(&mut app, true, &["b", "c", "d"], None);
+        assert_eq!(ids(&app), ["a", "u", "b", "c", "d"]);
+        app.load_feed(i, false);
+        answer(&mut app, false, &["a", "u"], Some("t3_u"));
+        assert_eq!(ids(&app), ["a", "u", "b", "c", "d"]);
+        assert!(!app.tabs[i].feed.loading());
+    }
+
+    #[test]
+    fn a_row_leaving_the_first_page_leaves_once_the_next_page_answers_without_it() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        let ids = |app: &App| {
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|post| post.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let answer = |app: &mut App, append: bool, posts: &[&str], after: Option<&str>| {
+            app.on_msg(Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append,
+                result: Ok(listing("vim", posts, after)),
+            });
+        };
+        answer(&mut app, false, &["a", "x", "b"], Some("t3_b"));
+        app.load_feed(i, true);
+        answer(&mut app, true, &["c", "d"], None);
+
+        app.reload();
+        answer(&mut app, false, &["a", "c", "b"], Some("t3_b"));
+        assert_eq!(ids(&app), ["a", "c", "b", "x", "d"]);
+        let restitching = app.tabs[i].feed.generation;
+        app.reload();
+        let generation = app.tabs[i].feed.generation;
+        assert_ne!(generation, restitching);
+        assert_eq!(app.tabs[i].feed.requests.get(&generation), Some(&None));
+        answer(&mut app, false, &["a", "c", "b"], Some("t3_b"));
+        answer(&mut app, true, &["d"], None);
+
+        assert_eq!(ids(&app), ["a", "c", "b", "d"]);
+        assert!(!app.tabs[i].feed.loading());
+    }
+
+    #[test]
+    fn a_next_page_requested_before_the_first_page_changed_is_fetched_from_its_new_end() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        let ids = |app: &App| {
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|post| post.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let answer = |app: &mut App, generation: u64, append: bool, posts: &[&str], after| {
+            app.on_msg(Msg::Feed {
+                tab,
+                generation,
+                append,
+                result: Ok(listing("vim", posts, after)),
+            });
+        };
+        let generation = app.tabs[i].feed.generation;
+        answer(&mut app, generation, false, &["a", "b"], Some("t3_b"));
+        app.load_feed(i, true);
+        let stale = app.tabs[i].feed.generation;
+        app.load_feed(i, false);
+
+        let generation = app.tabs[i].feed.generation;
+        answer(&mut app, generation, false, &["a", "t"], Some("t3_t"));
+        assert_eq!(ids(&app), ["a", "t", "b"]);
+        answer(&mut app, stale, true, &["c", "d"], None);
+        assert_eq!(ids(&app), ["a", "t", "b"]);
+        let generation = app.tabs[i].feed.generation;
+        answer(&mut app, generation, true, &["b", "c", "d"], None);
+
+        assert_eq!(ids(&app), ["a", "t", "b", "c", "d"]);
+        assert!(!app.tabs[i].feed.loading());
+    }
+
+    #[test]
+    fn a_kept_row_an_older_next_page_still_lists_stays() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        let answer = |app: &mut App, append: bool, posts: &[&str], after: Option<&str>, order| {
+            app.on_msg(ordered_snapshot(
+                Msg::Feed {
+                    tab,
+                    generation: app.tabs[i].feed.generation,
+                    append,
+                    result: Ok(listing("vim", posts, after)),
+                },
+                order,
+                false,
+                false,
+            ));
+        };
+        answer(&mut app, false, &["a", "b"], Some("t3_b"), 10);
+        app.load_feed(i, true);
+        answer(&mut app, true, &["c", "d"], Some("t3_d"), 11);
+        app.fetch_feed(i, Some("t3_b".into()), false);
+        answer(&mut app, true, &["c", "e"], Some("t3_e"), 12);
+        app.load_feed(i, true);
+
+        answer(&mut app, true, &["d", "f"], None, 5);
+
+        let ids: Vec<_> = app.tabs[i]
+            .feed
+            .posts
+            .iter()
+            .map(|post| post.id.as_str())
+            .collect();
+        assert!(ids.contains(&"d"), "{ids:?}");
+    }
+
+    #[test]
+    fn refetching_a_next_page_from_a_new_end_bypasses_the_cache() {
+        // Whether or not the page was first asked for past the cache.
+        for forced in [true, false] {
+            let mut app = app_with(&["vim"]);
+            let i = tab_index(&app, "vim");
+            app.switch_tab(i);
+            let tab = app.tabs[i].id;
+            let answer = |app: &mut App, generation: u64, append: bool, posts: &[&str], after| {
+                app.on_msg(Msg::Feed {
+                    tab,
+                    generation,
+                    append,
+                    result: Ok(listing("vim", posts, after)),
+                });
+            };
+            let generation = app.tabs[i].feed.generation;
+            answer(&mut app, generation, false, &["a", "b"], Some("t3_b"));
+            app.load_feed(i, true);
+            let generation = app.tabs[i].feed.generation;
+            answer(&mut app, generation, true, &["c", "d"], None);
+            if forced {
+                app.fetch_manual(Some("t3_b".into()));
+            }
+            app.load_feed(i, false);
+
+            let generation = app.tabs[i].feed.generation;
+            answer(&mut app, generation, false, &["a", "t"], Some("t3_t"));
+
+            let feed = &app.tabs[i].feed;
+            let (generation, _) = feed
+                .requests
+                .iter()
+                .find(|(_, cursor)| cursor.as_deref() == Some("t3_t"))
+                .unwrap();
+            assert!(feed.forced.contains(generation), "forced {forced}");
+        }
+    }
+
+    #[test]
+    fn an_island_that_loses_access_drops_its_new_posts_notice() {
+        let mut app = app_with(&["vim"]);
+        app.on_msg(island_answer(&app, &["a", "b"]));
+        app.on_msg(island_answer(&app, &["n", "a", "b"]));
+        assert!(app.all_subs.has_new_posts(&app.config));
+
+        app.on_msg(Msg::Group {
+            subreddit: "vim".into(),
+            generation: app.all_subs.groups[0].generation,
+            result: Err(FeedError::Access(AccessDenied::PrivateCommunity)),
+        });
+
+        assert!(!app.all_subs.has_new_posts(&app.config));
+    }
+
+    #[test]
+    fn an_island_holding_only_unseen_posts_keeps_showing_its_posts_until_r() {
+        let mut app = app_with(&["vim"]);
+        app.on_msg(island_answer(&app, &["a", "b"]));
+
+        app.on_msg(island_answer(&app, &["x", "y"]));
+
+        assert!(app.all_subs.has_new_posts(&app.config));
+        assert_eq!(island_ids(&app), ["a", "b"]);
+        app.reload();
+        assert_eq!(island_ids(&app), ["x", "y"]);
+    }
+
+    #[test]
+    fn a_held_island_keeps_its_order_and_selection_until_r() {
+        let mut app = app_with(&["vim"]);
+        app.on_msg(island_answer(&app, &["a", "b", "c", "d"]));
+        app.all_subs.post = 2;
+        assert_eq!(app.current_post().unwrap().id, "c");
+
+        let mut held = island_answer(&app, &["n", "d", "c"]);
+        if let Msg::Group {
+            result: Ok(listing),
+            ..
+        } = &mut held
+        {
+            listing.posts[2].score = Some(99);
+        }
+        app.on_msg(held);
+
+        assert!(app.all_subs.has_new_posts(&app.config));
+        assert_eq!(island_ids(&app), ["a", "b", "c"]);
+        assert_eq!(app.current_post().unwrap().id, "c");
+        assert_eq!(app.current_post().unwrap().score, Some(99));
+        app.reload();
+        assert_eq!(island_ids(&app), ["n", "d", "c"]);
+    }
+
+    #[test]
+    fn a_held_answer_that_stops_leading_applies_instead_of_vanishing() {
+        for home in [false, true] {
+            let mut app = app_with(&["vim"]);
+            let i = if home { 0 } else { tab_index(&app, "vim") };
+            app.switch_tab(i);
+            let tab = app.tabs[i].id;
+            let answer = |app: &mut App, append: bool, posts: &[&str]| {
+                app.on_msg(Msg::Feed {
+                    tab,
+                    generation: app.tabs[i].feed.generation,
+                    append,
+                    result: Ok(listing(
+                        "vim",
+                        posts,
+                        Some(&format!("t3_{}", posts[posts.len() - 1])),
+                    )),
+                });
+            };
+            answer(&mut app, false, &["a", "b"]);
+            app.load_feed(i, false);
+            answer(&mut app, false, &["x", "a", "y"]);
+            assert!(app.tabs[i].feed.has_new_posts(&app.config));
+
+            app.load_feed(i, true);
+            answer(&mut app, true, &["x", "c"]);
+
+            assert!(!app.tabs[i].feed.has_new_posts(&app.config));
+            assert!(
+                app.tabs[i].feed.posts.iter().any(|post| post.id == "y"),
+                "{home}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_feed_showing_nothing_takes_its_answer_at_once() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &[], None)),
+        });
+        app.load_feed(i, false);
+
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &["a", "b"], None)),
+        });
+
+        assert!(!app.tabs[i].feed.has_new_posts(&app.config));
+        assert_eq!(app.current_post().unwrap().id, "a");
+    }
+
+    #[test]
+    fn a_live_island_answer_keeps_the_selected_post_in_its_slot() {
+        let mut app = app_with(&["vim"]);
+        app.switch_tab(ALL_SUBS_TAB);
+        app.on_msg(island_answer(&app, &["a", "b", "c", "d"]));
+        app.all_subs.post = 2;
+        assert_eq!(app.current_post().unwrap().id, "c");
+
+        app.on_msg(island_answer(&app, &["a", "x", "b", "c"]));
+
+        assert!(!app.all_subs.has_new_posts(&app.config));
+        assert_eq!(island_ids(&app), ["a", "x", "c"]);
+        assert_eq!(app.current_post().unwrap().id, "c");
+
+        // Nobody reads an island while All subs is not shown: it takes Reddit's order.
+        app.switch_tab(0);
+        app.on_msg(island_answer(&app, &["a", "x", "b", "c"]));
+        assert_eq!(island_ids(&app), ["a", "x", "b"]);
+    }
+
+    #[test]
+    fn only_a_background_answer_keeps_the_island_post_being_read() {
+        let mut app = app_with(&["vim"]);
+        app.switch_tab(ALL_SUBS_TAB);
+        app.on_msg(island_answer(&app, &["a", "b", "c", "d"]));
+
+        // An untouched island top stays the top as the island reranks or drops it.
+        app.on_msg(island_answer(&app, &["b", "a", "c", "d"]));
+        assert_eq!(island_ids(&app), ["b", "a", "c"]);
+        assert_eq!(app.current_post().unwrap().id, "b");
+        app.on_msg(island_answer(&app, &["a", "c", "d"]));
+        assert_eq!(island_ids(&app), ["a", "c", "d"]);
+        assert_eq!(app.current_post().unwrap().id, "a");
+
+        // An open top post is being read.
+        app.open_current_post();
+        app.on_msg(island_answer(&app, &["c", "d"]));
+        assert_eq!(island_ids(&app), ["a", "c", "d"]);
+        assert_eq!(app.current_post().unwrap().id, "a");
+
+        // `r` shows the island as Reddit ranks it.
+        app.close_post();
+        app.all_subs.post = 1;
+        app.reload();
+        app.on_msg(island_answer(&app, &["d", "e"]));
+        assert_eq!(island_ids(&app), ["d", "e"]);
+        assert_eq!(app.current_post().unwrap().id, "e");
+    }
+
+    #[test]
+    fn opening_a_post_before_r_answers_keeps_the_list_on_it() {
+        // From the list, or from elsewhere such as Reddit tools.
+        for from_list in [true, false] {
+            let mut app = app_with(&["vim"]);
+            let i = tab_index(&app, "vim");
+            app.switch_tab(i);
+            let tab = app.tabs[i].id;
+            app.on_msg(Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Ok(listing("vim", &["a", "b", "c"], None)),
+            });
+            app.focus = Focus::List;
+            app.move_selection(2);
+
+            app.reload();
+            if from_list {
+                app.open_current_post();
+            } else {
+                let post = app.current_post().unwrap();
+                app.open_post_permalink(post.clone(), post.permalink);
+            }
+            app.on_msg(Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Ok(listing("vim", &["n", "a", "b", "c"], None)),
+            });
+
+            assert!(app.tabs[i].feed.has_new_posts(&app.config));
+            assert_eq!(app.current_post().unwrap().id, "c");
+            assert_eq!(app.post_view.as_ref().unwrap().shown_post().id, "c");
+        }
+
+        // A thread read from Reddit tools opens its post over the community already shown.
+        use crate::reddit::experience::{Query, Request, Response};
+        let mut app = app_with(&["neovim"]);
+        let i = tab_index(&app, "neovim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("neovim", &["a", "b", "c"], None)),
+        });
+        app.focus = Focus::List;
+        app.move_selection(2);
+        app.reload();
+        let page =
+            crate::reddit::parse::parse_post_page(include_str!("../tests/fixtures/post.json"))
+                .unwrap();
+        let query = Query::Thread(page.post.permalink.clone());
+        app.experience.pending = Some((7, Request::Read { query, after: None }));
+        app.on_msg(Msg::Experience {
+            generation: 7,
+            result: Ok(Response::Thread(Box::new(page))),
+        });
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("neovim", &["n", "a", "b", "c"], None)),
+        });
+        assert_eq!(app.active, i);
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+        assert_eq!(app.tabs[i].feed.selected, 2);
+    }
+
+    #[test]
+    fn a_background_feed_answer_keeps_the_post_being_read_in_its_row() {
+        let (mut app, _messages) = split_feed(&["a", "b", "c", "d"]);
+        let i = tab_index(&app, "s");
+        let tab = app.tabs[i].id;
+        let ids = |app: &App| {
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|post| post.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let answer = |app: &mut App, posts: &[&str]| {
+            app.on_msg(Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Ok(listing("s", posts, None)),
+            });
+        };
+        // An open top post is being read.
+        answer(&mut app, &["b", "c", "d"]);
+        assert_eq!(ids(&app), ["a", "b", "c", "d"]);
+        assert_eq!(app.post_view.as_ref().unwrap().shown_post().id, "a");
+
+        app.focus = Focus::List;
+        app.move_selection(2);
+        assert_eq!(app.post_view.as_ref().unwrap().shown_post().id, "c");
+
+        answer(&mut app, &["a", "b", "d", "e"]);
+        assert_eq!(ids(&app), ["a", "b", "c", "d", "e"]);
+        assert_eq!(app.current_post().unwrap().id, "c");
+        assert_eq!(app.post_view.as_ref().unwrap().shown_post().id, "c");
+
+        // `r` shows the feed as Reddit ranks it.
+        app.reload();
+        answer(&mut app, &["a", "b", "d", "e"]);
+        assert_eq!(ids(&app), ["a", "b", "d", "e"]);
+        assert_eq!(app.current_post().unwrap().id, "d");
+
+        // An untouched top stays the top as the list reranks or drops it, even when
+        // the dropped post stays below the page while new posts wait.
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        let answer = |app: &mut App, posts: &[&str]| {
+            app.on_msg(Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Ok(listing("vim", posts, None)),
+            });
+            let feed = &app.tabs[i].feed;
+            (
+                app.current_post().unwrap().id,
+                feed.selected + feed.offset,
+                feed.posts.len(),
+            )
+        };
+        answer(&mut app, &["a", "b", "c"]);
+        // Card scrolling left over from card view does not count in compact view.
+        app.tabs[i].feed.cards.line = 3;
+        if app.state.list_view() == crate::state::ListView::Card {
+            app.state.toggle_list_view();
+        }
+        assert_eq!(answer(&mut app, &["b", "a", "c"]), ("b".into(), 0, 3));
+        assert_eq!(answer(&mut app, &["a", "c"]), ("a".into(), 0, 2));
+        assert_eq!(answer(&mut app, &["n", "c"]), ("c".into(), 0, 2));
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+    }
+
+    #[test]
+    fn search_revision_connection_reset_should_end_the_retained_parent_pane() {
+        let mut app = app_with(&[]);
+        app.open_search(None);
+        app.search.discovered.entries.push(search::Row {
+            profile: None,
+            label: "r/rust".into(),
+            detail: "Parent communities".into(),
+            target: FeedTarget::Subreddit("rust".into()),
+        });
+        app.search.selected = 2;
+        app.open_search_row();
+        assert!(app.search_feed_open());
+        app.reset_search_loads();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let actual: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            !actual.contains("Explore"),
+            "a cleared Search origin must not leave unrelated parent rows: {actual}"
+        );
+    }
+
+    #[test]
+    fn search_rows_should_take_listing_icons_and_request_only_the_missing_ones_when_drawn() {
+        use crate::model::SubscriptionIcon;
+        use crate::reddit::experience::{Entry, Page, Query, Response};
+        let community = |name: &str, icon| Entry {
+            title: format!("r/{name}"),
+            body: String::new(),
+            target: None,
+            query: Some(Query::Community(name.into())),
+            post: None,
+            icon,
+        };
+        let mut app = app_with(&[]);
+        show_thumbnails(&mut app);
+        app.open_search(None);
+        app.on_search(
+            app.search.discovered_generation(),
+            Ok(Response::Page(Page {
+                title: "Discover".into(),
+                text: String::new(),
+                entries: vec![
+                    community("zig", SubscriptionIcon::Url("/icon/zig.png".into())),
+                    community("odin", SubscriptionIcon::Unknown),
+                    community("nim", SubscriptionIcon::Missing),
+                ],
+                after: None,
+                url: "/".into(),
+            })),
+        );
+        assert_eq!(
+            app.icons.get("zig").and_then(|icon| icon.url.as_deref()),
+            Some("/icon/zig.png")
+        );
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        assert!(
+            app.icon_lookups.contains("odin"),
+            "a drawn row without a listing icon asks for one"
+        );
+        assert!(
+            !app.icon_lookups.contains("zig") && !app.icon_lookups.contains("nim"),
+            "a listing icon, or a listing's lack of one, needs no lookup: {:?}",
+            app.icon_lookups
+        );
+    }
+
+    #[test]
+    fn search_rows_should_ask_for_icons_of_exactly_the_drawn_rows_when_scrolled() {
+        use crate::reddit::experience::{Entry, Page, Query, Response};
+        let names: Vec<String> = (0..40).map(|i| format!("c{i:02}")).collect();
+        let mut app = app_with(&[]);
+        show_thumbnails(&mut app);
+        app.open_search(None);
+        app.on_search(
+            app.search.discovered_generation(),
+            Ok(Response::Page(Page {
+                title: "Discover".into(),
+                text: String::new(),
+                entries: names
+                    .iter()
+                    .map(|name| Entry {
+                        title: format!("r/{name}"),
+                        body: String::new(),
+                        target: None,
+                        query: Some(Query::Community(name.clone())),
+                        post: None,
+                        icon: Default::default(),
+                    })
+                    .collect(),
+                after: None,
+                url: "/".into(),
+            })),
+        );
+        app.search.selected = 30;
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let shown: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+
+        for name in &names {
+            assert_eq!(
+                app.icon_lookups.contains(name.as_str()),
+                shown.contains(name.as_str()),
+                "{name}: icons are asked for the drawn rows only"
+            );
+        }
+    }
+
+    #[test]
+    fn search_rows_should_stop_paging_after_a_failure_and_drop_a_page_for_an_old_query() {
+        use crate::reddit::experience::{Entry, Page, Query, Response, SearchKind};
+        let page = |names: &[&str], after: Option<&str>| {
+            Ok(Response::Page(Page {
+                title: "Communities".into(),
+                text: String::new(),
+                entries: names
+                    .iter()
+                    .map(|name| Entry {
+                        icon: Default::default(),
+                        title: format!("r/{name}"),
+                        body: String::new(),
+                        query: Some(Query::Community((*name).into())),
+                        target: None,
+                        post: None,
+                    })
+                    .collect(),
+                after: after.map(str::to_string),
+                url: "/".into(),
+            }))
+        };
+        let mut app = app_with(&["vim"]);
+        app.open_search(Some(SearchKind::Communities));
+        assert_eq!(
+            app.search.rows_status(),
+            Some(search::RowsStatus::Discovering)
+        );
+        app.on_search(app.search.discovered_generation(), Err("offline".into()));
+        assert_eq!(
+            app.search.rows_status(),
+            Some(search::RowsStatus::DiscoveryFailed)
+        );
+        app.search_preview_drawn(true);
+        let _ = app.tick_at(Instant::now() + search::PREVIEW_SETTLE);
+        app.on_msg(Msg::Feed {
+            tab: crate::worker::PREVIEW_FEED,
+            generation: app.search.preview.generation,
+            append: false,
+            result: Err("offline".into()),
+        });
+        let failed = app.search.discovered_generation();
+        app.search_arrived();
+        let _ = app.tick_at(Instant::now() + search::PREVIEW_SETTLE);
+        assert!(
+            app.search.discovered_generation() == failed
+                && app.search.preview.error.is_some()
+                && !app.search.preview.loading,
+            "failures wait for r instead of the next arrival or poll"
+        );
+        press(&mut app, crossterm::event::KeyCode::Down);
+        assert_eq!(app.search.selected, 1);
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('a'),
+                crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
+            ),
+        );
+        assert_eq!(app.search.text(), "", "chords do not type into the query");
+        crate::keys::paste(&mut app, "ru\nst");
+        assert_eq!(app.search.text(), "ru st", "line breaks paste as spaces");
+        assert_eq!(
+            app.search.selected, 0,
+            "a pasted query starts at the first result"
+        );
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('u'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+        );
+        crate::keys::paste(&mut app, "rust");
+        assert_eq!(
+            app.search.selected, 0,
+            "a pasted query starts at the first result"
+        );
+        assert_eq!(
+            app.search.rows_status(),
+            None,
+            "the typing pause adds no line"
+        );
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        app.on_search(
+            app.search.results_generation(),
+            page(&["a", "b"], Some("next")),
+        );
+        press(&mut app, crossterm::event::KeyCode::Down);
+        assert_eq!(
+            app.search.rows_status(),
+            Some(search::RowsStatus::LoadingMore)
+        );
+        let interrupted = app.search.results_generation();
+        let rows = app.search.rows();
+        let selected = app.search.selected;
+        app.switch_tab(BOOKMARKS_TAB);
+        app.on_search(interrupted, Err("late failure".into()));
+        app.switch_tab(SEARCH_TAB);
+        app.tick_at(Instant::now() + Duration::from_secs(1));
+        assert_eq!(app.search.rows(), rows);
+        assert_eq!(app.search.selected, selected);
+        assert!(app.search.results.loading);
+        assert_ne!(app.search.results_generation(), interrupted);
+        let failed = app.search.results_generation();
+        app.on_search(failed, Err("offline".into()));
+        assert_eq!(app.search.rows().len(), 2);
+        assert_eq!(
+            app.search.rows_status(),
+            Some(search::RowsStatus::MoreFailed)
+        );
+        press(&mut app, crossterm::event::KeyCode::Up);
+        press(&mut app, crossterm::event::KeyCode::Down);
+        assert!(
+            app.search.results_generation() == failed && !app.search.results.loading,
+            "a failed page is not asked for again by moving"
+        );
+
+        press(&mut app, crossterm::event::KeyCode::Tab);
+        let _ = app.tick_at(Instant::now());
+        assert_eq!(app.search.kind, SearchKind::People);
+        app.on_search(failed, page(&["late"], None));
+        assert!(
+            app.search.rows().iter().all(|row| row.label != "r/late"),
+            "a page for the old query is dropped"
+        );
+
+        press(&mut app, crossterm::event::KeyCode::Char('/'));
+        crate::keys::paste(&mut app, " next");
+        app.switch_tab(BOOKMARKS_TAB);
+        app.switch_tab(SEARCH_TAB);
+        app.tick_at(Instant::now() + Duration::from_secs(1));
+        app.tick_at(Instant::now() + Duration::from_secs(1));
+        assert_eq!(
+            app.search.results_query(),
+            Some(&Query::Search {
+                text: "rust next".into(),
+                kind: crate::reddit::experience::ListSearch::People,
+                time: TimeRange::All,
+            }),
+            "returning during a debounce must search the edited query"
+        );
+
+        app.switch_tab(BOOKMARKS_TAB);
+        app.reset_search_loads();
+        app.tick_at(Instant::now() + Duration::from_secs(1));
+        assert!(
+            !app.search.results.loading,
+            "pool reset must not restart hidden Search work"
+        );
+        app.switch_tab(SEARCH_TAB);
+        app.tick_at(Instant::now() + Duration::from_secs(1));
+        app.tick_at(Instant::now() + Duration::from_secs(1));
+        assert!(app.search.results.loading);
+        assert_eq!(app.search.text(), "rust next");
+    }
+
+    #[test]
+    fn tab_on_the_search_tab_should_switch_the_kind_only_from_its_list() {
+        let mut app = app_with(&["a"]);
+        app.switch_tab(SEARCH_TAB);
+        press(&mut app, crossterm::event::KeyCode::Tab);
+        assert_eq!(app.active, SEARCH_TAB);
+        assert_eq!(
+            app.search.kind,
+            crate::reddit::experience::SearchKind::Communities
+        );
+
+        app.ancestor_follow = Some(AncestorFollow {
+            tab: app.tabs[SEARCH_TAB].id,
+            group: None,
+            waiting: true,
+        });
+        press(&mut app, crossterm::event::KeyCode::Tab);
+        assert_ne!(
+            app.active, SEARCH_TAB,
+            "following posts across tabs passes Search"
+        );
+
+        app.switch_tab(SEARCH_TAB);
+        app.focus_sidebar();
+        press(&mut app, crossterm::event::KeyCode::Tab);
+        assert_ne!(app.active, SEARCH_TAB, "the sidebar keeps tab cycling");
+    }
+
+    #[test]
+    fn clearing_the_search_query_should_drop_a_posts_answer_still_on_its_way() {
+        let mut app = app_with(&["vim"]);
+        app.open_search(None);
+        crate::keys::paste(&mut app, "neovim");
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        let (tab, generation) = (
+            app.tabs[SEARCH_TAB].id,
+            app.tabs[SEARCH_TAB].feed.generation,
+        );
+        assert!(app.tabs[SEARCH_TAB].feed.loading());
+        press(&mut app, crossterm::event::KeyCode::Char('/'));
+
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('u'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+        );
+        let _ = app.tick_at(Instant::now() + search::DEBOUNCE);
+        app.on_msg(Msg::Feed {
+            tab,
+            generation,
+            append: false,
+            result: Ok(listing("vim", &["late"], None)),
+        });
+
+        assert!(app.search.exploring());
+        assert!(app.tabs[SEARCH_TAB].feed.posts.is_empty());
+        assert!(!app.tabs[SEARCH_TAB].feed.loading());
+
+        crate::keys::paste(&mut app, "rust");
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(app.tabs[SEARCH_TAB].feed.search.is_some());
+        app.tabs[SEARCH_TAB].feed.search_sort = crate::reddit::experience::SearchSort::Top;
+        app.on_msg(Msg::Feed {
+            tab: app.tabs[SEARCH_TAB].id,
+            generation: app.tabs[SEARCH_TAB].feed.generation,
+            append: false,
+            result: Ok(listing("rust", &["r1"], None)),
+        });
+        app.resize(240);
+        app.open_current_post();
+        app.focus_main();
+        assert!(app.post_view.is_some());
+        press(&mut app, crossterm::event::KeyCode::Tab);
+        assert!(
+            app.post_view.is_none(),
+            "another kind's rows replace the post"
+        );
+        let _ = app.tick_at(Instant::now());
+        assert!(
+            app.tabs[SEARCH_TAB].feed.search.is_none() && !app.tabs[SEARCH_TAB].feed.loading(),
+            "community rows drop the hidden posts search"
+        );
+        press(&mut app, crossterm::event::KeyCode::BackTab);
+        let _ = app.tick_at(Instant::now());
+        let feed = &app.tabs[SEARCH_TAB].feed;
+        assert_eq!(
+            (feed.search.as_deref(), feed.search_sort),
+            (Some("rust"), crate::reddit::experience::SearchSort::Top),
+            "back on Posts the same query keeps its sort"
+        );
+    }
+
+    #[test]
+    fn a_search_feed_should_cycle_search_sort_and_time_and_a_new_query_should_reset_them() {
+        let mut app = app_with(&["vim"]);
+        app.open_search(None);
+        crate::keys::paste(&mut app, "neovim");
+        let _ = app.tick_at(Instant::now() + search::DEBOUNCE);
+        let i = SEARCH_TAB;
+        assert_eq!(app.active, i);
+        assert_eq!(app.tabs[i].feed.search.as_deref(), Some("neovim"));
+        assert!(app.tabs[i].feed.loading(), "the paused query is requested");
+        let generation = app.tabs[i].feed.generation;
+
+        app.on_msg(Msg::Feed {
+            tab: app.tabs[i].id,
+            generation,
+            append: false,
+            result: Ok(listing("vim", &["a", "b"], Some("t3_b"))),
+        });
+        app.resize(240);
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(
+            app.post_view.is_none() && !app.search_editing(),
+            "Enter while typing leaves the query for the results"
+        );
+        press(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(
+            app.post_view.is_some(),
+            "Enter on the results reads the chosen post"
+        );
+        app.prefetch_list(usize::MAX);
+        assert!(app.tabs[i].feed.loading_more(), "results page on");
+        app.focus_main();
+        assert!(app.post_view.is_some() && !app.post_focused());
+        press(&mut app, crossterm::event::KeyCode::Esc);
+        assert!(
+            app.post_view.is_none(),
+            "Esc from the results closes the post"
+        );
+        let generation = app.tabs[i].feed.generation;
+        sequence(&mut app, " fs");
+        sequence(&mut app, " ft");
+        let feed = &app.tabs[i].feed;
+        assert_eq!(feed.search_sort, crate::reddit::experience::SearchSort::Hot);
+        assert_eq!(feed.search_time, TimeRange::All.next());
+        assert!(feed.loading() && feed.generation > generation);
+        assert_eq!(feed.search.as_deref(), Some("neovim"));
+
+        sequence(&mut app, "/");
+        crate::keys::handle(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('u'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+        );
+        crate::keys::paste(&mut app, "rust");
+        let _ = app.tick_at(Instant::now() + search::DEBOUNCE);
+        let feed = &app.tabs[i].feed;
+        assert_eq!(feed.search.as_deref(), Some("rust"));
+        assert_eq!(feed.search_sort, Default::default());
+        assert_eq!(feed.search_time, TimeRange::All);
+    }
+
+    #[test]
+    fn staying_on_a_stale_feed_or_all_subs_refetches_and_holds_new_posts_behind_the_notice() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &["a", "b"], None)),
+        });
+        let start = Instant::now();
+        let _ = app.tick_at(start + FEED_POLL);
+        assert!(!app.tabs[i].feed.loading(), "fresh posts are not refetched");
+
+        app.tabs[i].feed.freshness.as_mut().unwrap().fetched_at = 0;
+        let _ = app.tick_at(start + FEED_POLL);
+        assert!(!app.tabs[i].feed.loading(), "the poll waits its interval");
+        let _ = app.tick_at(start + FEED_POLL * 2);
+        assert!(app.tabs[i].feed.loading());
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &["n", "a", "b"], None)),
+        });
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+        assert_eq!(app.current_post().unwrap().id, "a");
+
+        app.tabs[i]
+            .feed
+            .update
+            .as_mut()
+            .unwrap()
+            .freshness
+            .fetched_at = 0;
+        let _ = app.tick_at(start + FEED_POLL * 3);
+        assert!(app.tabs[i].feed.loading());
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Err("offline".into()),
+        });
+        let _ = app.tick_at(start + FEED_POLL * 4);
+        assert!(!app.tabs[i].feed.loading(), "a failed refetch waits for r");
+
+        let mut app = app_with(&["vim"]);
+        app.switch_tab(ALL_SUBS_TAB);
+        let answer = |app: &mut App, ids: &[&str]| {
+            app.on_msg(Msg::Group {
+                generation: app.all_subs.groups[0].generation,
+                subreddit: "vim".into(),
+                result: Ok(listing("vim", ids, None)),
+            });
+        };
+        app.all_subs.groups[0].loading = true;
+        answer(&mut app, &["a", "b"]);
+        app.groups_drawn(&[0], &[], &[]);
+        assert!(!app.all_subs.groups[0].loading);
+        app.all_subs.groups[0]
+            .freshness
+            .as_mut()
+            .unwrap()
+            .fetched_at = 0;
+        let _ = app.tick_at(Instant::now() + FEED_POLL);
+        assert!(app.all_subs.groups[0].loading);
+        answer(&mut app, &["n", "a", "b"]);
+        assert!(app.all_subs.has_new_posts(&app.config));
+    }
+
+    #[test]
+    fn reported_cached_reordering_should_wait_without_announcing_new_posts() {
+        let mut app = app_with(&["vim"]);
+        app.switch_tab(ALL_SUBS_TAB);
+        app.on_msg(ordered_snapshot(
+            island_answer(&app, &["a", "b"]),
+            1,
+            true,
+            true,
+        ));
+        app.on_msg(ordered_snapshot(
+            island_answer(&app, &["b", "a"]),
+            2,
+            false,
+            false,
+        ));
+        assert_eq!(island_ids(&app), ["a", "b"]);
+        assert!(!app.all_subs.has_new_posts(&app.config));
+        app.reload();
+        assert_eq!(island_ids(&app), ["b", "a"]);
+    }
+
+    #[test]
+    fn reported_failed_video_should_wait_for_explicit_retry_after_revisiting() {
+        let mut app = failed_card_playback_app();
+        app.tabs[0].feed.selected = 1;
+        app.card_video_drawn(Some(Size::new(68, 68)));
+        let next = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+        app.sync_video_with(next, |url, area, _| {
+            let mut player = Player::showing(&url, playback_frame(2));
+            player.area = area;
+            player
+        });
+        app.tabs[0].feed.selected = 0;
+        app.card_video_drawn(Some(Size::new(68, 68)));
+        assert!(app.selected_video().unwrap().error().is_some());
+        let returned = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+        app.sync_video_with(returned, |_, _, _| {
+            panic!("navigation must not retry failed media")
+        });
+        app.toggle_video_pause();
+        app.card_video_drawn(Some(Size::new(68, 68)));
+        app.sync_video_with(returned + NAV_SETTLE, |url, area, _| {
+            Player::silent(&url, area)
+        });
+        assert!(app.selected_video().unwrap().error().is_none());
+    }
+
+    #[test]
+    fn warm_return_controls_should_act_on_the_selected_video_before_settling() {
+        for action in [0, 1, 2] {
+            let mut app = card_playback_app();
+            let first = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+            app.sync_video_with(first, |url, area, _| {
+                let mut player = Player::silent(&url, area);
+                player.show(playback_frame(1));
+                player
+            });
+            app.tabs[0].feed.selected = 1;
+            app.card_video_drawn(Some(Size::new(68, 68)));
+            let second = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+            app.sync_video_with(second, |url, area, _| {
+                let mut player = Player::silent(&url, area);
+                player.show(playback_frame(2));
+                player
+            });
+            app.tabs[0].feed.selected = 0;
+            app.card_video_drawn(Some(Size::new(68, 68)));
+            match action {
+                0 => {
+                    app.toggle_video_pause();
+                    assert!(app.selected_video().unwrap().paused());
+                }
+                1 => {
+                    app.seek_video(true);
+                    assert!(
+                        app.selected_video().unwrap().position(Instant::now()) >= video::SEEK_STEP
+                    );
+                }
+                _ => {
+                    app.toggle_video_sound();
+                    assert!(app.video_sound_wanted());
+                }
+            }
+            let returned = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
+            app.sync_video_with(returned, |_, _, _| {
+                panic!("a control must not restart playback")
+            });
+            if action == 0 {
+                assert!(app.selected_video().unwrap().paused());
+            }
+        }
+    }
+
+    #[test]
+    fn post_notice_preview_entry_and_return_should_share_applied_and_waiting_posts() {
+        let mut app = app_with(&[]);
+        app.open_search(None);
+        app.search_preview_drawn(true);
+        app.tick_at(Instant::now() + NAV_SETTLE + search::PREVIEW_SETTLE);
+        let generation = app.search.preview.generation;
+        let preview = |ids: &[&str], after| Msg::Feed {
+            tab: crate::worker::PREVIEW_FEED,
+            generation,
+            append: false,
+            result: Ok(listing("popular", ids, after)),
+        };
+        app.on_msg(ordered_snapshot(
+            preview(&["a", "b"], Some("old-end")),
+            1,
+            true,
+            true,
+        ));
+        app.on_msg(ordered_snapshot(
+            preview(&["leader", "b", "a"], Some("fresh-end")),
+            2,
+            false,
+            false,
+        ));
+        assert_eq!(app.search.preview.posts[0].id, "a");
+        app.open_search_row();
+        let child = app.active;
+        let tab = app.active_tab().id;
+        assert_eq!(
+            app.active_tab()
+                .feed
+                .posts
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["leader", "b", "a"]
+        );
+        assert_eq!(app.active_tab().feed.after.as_deref(), Some("fresh-end"));
+        assert!(!app.active_tab().feed.has_new_posts(&app.config));
+        let feed = |app: &App, ids: &[&str]| Msg::Feed {
+            tab,
+            generation: app.tabs[child].feed.generation,
+            append: false,
+            result: Ok(listing("popular", ids, Some("fresh-end"))),
+        };
+        app.on_msg(ordered_snapshot(feed(&app, &["a", "b"]), 1, true, false));
+        assert_eq!(app.active_tab().feed.posts[0].id, "leader");
+        app.on_msg(ordered_snapshot(
+            feed(&app, &["later", "leader", "b", "a"]),
+            3,
+            false,
+            false,
+        ));
+        assert!(app.active_tab().feed.has_new_posts(&app.config));
+        assert!(app.return_to_search());
+        assert_eq!(app.search.preview.posts[0].id, "leader");
+        assert_eq!(app.search.preview.update.as_ref().unwrap()[0].id, "later");
+        app.open_search_row();
+        assert_eq!(app.active_tab().feed.posts[0].id, "later");
+        assert!(!app.active_tab().feed.has_new_posts(&app.config));
+        assert!(app.return_to_search());
+        assert_eq!(app.search.preview.posts[0].id, "later");
+        assert!(app.search.preview.update.is_none());
+    }
+
+    #[test]
+    fn post_notice_handoff_should_preserve_newer_feeds_and_distinct_queries() {
+        let mut app = app_with(&["rust"]);
+        let child = tab_index(&app, "rust");
+        app.switch_tab(child);
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab: app.active_tab().id,
+                generation: app.active_tab().feed.generation,
+                append: false,
+                result: Ok(listing("rust", &["newer"], None)),
+            },
+            5,
+            false,
+            false,
+        ));
+        app.open_search(None);
+        app.search.discovered.entries.push(search::Row {
+            profile: None,
+            label: "r/rust".into(),
+            detail: String::new(),
+            target: FeedTarget::Subreddit("rust".into()),
+        });
+        app.search.selected = 2;
+        app.search_preview_drawn(true);
+        app.tick_at(Instant::now() + NAV_SETTLE + search::PREVIEW_SETTLE);
+        let generation = app.search.preview.generation;
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab: crate::worker::PREVIEW_FEED,
+                generation,
+                append: false,
+                result: Ok(listing("rust", &["older"], None)),
+            },
+            4,
+            false,
+            false,
+        ));
+        app.open_search_row();
+        assert_eq!(app.active_tab().feed.posts[0].id, "newer");
+        assert!(app.return_to_search());
+        assert_eq!(app.search.preview.posts[0].id, "newer");
+
+        app.tabs[child].feed.sort = Sort::Top;
+        app.load_feed(child, false);
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab: app.tabs[child].id,
+                generation: app.tabs[child].feed.generation,
+                append: false,
+                result: Ok(listing("rust", &["top-result"], None)),
+            },
+            6,
+            false,
+            false,
+        ));
+        let preview = app.search.preview.posts.clone();
+        app.open_search_row();
+        assert_eq!(app.active_tab().feed.sort, Sort::Top);
+        assert_eq!(app.active_tab().feed.posts[0].id, "top-result");
+        assert!(app.return_to_search());
+        assert_eq!(app.search.preview.posts, preview);
+    }
+
+    #[test]
+    fn post_notice_preview_should_remember_loaded_feed_pages_when_ranking_changes() {
+        let mut app = app_with(&["rust"]);
+        let child = tab_index(&app, "rust");
+        app.switch_tab(child);
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab: app.active_tab().id,
+                generation: app.active_tab().feed.generation,
+                append: false,
+                result: Ok(listing("rust", &["a", "b"], Some("page2"))),
+            },
+            1,
+            false,
+            false,
+        ));
+        app.load_feed(child, true);
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab: app.active_tab().id,
+                generation: app.active_tab().feed.generation,
+                append: true,
+                result: Ok(listing("rust", &["tail"], None)),
+            },
+            2,
+            false,
+            false,
+        ));
+        app.open_search(None);
+        app.search.discovered.entries.push(search::Row {
+            profile: None,
+            label: "r/rust".into(),
+            detail: String::new(),
+            target: FeedTarget::Subreddit("rust".into()),
+        });
+        app.search.selected = 2;
+        app.search_preview_drawn(true);
+        app.tick_at(Instant::now() + NAV_SETTLE + search::PREVIEW_SETTLE);
+        let generation = app.search.preview.generation;
+        assert!(app.search.preview.loading);
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab: crate::worker::PREVIEW_FEED,
+                generation,
+                append: false,
+                result: Ok(listing("rust", &["a", "b"], Some("page2"))),
+            },
+            1,
+            true,
+            true,
+        ));
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab: crate::worker::PREVIEW_FEED,
+                generation,
+                append: false,
+                result: Ok(listing("rust", &["tail", "a", "b"], None)),
+            },
+            3,
+            false,
+            false,
+        ));
+        assert!(!app.search.preview.has_new_posts(&app.config));
+        assert_eq!(
+            app.search
+                .preview
+                .posts
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "tail"]
+        );
+    }
+
+    #[test]
+    fn post_notice_return_should_not_erase_a_newer_preview_failure() {
+        let mut app = app_with(&["rust"]);
+        let child = tab_index(&app, "rust");
+        app.switch_tab(child);
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab: app.active_tab().id,
+                generation: app.active_tab().feed.generation,
+                append: false,
+                result: Ok(listing("rust", &["newer"], None)),
+            },
+            2,
+            false,
+            false,
+        ));
+        app.open_search(None);
+        app.search.discovered.entries.push(search::Row {
+            profile: None,
+            label: "r/rust".into(),
+            detail: String::new(),
+            target: FeedTarget::Subreddit("rust".into()),
+        });
+        app.search.selected = 2;
+        app.search_preview_drawn(true);
+        app.tick_at(Instant::now() + NAV_SETTLE + search::PREVIEW_SETTLE);
+        let generation = app.search.preview.generation;
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab: crate::worker::PREVIEW_FEED,
+                generation,
+                append: false,
+                result: Ok(listing("rust", &["older"], None)),
+            },
+            1,
+            true,
+            true,
+        ));
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab: crate::worker::PREVIEW_FEED,
+                generation,
+                append: false,
+                result: Err("still offline".into()),
+            },
+            3,
+            false,
+            false,
+        ));
+        app.open_search_row();
+        assert!(app.return_to_search());
+        assert_eq!(app.search.preview.posts[0].id, "newer");
+        assert_eq!(app.search.preview.error.as_deref(), Some("still offline"));
+
+        app.load_feed(child, false);
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab: app.tabs[child].id,
+                generation: app.tabs[child].feed.generation,
+                append: false,
+                result: Ok(listing("rust", &["newer"], None)),
+            },
+            4,
+            false,
+            false,
+        ));
+        app.open_search_row();
+        assert!(app.return_to_search());
+        assert!(app.search.preview.error.is_none());
+    }
+
+    #[test]
+    fn post_notice_preview_should_show_arrivals_when_its_old_posts_are_hidden() {
+        let mut app = app_with(&[]);
+        app.config.show_nsfw = false;
+        app.open_search(None);
+        app.search_preview_drawn(true);
+        app.tick_at(Instant::now() + NAV_SETTLE + search::PREVIEW_SETTLE);
+        let generation = app.search.preview.generation;
+        let mut hidden = listing("popular", &["hidden"], None);
+        hidden.posts[0].nsfw = true;
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab: crate::worker::PREVIEW_FEED,
+                generation,
+                append: false,
+                result: Ok(hidden),
+            },
+            1,
+            true,
+            true,
+        ));
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab: crate::worker::PREVIEW_FEED,
+                generation,
+                append: false,
+                result: Ok(listing("popular", &["visible"], None)),
+            },
+            2,
+            false,
+            false,
+        ));
+        assert_eq!(
+            app.config
+                .visible(&app.search.preview.posts)
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["visible"]
+        );
+        assert!(app.search.preview.update.is_none());
+    }
+
+    #[test]
+    fn preview_refresh_should_apply_waiting_posts_without_resetting_selected_rows() {
+        use crate::reddit::experience::SearchKind;
+        for searched in [false, true] {
+            let mut app = app_with(&[]);
+            app.open_search(None);
+            let row = search::Row {
+                profile: None,
+                label: "r/rust".into(),
+                detail: String::new(),
+                target: FeedTarget::Subreddit("rust".into()),
+            };
+            if searched {
+                app.search.kind = SearchKind::Communities;
+                app.search.query.value = "rust".into();
+                app.search.results.entries.push(row);
+            } else {
+                app.search.discovered.entries.push(row);
+                app.search.selected = 2;
+            }
+            app.search.preview.target = Some(FeedTarget::Subreddit("rust".into()));
+            app.search.preview.posts = listing("rust", &["a"], None).posts;
+            app.search.preview.update = Some(listing("rust", &["n", "a"], None).posts);
+            let rows = app.search.rows();
+            let selected = app.search.selected;
+            app.reload_search();
+            assert_eq!(app.search.preview.posts[0].id, "n");
+            assert_eq!(app.search.rows(), rows);
+            assert_eq!(app.search.selected, selected);
+        }
+    }
+
+    #[test]
+    fn reported_cached_then_live_lists_should_keep_posts_until_refresh() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        let generation = app.tabs[i].feed.generation;
+        let answer = |names: &[&str]| Msg::Feed {
+            tab,
+            generation,
+            append: false,
+            result: Ok(listing("vim", names, None)),
+        };
+        app.on_msg(ordered_snapshot(answer(&["a", "b"]), 1, true, true));
+        let mut live = listing("vim", &["n", "b", "a"], None);
+        live.posts[2].score = Some(123);
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation,
+                append: false,
+                result: Ok(live),
+            },
+            2,
+            false,
+            false,
+        ));
+        let ids = |app: &App| {
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|post| post.id.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        assert_eq!(ids(&app), "a,b");
+        assert_eq!(app.tabs[i].feed.posts[0].score, Some(123));
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+        app.reload();
+        assert_eq!(ids(&app), "n,b,a");
+    }
+
+    #[test]
+    fn reported_islands_and_search_previews_should_hold_live_membership() {
+        let mut app = app_with(&["vim"]);
+        app.switch_tab(ALL_SUBS_TAB);
+        app.on_msg(ordered_snapshot(
+            island_answer(&app, &["a", "b"]),
+            1,
+            true,
+            true,
+        ));
+        app.on_msg(ordered_snapshot(
+            island_answer(&app, &["n", "b", "a"]),
+            2,
+            false,
+            false,
+        ));
+        assert_eq!(island_ids(&app), ["a", "b"]);
+        assert!(app.all_subs.has_new_posts(&app.config));
+        app.reload();
+        assert_eq!(island_ids(&app), ["n", "b", "a"]);
+
+        app.open_search(None);
+        app.search_preview_drawn(true);
+        app.tick_at(Instant::now() + search::PREVIEW_SETTLE);
+        let generation = app.search.preview.generation;
+        let answer = |names: &[&str]| Msg::Feed {
+            tab: crate::worker::PREVIEW_FEED,
+            generation,
+            append: false,
+            result: Ok(listing("popular", names, None)),
+        };
+        app.on_msg(ordered_snapshot(answer(&["a", "b"]), 3, true, true));
+        app.on_msg(ordered_snapshot(answer(&["n", "b", "a"]), 4, false, false));
+        assert_eq!(
+            app.search
+                .preview
+                .posts
+                .iter()
+                .map(|post| post.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        app.reload_search();
+        assert_eq!(
+            app.search
+                .preview
+                .posts
+                .iter()
+                .map(|post| post.id.as_str())
+                .collect::<Vec<_>>(),
+            ["n", "b", "a"]
+        );
+        assert_eq!(
+            app.search.preview.generation, generation,
+            "apply the held preview without another request"
+        );
+    }
+
+    #[test]
+    fn entering_a_feed_should_apply_waiting_posts_but_hold_later_arrivals() {
+        let feed_app = || {
+            let mut app = app_with(&["vim"]);
+            let i = tab_index(&app, "vim");
+            app.switch_tab(i);
+            let tab = app.tabs[i].id;
+            app.on_msg(Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Ok(listing("vim", &["a", "b"], None)),
+            });
+            (app, i, tab)
+        };
+        let answer = |app: &mut App, i: usize, tab: u64| {
+            app.on_msg(Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Ok(listing("vim", &["n", "a", "b"], None)),
+            });
+        };
+
+        // New posts that waited while you were away show on arrival.
+        let (mut app, i, tab) = feed_app();
+        app.load_feed(i, false);
+        answer(&mut app, i, tab);
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+        app.switch_tab(0);
+        app.switch_tab(i);
+        assert!(!app.tabs[i].feed.has_new_posts(&app.config));
+        assert_eq!(app.current_post().unwrap().id, "n");
+
+        let (mut app, i, tab) = feed_app();
+        app.switch_tab(0);
+        app.load_feed(i, false);
+        app.switch_tab(i);
+        answer(&mut app, i, tab);
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+        assert_eq!(app.current_post().unwrap().id, "a");
+
+        // Arriving through the sidebar starts the load once navigation settles.
+        let (mut app, i, tab) = feed_app();
+        app.switch_tab(0);
+        if let Some(freshness) = &mut app.tabs[i].feed.freshness {
+            freshness.fetched_at = 0;
+        }
+        app.focus = Focus::Sidebar;
+        app.switch_tab(i);
+        assert!(!app.tabs[i].feed.loading());
+        let _ = app.tick_at(Instant::now() + NAV_SETTLE);
+        assert!(app.tabs[i].feed.loading());
+        answer(&mut app, i, tab);
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+        assert_eq!(app.current_post().unwrap().id, "a");
+
+        let (mut app, i, _) = feed_app();
+        app.switch_tab(0);
+        app.all_subs.groups[0].needs_refresh = true;
+        app.picture_settle.due(Instant::now() + NAV_SETTLE);
+        app.ensure_group_loaded(0);
+        assert!(app.all_subs.groups[0].loading);
+        app.switch_tab(i);
+        app.on_msg(island_answer(&app, &["n", "a", "b"]));
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+        assert_eq!(app.current_post().unwrap().id, "a");
+
+        // Including when the island answers from its cache first.
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.on_msg(ordered_snapshot(
+            Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Ok(listing("vim", &["a", "b"], None)),
+            },
+            1,
+            false,
+            false,
+        ));
+        app.switch_tab(0);
+        app.all_subs.groups[0].needs_refresh = true;
+        app.picture_settle.due(Instant::now() + NAV_SETTLE);
+        app.ensure_group_loaded(0);
+        app.switch_tab(i);
+        app.on_msg(ordered_snapshot(
+            island_answer(&app, &["a", "b"]),
+            2,
+            true,
+            true,
+        ));
+        app.on_msg(ordered_snapshot(
+            island_answer(&app, &["n", "a", "b"]),
+            3,
+            false,
+            false,
+        ));
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+        assert_eq!(app.current_post().unwrap().id, "a");
+
+        // Moving before it answers means you are reading: they wait behind the notice.
+        let (mut app, i, tab) = feed_app();
+        app.switch_tab(0);
+        app.load_feed(i, false);
+        app.switch_tab(i);
+        app.focus = Focus::List;
+        app.move_selection(1);
+        answer(&mut app, i, tab);
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+        assert_eq!(app.current_post().unwrap().id, "b");
+
+        // So does moving before navigation settles starts the load.
+        let (mut app, i, tab) = feed_app();
+        app.switch_tab(0);
+        if let Some(freshness) = &mut app.tabs[i].feed.freshness {
+            freshness.fetched_at = 0;
+        }
+        app.focus = Focus::List;
+        app.switch_tab(i);
+        assert!(!app.tabs[i].feed.loading());
+        app.move_selection(1);
+        let _ = app.tick_at(Instant::now() + NAV_SETTLE * 3);
+        assert!(app.tabs[i].feed.loading());
+        answer(&mut app, i, tab);
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+        assert_eq!(app.current_post().unwrap().id, "b");
+
+        // And moving before the community's island load answers.
+        let (mut app, i, _) = feed_app();
+        app.switch_tab(0);
+        app.all_subs.groups[0].needs_refresh = true;
+        app.picture_settle.due(Instant::now() + NAV_SETTLE);
+        app.ensure_group_loaded(0);
+        assert!(app.all_subs.groups[0].loading);
+        app.switch_tab(i);
+        app.focus = Focus::List;
+        app.move_selection(1);
+        app.on_msg(island_answer(&app, &["n", "a", "b"]));
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+        assert_eq!(app.current_post().unwrap().id, "b");
+
+        for buffered in [false, true] {
+            for card_scroll in [false, true] {
+                let (mut app, i, tab) = feed_app();
+                app.focus = Focus::List;
+                if card_scroll {
+                    if app.state.list_view() != crate::state::ListView::Card {
+                        app.state.toggle_list_view();
+                    }
+                    app.tabs[i].feed.cards.line = 3;
+                } else {
+                    app.move_selection(1);
+                }
+                app.switch_tab(0);
+                app.load_feed(i, false);
+                if buffered {
+                    answer(&mut app, i, tab);
+                }
+                app.switch_tab(i);
+                if !buffered {
+                    answer(&mut app, i, tab);
+                }
+                assert_eq!(app.tabs[i].feed.has_new_posts(&app.config), !buffered);
+                assert_eq!(
+                    app.current_post().unwrap().id,
+                    if buffered {
+                        "n"
+                    } else if card_scroll {
+                        "a"
+                    } else {
+                        "b"
+                    }
+                );
+                if buffered {
+                    assert_eq!(app.tabs[i].feed.cards.line, 0);
+                }
+            }
+        }
+
+        // `r` before navigation settles ends the arrival: later loads wait behind the notice.
+        let (mut app, i, tab) = feed_app();
+        app.switch_tab(0);
+        if let Some(freshness) = &mut app.tabs[i].feed.freshness {
+            freshness.fetched_at = 0;
+        }
+        app.focus = Focus::Sidebar;
+        app.switch_tab(i);
+        app.reload();
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &["a", "b"], None)),
+        });
+        let _ = app.tick_at(Instant::now() + NAV_SETTLE * 3);
+        if let Some(freshness) = &mut app.tabs[i].feed.freshness {
+            freshness.fetched_at = 0;
+        }
+        app.ensure_feed_loaded(i);
+        assert!(app.tabs[i].feed.loading());
+        answer(&mut app, i, tab);
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+        assert_eq!(app.current_post().unwrap().id, "a");
+    }
+
+    #[test]
+    fn entering_all_subs_should_apply_waiting_posts_but_hold_later_arrivals() {
+        let subs_app = || {
+            let mut app = app_with(&["vim"]);
+            app.switch_tab(ALL_SUBS_TAB);
+            app.on_msg(island_answer(&app, &["a", "b", "c"]));
+            app
+        };
+
+        // New posts that waited while you were away show on arrival.
+        let mut app = subs_app();
+        app.on_msg(island_answer(&app, &["n", "a", "b"]));
+        assert!(app.all_subs.has_new_posts(&app.config));
+        app.switch_tab(0);
+        app.switch_tab(ALL_SUBS_TAB);
+        assert!(!app.all_subs.has_new_posts(&app.config));
+        assert_eq!(island_ids(&app), ["n", "a", "b"]);
+
+        let mut app = subs_app();
+        app.switch_tab(0);
+        app.all_subs.groups[0].needs_refresh = true;
+        app.switch_tab(ALL_SUBS_TAB);
+        app.picture_settle.due(Instant::now() + NAV_SETTLE);
+        app.groups_drawn(&[0], &[], &[]);
+        assert!(app.all_subs.groups[0].loading);
+        app.on_msg(island_answer(&app, &["n", "a", "b"]));
+        assert!(app.all_subs.has_new_posts(&app.config));
+        assert_eq!(app.current_post().unwrap().id, "a");
+
+        let mut app = subs_app();
+        app.switch_tab(0);
+        app.all_subs.groups[0].needs_refresh = true;
+        app.ensure_group_loaded(0);
+        assert!(app.all_subs.groups[0].loading);
+        app.focus = Focus::Sidebar;
+        app.switch_tab(ALL_SUBS_TAB);
+        app.on_msg(island_answer(&app, &["n", "a", "b"]));
+        assert!(app.all_subs.has_new_posts(&app.config));
+        assert_eq!(app.current_post().unwrap().id, "a");
+
+        // Through the sidebar, loads start only once navigation settles.
+        let mut app = subs_app();
+        app.focus = Focus::Sidebar;
+        app.switch_tab(0);
+        app.all_subs.groups[0].needs_refresh = true;
+        app.switch_tab(ALL_SUBS_TAB);
+        app.groups_drawn(&[0], &[], &[]);
+        assert!(!app.all_subs.groups[0].loading);
+        app.picture_settle.due(Instant::now() + NAV_SETTLE);
+        app.groups_drawn(&[0], &[], &[]);
+        assert!(app.all_subs.groups[0].loading);
+        app.on_msg(island_answer(&app, &["n", "a", "b"]));
+        assert!(app.all_subs.has_new_posts(&app.config));
+
+        // A later load is a refresh while you sit there: it waits behind the notice.
+        let mut app = subs_app();
+        app.switch_tab(0);
+        app.switch_tab(ALL_SUBS_TAB);
+        app.picture_settle.due(Instant::now() + NAV_SETTLE);
+        app.groups_drawn(&[0], &[], &[]);
+        assert!(!app.all_subs.groups[0].loading);
+        app.on_msg(island_answer(&app, &["n", "a", "b"]));
+        assert!(app.all_subs.has_new_posts(&app.config));
+
+        // Moving first means you are reading: they wait behind the notice.
+        let mut app = subs_app();
+        app.switch_tab(0);
+        app.all_subs.groups[0].needs_refresh = true;
+        app.switch_tab(ALL_SUBS_TAB);
+        app.focus = Focus::List;
+        app.move_selection(1);
+        app.picture_settle.due(Instant::now() + NAV_SETTLE);
+        app.groups_drawn(&[0], &[], &[]);
+        assert!(app.all_subs.groups[0].loading);
+        app.on_msg(island_answer(&app, &["n", "a", "b"]));
+        assert!(app.all_subs.has_new_posts(&app.config));
+        assert_eq!(app.current_post().unwrap().id, "b");
+
+        for buffered in [false, true] {
+            let mut app = subs_app();
+            app.all_subs.post = 1;
+            app.switch_tab(0);
+            app.all_subs.groups[0].needs_refresh = true;
+            app.picture_settle.due(Instant::now() + NAV_SETTLE);
+            app.ensure_group_loaded(0);
+            assert!(app.all_subs.groups[0].loading);
+            if buffered {
+                app.on_msg(island_answer(&app, &["n", "a", "b"]));
+            }
+            app.switch_tab(ALL_SUBS_TAB);
+            if !buffered {
+                app.on_msg(island_answer(&app, &["n", "a", "b"]));
+            }
+            assert_eq!(app.all_subs.has_new_posts(&app.config), !buffered);
+            assert_eq!(
+                app.current_post().unwrap().id,
+                if buffered { "n" } else { "b" }
+            );
+        }
+    }
+
+    #[test]
+    fn following_an_open_post_onto_a_list_top_keeps_new_posts_waiting() {
+        // Onto a feed whose top is the open post.
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(ALL_SUBS_TAB);
+        app.on_msg(island_answer(&app, &["a", "b"]));
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.load_feed(i, false);
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &["n", "a", "b"], None)),
+        });
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+        app.switch_tab(ALL_SUBS_TAB);
+        app.open_current_post();
+        app.switch_ancestor_tab(i);
+        assert_eq!(app.active, i);
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+        assert_eq!(app.list_post(i).unwrap().id, "a");
+        assert_eq!(app.post_view.as_ref().unwrap().shown_post().id, "a");
+
+        // Onto the All subs island whose first post is the open post.
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(ALL_SUBS_TAB);
+        app.on_msg(island_answer(&app, &["a", "b"]));
+        app.switch_tab(i);
+        app.open_current_post();
+        app.on_msg(island_answer(&app, &["n", "a", "b"]));
+        assert!(app.all_subs.has_new_posts(&app.config));
+        assert_eq!(app.list_post(i).unwrap().id, "a");
+        app.switch_ancestor_tab(ALL_SUBS_TAB);
+        assert_eq!(app.active, ALL_SUBS_TAB);
+        assert!(app.all_subs.has_new_posts(&app.config));
+        assert_eq!(app.current_post().unwrap().id, "a");
+        assert_eq!(app.post_view.as_ref().unwrap().shown_post().id, "a");
+    }
+
+    #[test]
+    fn a_post_open_on_another_surface_leaves_an_untouched_top_alone() {
+        // Open in All subs: the community tab seeded from its island keeps its top.
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(ALL_SUBS_TAB);
+        app.on_msg(island_answer(&app, &["a", "b", "c"]));
+        app.open_current_post();
+        app.on_msg(island_answer(&app, &["b", "a", "c"]));
+        assert_eq!(app.tabs[i].feed.selected, 0);
+        assert_eq!(app.tabs[i].feed.posts[0].id, "b");
+
+        // Open in the community tab: the hidden island keeps its top.
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.on_msg(island_answer(&app, &["a", "b", "c"]));
+        app.switch_tab(i);
+        app.open_current_post();
+        app.on_msg(island_answer(&app, &["b", "a", "c"]));
+        assert_eq!(app.all_subs.post, 0);
+    }
+
+    #[test]
+    fn a_post_being_read_survives_the_next_page_refetch_its_drop_starts() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        let answer = |app: &mut App, append: bool, posts: &[&str], after: Option<&str>| {
+            app.on_msg(Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append,
+                result: Ok(listing("vim", posts, after)),
+            });
+        };
+        answer(&mut app, false, &["a", "b", "c"], Some("t3_c"));
+        app.load_feed(i, true);
+        answer(&mut app, true, &["d", "e"], None);
+        app.focus = Focus::List;
+        app.move_selection(2);
+        app.load_feed(i, false);
+
+        answer(&mut app, false, &["a", "b", "x"], Some("t3_x"));
+        answer(&mut app, true, &["d", "e"], None);
+
+        assert_eq!(app.current_post().unwrap().id, "c");
+        assert!(app.tabs[i].feed.posts.iter().any(|post| post.id == "c"));
+
+        // After `r`, a dropped selection keeps its row even while the post waits below.
+        app.reload();
+        answer(&mut app, false, &["a", "b", "y"], Some("t3_y"));
+        assert!(app.tabs[i].feed.posts.iter().any(|post| post.id == "c"));
+        assert_eq!(app.current_post().unwrap().id, "y");
+    }
+
+    #[test]
+    fn a_settled_island_answer_keeps_the_selected_post_in_its_slot() {
+        let mut app = app_with(&["vim"]);
+        app.switch_tab(ALL_SUBS_TAB);
+        app.on_msg(island_answer(&app, &["a", "b", "c", "d"]));
+        app.all_subs.post = 2;
+        app.on_msg(island_answer(&app, &["n", "a", "b", "x", "d"]));
+        assert!(app.all_subs.has_new_posts(&app.config));
+
+        app.change_setting(
+            "filters.keywords",
+            toml::Value::Array(vec!["title n".into()]),
+        );
+
+        assert!(!app.all_subs.has_new_posts(&app.config));
+        assert_eq!(island_ids(&app), ["a", "b", "c"]);
+        assert_eq!(app.current_post().unwrap().id, "c");
+    }
+
+    #[test]
+    fn a_filter_hiding_a_post_above_the_read_one_keeps_it_when_an_island_settles() {
+        let mut app = app_with(&["vim"]);
+        app.switch_tab(ALL_SUBS_TAB);
+        app.on_msg(island_answer(&app, &["a", "b", "c", "d"]));
+        app.all_subs.post = 2;
+        app.on_msg(island_answer(&app, &["n", "a", "b", "x", "c", "d"]));
+        assert!(app.all_subs.has_new_posts(&app.config));
+
+        app.change_setting(
+            "filters.keywords",
+            toml::Value::Array(vec!["title n".into(), "title a".into()]),
+        );
+
+        assert!(!app.all_subs.has_new_posts(&app.config));
+        assert_eq!(island_ids(&app), ["b", "c", "x"]);
+        assert_eq!(app.current_post().unwrap().id, "c");
+    }
+
+    #[test]
+    fn an_island_applies_unseen_posts_below_its_top_live() {
+        let mut app = app_with(&["vim"]);
+        app.on_msg(island_answer(&app, &["a", "b"]));
+
+        app.on_msg(island_answer(&app, &["a", "m", "b"]));
+
+        assert!(!app.all_subs.has_new_posts(&app.config));
+        assert_eq!(island_ids(&app)[..2], ["a", "m"]);
+    }
+
+    #[test]
+    fn an_unseen_post_ending_the_first_page_applies_live_with_later_pages_loaded() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &["a", "b"], Some("t3_b"))),
+        });
+        app.load_feed(i, true);
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: true,
+            result: Ok(listing("vim", &["c", "d"], None)),
+        });
+        app.load_feed(i, false);
+
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &["a", "b", "t"], Some("t3_t"))),
+        });
+
+        assert!(!app.tabs[i].feed.has_new_posts(&app.config));
+        assert_eq!(
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|post| post.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "t", "c", "d"]
+        );
+    }
+
+    #[test]
+    fn r_in_all_subs_applies_its_refetch_and_shows_the_top_until_you_move() {
+        for moved in [false, true] {
+            let mut app = app_with(&["vim", "zsh"]);
+            app.switch_tab(ALL_SUBS_TAB);
+            app.on_msg(island_answer(&app, &["a", "b"]));
+            app.all_subs.group = 1;
+            app.reload();
+            app.ensure_group_loaded(0);
+            if moved {
+                app.move_selection(-1);
+            }
+            app.on_msg(island_answer(&app, &["fresh", "a", "b"]));
+
+            assert_eq!(
+                app.all_subs.has_new_posts(&app.config),
+                moved,
+                "moved={moved}"
+            );
+            if !moved {
+                assert_eq!(island_ids(&app)[0], "fresh");
+                assert_eq!((app.all_subs.group, app.all_subs.post), (0, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn banner_refresh_should_apply_island_snapshots_without_refetching_or_invalidating_reads() {
+        use crate::reddit::tests::{Fixture, Reply};
+        use std::sync::{Arc, Mutex};
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let calls = requests.clone();
+        let fixture = Fixture::new(move |request| {
+            calls.lock().unwrap().push(request.url.clone());
+            Reply::json(serde_json::from_str(include_str!("../tests/fixtures/sub.json")).unwrap())
+        });
+        let (mut app, messages) = app_at(&fixture.base, &["vim", "zsh", "zz", "zzz"]);
+        app.reddit
+            .listing("seed", Sort::Hot, TimeRange::Day, None)
+            .unwrap();
+        requests.lock().unwrap().clear();
+        for name in ["vim", "zsh", "zz", "zzz"] {
+            app.on_msg(Msg::Group {
+                subreddit: name.into(),
+                generation: 0,
+                result: Ok(listing(name, &["old"], None)),
+            });
+        }
+        for name in ["vim", "zsh"] {
+            app.on_msg(Msg::Group {
+                subreddit: name.into(),
+                generation: 0,
+                result: Ok(listing(name, &["new", "old"], None)),
+            });
+        }
+        let inflight_generation = app.all_subs.next_group_generation;
+        app.all_subs.next_group_generation += 1;
+        app.all_subs.groups[2].loading = true;
+        app.all_subs.groups[2].generation = inflight_generation;
+        app.all_subs.groups[3].error = Some("offline".into());
+        app.all_subs.error = Some("subscriptions offline".into());
+        app.all_subs.group = 1;
+        app.all_subs.post = 0;
+        app.all_subs.offset = 1;
+        app.all_subs.drawn = Some(("zsh".into(), 0));
+        app.icon_demands.insert("vim".into());
+        let generations: Vec<_> = app.all_subs.groups.iter().map(|g| g.generation).collect();
+        let subscription_generation = app.all_subs.generation;
+
+        app.reload();
+        app.groups_drawn(&[0, 1, 2, 3], &[], &[]);
+
+        assert!(messages.recv_timeout(Duration::from_millis(150)).is_err());
+        assert!(requests.lock().unwrap().is_empty());
+        assert_eq!(island_ids(&app), ["new", "old"]);
+        assert_eq!(app.all_subs.groups[1].posts[0].id, "new");
+        assert!(!app.all_subs.has_new_posts(&app.config));
+        assert_eq!(
+            (app.all_subs.group, app.all_subs.post, app.all_subs.offset),
+            (0, 0, 0)
+        );
+        assert!(app.all_subs.drawn.is_none());
+        assert_eq!(app.all_subs.generation, subscription_generation);
+        assert_eq!(
+            app.all_subs
+                .groups
+                .iter()
+                .map(|g| g.generation)
+                .collect::<Vec<_>>(),
+            generations
+        );
+        assert!(
+            app.all_subs
+                .groups
+                .iter()
+                .all(|g| !g.needs_refresh && !g.manual)
+        );
+        assert!(app.all_subs.groups[2].loading);
+        assert!(app.all_subs.groups[3].error.is_some());
+        assert_eq!(app.all_subs.error.as_deref(), Some("subscriptions offline"));
+        assert!(app.icon_demands.contains("vim"));
+
+        app.on_msg(Msg::Group {
+            subreddit: "zz".into(),
+            generation: inflight_generation,
+            result: Ok(listing("zz", &["later", "old"], None)),
+        });
+        assert!(app.all_subs.groups[2].arrivals.is_some());
+        assert_eq!(app.all_subs.groups[2].posts[0].id, "old");
+        app.reload();
+        assert_eq!(app.all_subs.groups[2].posts[0].id, "later");
+        assert!(!app.all_subs.has_new_posts(&app.config));
+        assert!(requests.lock().unwrap().is_empty());
+
+        app.reload();
+        app.groups_drawn(&[0, 1, 2, 3], &[], &[]);
+        assert!(
+            messages.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "manual refresh: signed_out={}, loading={}, generation={}, calls={:?}",
+            app.reddit.needs_sign_in(),
+            app.all_subs.loading,
+            app.all_subs.generation,
+            requests.lock().unwrap()
+        );
+        assert!(!requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn leaving_a_tab_cancels_its_pending_r_jump() {
+        for focus in [Focus::List, Focus::Sidebar] {
+            let mut app = app_with(&["vim", "zsh"]);
+            let i = tab_index(&app, "vim");
+            app.switch_tab(i);
+            let tab = app.tabs[i].id;
+            app.on_msg(Msg::Feed {
+                tab,
+                generation: app.tabs[i].feed.generation,
+                append: false,
+                result: Ok(listing("vim", &["a", "b", "c"], None)),
+            });
+            app.tabs[i].feed.selected = 2;
+            app.reload();
+            let generation = app.tabs[i].feed.generation;
+            app.focus = focus;
+            app.switch_tab(tab_index(&app, "zsh"));
+
+            app.on_msg(Msg::Feed {
+                tab,
+                generation,
+                append: false,
+                result: Ok(listing("vim", &["new", "a", "b", "c"], None)),
+            });
+
+            let feed = &app.tabs[i].feed;
+            assert_eq!(
+                app.config
+                    .visible(&feed.posts)
+                    .nth(feed.selected)
+                    .unwrap()
+                    .id,
+                "c",
+                "{focus:?}"
+            );
+            assert!(feed.has_new_posts(&app.config), "{focus:?}");
+        }
+    }
+
+    #[test]
+    fn moving_after_r_keeps_the_new_position_when_arrivals_land() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &["a", "b", "c"], None)),
+        });
+        app.reload();
+        app.move_selection(2);
+
         app.on_msg(Msg::Feed {
             tab,
             generation: app.tabs[i].feed.generation,
@@ -13496,8 +17815,167 @@ mod tests {
             result: Ok(listing("vim", &["new", "a", "b", "c"], None)),
         });
 
-        assert_eq!(app.current_post().unwrap().id, "b");
-        assert_eq!(app.tabs[i].feed.selected - app.tabs[i].feed.offset, 0);
+        assert_eq!(app.current_post().unwrap().id, "c");
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+    }
+
+    #[test]
+    fn waiting_arrivals_hold_unseen_tail_posts_so_nothing_new_shows_above_kept_rows() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        let answer = |app: &App, ids: &[&str]| Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", ids, None)),
+        };
+        app.on_msg(answer(&app, &["a", "b", "c"]));
+        app.load_feed(i, false);
+
+        app.on_msg(answer(&app, &["n", "a", "b", "t"]));
+
+        let ids = |app: &App| {
+            app.tabs[i]
+                .feed
+                .posts
+                .iter()
+                .map(|post| post.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+        assert_eq!(ids(&app), ["a", "b", "c"]);
+        app.reload();
+        assert_eq!(ids(&app), ["n", "a", "b", "t"]);
+    }
+
+    #[test]
+    fn a_bookmark_merged_above_the_selection_keeps_the_selected_row_on_screen() {
+        let mut app = app_with(&[]);
+        for (n, id) in ["c", "b", "a"].into_iter().enumerate() {
+            app.state
+                .toggle_bookmark(&post(id, "rust"), 1000 + n as i64);
+        }
+        app.switch_tab(BOOKMARKS_TAB);
+        app.tabs[BOOKMARKS_TAB].feed.selected = 2;
+        app.tabs[BOOKMARKS_TAB].feed.offset = 1;
+        let selected = app.selected_bookmark_id();
+
+        app.state.toggle_bookmark(&post("merged", "rust"), 2000);
+        app.reselect_bookmark(selected);
+
+        let feed = &app.tabs[BOOKMARKS_TAB].feed;
+        assert_eq!(app.current_post().unwrap().id, "c");
+        assert_eq!(feed.selected - feed.offset, 1);
+    }
+
+    #[test]
+    fn a_bookmark_added_above_an_untouched_bookmarks_top_shows_at_the_top() {
+        let mut app = app_with(&[]);
+        app.state.toggle_bookmark(&post("old", "rust"), 1000);
+        app.switch_tab(BOOKMARKS_TAB);
+        let selected = app.selected_bookmark_id();
+
+        app.state.toggle_bookmark(&post("fresh", "rust"), 2000);
+        app.reselect_bookmark(selected);
+
+        let feed = &app.tabs[BOOKMARKS_TAB].feed;
+        assert_eq!(app.current_post().unwrap().id, "fresh");
+        assert_eq!((feed.selected, feed.offset), (0, 0));
+
+        // An open top bookmark, or a first card scrolled into, is being read.
+        for open in [true, false] {
+            let mut app = app_with(&[]);
+            app.state.toggle_bookmark(&post("old", "rust"), 1000);
+            app.switch_tab(BOOKMARKS_TAB);
+            if open {
+                app.resize(200);
+                app.open_current_post();
+                app.focus = Focus::List;
+            } else {
+                app.tabs[BOOKMARKS_TAB].feed.cards.line = 3;
+            }
+            let selected = app.selected_bookmark_id();
+
+            app.state.toggle_bookmark(&post("fresh", "rust"), 2000);
+            app.reselect_bookmark(selected);
+
+            let feed = &app.tabs[BOOKMARKS_TAB].feed;
+            assert_eq!(app.current_post().unwrap().id, "old", "open {open}");
+            assert_eq!((feed.selected, feed.offset), (1, 1), "open {open}");
+            if open {
+                assert_eq!(app.post_view.as_ref().unwrap().shown_post().id, "old");
+            }
+        }
+    }
+
+    #[test]
+    fn a_fresh_refetch_after_a_write_waits_behind_the_notice_instead_of_jumping() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &["a", "b", "c"], None)),
+        });
+        app.tabs[i].feed.selected = 2;
+        app.tabs[i].feed.offset = 2;
+
+        app.fetch_feed(i, None, true);
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &["new", "a", "b", "c"], None)),
+        });
+
+        assert!(app.tabs[i].feed.has_new_posts(&app.config));
+        assert_eq!(app.current_post().unwrap().id, "c");
+        assert_eq!(app.tabs[i].feed.offset, 2);
+    }
+
+    #[test]
+    fn manual_fetch_with_arrivals_shows_the_list_top_but_a_forced_next_page_keeps_position() {
+        let mut app = app_with(&["vim"]);
+        let i = tab_index(&app, "vim");
+        app.switch_tab(i);
+        let tab = app.tabs[i].id;
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &["a", "b", "c"], Some("t3_c"))),
+        });
+        app.tabs[i].feed.selected = 2;
+        app.tabs[i].feed.offset = 2;
+        app.reload();
+
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: false,
+            result: Ok(listing("vim", &["new", "a", "b", "c"], Some("t3_c"))),
+        });
+
+        assert_eq!(app.current_post().unwrap().id, "new");
+        assert_eq!(app.tabs[i].feed.offset, 0);
+
+        app.tabs[i].feed.selected = 3;
+        app.tabs[i].feed.offset = 3;
+        app.fetch_manual(Some("t3_c".into()));
+        app.on_msg(Msg::Feed {
+            tab,
+            generation: app.tabs[i].feed.generation,
+            append: true,
+            result: Ok(listing("vim", &["d", "e"], None)),
+        });
+
+        assert_eq!(app.current_post().unwrap().id, "c");
+        assert_eq!(app.tabs[i].feed.offset, 3);
     }
 
     #[test]
@@ -13532,18 +18010,31 @@ mod tests {
         let mut app = app_with(&[]);
         app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
         let generation = app.post_view.as_ref().unwrap().generation;
-        app.on_msg(Msg::Post {
-            generation,
-            result: Ok(Box::new(PostPage {
-                post: post("p", "s"),
-                body: "offline reading works".into(),
-                comments: vec![],
-            })),
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Post {
+                generation,
+                result: Ok(Box::new(PostPage {
+                    post: post("p", "s"),
+                    body: "offline reading works".into(),
+                    comments: vec![],
+                })),
+            }),
+            fetched_at: 1000,
+            source: ordered_source(1, true),
+            refreshing: true,
         });
-        app.on_msg(Msg::Post {
-            generation,
-            result: Err("connection refused".into()),
+        app.on_msg(Msg::Snapshot {
+            message: Box::new(Msg::Post {
+                generation,
+                result: Err("connection refused".into()),
+            }),
+            fetched_at: 2000,
+            source: ordered_source(2, false),
+            refreshing: false,
         });
+        let view = app.post_view.as_ref().unwrap();
+        assert_eq!(view.freshness.unwrap().fetched_at, 1000);
+        assert!(!view.loading);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 30)).unwrap();
 
@@ -13590,7 +18081,7 @@ mod tests {
             result: Ok(listing("vim", &["new", "a"], Some("t3_a"))),
         });
 
-        assert_eq!(app.current_post().unwrap().id, "d");
+        assert_eq!(app.current_post().unwrap().id, "new");
         assert_eq!(app.tabs[i].feed.after.as_deref(), Some("t3_d"));
         assert_eq!(
             app.tabs[i]
@@ -13599,8 +18090,166 @@ mod tests {
                 .iter()
                 .map(|p| p.id.as_str())
                 .collect::<Vec<_>>(),
-            ["new", "a", "c", "d"]
+            ["new", "a", "b", "c", "d"]
         );
+    }
+
+    #[test]
+    fn manual_post_refresh_shows_the_top_only_when_it_brings_new_comments() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        app.focus = Focus::Post;
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(thread_message(
+            generation,
+            rooted(vec![
+                comment("c1", vec![], None),
+                comment("c2", vec![], None),
+            ]),
+        ));
+        let read_c2 = |app: &mut App| {
+            let view = app.post_view.as_mut().unwrap();
+            view.cursor = 1;
+            view.free_scroll = false;
+            view.row_starts = vec![5, 10];
+            view.drawn_cursor = Some(1);
+            view.scroll = 11;
+        };
+        read_c2(&mut app);
+
+        app.reload();
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(thread_message(
+            generation,
+            rooted(vec![
+                comment("c1", vec![], None),
+                comment("c2", vec![], None),
+            ]),
+        ));
+        let view = app.post_view.as_mut().unwrap();
+        assert!(matches!(view.cursor_key(), Some(RowKey::Comment(id)) if id == "c2"));
+        assert!(view.take_reading_anchor().is_some());
+
+        // Unseen comments below the thread's first comment arrive in place.
+        read_c2(&mut app);
+        app.reload();
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(thread_message(
+            generation,
+            rooted(vec![
+                comment("c1", vec![], None),
+                comment("lower", vec![], None),
+                comment("c2", vec![comment("reply", vec![], None)], None),
+            ]),
+        ));
+        let view = app.post_view.as_mut().unwrap();
+        assert!(matches!(view.cursor_key(), Some(RowKey::Comment(id)) if id == "c2"));
+        assert!(view.take_reading_anchor().is_some());
+
+        read_c2(&mut app);
+        app.reload();
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(thread_message(
+            generation,
+            rooted(vec![
+                comment("new", vec![], None),
+                comment("c1", vec![], None),
+                comment("c2", vec![], None),
+            ]),
+        ));
+        let view = app.post_view.as_mut().unwrap();
+        assert_eq!(view.cursor, 0);
+        assert_eq!(view.scroll, 0);
+        assert_eq!(view.take_reading_anchor(), None);
+    }
+
+    #[test]
+    fn manual_post_refresh_sets_a_pinned_first_comment_aside() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        app.focus = Focus::Post;
+        let pin = || Comment {
+            stickied: true,
+            ..comment("pin", vec![], None)
+        };
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(thread_message(
+            generation,
+            rooted(vec![
+                pin(),
+                comment("c1", vec![], None),
+                comment("c2", vec![], None),
+            ]),
+        ));
+        let view = app.post_view.as_mut().unwrap();
+        view.cursor = 2;
+        view.free_scroll = false;
+        view.row_starts = vec![5, 10, 15];
+        view.drawn_cursor = Some(2);
+        view.scroll = 16;
+
+        app.reload();
+        let generation = app.post_view.as_ref().unwrap().generation;
+        app.on_msg(thread_message(
+            generation,
+            rooted(vec![
+                pin(),
+                comment("new", vec![], None),
+                comment("c1", vec![], None),
+                comment("c2", vec![], None),
+            ]),
+        ));
+
+        let view = app.post_view.as_mut().unwrap();
+        assert_eq!(view.cursor, 0);
+        assert_eq!(view.scroll, 0);
+    }
+
+    #[test]
+    fn a_load_landing_after_a_fold_in_the_same_batch_keeps_the_selected_comment() {
+        let mut app = app_with(&[]);
+        app.open_post_permalink(post("p", "s"), "/r/s/comments/p/x/".into());
+        app.focus = Focus::Post;
+        let generation = app.post_view.as_ref().unwrap().generation;
+        let thread = |extra: bool| {
+            let mut long = comment("c2", vec![], None);
+            long.body = (1..=40)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let mut comments = vec![
+                comment("c1", vec![comment("reply", vec![], None)], None),
+                long,
+            ];
+            if extra {
+                comments.insert(0, comment("new", vec![], None));
+            }
+            thread_message(generation, comments)
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        let mut selected_row = |app: &mut App| {
+            terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .find(|&y| (0..buffer.area.width).any(|x| buffer[(x, y)].symbol() == "▌"))
+        };
+        app.on_msg(thread(false));
+        let view = app.post_view.as_mut().unwrap();
+        view.cursor = 0;
+        view.free_scroll = false;
+        selected_row(&mut app);
+        let view = app.post_view.as_mut().unwrap();
+        view.scroll += 3;
+        let before = selected_row(&mut app);
+        assert!(before.is_some());
+
+        app.activate_comment();
+        app.on_msg(thread(true));
+
+        assert_eq!(selected_row(&mut app), before);
+        let view = app.post_view.as_ref().unwrap();
+        assert!(matches!(view.cursor_key(), Some(RowKey::Comment(id)) if id == "c1"));
     }
 
     #[test]
@@ -13801,9 +18450,7 @@ mod tests {
             result: Ok(listing("vim", &["x", "c"], Some("t3_c"))),
         });
 
-        assert_eq!(app.tabs[i].feed.posts[2].id, "c");
-        assert_eq!(app.tabs[i].feed.posts[3].id, "d");
-        app.reload();
+        assert!(!app.tabs[i].feed.has_new_posts(&app.config));
         assert_eq!(
             app.tabs[i]
                 .feed
@@ -13811,10 +18458,10 @@ mod tests {
                 .iter()
                 .map(|p| p.id.as_str())
                 .collect::<Vec<_>>(),
-            ["a", "b", "x", "c"]
+            // d may have moved onto the next page: it stays until that page answers.
+            ["a", "b", "x", "c", "d"]
         );
-        assert_eq!(app.current_post().unwrap().id, "a");
-        assert_eq!(app.tabs[i].feed.offset, 0);
+        assert_eq!(app.current_post().unwrap().id, "c");
         assert_eq!(app.tabs[i].feed.after.as_deref(), Some("t3_c"));
     }
 
@@ -13864,7 +18511,7 @@ mod tests {
                 .iter()
                 .map(|p| p.id.as_str())
                 .collect::<Vec<_>>(),
-            ["new", "a", "c"]
+            ["new", "a", "b", "c"]
         );
     }
 
@@ -14055,7 +18702,7 @@ mod tests {
                 .iter()
                 .map(|p| p.id.as_str())
                 .collect::<Vec<_>>(),
-            ["c", "a", "d"]
+            ["c", "a", "b", "d"]
         );
     }
 
@@ -14112,7 +18759,7 @@ mod tests {
             false,
         ));
 
-        assert_eq!(app.current_post().unwrap().title, "newer cached title");
+        assert_eq!(app.tabs[i].feed.posts[1].title, "newer cached title");
         assert_eq!(
             app.tabs[i]
                 .feed
@@ -14251,6 +18898,7 @@ mod tests {
             }
 
             press(&mut app, crossterm::event::KeyCode::PageDown);
+            app.tick_at(Instant::now() + NAV_SETTLE);
 
             assert!(
                 !app.tabs[index].feed.loading_more(),
@@ -14298,6 +18946,7 @@ mod tests {
 
         app.move_selection(1);
 
+        app.tick_at(Instant::now() + NAV_SETTLE);
         assert!(
             !app.tabs[i].feed.loading(),
             "navigation must not retry the failed cursor"
@@ -14314,6 +18963,11 @@ mod tests {
             app.tabs[i].feed.generation, generation,
             "r must not duplicate an active continuation"
         );
+    }
+
+    /// Top-level comments under the thread root, as the parser delivers them.
+    fn rooted(comments: Vec<Comment>) -> Vec<Comment> {
+        vec![comment(&format!("{THREAD_ROOT}t3_p"), comments, None)]
     }
 
     fn thread_message(generation: u64, comments: Vec<Comment>) -> Msg {
@@ -15173,7 +19827,7 @@ mod tests {
                 app.tabs[i].feed.posts[0].id, "newer-disk",
                 "retired={retired}"
             );
-            app.fetch_feed(i, None, true);
+            app.fetch_manual(None);
             app.on_msg(Msg::Snapshot {
                 message: Box::new(Msg::Feed {
                     tab,
@@ -15234,7 +19888,7 @@ mod tests {
     }
 
     #[test]
-    fn private_community_denial_and_recovery_should_apply_to_both_views() {
+    fn request_refusals_and_private_denials_should_preserve_their_cross_view_scope() {
         for access in [AccessDenied::PrivateCommunity, AccessDenied::Forbidden] {
             for from_group in [true, false] {
                 let mut app = app_with(&["vim"]);
@@ -15266,6 +19920,11 @@ mod tests {
                     feed_message(&app, Err(FeedError::Access(access)))
                 };
                 app.on_msg(ordered_snapshot(denial, 2, false, false));
+                if access == AccessDenied::Forbidden {
+                    assert!(app.tabs[i].feed.access_denied().is_none());
+                    assert_eq!(app.group_posts(&app.all_subs.groups[0]).count(), 1);
+                    continue;
+                }
                 app.switch_tab(ALL_SUBS_TAB);
                 assert_eq!(app.group_posts(&app.all_subs.groups[0]).count(), 0);
                 app.open_current_community();
@@ -15366,63 +20025,62 @@ mod tests {
     fn private_community_navigation_should_not_move_hidden_posts_or_prefetch() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        for access in [AccessDenied::PrivateCommunity, AccessDenied::Forbidden] {
-            for code in [
-                KeyCode::Char('j'),
-                KeyCode::Char('k'),
-                KeyCode::Char('G'),
-                KeyCode::Char('g'),
-                KeyCode::PageDown,
-                KeyCode::PageUp,
-                KeyCode::Null,
-            ] {
-                let mut app = app_with(&["vim"]);
-                let i = tab_index(&app, "vim");
-                app.switch_tab(i);
-                app.load_feed(i, false);
-                let tab = app.tabs[i].id;
-                let generation = app.tabs[i].feed.generation;
-                app.on_msg(ordered_snapshot(
-                    Msg::Feed {
-                        tab,
-                        generation,
-                        append: false,
-                        result: Ok(listing("vim", &["a", "b", "c", "d", "e"], Some("next"))),
-                    },
-                    1,
-                    false,
-                    false,
-                ));
-                app.tabs[i].feed.selected = 2;
-                app.on_msg(ordered_snapshot(
-                    Msg::Feed {
-                        tab,
-                        generation,
-                        append: false,
-                        result: Err(FeedError::Access(access)),
-                    },
-                    2,
-                    false,
-                    false,
-                ));
+        let access = AccessDenied::PrivateCommunity;
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Char('G'),
+            KeyCode::Char('g'),
+            KeyCode::PageDown,
+            KeyCode::PageUp,
+            KeyCode::Null,
+        ] {
+            let mut app = app_with(&["vim"]);
+            let i = tab_index(&app, "vim");
+            app.switch_tab(i);
+            app.load_feed(i, false);
+            let tab = app.tabs[i].id;
+            let generation = app.tabs[i].feed.generation;
+            app.on_msg(ordered_snapshot(
+                Msg::Feed {
+                    tab,
+                    generation,
+                    append: false,
+                    result: Ok(listing("vim", &["a", "b", "c", "d", "e"], Some("next"))),
+                },
+                1,
+                false,
+                false,
+            ));
+            app.tabs[i].feed.selected = 2;
+            app.on_msg(ordered_snapshot(
+                Msg::Feed {
+                    tab,
+                    generation,
+                    append: false,
+                    result: Err(FeedError::Access(access)),
+                },
+                2,
+                false,
+                false,
+            ));
 
-                if code == KeyCode::Null {
-                    app.prefetch_list(usize::MAX);
-                } else {
-                    crate::keys::handle(&mut app, KeyEvent::new(code, KeyModifiers::NONE));
-                }
-
-                assert_eq!(app.tabs[i].feed.selected, 2, "{access:?} {code:?}");
-                assert_eq!(
-                    app.tabs[i].feed.generation, generation,
-                    "{access:?} {code:?}"
-                );
-                assert!(!app.tabs[i].feed.loading(), "{access:?} {code:?}");
-                assert!(app.current_post().is_none());
-                app.reload();
-                assert!(app.tabs[i].feed.loading(), "explicit recheck: {code:?}");
-                assert_eq!(app.tabs[i].feed.access_denied(), Some(access));
+            if code == KeyCode::Null {
+                app.prefetch_list(usize::MAX);
+            } else {
+                crate::keys::handle(&mut app, KeyEvent::new(code, KeyModifiers::NONE));
             }
+
+            assert_eq!(app.tabs[i].feed.selected, 2, "{access:?} {code:?}");
+            assert_eq!(
+                app.tabs[i].feed.generation, generation,
+                "{access:?} {code:?}"
+            );
+            assert!(!app.tabs[i].feed.loading(), "{access:?} {code:?}");
+            assert!(app.current_post().is_none());
+            app.reload();
+            assert!(app.tabs[i].feed.loading(), "explicit recheck: {code:?}");
+            assert_eq!(app.tabs[i].feed.access_denied(), Some(access));
         }
     }
 
@@ -15708,7 +20366,7 @@ mod tests {
         });
         app.load_feed(i, true);
         let page_request = app.tabs[i].feed.generation;
-        app.fetch_feed(i, None, true);
+        app.fetch_manual(None);
         app.on_msg(Msg::Snapshot {
             message: Box::new(Msg::Feed {
                 tab,
@@ -16257,9 +20915,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let mut app = app_with(&["rust"]);
-        app.settings =
-            settings::Settings::new(crate::config::store::Store::open(Some(&path)).unwrap());
-        std::fs::write(&path, "all_subs_posts_per_group=1\n[media]\nimage_preview=false\n[signed_out.filters]\nkeywords=[\"hidden\"]\nflairs=[\"Meme\"]\nauthors=[\"bot\"]\n[signed_out.highlight]\nkeywords=[\"rust\"]\n[commands]\nbrowser=[\"browser-fixture\"]\nvideo=[\"video-fixture\",\"--flag\"]\nimage=[\"image-fixture\"]\n").unwrap();
+        let mut store = crate::config::store::Store::open(Some(&path)).unwrap();
+        store.select_account(Some("reader"));
+        app.settings = settings::Settings::new(store);
+        std::fs::write(&path, "all_subs_posts_per_group=1\n[media]\nimage_preview=false\n[accounts.reader.filters]\nkeywords=[\"hidden\"]\nflairs=[\"Meme\"]\nauthors=[\"bot\"]\n[accounts.reader.highlight]\nkeywords=[\"rust\"]\n[commands]\nbrowser=[\"browser-fixture\"]\nvideo=[\"video-fixture\",\"--flag\"]\nimage=[\"image-fixture\"]\n").unwrap();
         assert!(app.poll_settings(Instant::now() + Duration::from_secs(1)));
         assert_eq!(app.config.all_subs_posts_per_group, 1);
         assert!(!app.show_images);
@@ -16812,12 +21471,12 @@ mod tests {
         });
         let (mut app, messages) = app_at(&fixture.base, &["blocker", "s"]);
         show_thumbnails(&mut app);
-        app.active = 3;
-        app.groups_drawn(&[], &[]);
+        app.active = 4;
+        app.groups_drawn(&[], &[], &[]);
         app.demand_icon("blocker");
         began.recv_timeout(Duration::from_secs(2)).unwrap();
-        app.active = 4;
-        app.groups_drawn(&[], &[]);
+        app.active = 5;
+        app.groups_drawn(&[], &[], &[]);
         app.demand_icon("s");
         app.active = 0;
         let mut terminal =

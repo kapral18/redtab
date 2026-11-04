@@ -97,7 +97,7 @@ fn empty_browse_text(
     } else if !show_nsfw
         && matches!(
             query,
-            Query::Search { .. } | Query::User { .. } | Query::Communities | Query::Multi { .. }
+            Query::User { .. } | Query::Communities | Query::Multi { .. }
         )
     {
         format!("No visible items.\n\n{NSFW_EMPTY_HINT}")
@@ -140,6 +140,7 @@ fn body_rows(screen: &Screen, width: u16, show_nsfw: bool) -> usize {
 }
 
 fn footer(app: &App, screen: &Screen, width: usize, loader_visible: bool) -> String {
+    let can_open = crate::keys::map::available(app, crate::keys::map::Action::Right);
     let loading_more = app.experience.loading_more();
     let failed_read = app.experience.error().is_some()
         && matches!(screen, Screen::Browse { .. } | Screen::Loading(_));
@@ -155,7 +156,7 @@ fn footer(app: &App, screen: &Screen, width: usize, loader_visible: bool) -> Str
                 && !page.text.is_empty())
             || !preview_text(query, page, *selected).is_empty())
     {
-        Some(if page.entries.is_empty() || loading_more {
+        Some(if !can_open || loading_more {
             fitting_label(
                 &[
                     "Ctrl+d/u scroll · Ctrl+e/y line · Esc back",
@@ -199,6 +200,19 @@ fn footer(app: &App, screen: &Screen, width: usize, loader_visible: bool) -> Str
     } else {
         None
     };
+    if matches!(screen, Screen::Browse { page, pagination, .. } if pagination.has_new_entries(page))
+    {
+        return fitting_label(
+            &[
+                "New items · r refresh · Enter open · Esc back",
+                "New items · r refresh",
+                "r refresh",
+                "r",
+            ],
+            width,
+        )
+        .into();
+    }
     if width < 28 {
         let (hint, short) = if app.experience.writing() {
             ("Sending…".into(), "Sending…")
@@ -207,12 +221,16 @@ fn footer(app: &App, screen: &Screen, width: usize, loader_visible: bool) -> Str
                 "r retry · Esc".into(),
                 fitting_label(&["r retry · Esc", "r · Esc", "r Esc", "⎋"], width),
             )
-        } else if app.experience.pending.is_some() && !loading_more && loader_visible {
+        } else if app.experience.pending.is_some()
+            && !loading_more
+            && !app.experience.refreshing
+            && loader_visible
+        {
             (
                 "Esc back".into(),
                 fitting_label(&["Esc back", "Esc", "⎋"], width),
             )
-        } else if app.experience.pending.is_some() && !loading_more {
+        } else if app.experience.pending.is_some() && !loading_more && !app.experience.refreshing {
             (
                 "Loading · Esc".into(),
                 fitting_label(&["… · Esc", "… Esc", "…⎋", "⎋"], width),
@@ -233,8 +251,13 @@ fn footer(app: &App, screen: &Screen, width: usize, loader_visible: bool) -> Str
                 "r retry · Esc".into(),
                 fitting_label(&["r · Esc", "r Esc", "r⎋", "⎋"], width),
             )
-        } else {
+        } else if can_open || matches!(screen, Screen::Confirm { .. }) {
             ("Enter · Esc".into(), enter_escape(width))
+        } else {
+            (
+                "Esc back".into(),
+                fitting_label(&["Esc back", "Esc", "⎋"], width),
+            )
         };
         return if hint.width() <= width {
             hint
@@ -247,7 +270,7 @@ fn footer(app: &App, screen: &Screen, width: usize, loader_visible: bool) -> Str
     }
     let mut parts: Vec<&str> = if failed_read {
         vec!["r retry", "Esc back"]
-    } else if app.experience.pending.is_some() && !loading_more {
+    } else if app.experience.pending.is_some() && !loading_more && !app.experience.refreshing {
         if loader_visible {
             vec!["Esc back"]
         } else {
@@ -262,8 +285,10 @@ fn footer(app: &App, screen: &Screen, width: usize, loader_visible: bool) -> Str
             Screen::Browse { .. } => {
                 if let Some(controls) = scroll_controls {
                     vec![controls]
-                } else {
+                } else if can_open {
                     vec!["Enter open", "Esc back"]
+                } else {
+                    vec!["Esc back"]
                 }
             }
         }
@@ -286,19 +311,7 @@ fn footer(app: &App, screen: &Screen, width: usize, loader_visible: bool) -> Str
                 .get(*selected)
                 .is_some_and(|entry| entry.target.is_some())
             {
-                extras.insert(0, "SPC a a actions");
-            }
-            if matches!(
-                query,
-                crate::reddit::experience::Query::Search {
-                    kind: crate::reddit::experience::SearchKind::Posts,
-                    ..
-                }
-            ) {
-                extras.push("SPC f s sort");
-            }
-            if matches!(query, crate::reddit::experience::Query::Search { .. }) {
-                extras.push("SPC f t time");
+                extras.insert(0, "SPC a actions");
             }
             if matches!(query, crate::reddit::experience::Query::Multi { .. }) {
                 extras.extend(["a add", "d remove", "D delete"]);
@@ -314,8 +327,9 @@ fn footer(app: &App, screen: &Screen, width: usize, loader_visible: bool) -> Str
     parts.join(" · ")
 }
 
-pub(super) fn draw(f: &mut Frame, app: &App) -> Option<Rect> {
+pub(super) fn draw(f: &mut Frame, app: &mut App) -> Option<Rect> {
     let screen = app.experience.screens.last()?;
+    let mut browse_scroll = None;
     let loading_more = app.experience.loading_more();
     let mut loader_visible = false;
     let title = match screen {
@@ -472,7 +486,9 @@ pub(super) fn draw(f: &mut Frame, app: &App) -> Option<Rect> {
             scroll,
             ..
         } => {
-            loader_visible = draw_browse(f, app, query, page, *selected, *scroll, body);
+            let (visible, scroll) = draw_browse(f, app, query, page, *selected, *scroll, body);
+            loader_visible = visible;
+            browse_scroll = Some(scroll);
         }
     }
     if let Some(message) = error_message
@@ -506,6 +522,8 @@ pub(super) fn draw(f: &mut Frame, app: &App) -> Option<Rect> {
     if pending_footer && inner.width > 2 {
         let kind = if app.experience.writing() {
             loading::Kind::Action
+        } else if app.experience.refreshing {
+            loading::Kind::Background
         } else if loading_more {
             loading::Kind::More
         } else {
@@ -523,6 +541,11 @@ pub(super) fn draw(f: &mut Frame, app: &App) -> Option<Rect> {
             hint,
         );
     }
+    if let Some(scroll) = browse_scroll
+        && let Some(Screen::Browse { scroll: shown, .. }) = app.experience.screens.last_mut()
+    {
+        *shown = scroll;
+    }
     Some(area)
 }
 
@@ -534,27 +557,30 @@ fn draw_browse(
     selected: usize,
     scroll: usize,
     body: Rect,
-) -> bool {
+) -> (bool, usize) {
     let loading_more = app.experience.loading_more();
     let show_nsfw = app.config.show_nsfw;
     if loading_more && page.entries.is_empty() {
-        return loading::draw(
-            f,
-            body,
-            loading::Kind::More,
-            "Loading results",
-            app.loading_frame,
-        )
-        .is_some();
+        return (
+            loading::draw(
+                f,
+                body,
+                loading::Kind::More,
+                "Loading results",
+                app.loading_frame,
+            )
+            .is_some(),
+            0,
+        );
     }
     if page.entries.is_empty() {
         let text = empty_browse_text(query, page, show_nsfw);
-        f.render_widget(
-            Paragraph::new(reading_lines(&text, body.width))
-                .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
-            body,
-        );
-        return false;
+        let lines = reading_lines(&text, body.width);
+        let scroll = scroll
+            .min(lines.len().saturating_sub(body.height as usize))
+            .min(u16::MAX as usize);
+        f.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), body);
+        return (false, scroll);
     }
     let summary = if matches!(query, crate::reddit::experience::Query::Thread(_)) {
         ""
@@ -598,9 +624,27 @@ fn draw_browse(
         Constraint::Min(0),
     ])
     .areas(body);
+    let summary_lines = reading_lines(summary, summary_area.width);
+    let preview_lines = reading_lines(preview, preview_area.width);
+    let summary_max = if summary_area.is_empty() {
+        0
+    } else {
+        summary_lines
+            .len()
+            .saturating_sub(summary_area.height as usize)
+    };
+    let preview_max = if preview_area.is_empty() {
+        0
+    } else {
+        preview_lines
+            .len()
+            .saturating_sub(usize::from(preview_area.height) - usize::from(preview_area.height > 1))
+    };
+    let scroll = scroll
+        .min(summary_max.max(preview_max))
+        .min(u16::MAX as usize);
     f.render_widget(
-        Paragraph::new(reading_lines(summary, summary_area.width))
-            .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+        Paragraph::new(summary_lines).scroll((scroll as u16, 0)),
         summary_area,
     );
     let offset = selected.saturating_sub((list.height as usize).saturating_sub(1));
@@ -630,8 +674,8 @@ fn draw_browse(
     f.render_widget(Paragraph::new(rows), list);
     if has_preview && !preview_area.is_empty() {
         f.render_widget(
-            Paragraph::new(reading_lines(preview, preview_area.width))
-                .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+            Paragraph::new(preview_lines)
+                .scroll((scroll as u16, 0))
                 .block(
                     Block::default()
                         .borders(if preview_area.height > 1 {
@@ -644,7 +688,7 @@ fn draw_browse(
             preview_area,
         );
     }
-    loading_more
+    let loader_visible = loading_more
         && loading::draw(
             f,
             loader,
@@ -652,7 +696,8 @@ fn draw_browse(
             "Loading results",
             app.loading_frame,
         )
-        .is_some()
+        .is_some();
+    (loader_visible, scroll)
 }
 
 struct FormLayout {
@@ -818,6 +863,7 @@ mod tests {
                 ),
                 entries: ["Overview", "Posts", "Comments"]
                     .map(|title| Entry {
+                        icon: Default::default(),
                         title: title.into(),
                         body: String::new(),
                         target: None,
@@ -834,7 +880,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 60)).unwrap();
         terminal
             .draw(|f| {
-                super::draw(f, &app);
+                super::draw(f, &mut app);
             })
             .unwrap();
         let karma = terminal
@@ -895,12 +941,19 @@ mod tests {
         app.overlay = Some(Overlay::Experience);
         app.experience.screens.push(Screen::Loading(query.clone()));
         app.experience.pending = Some((91, Request::Read { query, after: None }));
-        app.on_experience(91, Err("Reddit denied this request (HTTP 403)".into()));
+        app.on_experience(
+            91,
+            Err("Reddit denied this request (HTTP 403)".into()),
+            crate::cache::Freshness {
+                fetched_at: crate::app::now(),
+                source: Default::default(),
+            },
+        );
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
 
         terminal
             .draw(|frame| {
-                super::draw(frame, &app);
+                super::draw(frame, &mut app);
             })
             .unwrap();
 
@@ -943,7 +996,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         terminal
             .draw(|frame| {
-                super::draw(frame, &app);
+                super::draw(frame, &mut app);
             })
             .unwrap();
         let actual: String = terminal

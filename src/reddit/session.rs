@@ -1,4 +1,5 @@
-//! Browser sessions, scoped to https://www.reddit.com.
+//! Browser sessions for https://www.reddit.com; api.reddit.com and old.reddit.com get only
+//! the `.reddit.com` cookies.
 
 use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,7 +10,7 @@ use wreq::header::HeaderValue;
 
 const INPUT_LIMIT: u64 = 1024 * 1024;
 pub(super) const SIGN_IN: &str =
-    "Reddit sign-in expired or missing; connect with A or redtab --signin";
+    "Reddit sign-in expired or missing; connect through Accounts or redtab --signin";
 const CONNECTION: &str = "# redtab-connection ";
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -83,7 +84,7 @@ impl Session {
                 cookie.name == "csrf_token" && cookie.matches("/svc/shreddit/graphql", now())
             })
             .map(|cookie| cookie.value.as_str())
-            .context("Reconnect with A to refresh the browser's settings token")
+            .context("Reconnect through Accounts to refresh the browser's settings token")
     }
 
     pub fn export(&self, connection: Connection) -> Result<String> {
@@ -158,11 +159,12 @@ impl Session {
         })
     }
 
-    pub fn header(&self, path: &str, now: u64) -> Result<HeaderValue> {
+    /// `www` is false for another reddit.com host, which gets only `.reddit.com` cookies.
+    pub fn header(&self, path: &str, www: bool, now: u64) -> Result<HeaderValue> {
         let cookies: Vec<_> = self
             .cookies
             .iter()
-            .filter(|c| c.matches(path, now))
+            .filter(|c| (www || c.domain == "reddit.com") && c.matches(path, now))
             .collect();
         if !cookies
             .iter()
@@ -297,7 +299,7 @@ mod tests {
     #[test]
     fn when_an_export_has_http_only_comments_and_crlf_it_should_load() {
         let session = Session::parse("\u{feff}# Netscape HTTP Cookie File\r\n\r\n#HttpOnly_.reddit.com\tTRUE\t/\tTRUE\t2000\treddit_session\tfixture-session\r\n", 1000).unwrap();
-        let actual = session.header("/comments/abc.json", 1000).unwrap();
+        let actual = session.header("/comments/abc.json", true, 1000).unwrap();
         assert_eq!(actual, "reddit_session=fixture-session");
         assert!(actual.is_sensitive());
         assert!(!format!("{actual:?}").contains("fixture-session"));
@@ -308,11 +310,15 @@ mod tests {
         let text = format!(
             "{LOGIN}www.reddit.com\tFALSE\t/\tFALSE\t0\tprefs\twww\n.reddit.com.evil.test\tTRUE\t/\tTRUE\t0\tevil\tsecret\nreddit.com\tFALSE\t/\tTRUE\t0\thost_only\tsecret\nold.reddit.com\tFALSE\t/\tTRUE\t0\told\tsecret\n"
         );
-        let actual = Session::parse(&text, 1000)
-            .unwrap()
-            .header("/", 1000)
-            .unwrap();
-        assert_eq!(actual, "reddit_session=fixture-session; prefs=www");
+        let session = Session::parse(&text, 1000).unwrap();
+        assert_eq!(
+            session.header("/", true, 1000).unwrap(),
+            "reddit_session=fixture-session; prefs=www"
+        );
+        assert_eq!(
+            session.header("/", false, 1000).unwrap(),
+            "reddit_session=fixture-session"
+        );
     }
 
     #[test]
@@ -322,11 +328,11 @@ mod tests {
         );
         let session = Session::parse(&text, 1000).unwrap();
         assert_eq!(
-            session.header("/r/rust/hot.json", 1000).unwrap(),
+            session.header("/r/rust/hot.json", true, 1000).unwrap(),
             "prefs=subreddit; reddit_session=fixture-session; prefs=root"
         );
         assert_eq!(
-            session.header("/random", 1000).unwrap(),
+            session.header("/random", true, 1000).unwrap(),
             "reddit_session=fixture-session; prefs=root"
         );
     }
@@ -336,7 +342,7 @@ mod tests {
         let text = format!("{LOGIN}.reddit.com\tTRUE\t/\tTRUE\t0\treddit_session\treplacement\n");
         let actual = Session::parse(&text, 1000)
             .unwrap()
-            .header("/", 1000)
+            .header("/", true, 1000)
             .unwrap();
         assert_eq!(actual, "reddit_session=replacement");
     }
@@ -346,7 +352,7 @@ mod tests {
         let text = format!("{LOGIN}.reddit.com\tTRUE\t/\tTRUE\t0\tprefs\t{{\"a\":1,\"b\":2}}\n");
         let actual = Session::parse(&text, 1000)
             .unwrap()
-            .header("/", 1000)
+            .header("/", true, 1000)
             .unwrap();
         assert_eq!(
             actual,
@@ -382,8 +388,11 @@ mod tests {
             1000,
         )
         .unwrap();
-        assert!(session.header("/", 1000).is_ok());
-        assert_eq!(session.header("/", 1001).unwrap_err().to_string(), SIGN_IN);
+        assert!(session.header("/", true, 1000).is_ok());
+        assert_eq!(
+            session.header("/", true, 1001).unwrap_err().to_string(),
+            SIGN_IN
+        );
     }
 
     #[test]

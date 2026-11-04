@@ -653,14 +653,6 @@ impl State {
     }
 
     pub fn mark_read(&mut self, post: &Post, now: i64) {
-        let was_read = self.read.contains_key(&post.id);
-        if !was_read {
-            self.read_revision = self.read_revision.wrapping_add(1);
-        }
-        self.read
-            .entry(post.id.clone())
-            .and_modify(|time| *time = (*time).max(now))
-            .or_insert(now);
         if let Some(key) = post.community().map(str::to_lowercase) {
             let community = self.observed.entry(key.clone()).or_default();
             community.observed_at = community.observed_at.max(now);
@@ -668,11 +660,24 @@ impl State {
                 cache.counts.entry(key).or_default();
             }
         }
+        self.mark_read_id(&post.id, now);
+    }
+
+    /// Marks a post read by id alone, for a post no longer at hand.
+    pub fn mark_read_id(&mut self, id: &str, now: i64) {
+        let was_read = self.read.contains_key(id);
+        if !was_read {
+            self.read_revision = self.read_revision.wrapping_add(1);
+        }
+        self.read
+            .entry(id.to_owned())
+            .and_modify(|time| *time = (*time).max(now))
+            .or_insert(now);
         if was_read {
             return;
         }
         for (subreddit, community) in &mut self.observed {
-            let Some(old) = community.posts.remove(&post.id) else {
+            let Some(old) = community.posts.remove(id) else {
                 continue;
             };
             if let Some(cache) = self.unread_counts.get_mut()
@@ -821,13 +826,6 @@ mod tests {
         }
     }
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("redtab-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn when_older_state_has_no_view_it_should_default_to_cards() {
         let state: State = serde_json::from_str("{\"bookmarks\":[]}").unwrap();
@@ -861,8 +859,11 @@ mod tests {
 
     #[test]
     fn when_an_unchanged_instance_saves_it_should_keep_the_latest_list_view() {
-        let dir = scratch("list-view-東京");
-        let path = dir.join("state.json");
+        let dir = tempfile::Builder::new()
+            .prefix("list-view-東京")
+            .tempdir()
+            .unwrap();
+        let path = dir.path().join("state.json");
         let mut first = State::default();
         first.save(&path, 1).unwrap();
         let (mut second, _) = State::load(&path);
@@ -871,7 +872,6 @@ mod tests {
 
         first.save(&path, 3).unwrap();
         let (saved, warning) = State::load(&path);
-        std::fs::remove_dir_all(dir).unwrap();
 
         assert!(warning.is_none());
         assert_eq!(saved.list_view(), ListView::Compact);
@@ -880,9 +880,9 @@ mod tests {
 
     #[test]
     fn when_both_instances_change_view_the_latest_choice_should_survive_a_symlink_save() {
-        let dir = scratch("list-view-merge");
-        let path = dir.join("state.json");
-        let link = dir.join("linked.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let link = dir.path().join("linked.json");
         std::os::unix::fs::symlink(&path, &link).unwrap();
         let mut first = State::default();
         first.toggle_list_view();
@@ -897,7 +897,6 @@ mod tests {
         first.save(&link, 3).unwrap();
         let (saved, warning) = State::load(&path);
         assert!(link.is_symlink());
-        std::fs::remove_dir_all(dir).unwrap();
         assert!(warning.is_none());
         assert_eq!(saved.list_view(), ListView::Card);
     }
@@ -957,8 +956,8 @@ mod tests {
 
     #[test]
     fn save_round_trips_and_prunes_stale_marks_but_keeps_bookmarks() {
-        let dir = scratch("roundtrip");
-        let path = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
         let mut state = State::default();
         let old = post("old", "s");
         state.mark_read(&old, 0);
@@ -967,7 +966,6 @@ mod tests {
 
         state.save(&path, RETENTION_SECS + 20).unwrap();
         let (loaded, warning) = State::load(&path);
-        std::fs::remove_dir_all(&dir).unwrap();
 
         assert!(warning.is_none());
         assert!(!loaded.is_read("old"));
@@ -994,8 +992,8 @@ mod tests {
 
     #[test]
     fn two_instances_keep_each_others_bookmarks_and_removals() {
-        let dir = scratch("merge");
-        let path = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
         let mut first = State::default();
         first.toggle_bookmark(&post("keep", "s"), 1);
         first.toggle_bookmark(&post("drop", "s"), 2);
@@ -1008,7 +1006,6 @@ mod tests {
         second.save(&path, 10).unwrap();
         first.save(&path, 10).unwrap();
         let (merged, _) = State::load(&path);
-        std::fs::remove_dir_all(&dir).unwrap();
 
         let ids: Vec<&str> = merged
             .bookmarks()
@@ -1026,8 +1023,8 @@ mod tests {
 
     #[test]
     fn re_adding_a_removed_bookmark_in_the_same_second_keeps_it() {
-        let dir = scratch("readd");
-        let path = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
         let mut state = State::default();
         let p = post("x", "s");
         state.toggle_bookmark(&p, 7);
@@ -1036,20 +1033,18 @@ mod tests {
         state.toggle_bookmark(&p, 7);
         state.save(&path, 7).unwrap();
         let (loaded, _) = State::load(&path);
-        std::fs::remove_dir_all(&dir).unwrap();
 
         assert!(loaded.is_bookmarked("x"));
     }
 
     #[test]
     fn corrupt_state_is_moved_aside() {
-        let dir = scratch("bad");
-        let path = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
         std::fs::write(&path, b"\xff\xfe not json").unwrap();
 
         let (state, warning) = State::load(&path);
-        let moved = dir.join("state.json.bad").exists();
-        std::fs::remove_dir_all(&dir).unwrap();
+        let moved = dir.path().join("state.json.bad").exists();
 
         assert!(state.bookmarks().is_empty());
         assert!(warning.unwrap().contains("moved to"));
@@ -1058,14 +1053,14 @@ mod tests {
 
     #[test]
     fn a_second_corrupt_file_keeps_the_first_backup() {
-        let dir = scratch("bad2");
-        let path = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
         std::fs::write(&path, b"first").unwrap();
         State::load(&path);
         std::fs::write(&path, b"second").unwrap();
         State::load(&path);
-        let first = std::fs::read_to_string(dir.join("state.json.bad")).unwrap();
-        let backups = std::fs::read_dir(&dir)
+        let first = std::fs::read_to_string(dir.path().join("state.json.bad")).unwrap();
+        let backups = std::fs::read_dir(dir.path())
             .unwrap()
             .filter(|entry| {
                 entry
@@ -1076,7 +1071,6 @@ mod tests {
                     .starts_with("state.json.bad")
             })
             .count();
-        std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(first, "first");
         assert_eq!(backups, 2);
@@ -1084,14 +1078,14 @@ mod tests {
 
     #[test]
     fn repeated_corrupt_state_recovery_should_keep_every_backup() {
-        let dir = scratch("bad-repeat");
-        let path = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
         for text in ["first", "second", "third", "fourth"] {
             std::fs::write(&path, text).unwrap();
             let (_, warning) = State::load(&path);
             assert!(warning.unwrap().contains("moved to"));
         }
-        let mut backups: Vec<_> = std::fs::read_dir(&dir)
+        let mut backups: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter(|entry| {
                 entry
@@ -1104,15 +1098,14 @@ mod tests {
             .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
             .collect();
         backups.sort();
-        std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(backups, ["first", "fourth", "second", "third"]);
     }
 
     #[test]
     fn when_another_instance_holds_the_save_lock_corrupt_recovery_should_leave_the_file_alone() {
-        let dir = scratch("bad-locked");
-        let path = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
         std::fs::write(&path, "corrupt").unwrap();
         let held = lock(&path).unwrap();
 
@@ -1122,20 +1115,18 @@ mod tests {
         assert!(warning.unwrap().contains("another redtab"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "corrupt");
         drop(held);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_file_corrupted_during_the_session_is_not_overwritten() {
-        let dir = scratch("midbad");
-        let path = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
         let mut state = State::default();
         state.save(&path, 1).unwrap();
         std::fs::write(&path, b"{\"bookmarks\":[{\"post\":1}]}").unwrap();
 
         let saved = state.save(&path, 2);
         let on_disk = std::fs::read_to_string(&path).unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
 
         assert!(saved.is_err());
         assert_eq!(on_disk, "{\"bookmarks\":[{\"post\":1}]}");
@@ -1144,9 +1135,9 @@ mod tests {
     #[test]
     fn saving_keeps_a_symlink_and_the_file_permissions() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = scratch("link");
-        let real = dir.join("real.json");
-        let link = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.json");
+        let link = dir.path().join("state.json");
         std::fs::write(&real, b"{}").unwrap();
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
@@ -1160,7 +1151,6 @@ mod tests {
             .is_symlink();
         let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
         let (loaded, _) = State::load(&real);
-        std::fs::remove_dir_all(&dir).unwrap();
 
         assert!(still_link);
         assert_eq!(mode, 0o600);
@@ -1169,8 +1159,8 @@ mod tests {
 
     #[test]
     fn a_dangling_or_corrupt_symlinked_state_file_keeps_the_link() {
-        let dir = scratch("link2");
-        let link = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("state.json");
         std::os::unix::fs::symlink("synced.json", &link).unwrap();
         let mut state = State::default();
         state.toggle_bookmark(&post("a", "s"), 1);
@@ -1179,16 +1169,15 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink();
-        let target_written = dir.join("synced.json").exists();
+        let target_written = dir.path().join("synced.json").exists();
 
-        std::fs::write(dir.join("synced.json"), b"garbage").unwrap();
+        std::fs::write(dir.path().join("synced.json"), b"garbage").unwrap();
         State::load(&link);
         let corrupt_kept = std::fs::symlink_metadata(&link)
             .unwrap()
             .file_type()
             .is_symlink();
-        let backup = std::fs::read_to_string(dir.join("synced.json.bad")).ok();
-        std::fs::remove_dir_all(&dir).unwrap();
+        let backup = std::fs::read_to_string(dir.path().join("synced.json.bad")).ok();
 
         assert!(dangling_kept && target_written);
         assert!(corrupt_kept, "the link itself was moved aside");
@@ -1197,15 +1186,14 @@ mod tests {
 
     #[test]
     fn unreadable_state_is_never_overwritten() {
-        let dir = scratch("unreadable");
-        let path = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
         std::fs::create_dir(&path).unwrap(); // reading a directory fails
 
         let (mut state, warning) = State::load(&path);
         state.toggle_bookmark(&post("a", "s"), 1);
         let saved = state.save(&path, 1);
         let still_dir = path.is_dir();
-        std::fs::remove_dir_all(&dir).unwrap();
 
         assert!(warning.unwrap().contains("will not save"));
         assert!(saved.is_err(), "a skipped save must not report success");
@@ -1233,8 +1221,8 @@ mod tests {
 
     #[test]
     fn a_spoiler_tag_learned_by_one_instance_survives_the_others_save() {
-        let dir = scratch("spoilmerge");
-        let path = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
         let mut a = State::default();
         a.toggle_bookmark(&post("p", "s"), 5);
         a.save(&path, 5).unwrap();
@@ -1244,15 +1232,14 @@ mod tests {
         a.save(&path, 6).unwrap();
         b.save(&path, 7).unwrap();
         let (loaded, _) = State::load(&path);
-        std::fs::remove_dir_all(&dir).unwrap();
 
         assert!(loaded.bookmarks()[0].post.spoiler);
     }
 
     #[test]
     fn when_an_original_deletion_is_learned_it_should_survive_another_instances_save() {
-        let dir = scratch("original-deleted");
-        let path = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
         let mut a = State::default();
         a.toggle_bookmark(&post("p", "s"), 5);
         a.save(&path, 5).unwrap();
@@ -1262,7 +1249,6 @@ mod tests {
 
         b.save(&path, 7).unwrap();
         let (loaded, _) = State::load(&path);
-        std::fs::remove_dir_all(&dir).unwrap();
 
         assert!(loaded.bookmarks()[0].post.original_deleted);
         assert!(loaded.original_deleted("p"));
@@ -1294,8 +1280,8 @@ mod tests {
 
     #[test]
     fn bookmark_deletion_should_survive_a_stale_readd_saved_by_another_instance() {
-        let dir = scratch("deletion-readd-merge");
-        let path = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
         let mut a = State::default();
         a.toggle_bookmark(&post("p", "s"), 5);
         a.save(&path, 5).unwrap();
@@ -1307,7 +1293,6 @@ mod tests {
 
         b.save(&path, 7_776_009).unwrap();
         let (loaded, _) = State::load(&path);
-        std::fs::remove_dir_all(&dir).unwrap();
 
         assert!(loaded.original_deleted("p"));
         assert!(loaded.bookmarks()[0].post.original_deleted);
@@ -1338,8 +1323,8 @@ mod tests {
 
     #[test]
     fn bookmark_deletion_should_survive_remove_save_readd_after_observation_expiry() {
-        let dir = scratch("deletion-expired-readd");
-        let path = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
         let mut state = State::default();
         let mut deleted = post("p", "s");
         deleted.original_deleted = true;
@@ -1352,7 +1337,6 @@ mod tests {
         state.toggle_bookmark(&post("p", "s"), 7_776_012);
         state.save(&path, 7_776_012).unwrap();
         let (loaded, _) = State::load(&path);
-        std::fs::remove_dir_all(&dir).unwrap();
 
         assert!(loaded.bookmarks()[0].post.original_deleted);
         assert!(loaded.original_deleted("p"));
@@ -1360,8 +1344,8 @@ mod tests {
 
     #[test]
     fn bookmark_deletion_should_survive_stale_instance_removal_of_disk_only_knowledge() {
-        let dir = scratch("deletion-disk-only");
-        let path = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
         let mut stale = State::default();
         stale.toggle_bookmark(&post("p", "s"), 1);
         let mut disk = State::default();
@@ -1376,7 +1360,6 @@ mod tests {
         stale.toggle_bookmark(&post("p", "s"), 7_776_012);
         stale.save(&path, 7_776_012).unwrap();
         let (loaded, _) = State::load(&path);
-        std::fs::remove_dir_all(&dir).unwrap();
 
         assert!(loaded.bookmarks()[0].post.original_deleted);
         assert!(loaded.original_deleted("p"));
@@ -1384,9 +1367,9 @@ mod tests {
 
     #[test]
     fn the_directory_lock_lets_only_one_saver_in_at_a_time() {
-        let dir = scratch("dirlock");
-        let target = dir.join("state.json");
-        let counter = dir.join("counter");
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("state.json");
+        let counter = dir.path().join("counter");
         std::fs::write(&counter, "0").unwrap();
         let workers: Vec<_> = (0..2)
             .map(|_| {
@@ -1410,7 +1393,6 @@ mod tests {
         }
         let total = std::fs::read_to_string(&counter).unwrap();
         let lock_left = target.with_extension("json.lockdir").exists();
-        std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(total, "20");
         assert!(!lock_left, "the lock is removed when released");
@@ -1426,8 +1408,8 @@ mod tests {
 
     #[test]
     fn an_old_directory_lock_is_never_broken_while_its_holder_lives() {
-        let dir = scratch("oldlock");
-        let target = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("state.json");
         let lockdir = target.with_extension("json.lockdir");
         let stalled = dir_lock(&target).unwrap();
         age(&lockdir); // a holder stalled past STALE_LOCK, or a crash's leftover
@@ -1438,7 +1420,6 @@ mod tests {
         let still_held = lockdir.exists();
         drop(stalled);
         let after_release = dir_lock(&target).is_ok();
-        std::fs::remove_dir_all(&dir).unwrap();
 
         let message = refused.expect("a second holder must be refused");
         assert!(
@@ -1457,8 +1438,8 @@ mod tests {
     /// tell the reader to delete it.
     #[test]
     fn a_lock_in_use_gives_up_after_the_wait_and_stays() {
-        let dir = scratch("freshlock");
-        let target = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("state.json");
         let held = dir_lock(&target).unwrap();
 
         let started = std::time::Instant::now();
@@ -1466,7 +1447,6 @@ mod tests {
         let waited = started.elapsed();
         let still_held = target.with_extension("json.lockdir").exists();
         drop(held);
-        std::fs::remove_dir_all(&dir).unwrap();
 
         let message = refused.expect("a second holder must be refused");
         assert!(waited >= LOCK_WAIT && waited < LOCK_WAIT * 3, "{waited:?}");
@@ -1487,8 +1467,8 @@ mod tests {
 
     #[test]
     fn a_save_gives_up_when_another_instance_holds_the_lock() {
-        let dir = scratch("busy");
-        let path = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
         let held = lock(&path).unwrap();
         let mut state = State::default();
         state.toggle_bookmark(&post("a", "s"), 1);
@@ -1498,7 +1478,6 @@ mod tests {
         let waited = started.elapsed();
         drop(held);
         let after = state.save(&path, 1);
-        std::fs::remove_dir_all(&dir).unwrap();
 
         assert!(saved.unwrap_err().to_string().contains("still saving"));
         assert!(waited >= LOCK_WAIT && waited < LOCK_WAIT * 3, "{waited:?}");
@@ -1507,23 +1486,22 @@ mod tests {
 
     #[test]
     fn saving_through_a_chain_of_dangling_links_keeps_every_link() {
-        let dir = scratch("chain");
-        std::fs::create_dir(dir.join("real")).unwrap();
-        std::os::unix::fs::symlink("hop.json", dir.join("state.json")).unwrap();
-        std::os::unix::fs::symlink("real/state.json", dir.join("hop.json")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink("hop.json", dir.path().join("state.json")).unwrap();
+        std::os::unix::fs::symlink("real/state.json", dir.path().join("hop.json")).unwrap();
         let mut state = State::default();
         state.toggle_bookmark(&post("a", "s"), 1);
 
-        state.save(&dir.join("state.json"), 1).unwrap();
+        state.save(&dir.path().join("state.json"), 1).unwrap();
         let is_link = |p: &str| {
-            std::fs::symlink_metadata(dir.join(p))
+            std::fs::symlink_metadata(dir.path().join(p))
                 .unwrap()
                 .file_type()
                 .is_symlink()
         };
         let links = (is_link("state.json"), is_link("hop.json"));
-        let written = dir.join("real/state.json").is_file();
-        std::fs::remove_dir_all(&dir).unwrap();
+        let written = dir.path().join("real/state.json").is_file();
 
         assert_eq!(links, (true, true));
         assert!(written);
@@ -1531,8 +1509,8 @@ mod tests {
 
     #[test]
     fn simultaneous_saves_from_two_instances_lose_no_bookmark() {
-        let dir = scratch("race");
-        let path = dir.join("state.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
         let savers: Vec<_> = ["a", "b"]
             .into_iter()
             .map(|who| {
@@ -1556,7 +1534,6 @@ mod tests {
             .flat_map(|who| (0..60).map(move |i| format!("{who}{i}")))
             .filter(|id| !loaded.is_bookmarked(id))
             .collect();
-        std::fs::remove_dir_all(&dir).unwrap();
 
         assert!(lost.is_empty(), "lost {} bookmarks: {lost:?}", lost.len());
     }

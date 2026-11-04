@@ -37,7 +37,7 @@ pub const SETTINGS: &[Setting] = &[
         key: "media.video_autoplay",
         scope: Scope::Reddit,
         label: "Autoplay videos",
-        description: "Use Reddit account autoplay for selected videos and GIFs. Saves to Reddit; SPC m p still plays manually.",
+        description: "Use Reddit account autoplay for selected videos and GIFs. Saves to Reddit; p still plays manually.",
         kind: Kind::Boolean,
     },
     Setting {
@@ -106,17 +106,23 @@ pub const SETTINGS: &[Setting] = &[
 ];
 
 impl Setting {
+    /// Reader rules belong to an identified account; without one F2 does not list them.
+    pub fn available(&self, config: &Config) -> bool {
+        self.scope != Scope::Reader
+            || config
+                .active_account
+                .as_deref()
+                .is_some_and(|name| !name.is_empty())
+    }
+
     pub fn file_key(&self, config: &Config) -> String {
-        if self.scope != Scope::Reader {
-            return self.key.into();
+        match self.scope {
+            Scope::Device => return self.key.into(),
+            Scope::Reddit => return "Reddit account".into(),
+            Scope::Reader => {}
         }
-        match &config.active_account {
-            Some(name) if name.is_empty() => {
-                "Reconnect with SPC p a to identify this account".into()
-            }
-            Some(name) => format!("accounts.{name}.{}", self.key),
-            None => format!("signed_out.{}", self.key),
-        }
+        let name = config.active_account.as_deref().unwrap_or_default();
+        format!("accounts.{name}.{}", self.key)
     }
     pub fn value(&self, config: &Config) -> toml::Value {
         let strings =
@@ -158,8 +164,14 @@ impl Setting {
     }
 
     pub fn set(&self, config: &Config, value: toml::Value) -> Result<Config> {
-        if self.scope == Scope::Reader && config.active_account.as_deref() == Some("") {
-            bail!("Reconnect with SPC p a to identify this account before editing reader settings");
+        if self.scope == Scope::Reader {
+            match config.active_account.as_deref() {
+                None => bail!("Sign in with SPC p a before editing reader settings"),
+                Some("") => bail!(
+                    "Reconnect with SPC p a to identify this account before editing reader settings"
+                ),
+                Some(_) => {}
+            }
         }
         self.validate_value(&value)?;
         let mut next = config.clone();
@@ -208,21 +220,12 @@ pub fn annotated() -> String {
     let mut text = String::from(
         "# redtab settings — edit here or press F2 in the app.\n# Valid file changes apply live. UI changes save here when writable.\n# F2 offers confirmed source saves for plain chezmoi-managed configs.\n# Reddit account preferences are read from and saved to Reddit.\n# Account reader rules use [accounts.<username>.filters] and .highlight.\n\n",
     );
-    for section in [
-        "",
-        "media",
-        "commands",
-        "signed_out.filters",
-        "signed_out.highlight",
-    ] {
+    for section in ["", "media", "commands"] {
         if !section.is_empty() {
             text.push_str(&format!("[{section}]\n"));
         }
-        let reader_section = section.strip_prefix("signed_out.");
         for field in SETTINGS.iter().filter(|f| {
-            f.scope != Scope::Reddit
-                && f.key.rsplit_once('.').map_or("", |(s, _)| s)
-                    == reader_section.unwrap_or(section)
+            f.scope == Scope::Device && f.key.rsplit_once('.').map_or("", |(s, _)| s) == section
         }) {
             let key = field.key.rsplit('.').next().unwrap();
             text.push_str(&format!(
@@ -265,21 +268,15 @@ mod tests {
         );
         let mut schema: Vec<_> = SETTINGS
             .iter()
-            .filter(|f| f.scope != Scope::Reddit)
-            .map(|f| {
-                if f.scope == Scope::Reader {
-                    format!("signed_out.{}", f.key)
-                } else {
-                    f.key.into()
-                }
-            })
+            .filter(|f| f.scope == Scope::Device)
+            .map(|f| f.key.to_owned())
             .collect();
         keys.sort();
         schema.sort();
         assert_eq!(keys, schema);
         let config: Config = toml::from_str(&annotated()).unwrap();
         assert_eq!(config, Config::default());
-        for field in SETTINGS.iter().filter(|f| f.scope != Scope::Reddit) {
+        for field in SETTINGS.iter().filter(|f| f.scope == Scope::Device) {
             assert!(annotated().contains(field.description));
         }
     }

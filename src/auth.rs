@@ -642,6 +642,21 @@ fn run_helper(request: Request, cancelled: &Attempt, timeout: Duration) -> Resul
     let child = command.spawn().context("Could not start browser sign-in")?;
     helpers.insert(child.id(), directory.path().to_path_buf());
     drop(helpers);
+    let timed_out = match &request {
+        Request::Import(Source::Window { .. }) => crate::auth_browser::WINDOW_TIMED_OUT,
+        Request::Import(Source::Browser { .. }) => {
+            "Browser sign-in timed out. Unlock the keyring or use the separate login window."
+        }
+        Request::Discover => "Finding browser profiles timed out; r rescans.",
+        Request::Load
+        | Request::Accounts
+        | Request::LoadAccount(_)
+        | Request::Store(_)
+        | Request::Activate { .. }
+        | Request::Delete(_) => {
+            "The OS credential store did not answer in time; unlock it and retry."
+        }
+    };
     let mut helper = Helper {
         child,
         _directory: directory,
@@ -675,9 +690,7 @@ fn run_helper(request: Request, cancelled: &Attempt, timeout: Duration) -> Resul
             bail!("Sign-in cancelled");
         }
         if started.elapsed() > timeout {
-            bail!(
-                "Browser sign-in timed out. Unlock the keyring or use the separate login window."
-            );
+            bail!("{timed_out}");
         }
         if let Ok(result) = rx.try_recv() {
             let bytes = result?;

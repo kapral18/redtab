@@ -45,6 +45,7 @@
                       "id": "c2",
                       "author": "mod",
                       "distinguished": "moderator",
+                      "stickied": true,
                       "body": "reply",
                       "replies": ""
                     }

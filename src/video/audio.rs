@@ -171,9 +171,6 @@ impl Drop for Audio {
 fn samples(url: &str, headers: &[(String, String)], at: f64) -> Command {
     let mut command = crate::media::local_command("ffmpeg");
     command.args(["-nostdin", "-loglevel", "error"]);
-    if url.starts_with("https://") || url.starts_with("http://") {
-        command.args(["-rw_timeout", "10000000"]);
-    }
     command
         .args(super::header_args(headers))
         .args(super::input_args(url, at))
@@ -304,9 +301,8 @@ mod tests {
 
     #[test]
     fn when_the_index_lands_before_the_start_the_samples_should_begin_at_the_start() {
-        let dir = std::env::temp_dir().join(format!("redtab-audio-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("sparse.webm");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse.webm");
         // Silent until 30s, then a tone; one index entry every 20s.
         let made = Command::new("ffmpeg")
             .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
@@ -317,7 +313,6 @@ mod tests {
             .status();
         // ffmpeg, and its Opus encoder, are optional dependencies.
         if !made.is_ok_and(|status| status.success()) {
-            let _ = std::fs::remove_dir_all(&dir);
             return;
         }
 
@@ -330,7 +325,6 @@ mod tests {
             .unwrap()
             .stdout;
         let _ = source.wait();
-        let _ = std::fs::remove_dir_all(&dir);
 
         let loudest = pcm
             .chunks_exact(2)
@@ -344,16 +338,15 @@ mod tests {
 
     #[test]
     fn when_the_audio_connection_drops_mid_file_the_decoder_log_should_report_it() {
-        let dir = std::env::temp_dir().join(format!("redtab-audio-drop-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("tone.webm");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tone.webm");
         let made = Command::new("ffmpeg")
             .args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=f=440:d=20"])
             .args(["-c:a", "libopus"])
             .arg(&path)
             .status();
         let file = std::fs::read(&path);
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
         // ffmpeg, and its Opus encoder, are optional dependencies.
         let (true, Ok(file)) = (made.is_ok_and(|status| status.success()), file) else {
             return;
