@@ -236,8 +236,8 @@ establish known zero; unfetched/failed listings remain unknown. See the
 
 ## Form fields
 
-Definitions and validation: [app forms](../src/app/experience.rs).
-Layout and editing: [form renderer](../src/ui/experience.rs).
+Form types: [app forms](../src/app/experience/types.rs). Per-form fields: [experience actions](../src/app/experience/). Validation: [form submit](../src/app/experience/input.rs).
+Layout and editing: [form renderer](../src/ui/experience/form.rs).
 Required fields below describe client validation.
 
 | Form | Fields and defaults | Submission |
@@ -264,8 +264,8 @@ Pending writes keep the draft and prevent duplicate submission or cancellation.
 
 ## Menus
 
-Definitions: [app menus](../src/app/experience.rs).
-Presentation: [menu renderer](../src/ui/experience.rs).
+Definitions: [app menus](../src/app/experience/menus.rs).
+Presentation: [menu renderer](../src/ui/experience/menu.rs).
 
 | Menu/group | Choices |
 | --- | --- |
@@ -301,7 +301,7 @@ invalid/deleted authors.
 
 ## Dialogs and collections
 
-Models: [Reddit pages](../src/reddit/experience.rs).
+Models: [Reddit pages](../src/reddit/experience/types.rs).
 Presentation: [dialogs](../src/ui/experience.rs).
 
 | Surface | Contents and behavior |
@@ -336,7 +336,7 @@ and include it when sizing content dialogs.
 
 ## Accounts
 
-Presentation: [auth UI](../src/ui.rs). Lifecycle: [controller](../src/auth.rs).
+Presentation: [auth UI](../src/ui/auth_dialog.rs). Lifecycle: [controller](../src/auth/controller.rs).
 
 | Phase | Visible data and controls |
 | --- | --- |
@@ -379,5 +379,5 @@ its backing post becomes hidden.
 phase, available collection entries/actions/pagination and form field count.
 Descriptions wrap; scrolling help does not act on the covered view or draft.
 
-The [CLI](../src/main.rs) prints usage/version, argument errors, sign-in results
-and diagnostics as plain terminal output.
+The [CLI](../src/cli.rs) prints usage/version and argument errors; [startup](../src/event_loop.rs)
+prints sign-in results and diagnostics. Both are plain terminal output.

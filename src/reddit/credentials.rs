@@ -311,7 +311,13 @@ mod tests {
             Err(std::fs::TryLockError::WouldBlock)
         ));
         drop(holder);
-        assert!(contender.try_lock().is_ok());
+        // A process another test is spawning can briefly hold a copy of the descriptor,
+        // so the release is awaited as `lock_at` itself waits.
+        let started = std::time::Instant::now();
+        while contender.try_lock().is_err() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]

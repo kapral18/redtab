@@ -37,14 +37,14 @@ sequence hints support paging in short terminals; dismissing help consumes the k
 | `/` | Search the community feed; find loaded comments in a post; type in the Search tab elsewhere |
 | `r` | Reload; retry failed loading, including a failed continuation |
 | `yy` | Copy the selected Reddit permalink |
-| `q` | Close the current dialog or post; quit from the main feed |
+| `q` | Close the current dialog or post, or a feed opened beside Search; quit from the main feed |
 | `Esc` / `Backspace` | Back; clear a feed search when applicable. In the Search tab's query, `Esc` leaves it and `Backspace` deletes |
 | `C-c` | Quit |
 
 Arrows, Enter, Home/End and Page Up/Down remain terminal equivalents. Tab and
-Shift+Tab switch feed tabs outside dialogs; in the Search tab's query or results they
-switch Posts / Communities / People instead. The sidebar, a focused post and pending
-post-follow navigation keep buffer switching. Enter also activates a selected comment.
+Shift+Tab switch feed tabs outside dialogs. Inside Search (its query, its results, a
+post opened from them, or a feed opened beside them) they switch Posts / Communities /
+People instead. The sidebar and pending post-follow navigation keep buffer switching. Enter also activates a selected comment.
 In narrow post view, `h` leaves the selected comment before closing the post.
 In wide Search, `l`/Enter keeps community rows beside the active post list.
 Opening a post advances the pair to post list and post detail. The first `h`/Left
@@ -225,5 +225,5 @@ action has a direct key or a displayed menu sequence. Startup flags and external
 browser/OS controls keep their separate interfaces.
 
 The dispatch and action hints share [binding definitions](../src/keys/map.rs).
-[Context dispatch](../src/keys.rs) preserves text editing and confirmation guards;
-[menu definitions](../src/app/experience.rs) supply the displayed mnemonics.
+[Context dispatch](../src/keys/dispatch.rs) preserves text editing and confirmation guards;
+[menu definitions](../src/app/experience/menus.rs) supply the displayed mnemonics.
