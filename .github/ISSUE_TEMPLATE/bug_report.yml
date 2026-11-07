@@ -1,0 +1,30 @@
+name: Bug report
+description: Something in redtab doesn't work as expected.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you saw instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: redtab version
+      description: Output of `redtab --version`.
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: OS and terminal
+      description: For example "macOS 26, Ghostty in tmux" or "Ubuntu 24.04, Kitty".
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Screenshot or error text
+      description: Remove usernames and anything private first.
