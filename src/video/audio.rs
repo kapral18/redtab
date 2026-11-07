@@ -327,8 +327,10 @@ mod tests {
         let _ = source.wait();
 
         let loudest = pcm
-            .chunks_exact(2)
-            .map(|sample| i16::from_le_bytes([sample[0], sample[1]]).unsigned_abs())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|sample| i16::from_le_bytes(*sample).unsigned_abs())
             .max();
         assert!(
             loudest > Some(8_000),

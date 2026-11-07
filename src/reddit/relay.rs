@@ -123,12 +123,19 @@ struct RequestSlot(Arc<AtomicUsize>);
 
 impl RequestSlot {
     fn acquire(active: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
-        active
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                (count < limit).then_some(count + 1)
-            })
-            .ok()
-            .map(|_| Self(active.clone()))
+        let mut count = active.load(Ordering::Relaxed);
+        while count < limit {
+            match active.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self(active.clone())),
+                Err(actual) => count = actual,
+            }
+        }
+        None
     }
 }
 
