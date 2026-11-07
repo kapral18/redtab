@@ -44,7 +44,16 @@ jobs:
           state=$(gh pr view "$PR" --repo "$REPO" --json author,state,headRefOid \
             --jq 'select(.author.login == "app/dependabot" and .headRefOid == env.SHA) | .state')
           case "$state" in
-            OPEN) gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$SHA" ;;
+            OPEN)
+              # GITHUB_TOKEN cannot get the workflows permission, so GitHub refuses
+              # to merge changes to workflow files with it; those wait for a person.
+              if gh pr view "$PR" --repo "$REPO" --json files \
+                --jq '.files[].path' | grep -q '^\.github/workflows/'; then
+                echo "::notice::#$PR changes workflow files: merge it by hand"
+                exit 0
+              fi
+              gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$SHA"
+              ;;
             MERGED) echo "::notice::#$PR is already merged; dispatching its release" ;;
             *)
               echo "::notice::#$PR is not an open Dependabot pull request at the tested commit"

@@ -10,6 +10,11 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    # gh aw compile owns the pins in its generated *.lock.yml files.
+    exclude-paths:
+      - ".github/workflows/*.lock.yml"
+    ignore:
+      - dependency-name: "github/gh-aw-actions/*" # Managed by gh aw compile. Version-locked to the gh-aw compiler; do not bump.
     commit-message:
       prefix: ci
       include: scope
