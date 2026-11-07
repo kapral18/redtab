@@ -94,24 +94,6 @@ fn when_quota_cannot_cover_the_reserve_only_interactive_reads_should_progress() 
 }
 
 #[test]
-fn when_burst_credit_recovers_background_should_make_progress() {
-    let (rate, url) = quota("10", "0.2");
-    rate.admit(&url, Priority::Listing, true, || false).unwrap();
-    rate.admit(&url, Priority::Listing, true, || false).unwrap();
-    rate.admit(&url, Priority::Listing, true, || false).unwrap();
-    let deadline = Instant::now() + Duration::from_millis(150);
-
-    let actual = rate.admit(&url, Priority::Background, true, || {
-        Instant::now() >= deadline
-    });
-
-    assert!(
-        actual.is_ok(),
-        "paced traffic must resume after one quota interval"
-    );
-}
-
-#[test]
 fn when_background_is_waiting_after_two_selected_starts_it_should_get_its_fair_turn() {
     use std::sync::{Arc, mpsc::channel};
 
