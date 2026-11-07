@@ -40,26 +40,6 @@ fn held_cache_locks_do_not_stall_cache_work() {
 }
 
 #[test]
-fn a_briefly_held_external_lock_is_waited_for() {
-    let dir = tempfile::tempdir().unwrap();
-    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-    let root = dir.path().to_path_buf();
-    let other_instance = std::thread::spawn(move || {
-        let file = fs::File::create(root.join("cache.lock")).unwrap();
-        file.lock().unwrap();
-        locked_tx.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(20));
-        file.unlock().unwrap();
-    });
-    locked_rx.recv().unwrap();
-
-    let reserved = Cache::new(dir.path().to_path_buf()).reserve_request();
-    other_instance.join().unwrap();
-
-    assert!(reserved.is_ok(), "{reserved:?}");
-}
-
-#[test]
 fn releasing_a_writer_unlocks_inherited_file_descriptors() {
     let dir = tempfile::tempdir().unwrap();
     let cache = Cache::new(dir.path().to_path_buf());

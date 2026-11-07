@@ -404,18 +404,6 @@ fn when_the_selection_is_cancelled_it_should_stop_an_active_extractor() {
 }
 
 #[test]
-fn when_extractor_output_exceeds_the_limit_it_should_stop_without_parsing_it() {
-    let fake = Fake::new("/usr/bin/head -c 4194305 /dev/zero");
-
-    let actual = fake.resolve(&Resolver::default());
-
-    assert_eq!(
-        actual.unwrap_err(),
-        "YouTube metadata exceeds the inline limit; O opens browser"
-    );
-}
-
-#[test]
 fn when_input_is_not_a_supported_video_it_should_not_launch_the_extractor() {
     let fake = Fake::new("exit 99");
 

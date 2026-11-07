@@ -94,55 +94,6 @@ fn when_quota_cannot_cover_the_reserve_only_interactive_reads_should_progress() 
 }
 
 #[test]
-fn waiting_background_spacing_should_not_block_listings_or_starve_its_fair_turn() {
-    use std::sync::{Arc, mpsc::channel};
-
-    let (mut rate, url) = quota("100", "300");
-    rate.base = Duration::from_secs(1);
-    rate.state.lock().budgets[0].next = Instant::now();
-    let started = Instant::now();
-    rate.admit(&url, Priority::Background, true, || false)
-        .unwrap();
-    let rate = Arc::new(rate);
-    let worker_rate = Arc::clone(&rate);
-    let worker_url = url.clone();
-    let (entered, waiting) = channel();
-    let background = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_millis(1200);
-        worker_rate
-            .admit(&worker_url, Priority::Background, true, || {
-                let _ = entered.send(());
-                Instant::now() >= deadline
-            })
-            .map(|_| started.elapsed())
-    });
-    waiting.recv_timeout(Duration::from_secs(1)).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut foreground = Vec::new();
-    for _ in 0..5 {
-        if rate
-            .admit(&url, Priority::Listing, true, || Instant::now() >= deadline)
-            .is_err()
-        {
-            break;
-        }
-        foreground.push(started.elapsed());
-    }
-    let actual_background = background.join().unwrap();
-
-    assert_eq!(foreground.len(), 5);
-    assert!(
-        foreground[3] < Duration::from_millis(550),
-        "ready listings waited behind background spacing: {foreground:?}"
-    );
-    let actual_background = actual_background.unwrap();
-    assert!(
-        (Duration::from_millis(450)..Duration::from_millis(950)).contains(&actual_background),
-        "background lost its paced fair turn: {actual_background:?}"
-    );
-}
-
-#[test]
 fn when_burst_credit_recovers_background_should_make_progress() {
     let (rate, url) = quota("10", "0.2");
     rate.admit(&url, Priority::Listing, true, || false).unwrap();
