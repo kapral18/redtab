@@ -41,11 +41,20 @@ jobs:
             echo "::notice::The CI run has no pull request in this repository"
             exit 0
           fi
-          author=$(gh pr view "$PR" --repo "$REPO" --json author,state --jq 'select(.state == "OPEN") | .author.login')
-          if [ "$author" != "app/dependabot" ]; then
-            echo "::notice::Pull request #$PR is not an open Dependabot pull request"
-            exit 0
-          fi
-          gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$SHA"
+          state=$(gh pr view "$PR" --repo "$REPO" --json author,state,headRefOid \
+            --jq 'select(.author.login == "app/dependabot" and .headRefOid == env.SHA) | .state')
+          case "$state" in
+            OPEN) gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$SHA" ;;
+            MERGED) echo "::notice::#$PR is already merged; dispatching its release" ;;
+            *)
+              echo "::notice::#$PR is not an open Dependabot pull request at the tested commit"
+              exit 0
+              ;;
+          esac
           # A merge made with GITHUB_TOKEN starts no push workflows; dispatch the release.
-          gh workflow run release.yml --repo "$REPO" --ref main
+          for attempt in 1 2 3; do
+            gh workflow run release.yml --repo "$REPO" --ref main && exit 0
+            sleep $((attempt * 10))
+          done
+          echo "::error::Merged #$PR but could not dispatch the release"
+          exit 1
