@@ -74,8 +74,9 @@ because the title becomes the commit message.
   never contact Reddit.
 - UI tests cover wide, narrow and short terminals.
 - Each test guards a behavior a user or caller relies on, with its own check. Don't
-  add one that repeats another test's check or pins private fields or wording;
-  extend that test's table instead.
+  add one that repeats another test's check; extend that test's table instead.
+  Check what users or callers see (screen text, messages, requests); read internal
+  state only when the visible result would need a real wait.
 - Don't sleep for timing logic: pass the time (`App::tick_at`), age content with
   the test clock in `ui`, or shrink the wait or budget in the test. Real waits are
   for real processes, sockets and file locks, and stay as short as their check

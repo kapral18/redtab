@@ -77,7 +77,7 @@ fn an_old_directory_lock_is_never_broken_while_its_holder_lives() {
     assert!(after_release);
 }
 
-/// A lock in use gives up after `LOCK_WAIT`, leaves the lock alone and does not
+/// A lock in use gives up after the lock wait, leaves the lock alone and does not
 /// tell the reader to delete it.
 #[test]
 fn a_lock_in_use_gives_up_after_the_wait_and_stays() {

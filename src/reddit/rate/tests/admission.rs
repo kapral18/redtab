@@ -125,6 +125,27 @@ fn when_congestion_native_preferences_are_paced_labels_should_identify_account_s
 }
 
 #[test]
+fn native_pages_and_classic_json_draw_on_separate_quotas() {
+    let budget = |path: &str| {
+        budget_index(
+            &Url::parse("https://www.reddit.com")
+                .unwrap()
+                .join(path)
+                .unwrap(),
+        )
+    };
+    let native = budget("/svc/shreddit/graphql");
+    for path in [
+        "/settings/preferences",
+        crate::reddit::home::PATH,
+        crate::reddit::experience::SEARCH_PATH,
+    ] {
+        assert_eq!(budget(path), native, "{path}");
+    }
+    assert_ne!(budget("/r/rust/hot.json"), native);
+}
+
+#[test]
 fn when_background_is_paced_it_should_leave_interactive_capacity_available() {
     let (rate, url) = quota("10", "30");
     let deadline = Instant::now() + Duration::from_millis(50);
