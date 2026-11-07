@@ -40,7 +40,7 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
       - name: Test
-        run: cargo +stable test --locked --all-targets
+        run: cargo +stable test --locked --all-targets -- --test-threads=1
       - name: Build
         run: cargo +stable build --release --locked --target ${{ matrix.target }}
       - name: Fetch license texts

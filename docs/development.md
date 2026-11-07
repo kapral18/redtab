@@ -12,9 +12,10 @@ cargo +1.90.0 check --locked --all-targets
 cargo deny check advisories bans licenses sources
 ```
 
-CI runs these on Ubuntu 24.04 and macOS 15: stable for formatting, tests and clippy;
-Rust 1.90.0 for the minimum-version check; `cargo deny` on Ubuntu with
-[deny.toml](../deny.toml). Pushing a `v*` tag runs
+CI runs these on Ubuntu 24.04 and macOS 15: stable for formatting, tests and clippy,
+Rust 1.90.0 for the minimum-version check, and `cargo deny` on Ubuntu with
+[deny.toml](../deny.toml). CI runs tests with `--test-threads=1` because many tests
+measure real time and miss their margins on busy runners. Pushing a `v*` tag runs
 [release.yml](../.github/workflows/release.yml): tests, release builds, archives,
 `SHA256SUMS`, build attestations and a GitHub release. Build a debug binary with
 `cargo build --locked`.
