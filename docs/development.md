@@ -12,11 +12,12 @@ cargo +1.90.0 check --locked --all-targets
 cargo deny check advisories bans licenses sources
 ```
 
-CI runs these on Ubuntu 24.04 and macOS 26: stable for formatting, tests and clippy,
-Rust 1.90.0 for the minimum-version check, and `cargo deny` on Ubuntu with
-[deny.toml](../deny.toml). CI runs tests with `--test-threads=1` because many tests
-measure real time and miss their margins on busy runners. Build a debug binary
-with `cargo build --locked`.
+CI runs these on Ubuntu 24.04 and macOS 26 as separate parallel jobs (tests,
+formatting and clippy, and the Rust 1.90.0 minimum-version check), plus
+`cargo deny` on Ubuntu with [deny.toml](../deny.toml). Jobs restore a compile
+cache, and runs on `main` update it. Tests run on the default parallel test
+threads, so a test that measures real time must leave room for a busy runner.
+Build a debug binary with `cargo build --locked`.
 
 ## Releases
 
@@ -35,8 +36,9 @@ pushes tags by hand. Runs are serialized, one at a time.
 1. **ci** runs [ci.yml](../.github/workflows/ci.yml) on the pushed commit.
 2. **plan** asks [git-cliff](https://git-cliff.org) ([cliff.toml](../cliff.toml))
    for the next version. If it equals the last tag, the run ends.
-3. **build** sets that version in `Cargo.toml`, then tests and builds the four
-   targets. Nothing outside the run has changed yet.
+3. **build** sets that version in `Cargo.toml` and builds the four targets. It
+   also runs the tests on Intel macOS and ARM Linux, which CI does not cover.
+   Nothing outside the run has changed yet.
 4. **release** commits `chore(release): v<version>` (version in `Cargo.toml` and
    `Cargo.lock`, `CHANGELOG.md` regenerated) on top of the pushed commit, tags it,
    and pushes both to `main` in one atomic push. If `main` moved in the meantime,
