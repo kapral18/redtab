@@ -39,6 +39,10 @@ jobs:
         run: brew list cmake >/dev/null 2>&1 || brew install cmake
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+      - name: Check tag matches Cargo.toml version
+        run: |
+          version=$(cargo +stable metadata --no-deps --locked --format-version 1 | jq -r '.packages[0].version')
+          test "${GITHUB_REF_NAME#v}" = "$version"
       - name: Test
         run: cargo +stable test --locked --all-targets -- --test-threads=1
       - name: Build
@@ -133,6 +137,7 @@ jobs:
   crate:
     needs: release
     runs-on: ubuntu-24.04
+    environment: release
     timeout-minutes: 30
     permissions:
       contents: read
