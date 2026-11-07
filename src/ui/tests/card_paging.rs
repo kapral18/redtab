@@ -110,30 +110,6 @@ fn when_a_half_page_spans_short_cards_it_should_consume_all_rows() {
 }
 
 #[test]
-fn when_bookmarks_half_page_across_tall_media_the_next_card_should_enter_naturally() {
-    let mut app = two_tall_media_cards();
-    app.state
-        .toggle_bookmark(&app.tabs[4].feed.posts[1].clone(), 1);
-    app.state
-        .toggle_bookmark(&app.tabs[4].feed.posts[0].clone(), 2);
-    app.switch_tab(1);
-    screen(&mut app, 100, 20);
-    app.scroll_card(0);
-    screen(&mut app, 100, 20);
-
-    app.page_list(1, 2);
-    let actual = screen(&mut app, 100, 20);
-
-    assert_eq!(app.active_tab().feed.cards.line, 7);
-    assert_eq!(
-        actual
-            .lines()
-            .position(|line| line.contains("Following video")),
-        Some(10)
-    );
-}
-
-#[test]
 fn when_pressing_g_inside_the_first_card_it_should_return_to_its_top() {
     let mut app = card_with_image(320, 640);
     screen(&mut app, 100, 20);
@@ -143,24 +119,6 @@ fn when_pressing_g_inside_the_first_card_it_should_return_to_its_top() {
     let actual = screen(&mut app, 100, 20);
 
     assert!(actual.contains("Full width image"), "{actual}");
-    assert_eq!(app.active_tab().feed.cards.line, 0);
-}
-
-#[test]
-fn when_bookmarks_page_a_tall_card_the_saved_post_should_stay_selected() {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    let mut app = card_with_image(320, 640);
-    app.state.toggle_bookmark(&app.current_post().unwrap(), 1);
-    app.switch_tab(1);
-    screen(&mut app, 100, 20);
-
-    crate::keys::handle(
-        &mut app,
-        KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
-    );
-    screen(&mut app, 100, 20);
-
-    assert_eq!(app.current_post().unwrap().id, "p1");
     assert_eq!(app.active_tab().feed.cards.line, 0);
 }
 

@@ -147,7 +147,7 @@ pub(super) fn post_meta(
         ));
     }
     meta.push(Span::styled(format!("u/{}", post.author), bg.fg(SUBTEXT)));
-    let age = post.age_at(Utc::now());
+    let age = post.age_at(now());
     if !age.is_empty() {
         meta.push(Span::styled(format!(" · {age}"), bg.fg(OVERLAY)));
     }

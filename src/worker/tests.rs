@@ -114,7 +114,10 @@ fn assert_queued_image_can_promote(cache: Option<Cache>) {
     for _ in 0..3 {
         next_image(&messages);
     }
-    let extra = data_request(&server)
+    // Every reply is in, so a refetch would already be on its way.
+    let extra = server
+        .recv_timeout(std::time::Duration::from_millis(200))
+        .unwrap()
         .map(|request| (request.method().to_string(), request.url().to_string()));
     assert!(
         extra.is_none(),

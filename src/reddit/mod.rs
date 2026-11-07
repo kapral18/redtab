@@ -116,7 +116,10 @@ const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleW
 const IMAGE_LIMIT: u64 = 64 * 1024 * 1024;
 const DECODE_LIMIT: u64 = 512 * 1024 * 1024;
 const STILL_DECODE_LIMIT: u64 = 128 * 1024 * 1024;
+#[cfg(not(test))]
 const READ_REUSE_GRACE: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const READ_REUSE_GRACE: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub struct Reddit(Arc<Inner>, bool, RequestContext);

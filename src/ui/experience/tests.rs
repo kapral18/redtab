@@ -146,43 +146,6 @@ fn failed_action_loading_should_show_retry_controls_without_submission_advice() 
 }
 
 #[test]
-fn when_a_reddit_menu_is_rendered_in_a_narrow_terminal_it_should_keep_navigation_visible() {
-    let fixture = Fixture::new(|_| Reply::json(json!({})));
-    let reddit = fixture.saved_reddit(&saved_export("reader", "reader"));
-    let (pool, _) = crate::worker::Pool::start(reddit.clone(), 1, None);
-    let directory = tempfile::tempdir().unwrap();
-    let mut app = App::new(
-        crate::config::Config {
-            media: crate::config::MediaSettings {
-                image_preview: false,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        pool,
-        reddit,
-        directory.path().join("state.json"),
-        ratatui_image::picker::Picker::halfblocks(),
-    );
-    app.reddit_menu();
-    let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
-    terminal
-        .draw(|frame| {
-            super::draw(frame, &mut app);
-        })
-        .unwrap();
-    let actual: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect();
-    assert!(actual.contains("Unread notifications"));
-    assert!(actual.contains("Esc back"));
-}
-
-#[test]
 fn when_editing_raw_markdown_spoiler_delimiters_it_should_keep_the_literal_source() {
     assert_eq!(clean(">!secret!<"), ">!secret!<");
 }

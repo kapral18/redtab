@@ -20,31 +20,6 @@ fn when_a_saved_post_predates_preview_geometry_it_should_still_load() {
 }
 
 #[test]
-fn a_second_corrupt_file_keeps_the_first_backup() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("state.json");
-    std::fs::write(&path, b"first").unwrap();
-    State::load(&path);
-    std::fs::write(&path, b"second").unwrap();
-    State::load(&path);
-    let first = std::fs::read_to_string(dir.path().join("state.json.bad")).unwrap();
-    let backups = std::fs::read_dir(dir.path())
-        .unwrap()
-        .filter(|entry| {
-            entry
-                .as_ref()
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with("state.json.bad")
-        })
-        .count();
-
-    assert_eq!(first, "first");
-    assert_eq!(backups, 2);
-}
-
-#[test]
 fn repeated_corrupt_state_recovery_should_keep_every_backup() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.json");

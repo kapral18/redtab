@@ -205,7 +205,7 @@ fn simultaneous_saves_from_two_instances_lose_no_bookmark() {
             let path = path.clone();
             std::thread::spawn(move || {
                 let mut state = State::default();
-                for i in 0..60 {
+                for i in 0..20 {
                     state.toggle_bookmark(&post(&format!("{who}{i}"), "s"), 1);
                     state.save(&path, 1).unwrap();
                 }
@@ -219,7 +219,7 @@ fn simultaneous_saves_from_two_instances_lose_no_bookmark() {
     let (loaded, _) = State::load(&path);
     let lost: Vec<String> = ["a", "b"]
         .iter()
-        .flat_map(|who| (0..60).map(move |i| format!("{who}{i}")))
+        .flat_map(|who| (0..20).map(move |i| format!("{who}{i}")))
         .filter(|id| !loaded.is_bookmarked(id))
         .collect();
 

@@ -1,5 +1,4 @@
 use super::*;
-use crate::reddit::experience::ListSearch;
 use crate::reddit::tests::{Fixture, Reply, saved_export};
 use ratatui_image::picker::Picker;
 use serde_json::json;

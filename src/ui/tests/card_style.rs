@@ -110,8 +110,7 @@ fn when_card_style_scrolls_into_an_image_the_bar_should_remain_visible_with_nati
     app.tabs[4].feed.posts.push(post_with("tail", Media::None));
     app.tabs[4].feed.posts.push(post_with("tail2", Media::None));
     app.scroll_card(3);
-    std::thread::sleep(crate::app::NAV_SETTLE);
-    app.tick();
+    app.tick_at(std::time::Instant::now() + crate::app::NAV_SETTLE);
 
     let actual = screen_buffer(&mut app, 100, 20);
 

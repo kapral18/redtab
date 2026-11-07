@@ -172,8 +172,7 @@ fn when_scrolling_an_iterm2_card_it_should_encode_only_the_visible_image_rows() 
     app.image_picker.set_protocol_type(ProtocolType::Iterm2);
     screen(&mut app, 100, 20);
     app.scroll_card(3);
-    std::thread::sleep(crate::app::NAV_SETTLE);
-    app.tick();
+    app.tick_at(std::time::Instant::now() + crate::app::NAV_SETTLE);
 
     screen(&mut app, 100, 20);
 
@@ -200,8 +199,7 @@ fn when_scrolling_a_sixel_card_it_should_encode_only_the_visible_image_rows() {
     app.image_picker.set_protocol_type(ProtocolType::Sixel);
     screen(&mut app, 100, 20);
     app.scroll_card(3);
-    std::thread::sleep(crate::app::NAV_SETTLE);
-    app.tick();
+    app.tick_at(std::time::Instant::now() + crate::app::NAV_SETTLE);
 
     screen(&mut app, 100, 20);
 

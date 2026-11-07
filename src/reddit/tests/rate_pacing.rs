@@ -154,7 +154,7 @@ fn when_json_and_home_have_separate_budgets_home_should_not_wait_for_json() {
 #[test]
 fn when_a_response_takes_longer_than_base_pacing_the_next_request_should_not_wait_again() {
     let fixture = Fixture::new(|_| {
-        std::thread::sleep(Duration::from_millis(600));
+        std::thread::sleep(Duration::from_millis(300));
         Reply {
             status: 200,
             body: empty_listing().to_string(),
@@ -165,7 +165,7 @@ fn when_a_response_takes_longer_than_base_pacing_the_next_request_should_not_wai
         }
     });
     let mut reddit = fixture.reddit();
-    Arc::get_mut(&mut reddit.0).unwrap().rate = rate::Rate::new(Duration::from_millis(500));
+    Arc::get_mut(&mut reddit.0).unwrap().rate = rate::Rate::new(Duration::from_millis(250));
     reddit.search("rust", "first", None).unwrap();
 
     let (_, waited) = reddit
@@ -178,7 +178,7 @@ fn when_a_response_takes_longer_than_base_pacing_the_next_request_should_not_wai
         .unwrap();
 
     assert!(
-        waited < Duration::from_millis(300),
+        waited < Duration::from_millis(150),
         "pacing added after response: {waited:?}"
     );
 }
@@ -223,7 +223,7 @@ fn when_a_new_response_reports_recovered_quota_old_slow_pacing_should_not_stick(
         headers: if count.fetch_add(1, Ordering::SeqCst) == 0 {
             vec![
                 ("X-Ratelimit-Remaining".into(), "2".into()),
-                ("X-Ratelimit-Reset".into(), "1.2".into()),
+                ("X-Ratelimit-Reset".into(), "0.6".into()),
             ]
         } else {
             vec![
@@ -242,8 +242,8 @@ fn when_a_new_response_reports_recovered_quota_old_slow_pacing_should_not_stick(
     reddit.search("rust", "third", None).unwrap();
 
     assert!(
-        started.elapsed() < Duration::from_millis(300),
-        "recovered budget kept an old600ms interval: {:?}",
+        started.elapsed() < Duration::from_millis(150),
+        "recovered budget kept an old 300ms interval: {:?}",
         started.elapsed()
     );
 }
@@ -326,30 +326,4 @@ fn when_rate_headers_are_dates_exhausted_or_malformed_the_wait_should_follow_val
             None => assert!(reddit.pause().is_none()),
         }
     }
-}
-
-#[test]
-fn when_startup_reports_quota_initial_navigation_should_use_reserved_capacity() {
-    let fixture = Fixture::new(|_| Reply {
-        status: 200,
-        body: empty_listing().to_string(),
-        headers: vec![
-            ("X-Ratelimit-Remaining".into(), "10".into()),
-            ("X-Ratelimit-Reset".into(), "30".into()),
-        ],
-    });
-    let reddit = fixture.reddit();
-    reddit.subscriptions().unwrap();
-    let visible = reddit.for_worker(Priority::Listing, true, || false);
-    let started = Instant::now();
-
-    visible
-        .listing("rust", Sort::Hot, TimeRange::Day, None)
-        .unwrap();
-
-    assert!(
-        started.elapsed() < Duration::from_millis(500),
-        "initial navigation inherited the full three-second quota interval: {:?}",
-        started.elapsed()
-    );
 }

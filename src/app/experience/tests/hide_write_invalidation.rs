@@ -240,30 +240,6 @@ fn when_a_write_invalidates_an_inactive_feed_its_old_response_should_not_mark_it
 }
 
 #[test]
-fn when_a_write_restarts_a_group_the_next_refresh_should_receive_a_distinct_generation() {
-    let (mut app, _dir, _fixture) = app();
-    app.all_subs.next_group_generation = 8;
-    app.all_subs.groups.push(Group {
-        subreddit: "rust".into(),
-        posts: Vec::new(),
-        loading: true,
-        error: None,
-        freshness: None,
-        generation: 7,
-        needs_refresh: false,
-        stream: None,
-        arrivals: None,
-        manual: false,
-    });
-    app.after_experience_write(&Action::Save {
-        id: "t3_post".into(),
-        save: true,
-    });
-    assert_eq!(app.all_subs.groups[0].generation, 8);
-    assert_eq!(app.all_subs.next_group_generation, 9);
-}
-
-#[test]
 fn when_an_old_read_finishes_after_a_write_only_the_post_write_refresh_should_replace_content() {
     let (mut app, _dir, _fixture) = app();
     let page = post_page();

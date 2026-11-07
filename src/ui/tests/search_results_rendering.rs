@@ -330,8 +330,7 @@ fn an_empty_search_answer_should_be_asked_again_before_it_counts_as_no_matches()
     };
     let retried = |app: &mut App, wait: u64| {
         let generation = app.search.results_generation();
-        std::thread::sleep(std::time::Duration::from_millis(wait));
-        app.tick();
+        app.tick_at(std::time::Instant::now() + std::time::Duration::from_millis(wait));
         assert_ne!(app.search.results_generation(), generation, "asked again");
     };
     let searched = || {
@@ -339,8 +338,7 @@ fn an_empty_search_answer_should_be_asked_again_before_it_counts_as_no_matches()
         app.open_search(Some(crate::reddit::experience::SearchKind::Communities));
         crate::keys::paste(&mut app, "jon");
         key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        std::thread::sleep(crate::app::search::DEBOUNCE);
-        app.tick();
+        app.tick_at(std::time::Instant::now() + crate::app::search::DEBOUNCE);
         app
     };
 
@@ -374,6 +372,7 @@ fn an_empty_search_answer_should_be_asked_again_before_it_counts_as_no_matches()
     answer(&mut app, &[]);
     app.switch_tab(0);
     let away = app.search.results_generation();
+    // Returning checks the deadline against the real clock.
     std::thread::sleep(std::time::Duration::from_millis(1050));
     app.tick();
     assert_eq!(app.search.results_generation(), away, "asked while away");

@@ -66,3 +66,6 @@ tokio = { version = "1", features = ["sync"] }
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[profile.dev.package."*"]
+opt-level = 3

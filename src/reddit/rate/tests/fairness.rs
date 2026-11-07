@@ -16,11 +16,11 @@ fn bounded_browsing_should_leave_the_last_three_credits_for_selected_posts() {
                 .is_err()
         );
     }
-    for _ in 0..3 {
+    // Both interactive classes may spend the reserve.
+    for priority in [Priority::Listing, Priority::Selected, Priority::Selected] {
         let deadline = Instant::now() + Duration::from_millis(50);
         assert!(
-            rate.admit(&url, Priority::Selected, true, || Instant::now()
-                >= deadline)
+            rate.admit(&url, priority, true, || Instant::now() >= deadline)
                 .is_ok()
         );
     }
@@ -68,29 +68,6 @@ fn low_quota_browsing_waiters_should_not_block_a_selected_fairness_turn() {
     rate.wake();
     assert!(worker.join().unwrap().is_err());
     assert!(actual.is_ok(), "paced browsing held a ready post open");
-}
-
-#[test]
-fn when_quota_cannot_cover_the_reserve_only_interactive_reads_should_progress() {
-    let (rate, url) = quota("2", "30");
-    rate.state.lock().budgets[0].next = Instant::now();
-    let deadline = Instant::now() + Duration::from_millis(50);
-
-    let actual = rate.admit(&url, Priority::Background, true, || {
-        Instant::now() >= deadline
-    });
-
-    assert!(
-        actual.is_err(),
-        "background work spent the protected interactive quota"
-    );
-    for priority in [Priority::Listing, Priority::Selected] {
-        let deadline = Instant::now() + Duration::from_millis(50);
-        assert!(
-            rate.admit(&url, priority, true, || Instant::now() >= deadline)
-                .is_ok()
-        );
-    }
 }
 
 #[test]

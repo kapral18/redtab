@@ -38,7 +38,7 @@ impl App {
         self.tick_at(Instant::now())
     }
 
-    pub(super) fn tick_at(&mut self, now: Instant) -> bool {
+    pub(crate) fn tick_at(&mut self, now: Instant) -> bool {
         let was_visible = self.keymap.hint_visible();
         crate::keys::map::sync(self);
         let mut changed = std::mem::take(&mut self.read_redraw);

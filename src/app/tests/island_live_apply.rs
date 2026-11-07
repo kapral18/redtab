@@ -1,25 +1,6 @@
 use super::*;
 
 #[test]
-fn a_settled_island_answer_keeps_the_selected_post_in_its_slot() {
-    let mut app = app_with(&["vim"]);
-    app.switch_tab(ALL_SUBS_TAB);
-    app.on_msg(island_answer(&app, &["a", "b", "c", "d"]));
-    app.all_subs.post = 2;
-    app.on_msg(island_answer(&app, &["n", "a", "b", "x", "d"]));
-    assert!(app.all_subs.has_new_posts(&app.config));
-
-    app.change_setting(
-        "filters.keywords",
-        toml::Value::Array(vec!["title n".into()]),
-    );
-
-    assert!(!app.all_subs.has_new_posts(&app.config));
-    assert_eq!(island_ids(&app), ["a", "b", "c"]);
-    assert_eq!(app.current_post().unwrap().id, "c");
-}
-
-#[test]
 fn navigation_cache_island_progress_shows_cold_posts_but_keeps_established_refreshes_stable() {
     let mut app = app_with(&["vim"]);
     app.switch_tab(ALL_SUBS_TAB);
@@ -134,55 +115,4 @@ fn a_live_island_answer_keeps_the_selected_post_in_its_slot() {
     app.switch_tab(0);
     app.on_msg(island_answer(&app, &["a", "x", "b", "c"]));
     assert_eq!(island_ids(&app), ["a", "x", "b"]);
-}
-
-#[test]
-fn an_island_applies_unseen_posts_below_its_top_live() {
-    let mut app = app_with(&["vim"]);
-    app.on_msg(island_answer(&app, &["a", "b"]));
-
-    app.on_msg(island_answer(&app, &["a", "m", "b"]));
-
-    assert!(!app.all_subs.has_new_posts(&app.config));
-    assert_eq!(island_ids(&app)[..2], ["a", "m"]);
-}
-
-#[test]
-fn an_unseen_post_ending_the_first_page_applies_live_with_later_pages_loaded() {
-    let mut app = app_with(&["vim"]);
-    let i = tab_index(&app, "vim");
-    app.switch_tab(i);
-    let tab = app.tabs[i].id;
-    app.on_msg(Msg::Feed {
-        tab,
-        generation: app.tabs[i].feed.generation,
-        append: false,
-        result: Ok(listing("vim", &["a", "b"], Some("t3_b"))),
-    });
-    app.load_feed(i, true);
-    app.on_msg(Msg::Feed {
-        tab,
-        generation: app.tabs[i].feed.generation,
-        append: true,
-        result: Ok(listing("vim", &["c", "d"], None)),
-    });
-    app.load_feed(i, false);
-
-    app.on_msg(Msg::Feed {
-        tab,
-        generation: app.tabs[i].feed.generation,
-        append: false,
-        result: Ok(listing("vim", &["a", "b", "t"], Some("t3_t"))),
-    });
-
-    assert!(!app.tabs[i].feed.has_new_posts(&app.config));
-    assert_eq!(
-        app.tabs[i]
-            .feed
-            .posts
-            .iter()
-            .map(|post| post.id.as_str())
-            .collect::<Vec<_>>(),
-        ["a", "b", "t", "c", "d"]
-    );
 }

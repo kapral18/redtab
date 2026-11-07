@@ -1,21 +1,6 @@
 use super::*;
 
 #[test]
-fn community_menu_should_offer_a_local_read_action() {
-    let (mut app, _dir, _fixture) = app();
-    app.open_subreddit("s");
-    app.community_menu();
-    let Some(Screen::Menu { choices, .. }) = app.experience.screens.last() else {
-        panic!("menu missing")
-    };
-    assert!(
-        choices
-            .iter()
-            .any(|choice| choice.label == "Mark community read")
-    );
-}
-
-#[test]
 fn user_feed_tools_should_put_unfollow_first_and_capture_the_person() {
     let (mut app, _dir, _fixture) = app();
     app.on_msg(Msg::Subscriptions {

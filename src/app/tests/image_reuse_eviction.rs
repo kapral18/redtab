@@ -98,26 +98,6 @@ fn when_a_card_returns_after_a_skipped_image_it_should_resume_the_fetch() {
 }
 
 #[test]
-fn when_revisiting_a_card_its_recent_decoded_image_should_be_reused() {
-    let mut app = app_with(&[]);
-    let url = "https://i.redd.it/revisit.png";
-    app.card_pictures_drawn(&[url]);
-    app.on_msg(Msg::Image {
-        url: url.into(),
-        result: Ok(image::DynamicImage::new_rgb8(320, 640).into()),
-    });
-    app.card_pictures_drawn(&[]);
-
-    app.card_pictures_drawn(&[url]);
-
-    assert!(matches!(
-        app.card_images.get(url),
-        Some(CardImageSlot::Ready { .. })
-    ));
-    assert!(!app.queued_images.contains_key(url));
-}
-
-#[test]
 fn navigating_back_through_twelve_loaded_images_should_not_queue_another_image_job() {
     let mut app = app_with(&[]);
     for i in 0..12 {

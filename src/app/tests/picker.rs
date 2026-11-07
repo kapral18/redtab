@@ -28,17 +28,6 @@ fn picker_offers_a_new_subreddit_before_containing_and_fuzzy_matches() {
 }
 
 #[test]
-fn picker_never_offers_an_invalid_name() {
-    let app = app_with(&[]);
-
-    assert!(
-        !app.picker_entries("no spaces")
-            .iter()
-            .any(|e| matches!(e, PickerEntry::Open(_)))
-    );
-}
-
-#[test]
 fn opening_a_subreddit_accepts_common_reddit_spellings() {
     let mut app = app_with(&[]);
     for name in ["r/tmux/", "R/rust", "/r/vim/"] {

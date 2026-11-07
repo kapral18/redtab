@@ -154,8 +154,7 @@ fn when_sidebar_navigation_settles_missing_card_graphics_should_resume_preparati
     app.switch_tab(4);
     first_screen(&mut app, 100, 24);
 
-    std::thread::sleep(crate::app::NAV_SETTLE);
-    assert!(app.tick());
+    assert!(app.tick_at(std::time::Instant::now() + crate::app::NAV_SETTLE));
     let actual = screen(&mut app, 100, 24);
 
     assert!(actual.contains('\u{10EEEE}'), "{actual}");

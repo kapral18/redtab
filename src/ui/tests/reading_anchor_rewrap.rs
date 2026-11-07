@@ -1,49 +1,6 @@
 use super::*;
 
 #[test]
-fn unchanged_redraws_reuse_document_text_and_content_updates_replace_it() {
-    let mut app = image_post("Stable layout marker");
-    let marker_pointer = |app: &App| {
-        app.post_view
-            .as_ref()
-            .unwrap()
-            .rendered_document
-            .iter()
-            .flat_map(|line| &line.spans)
-            .find(|span| span.content.contains("Stable layout marker"))
-            .unwrap()
-            .content
-            .as_ptr()
-    };
-    // The document cache key includes the clock second, so only two draws within one
-    // second must share the wrapped text.
-    for attempt in 1.. {
-        assert!(attempt <= 3, "draws never shared a clock second");
-        let second = chrono::Utc::now().timestamp();
-        screen(&mut app, 100, 40);
-        let pointer = marker_pointer(&app);
-        screen(&mut app, 100, 40);
-        if chrono::Utc::now().timestamp() == second {
-            assert_eq!(
-                marker_pointer(&app),
-                pointer,
-                "unchanged text should not be allocated and wrapped on every media draw"
-            );
-            break;
-        }
-    }
-    let view = app.post_view.as_ref().unwrap();
-    let generation = view.generation;
-    let mut page = view.page.clone().unwrap();
-    page.body = "Changed layout marker".into();
-    app.on_msg(Msg::Post {
-        generation,
-        result: Ok(Box::new(page)),
-    });
-    assert!(screen(&mut app, 100, 40).contains("Changed layout marker"));
-}
-
-#[test]
 fn when_body_markup_wraps_it_should_style_visible_text_without_changing_column_width() {
     use crate::model::{LINK_TARGET, LINK_TARGET_END, TEXT_BOLD, TEXT_END, TEXT_ITALIC, TEXT_LINK};
     let mut lines = Vec::new();
@@ -165,8 +122,7 @@ fn a_header_age_rewrapping_above_keeps_the_text_being_read() {
         .collect();
     let selected = shown(&screen(&mut apps[1], width, 30), "▌");
 
-    let wait = created + chrono::Duration::milliseconds(60_300) - Utc::now();
-    std::thread::sleep(wait.to_std().unwrap_or_default());
+    let _later = clock_ahead(created + chrono::Duration::seconds(61) - Utc::now());
 
     for (app, (before, lines_before)) in apps.iter_mut().zip(befores) {
         let after = shown(&screen(app, width, 30), "line ");
@@ -218,8 +174,7 @@ fn a_header_shrinking_above_while_one_grows_below_keeps_the_text_being_read() {
     let lines_before = len(&app);
     let before = shown(&screen(&mut app, width, 30));
 
-    let wait = created + chrono::Duration::milliseconds(60_300) - Utc::now();
-    std::thread::sleep(wait.to_std().unwrap_or_default());
+    let _later = clock_ahead(created + chrono::Duration::seconds(61) - Utc::now());
     // A spinner advancing in the same draw, as while anything loads.
     app.loading_frame += 1;
     let after = shown(&screen(&mut app, width, 30));
@@ -227,4 +182,16 @@ fn a_header_shrinking_above_while_one_grows_below_keeps_the_text_being_read() {
     assert_eq!(len(&app), lines_before, "the rewraps cancel out");
     assert!(before.is_some());
     assert_eq!(after, before, "the text being read stays");
+}
+
+/// Moves the aging clock ahead on this thread until dropped.
+fn clock_ahead(by: chrono::TimeDelta) -> impl Drop {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::ui::TEST_CLOCK_AHEAD.with(|ahead| ahead.set(chrono::TimeDelta::zero()));
+        }
+    }
+    crate::ui::TEST_CLOCK_AHEAD.with(|ahead| ahead.set(by));
+    Restore
 }

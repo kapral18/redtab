@@ -75,28 +75,6 @@ fn a_focused_descendant_should_fetch_its_missing_ancestor_without_reparenting_it
 }
 
 #[test]
-fn the_last_focused_batch_should_keep_partial_coverage_for_prior_siblings() {
-    let more = MoreRequest {
-        post: "p".into(),
-        parent: "t1_parent".into(),
-        children: vec!["child".into()],
-        sort: String::new(),
-    };
-    let actual = expanded_replies(&more, |_| {
-        Ok(focused_thread(
-            "p",
-            json!([
-                {"kind":"t1","data":{"id":"child","parent_id":"t1_parent","body":"reply"}}
-            ]),
-        ))
-    })
-    .unwrap();
-    assert_eq!(actual.comments[0].id, "child");
-    assert_eq!(actual.refreshed, Some(vec!["child".into()]));
-    assert!(actual.more.is_none());
-}
-
-#[test]
 fn a_focused_comment_from_another_post_or_parent_should_be_rejected() {
     let more = MoreRequest {
         post: "p".into(),

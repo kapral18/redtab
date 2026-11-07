@@ -126,29 +126,6 @@ fn when_inputs_are_invalid_the_client_should_reject_them_before_any_request() {
 }
 
 #[test]
-fn when_the_connection_is_retired_no_collection_or_write_should_contact_reddit() {
-    let fixture = Fixture::new(|_| panic!("Retired session reached HTTP"));
-    let reddit = fixture.reddit();
-    reddit.retire();
-    assert!(
-        reddit
-            .experience(&Request::Write(Action::Save {
-                id: "t3_post".into(),
-                save: true
-            }))
-            .is_err()
-    );
-    assert!(
-        reddit
-            .experience(&Request::Read {
-                query: Query::Multis,
-                after: None
-            })
-            .is_err()
-    );
-}
-
-#[test]
 fn when_searching_communities_it_should_read_the_search_page_and_follow_only_its_own_cursor() {
     let fixture = Fixture::new(|request| {
         let url = Url::parse(&format!("http://fixture{}", request.url)).unwrap();

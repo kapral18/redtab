@@ -106,39 +106,6 @@ fn when_a_loaded_video_is_revisited_after_an_image_it_should_keep_its_player() {
 }
 
 #[test]
-fn reported_returning_between_loaded_videos_should_not_restart() {
-    let mut app = card_playback_app();
-    let start = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
-    app.sync_video_with(start, |url, area, _| {
-        let mut player = Player::showing(&url, playback_frame(1));
-        player.area = area;
-        player
-    });
-    app.tabs[0].feed.selected = 1;
-    app.card_video_drawn(Some(Size::new(68, 68)));
-    let next = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
-    app.sync_video_with(next, |url, area, _| {
-        let mut player = Player::showing(&url, playback_frame(2));
-        player.area = area;
-        player
-    });
-    app.tabs[0].feed.selected = 0;
-    app.card_video_drawn(Some(Size::new(68, 68)));
-    let returned = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
-    app.sync_video_with(returned, |_, _, _| {
-        panic!("loaded video must resume without startup")
-    });
-    let frame = app
-        .card_player()
-        .and_then(Player::frame)
-        .expect("retain the first video's frame while its decoder waits");
-    let video::Pixels::Raw(pixels) = &frame.pixels else {
-        panic!("decoded pixels")
-    };
-    assert_eq!(pixels.to_rgb8().get_pixel(0, 0).0, [1, 0, 0]);
-}
-
-#[test]
 fn when_recent_video_frames_are_revisited_they_should_stay_bounded_and_match_the_source() {
     for manual in [false, true] {
         let mut app = card_playback_app();

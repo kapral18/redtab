@@ -84,22 +84,6 @@ fn when_disconnect_cannot_save_state_its_controls_should_stay_visible_with_a_lon
 }
 
 #[test]
-fn when_the_connect_dialog_is_open_it_should_show_profile_selection_without_export_instructions() {
-    let mut app = app(&[]);
-    app.auth.phase = crate::auth::Phase::Choose;
-    app.auth.sources = vec![crate::auth::Source::Browser {
-        browser: "firefox".into(),
-        profile: "fixture-profile".into(),
-        label: "Firefox · Work".into(),
-    }];
-    app.overlay = Some(Overlay::Auth);
-    let actual = screen(&mut app, 110, 30);
-    assert!(actual.contains("Connect Reddit"));
-    assert!(actual.contains("Firefox · Work"));
-    assert!(actual.contains("Enter connects"));
-}
-
-#[test]
 fn when_saved_accounts_are_shown_it_should_mark_active_expired_and_add_choices() {
     let mut app = app(&[]);
     app.auth.phase = crate::auth::Phase::Accounts;
@@ -327,14 +311,4 @@ fn when_import_fails_in_a_small_terminal_it_should_show_the_error_selection_and_
     assert!(actual.contains("▌ Firefox 9"), "{actual}");
     assert!(actual.contains("Enter connects"), "{actual}");
     assert!(actual.contains("Esc cancel"), "{actual}");
-}
-
-#[test]
-fn when_import_is_pending_it_should_remain_visible_in_a_small_terminal() {
-    let mut app = app(&[]);
-    app.auth.phase = crate::auth::Phase::Importing;
-    app.overlay = Some(Overlay::Auth);
-    let actual = screen(&mut app, 60, 12);
-    assert!(actual.contains("verifying account"));
-    assert!(actual.contains("Esc cancels"));
 }

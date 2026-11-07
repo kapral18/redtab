@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn when_a_card_is_wider_than_kittys_column_limit_it_should_render_its_right_edge() {
-    let mut app = card_with_image(640, 320);
+    let mut app = card_with_image_on(small_kitty(), 640, 320);
 
     let cells = placeholder_cells(&mut app, 340, 150);
 
@@ -12,7 +12,7 @@ fn when_a_card_is_wider_than_kittys_column_limit_it_should_render_its_right_edge
 
 #[test]
 fn when_scrolling_below_kittys_row_limit_image_tiles_should_use_local_coordinates() {
-    let mut app = card_with_image(100, 1000);
+    let mut app = card_with_image_on(small_kitty(), 100, 1000);
     app.tabs[4]
         .feed
         .posts
@@ -44,4 +44,12 @@ fn when_scrolling_below_kittys_row_limit_image_tiles_should_use_local_coordinate
         .chars()
         .next();
     assert_eq!(row, Some('\u{34B}'));
+}
+
+/// Kitty limits count cells; one pixel per column keeps the canvases small.
+fn small_kitty() -> Picker {
+    #[allow(deprecated)]
+    let mut picker = Picker::from_fontsize(ratatui_image::FontSize::new(1, 2));
+    picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+    picker
 }

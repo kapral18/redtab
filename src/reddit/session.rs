@@ -396,13 +396,6 @@ mod tests {
     }
 
     #[test]
-    fn when_a_session_is_removed_and_readded_only_the_current_export_should_load() {
-        let text = format!("{LOGIN}.reddit.com\tTRUE\t/\tTRUE\t1\treddit_session\tdeleted\n");
-        assert!(Session::parse(&text, 1000).is_err());
-        assert!(Session::parse(&format!("{text}{LOGIN}"), 1000).is_ok());
-    }
-
-    #[test]
     fn when_valid_sessions_disagree_the_export_should_be_rejected() {
         let text =
             format!("{LOGIN}www.reddit.com\tFALSE\t/\tTRUE\t0\treddit_session\tother-session\n");

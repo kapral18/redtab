@@ -343,7 +343,7 @@ fn when_the_tool_times_out_it_should_kill_and_reap_its_process() {
     let registration = cancelled.process.lock();
     let signal = cancelled.clone();
     let worker = std::thread::spawn(move || {
-        Resolver::default().resolve_with(PAGE, &signal, program.as_os_str(), Duration::from_secs(2))
+        Resolver::default().resolve_with(PAGE, &signal, program.as_os_str(), Duration::from_secs(1))
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     let pid: i32 = loop {

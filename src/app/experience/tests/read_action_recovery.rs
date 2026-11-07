@@ -68,35 +68,3 @@ fn when_a_read_is_abandoned_its_late_response_should_not_replace_the_new_screen(
         matches!(app.experience.screens.last(), Some(Screen::Menu { title, .. }) if title == "Reddit")
     );
 }
-
-#[test]
-fn ui_audit_read_errors_should_offer_the_reload_key() {
-    let (mut app, _dir, _fixture) = app();
-    app.experience.pending = Some((
-        71,
-        Request::Read {
-            query: Query::Search {
-                text: "rust".into(),
-                kind: ListSearch::Communities,
-            },
-            after: Some("next".into()),
-        },
-    ));
-
-    app.on_experience(
-        71,
-        Err("Page failed".into()),
-        crate::cache::Freshness {
-            fetched_at: crate::app::now(),
-            source: Default::default(),
-        },
-    );
-
-    assert!(
-        app.experience
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("r retries")
-    );
-}

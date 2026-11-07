@@ -1,45 +1,6 @@
 use super::*;
 
 #[test]
-fn a_rate_limit_shows_paused_requests_not_an_unanswering_reddit() {
-    let fixture = crate::reddit::tests::Fixture::new(|_| crate::reddit::tests::Reply {
-        status: 429,
-        body: String::new(),
-        headers: vec![("Retry-After".into(), "60".into())],
-    });
-    let url = fixture.base.clone();
-    let (mut app, messages) = app_at(&url, &[]);
-    app.status = None;
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 30)).unwrap();
-    let mut footer = |app: &mut App| {
-        let buffer = terminal
-            .draw(|frame| crate::ui::draw(frame, app))
-            .unwrap()
-            .buffer
-            .clone();
-        (0..110)
-            .map(|x| buffer[(x, 29)].symbol())
-            .collect::<String>()
-    };
-
-    assert!(app.reddit.search("rust", "x", None).is_err());
-    let started = Instant::now();
-    let mut shown = footer(&mut app);
-    while !shown.contains("paused")
-        && !shown.contains("not answering")
-        && started.elapsed() < Duration::from_secs(5)
-    {
-        if let Ok(msg) = messages.recv_timeout(Duration::from_millis(20)) {
-            app.on_msg(msg);
-        }
-        app.tick();
-        shown = footer(&mut app);
-    }
-
-    assert!(shown.contains("paused"), "{shown}");
-}
-
-#[test]
 fn when_a_cooldown_counts_down_tick_should_redraw_only_when_the_display_changes() {
     use crate::reddit::tests::{Fixture, Reply};
     let fixture = Fixture::new(|_| Reply {

@@ -3,6 +3,21 @@ use super::*;
 /// How long a save waits for another instance's save before giving up.
 pub(super) const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
+#[cfg(test)]
+thread_local! {
+    /// Tests that wait out a held lock shorten the wait on their own thread.
+    pub(super) static TEST_LOCK_WAIT: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn lock_wait() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(wait) = TEST_LOCK_WAIT.with(std::cell::Cell::get) {
+        return wait;
+    }
+    LOCK_WAIT
+}
+
 /// A lockdir older than this is likely a crash's leftover; the error says how to clear it.
 pub(super) const STALE_LOCK: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -60,7 +75,7 @@ pub(super) fn lock(target: &Path) -> Result<SaveLock> {
         .open(&path)
         .with_context(|| format!("cannot open {}", path.display()))?;
     // Bounded: a stalled instance must not freeze this one's quit.
-    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    let deadline = std::time::Instant::now() + lock_wait();
     loop {
         // SAFETY: flock on a descriptor this function owns; no memory is involved.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -85,7 +100,7 @@ pub(super) fn lock(target: &Path) -> Result<SaveLock> {
 /// crash's leftover blocks saves until deleted.
 pub(super) fn dir_lock(target: &Path) -> Result<SaveLock> {
     let path = target.with_extension("json.lockdir");
-    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    let deadline = std::time::Instant::now() + lock_wait();
     loop {
         match std::fs::create_dir(&path) {
             Ok(()) => return Ok(SaveLock::Dir(path)),

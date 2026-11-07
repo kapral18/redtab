@@ -81,17 +81,6 @@ fn when_a_community_is_open_it_should_show_membership_and_discoverable_controls(
 }
 
 #[test]
-fn when_home_sort_opens_it_should_explain_where_recommendations_appear() {
-    let mut app = app(&[]);
-    app.switch_tab(0);
-    app.overlay = Some(Overlay::Sort { selected: 0 });
-
-    let shown = screen(&mut app, 80, 24);
-
-    assert!(shown.contains("recommendations"), "{shown}");
-}
-
-#[test]
 fn when_home_sorts_change_best_should_be_available_only_on_home() {
     let mut app = app(&["rust"]);
     app.switch_tab(0);

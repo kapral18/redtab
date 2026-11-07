@@ -298,8 +298,7 @@ fn a_scrolled_home_card_loads_thumbnails_only_for_whole_rows() {
     let mut top: Vec<String> = app.thumbs.keys().cloned().collect();
     top.sort();
     app.move_selection(2);
-    std::thread::sleep(crate::app::NAV_SETTLE);
-    app.tick();
+    app.tick_at(std::time::Instant::now() + crate::app::NAV_SETTLE);
     screen(&mut app, 100, 12);
 
     assert_eq!(top, ["https://i.redd.it/p1.jpeg"]);

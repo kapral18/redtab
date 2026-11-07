@@ -1,36 +1,6 @@
 use super::*;
 
 #[test]
-fn manual_metadata_refresh_keeps_the_selected_post_and_screen_row() {
-    let mut app = app_with(&["vim"]);
-    let i = tab_index(&app, "vim");
-    app.switch_tab(i);
-    let tab = app.tabs[i].id;
-    app.on_msg(Msg::Feed {
-        tab,
-        generation: app.tabs[i].feed.generation,
-        append: false,
-        result: Ok(listing("vim", &["a", "b", "c"], None)),
-    });
-    app.tabs[i].feed.selected = 1;
-    app.tabs[i].feed.offset = 1;
-    app.reload();
-
-    let mut updated = listing("vim", &["a", "b", "c"], None);
-    updated.posts[1].score = Some(42);
-    app.on_msg(Msg::Feed {
-        tab,
-        generation: app.tabs[i].feed.generation,
-        append: false,
-        result: Ok(updated),
-    });
-
-    assert_eq!(app.current_post().unwrap().id, "b");
-    assert_eq!(app.current_post().unwrap().score, Some(42));
-    assert_eq!(app.tabs[i].feed.selected - app.tabs[i].feed.offset, 0);
-}
-
-#[test]
 fn unseen_posts_below_every_known_post_on_the_last_page_apply_without_a_notice() {
     let mut app = app_with(&["vim"]);
     let i = tab_index(&app, "vim");

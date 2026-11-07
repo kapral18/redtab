@@ -45,6 +45,16 @@ pub struct Renderer {
     /// A video frame waited for the output budget: it shows once the budget allows,
     /// instead of being skipped for the one after it.
     pub(super) video_waiting: bool,
+    pub(super) cache_bytes: CacheBytes,
+}
+
+/// Bytes of encoded pictures kept for offscreen reuse.
+pub(super) struct CacheBytes(pub(super) usize);
+
+impl Default for CacheBytes {
+    fn default() -> Self {
+        Self(CACHE_BYTES)
+    }
 }
 
 impl Completed {
@@ -245,7 +255,7 @@ impl Renderer {
             .fold((0usize, 0usize), |(count, bytes), (key, entry)| {
                 (count + 1, bytes + entry.bytes(key))
             });
-        while bytes > CACHE_BYTES || count > CACHE_TILES {
+        while bytes > self.cache_bytes.0 || count > CACHE_TILES {
             let Some(key) = self.order.pop_front() else {
                 break;
             };

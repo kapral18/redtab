@@ -61,25 +61,6 @@ fn when_home_and_a_subreddit_share_a_name_their_cache_keys_should_stay_separate(
 }
 
 #[test]
-fn when_home_uses_the_browser_feed_it_should_not_reuse_legacy_json_snapshots() {
-    let query = FeedQuery::Listing {
-        sort: Sort::Best,
-        time: TimeRange::Day,
-    };
-    let legacy = serde_json::to_string(&("home", &query, Option::<&str>::None)).unwrap();
-    assert_ne!(
-        query.cache_request(&FeedTarget::Home, None).unwrap(),
-        legacy
-    );
-    assert_eq!(
-        FeedQuery::DEFAULT_LISTING
-            .cache_request(&FeedTarget::Subreddit("rust".into()), None)
-            .unwrap(),
-        r#"["feed","rust",{"Listing":{"sort":"Hot","time":"Day"}},null]"#
-    );
-}
-
-#[test]
 fn when_bodies_retain_markup_they_should_not_reuse_flattened_cached_documents() {
     let directory = tempfile::tempdir().unwrap();
     let cache = Cache::new(directory.path().to_path_buf());

@@ -103,8 +103,7 @@ fn when_scrolling_a_short_loaded_feed_it_should_prefetch_at_the_visible_end() {
     screen(&mut app, 100, 100);
 
     assert!(!app.active_tab().feed.loading());
-    std::thread::sleep(crate::app::NAV_SETTLE);
-    app.tick();
+    app.tick_at(std::time::Instant::now() + crate::app::NAV_SETTLE);
     assert!(app.active_tab().feed.loading());
     assert_eq!(app.active_tab().feed.selected, 0);
     assert_eq!(app.active_tab().feed.cards.line, 0);

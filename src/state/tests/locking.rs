@@ -2,6 +2,7 @@ use super::*;
 
 #[test]
 fn when_another_instance_holds_the_save_lock_corrupt_recovery_should_leave_the_file_alone() {
+    let _wait = short_lock_wait();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.json");
     std::fs::write(&path, "corrupt").unwrap();
@@ -80,6 +81,7 @@ fn an_old_directory_lock_is_never_broken_while_its_holder_lives() {
 /// tell the reader to delete it.
 #[test]
 fn a_lock_in_use_gives_up_after_the_wait_and_stays() {
+    let _wait = short_lock_wait();
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("state.json");
     let held = dir_lock(&target).unwrap();
@@ -91,7 +93,10 @@ fn a_lock_in_use_gives_up_after_the_wait_and_stays() {
     drop(held);
 
     let message = refused.expect("a second holder must be refused");
-    assert!(waited >= LOCK_WAIT && waited < LOCK_WAIT * 3, "{waited:?}");
+    assert!(
+        waited >= lock_wait() && waited < lock_wait() * 3,
+        "{waited:?}"
+    );
     assert!(still_held);
     assert!(!message.contains("delete"), "{message}");
 }
@@ -109,6 +114,7 @@ fn flock_errors_choose_wait_fallback_or_fail() {
 
 #[test]
 fn a_save_gives_up_when_another_instance_holds_the_lock() {
+    let _wait = short_lock_wait();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.json");
     let held = lock(&path).unwrap();
@@ -122,6 +128,21 @@ fn a_save_gives_up_when_another_instance_holds_the_lock() {
     let after = state.save(&path, 1);
 
     assert!(saved.unwrap_err().to_string().contains("still saving"));
-    assert!(waited >= LOCK_WAIT && waited < LOCK_WAIT * 3, "{waited:?}");
+    assert!(
+        waited >= lock_wait() && waited < lock_wait() * 3,
+        "{waited:?}"
+    );
     assert!(after.is_ok(), "the lock is free again");
+}
+
+/// Shortens this thread's lock wait until dropped.
+fn short_lock_wait() -> impl Drop {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_LOCK_WAIT.with(|wait| wait.set(None));
+        }
+    }
+    TEST_LOCK_WAIT.with(|wait| wait.set(Some(std::time::Duration::from_millis(200))));
+    Restore
 }

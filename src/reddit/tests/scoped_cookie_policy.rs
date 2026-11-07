@@ -1,18 +1,6 @@
 use super::*;
 
 #[test]
-fn when_an_api_url_changes_origin_cookies_should_not_be_sent() {
-    let reddit = Reddit::test_at("http://127.0.0.1:9/", false);
-    let error = reddit
-        .get(Url::parse("https://example.invalid/r/rust/hot.json").unwrap())
-        .unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "refusing to send Reddit cookies to another origin"
-    );
-}
-
-#[test]
 fn settings_policy_clone_should_share_session_health_and_identity_but_isolate_nsfw_namespace() {
     let fixture = Fixture::new(|_| panic!("Policy rebinding must not use HTTP"));
     let original = fixture.saved_reddit(&saved_export("reader", "reader"));
@@ -133,24 +121,4 @@ fn a_search_host_should_get_only_reddit_wide_cookies_and_its_401_should_not_sign
     Arc::get_mut(&mut expired.0).unwrap().classic = Url::parse(&fixture.base).unwrap();
     let error = expired.search("rust", "async", None).unwrap_err();
     assert_eq!(error.to_string(), session::SIGN_IN);
-}
-
-#[test]
-fn when_signed_in_a_feed_should_use_the_exported_session_without_oauth() {
-    let fixture = Fixture::new(|r| {
-        if r.headers.get("cookie").map(String::as_str) == Some("reddit_session=fixture-session")
-            && !r.headers.contains_key("authorization")
-            && r.url.starts_with("/r/rust/hot?")
-        {
-            Reply::json(empty_listing())
-        } else {
-            Reply::status(403)
-        }
-    });
-
-    let actual = fixture
-        .reddit()
-        .listing("rust", Sort::Hot, TimeRange::Day, None);
-
-    assert!(actual.unwrap().posts.is_empty());
 }

@@ -319,7 +319,11 @@ pub(super) fn refreshing_thumbnail_app() -> App {
 }
 
 pub(super) fn card_with_image(width: u32, height: u32) -> App {
-    let mut app = card_feed_app(kitty());
+    card_with_image_on(kitty(), width, height)
+}
+
+pub(super) fn card_with_image_on(picker: Picker, width: u32, height: u32) -> App {
+    let mut app = card_feed_app(picker);
     app.tabs[4].feed.posts.truncate(1);
     app.tabs[4].feed.posts[0].title = "Full width image".into();
     screen(&mut app, 100, 20);

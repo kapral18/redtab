@@ -119,14 +119,14 @@ fn visible_search_pages_should_start_before_passive_feed_previews() {
             headers: if request.url.starts_with("/r/seed/") {
                 vec![
                     ("x-ratelimit-remaining".into(), "0".into()),
-                    ("x-ratelimit-reset".into(), "2".into()),
+                    ("x-ratelimit-reset".into(), "1".into()),
                 ]
             } else {
                 Vec::new()
             },
         }
     });
-    let reddit = Reddit::test_at_paced(&fixture.base, std::time::Duration::from_millis(500));
+    let reddit = Reddit::test_at_paced(&fixture.base, std::time::Duration::from_millis(100));
     reddit
         .listing("seed", Sort::Hot, TimeRange::Day, None)
         .unwrap();

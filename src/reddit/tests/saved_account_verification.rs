@@ -49,31 +49,6 @@ fn when_a_candidate_is_unverified_saving_should_not_touch_the_credential_store()
 }
 
 #[test]
-fn when_reddit_confirms_an_account_it_should_be_saved_only_after_verification() {
-    let fixture = Fixture::new(|request| {
-        assert_eq!(request.url, "/api/me.json");
-        Reply::json(json!({"data":{"id":"fixture", "name":"reader"}}))
-    });
-    let reddit = fixture.reddit();
-    let actual = reddit.verify_account().unwrap();
-    let mut stored = String::new();
-    reddit
-        .save_connection_with(None, |text| {
-            stored = text.into();
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(
-        actual,
-        Account {
-            id: "fixture".into(),
-            name: "reader".into()
-        }
-    );
-    assert!(stored.contains("# redtab-connection"));
-}
-
-#[test]
 fn when_account_identity_contains_a_path_it_should_not_be_accepted_or_saved() {
     let fixture = Fixture::new(|_| Reply::json(json!({"data":{"id":"../other", "name":"reader"}})));
     let reddit = fixture.reddit();

@@ -34,6 +34,21 @@ use crate::reddit::Health;
 use crate::state::ListView;
 use crate::video;
 
+#[cfg(test)]
+thread_local! {
+    /// Tests move the clock that ages posts and comments instead of waiting.
+    pub(crate) static TEST_CLOCK_AHEAD: std::cell::Cell<chrono::TimeDelta> =
+        const { std::cell::Cell::new(chrono::TimeDelta::zero()) };
+}
+
+/// The time posts and comments are aged against.
+fn now() -> DateTime<Utc> {
+    #[cfg(test)]
+    return Utc::now() + TEST_CLOCK_AHEAD.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    Utc::now()
+}
+
 mod all_subs;
 mod auth_dialog;
 mod card;

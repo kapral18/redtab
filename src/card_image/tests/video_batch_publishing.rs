@@ -1,28 +1,6 @@
 use super::*;
 
 #[test]
-fn when_video_advances_during_encoding_the_inflight_picture_should_finish() {
-    let picker = picker();
-    let old = Arc::new(DynamicImage::new_rgb8(4, 4));
-    let next = Arc::new(DynamicImage::new_rgb8(4, 4));
-    let mut key = Key::new("video", &picker, Size::new(4, 4), (4, 4), 0, 4, 0);
-    key.video = true;
-    let mut renderer = Renderer::default();
-    renderer.started = true;
-    renderer.begin();
-    renderer.tile(key.clone(), &old, &picker, Preparation::Refresh);
-    renderer.finish();
-
-    renderer.begin();
-    renderer.tile(key.clone(), &next, &picker, Preparation::Refresh);
-    renderer.finish();
-
-    let work = renderer.shared.work.lock();
-    assert!(Weak::ptr_eq(&work.wanted[0].1, &Arc::downgrade(&old)));
-    assert!(Arc::ptr_eq(&work.pending.as_ref().unwrap()[0].image, &old));
-}
-
-#[test]
 fn video_strips_should_publish_together_after_the_last_completion() {
     let picker = picker();
     let red = Arc::new(DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(

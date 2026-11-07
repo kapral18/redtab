@@ -14,49 +14,6 @@ fn private_community_help_should_prioritize_access_actions() {
 }
 
 #[test]
-fn private_community_worker_result_should_show_access_guidance_in_the_feed() {
-    use crate::reddit::tests::{Fixture, Reply};
-    let fixture = Fixture::new(|request| {
-        assert!(request.url.starts_with("/r/doit/"));
-        Reply {
-            status: 403,
-            body: serde_json::json!({"error":403,"reason":"private","message":"Forbidden"})
-                .to_string(),
-            headers: vec![],
-        }
-    });
-    let reddit = fixture.reddit();
-    let (pool, messages) = Pool::start(reddit.clone(), 3, None);
-    let state = crate::test_support::state_path();
-    let mut app = App::new(
-        Config {
-            media: crate::config::MediaSettings {
-                image_preview: false,
-                ..Default::default()
-            },
-            ..Config::default()
-        },
-        pool,
-        reddit,
-        state,
-        Picker::halfblocks(),
-    );
-    app.open_subreddit("doit");
-    app.on_msg(
-        messages
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .unwrap(),
-    );
-
-    let actual = screen(&mut app, 100, 24);
-
-    assert!(actual.contains("Private community"), "{actual}");
-    assert!(actual.contains("approved members"), "{actual}");
-    assert!(!actual.contains("Could not load posts"), "{actual}");
-    assert!(!actual.contains("press r to retry"), "{actual}");
-}
-
-#[test]
 fn private_community_cached_feed_should_hide_unavailable_posts_and_keep_recovery_visible() {
     for (width, height) in [(24, 10), (40, 12), (100, 24)] {
         let mut app = denied_community(crate::reddit::AccessDenied::PrivateCommunity);

@@ -18,7 +18,7 @@ pub(super) fn draw_post(
         controls && crate::keys::map::available(app, crate::keys::map::Action::NextImage);
     let view = app.post_view.as_ref()?;
     let post = view.shown_post();
-    let now = Utc::now();
+    let now = now();
 
     let (rest, overflow_title) = draw_post_header(f, app, area, now, controls, gallery_controls)?;
 

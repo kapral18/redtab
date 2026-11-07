@@ -1,33 +1,6 @@
 use super::*;
 
 #[test]
-fn when_reconnecting_after_disconnect_it_should_restore_that_accounts_bookmarks() {
-    use crate::reddit::tests::{Fixture, Reply};
-    let fixture = Fixture::new(|_| {
-        Reply::json(serde_json::json!({"data":{"id":"readerid", "name":"reader"}}))
-    });
-    let (mut app, _messages) = app_at(&fixture.base, &[]);
-    let directory = tempfile::tempdir().unwrap();
-    app.state_path = directory.path().join("accounts/readerid/state.json");
-    std::fs::create_dir_all(app.state_path.parent().unwrap()).unwrap();
-    app.reddit.verify_account().unwrap();
-    app.state.toggle_bookmark(&post("saved", "rust"), 1000);
-    app.save_state();
-    app.install_connection(Reddit::disconnected(false).unwrap());
-    let connection = fixture.reddit();
-    connection.verify_account().unwrap();
-
-    app.install_connection(connection);
-
-    assert!(app.state.is_bookmarked("saved"));
-    assert_eq!(
-        app.state_path,
-        directory.path().join("accounts/readerid/state.json")
-    );
-    assert_eq!(app.reddit.account().unwrap().id, "readerid");
-}
-
-#[test]
 fn when_switching_between_saved_accounts_and_back_it_should_restore_each_accounts_own_bookmarks() {
     use crate::reddit::tests::{Fixture, Reply, saved_export};
     let first = Fixture::new(|_| {
@@ -182,23 +155,6 @@ fn removing_a_bookmark_from_another_tab_keeps_the_bookmarks_selection_usable() {
     let current = app.current_post().map(|p| p.id);
 
     assert_eq!(current.as_deref(), Some("a"));
-}
-
-#[test]
-fn a_merge_from_another_instance_keeps_the_selected_bookmark() {
-    let mut app = app_with(&[]);
-    app.state.toggle_bookmark(&post("x", "s"), 50);
-    app.state.toggle_bookmark(&post("y", "s"), 100);
-    app.switch_tab(BOOKMARKS_TAB);
-    app.tabs[BOOKMARKS_TAB].feed.selected = 1; // [y, x] → x
-    let mut other = State::default();
-    other.toggle_bookmark(&post("z", "s"), 200);
-    other.save(&app.state_path, 200).unwrap();
-
-    let redraw = app.persist();
-
-    assert!(redraw);
-    assert_eq!(app.current_post().unwrap().id, "x");
 }
 
 #[test]

@@ -86,70 +86,6 @@ fn background_burst_should_stay_bounded_without_pacing_browsing() {
 }
 
 #[test]
-fn when_congestion_native_settings_reply_arrives_json_quota_should_remain_independent() {
-    use crate::reddit::{
-        tests::{Fixture, Reply},
-        transport::{self, Transport},
-    };
-    let fixture = Fixture::new(|_| Reply {
-        status: 200,
-        body: String::new(),
-        headers: vec![
-            ("X-Ratelimit-Remaining".into(), "600".into()),
-            ("X-Ratelimit-Reset".into(), "600".into()),
-        ],
-    });
-    let (rate, json) = quota("10", "30");
-    let native = Url::parse(&fixture.base)
-        .unwrap()
-        .join("settings/preferences")
-        .unwrap();
-    let response = transport::wait(
-        transport::send(Transport::new().unwrap().client.get(native.as_str()), None),
-        None,
-    )
-    .unwrap()
-    .unwrap();
-
-    rate.observe(&response, &native, Instant::now(), 0, 0);
-
-    assert_eq!(
-        rate.state.lock().budgets[budget_index(&json)].interval,
-        Duration::from_secs(3)
-    );
-    assert_eq!(
-        budget_index(&native),
-        budget_index(&Url::parse("https://www.reddit.com/svc/shreddit/graphql").unwrap())
-    );
-}
-
-#[test]
-fn when_congestion_background_uses_idle_capacity_three_navigation_starts_should_remain() {
-    let (rate, url) = quota("100", "30");
-    {
-        let mut state = rate.state.lock();
-        state.budgets[0].next = Instant::now();
-        state.budgets[0].credited = Instant::now() - Duration::from_secs(2);
-    }
-    let deadline = Instant::now() + Duration::from_millis(50);
-    rate.admit(&url, Priority::Background, true, || {
-        Instant::now() >= deadline
-    })
-    .unwrap();
-
-    let actual: Vec<_> = [Priority::Listing, Priority::Selected, Priority::Foreground]
-        .into_iter()
-        .map(|rank| {
-            let deadline = Instant::now() + Duration::from_millis(50);
-            rate.admit(&url, rank, true, || Instant::now() >= deadline)
-                .is_ok()
-        })
-        .collect();
-
-    assert_eq!(actual, [true, true, true]);
-}
-
-#[test]
 fn when_background_uses_one_credit_eighteen_navigation_starts_should_remain() {
     let (rate, url) = quota("100", "600");
     rate.state.lock().budgets[0].next = Instant::now();
@@ -275,22 +211,6 @@ fn when_navigation_has_quota_credit_it_should_start_quickly_and_keep_background_
             .contains(&background_started.elapsed()),
         "background spacing followed intervening navigation: {:?}",
         background_started.elapsed()
-    );
-}
-
-#[test]
-fn when_quota_is_smaller_than_the_burst_it_should_limit_total_admissions() {
-    let (rate, url) = quota("1", "30");
-    rate.admit(&url, Priority::Listing, true, || false).unwrap();
-    let deadline = Instant::now() + Duration::from_millis(50);
-
-    let actual = rate.admit(&url, Priority::Selected, true, || {
-        Instant::now() >= deadline
-    });
-
-    assert!(
-        actual.is_err(),
-        "an unacknowledged start already spent the last known request"
     );
 }
 

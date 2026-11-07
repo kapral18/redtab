@@ -87,10 +87,12 @@ fn when_native_stills_are_prepared_the_upload_should_compress_the_pixels() {
 #[test]
 fn when_native_uploads_exceed_terminal_residency_a_warm_still_should_upload_again() {
     #[allow(deprecated)]
-    let mut picker = Picker::from_fontsize(ratatui_image::FontSize::new(17, 37));
+    let mut picker = Picker::from_fontsize(ratatui_image::FontSize::new(1, 2));
     picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
     let image = Arc::new(DynamicImage::new_rgba8(1, 1));
     let mut encoder = Encoder::default();
+    // 128x16 cells at 1x2 pixels decode to 16 KiB per strip.
+    encoder.residency.lock().limit = 20 * 128 * 32 * 4;
     let mut video_key = Key::new("paused", &picker, Size::new(128, 16), (1, 1), 0, 16, 0);
     video_key.video = true;
     let video = encoder

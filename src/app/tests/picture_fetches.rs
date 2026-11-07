@@ -84,8 +84,10 @@ fn scroll_pictures_wait_from_the_first_movement_until_it_stops() {
 
     assert!(!app.thumbs.contains_key(thumb), "mid-run rows wait");
     assert!(!app.images.contains_key(picture), "mid-run pictures wait");
-    std::thread::sleep(NAV_SETTLE);
-    assert!(app.tick(), "the pause redraws");
+    assert!(
+        app.tick_at(std::time::Instant::now() + NAV_SETTLE),
+        "the pause redraws"
+    );
     app.thumbs_drawn(&[thumb]);
     app.request_text_picture(picture);
     assert!(app.thumbs.contains_key(thumb));

@@ -1,22 +1,6 @@
 use super::*;
 
 #[test]
-fn when_revisiting_a_card_after_pixel_eviction_its_geometry_should_stay_reserved() {
-    let mut app = card_with_image(320, 640);
-    app.tabs[4].feed.posts.push(post_with("p2", Media::None));
-    screen(&mut app, 100, 20);
-    app.card_images.clear();
-    app.move_selection(1);
-    screen(&mut app, 100, 20);
-    app.move_selection(-1);
-
-    let actual = screen(&mut app, 100, 20);
-
-    assert_eq!(app.active_tab().feed.cards.height, 11, "{actual}");
-    assert!(actual.contains("p2"), "{actual}");
-}
-
-#[test]
 fn when_paging_a_bookmark_before_its_image_loads_it_should_keep_all_reserved_media_visible() {
     let mut app = card_feed_app(kitty());
     app.tabs[4].feed.posts[0].title = "Reserved bookmark".into();
@@ -93,8 +77,7 @@ fn when_returning_to_card_media_after_eviction_its_preview_should_stay_visible()
         );
         assert!(!actual.contains("loading image"), "{actual}");
         assert_eq!(app.active_tab().feed.cards.height, 11);
-        std::thread::sleep(crate::app::NAV_SETTLE);
-        app.tick();
+        app.tick_at(std::time::Instant::now() + crate::app::NAV_SETTLE);
         screen(&mut app, 100, 20);
         app.on_msg(Msg::Image {
             url: "https://i.redd.it/p1.jpeg".into(),

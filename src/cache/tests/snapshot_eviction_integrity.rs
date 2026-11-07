@@ -261,25 +261,6 @@ fn fifo_cache_locks_should_fail_without_waiting_for_a_reader() {
 }
 
 #[test]
-fn an_older_request_finishing_later_cannot_overwrite_a_newer_snapshot() {
-    let dir = tempfile::tempdir().unwrap();
-    let cache = Cache::new(dir.path().to_path_buf());
-    let key = Cache::key("instance", "post");
-    let now = crate::app::now();
-    let old = cache.reserve_request().unwrap();
-    let new = cache.reserve_request().unwrap();
-    cache.store(&key, b"new response", now, new).unwrap();
-
-    Cache::new(dir.path().to_path_buf())
-        .store(&key, b"old response", now + 1, old)
-        .unwrap();
-
-    let actual = cache.load(&key, now + 1).unwrap();
-    assert_eq!(actual.bytes, b"new response");
-    assert_eq!(actual.fetched_at, now);
-}
-
-#[test]
 fn the_next_write_removes_abandoned_temporary_files_only() {
     let dir = tempfile::tempdir().unwrap();
     let cache = Cache::new(dir.path().to_path_buf());

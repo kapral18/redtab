@@ -25,15 +25,14 @@ fn scrolling_inside_a_video_card_should_defer_startup_and_keep_existing_playback
 
 #[test]
 fn when_moves_settle_each_selected_post_should_start_without_waiting_for_obsolete_reads() {
-    let server = SlowReddit::start(Duration::from_millis(1500));
+    let delay = Duration::from_millis(500);
+    let server = SlowReddit::start(delay);
     let (mut app, messages) = server.home(&["warm", "fa", "fb", "fc", "fd"]);
     wait_for_page(&mut app, &messages);
-    let pause = NAV_SETTLE + Duration::from_millis(50);
 
     for _ in 0..4 {
         app.move_selection(1);
-        std::thread::sleep(pause);
-        app.tick();
+        app.tick_at(Instant::now() + NAV_SETTLE);
     }
     let waited = wait_for_page(&mut app, &messages);
 
@@ -48,8 +47,8 @@ fn when_moves_settle_each_selected_post_should_start_without_waiting_for_obsolet
         1
     );
     assert!(
-        waited < Duration::from_secs(2),
-        "the current post must not wait for every obsolete response"
+        waited < delay * 2,
+        "the current post must not wait for an obsolete response"
     );
 }
 

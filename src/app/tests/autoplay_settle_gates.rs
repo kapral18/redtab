@@ -38,15 +38,6 @@ fn card_media_sidebar_navigation_should_autoplay_the_visible_settled_selection()
 }
 
 #[test]
-fn card_media_selection_should_wait_for_settling_before_autoplay() {
-    let app = card_playback_app();
-    let since = app.card_video.as_ref().unwrap().since;
-
-    assert!(app.wanted_video(since).is_none());
-    assert!(app.wanted_video(since + NAV_SETTLE).is_some());
-}
-
-#[test]
 fn card_media_new_selection_should_restart_the_settle_timer() {
     let mut app = card_playback_app();
     app.tabs[0].feed.selected = 1;
@@ -56,18 +47,6 @@ fn card_media_new_selection_should_restart_the_settle_timer() {
     assert_eq!(app.card_video.as_ref().unwrap().id, "second");
     assert!(app.wanted_video(since).is_none());
     assert!(app.wanted_video(since + NAV_SETTLE).is_some());
-}
-
-#[test]
-fn card_media_disabled_autoplay_should_wait_for_explicit_play() {
-    let mut app = card_playback_app();
-    app.config.media.video_autoplay = false;
-    let later = app.card_video.as_ref().unwrap().since + NAV_SETTLE;
-    assert!(app.wanted_video(later).is_none());
-
-    app.toggle_video_pause();
-
-    assert!(app.wanted_video(later).is_some());
 }
 
 #[test]

@@ -197,8 +197,7 @@ fn scrolling_should_defer_pagination_until_settled_then_show_the_append_loader()
 
     screen(&mut app, 80, 20);
     assert!(!app.active_tab().feed.loading_more());
-    std::thread::sleep(crate::app::NAV_SETTLE);
-    app.tick();
+    app.tick_at(std::time::Instant::now() + crate::app::NAV_SETTLE);
     let actual = screen(&mut app, 80, 20);
 
     assert!(app.active_tab().feed.loading_more());

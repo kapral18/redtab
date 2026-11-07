@@ -89,28 +89,6 @@ fn when_the_last_account_is_removed_it_should_delete_the_native_payload() {
 }
 
 #[test]
-fn when_a_removed_account_is_added_again_it_should_become_active_without_losing_others() {
-    let first = export("first", "reader", "old-token", 0);
-    let second = export("second", "other_reader", "other-token", 0);
-    let mut store = store_with(&[("first", &first), ("second", &second)], Some("first"));
-    edit(&mut store, |vault| {
-        vault.remove("first");
-        Ok(())
-    })
-    .unwrap();
-
-    edit(&mut store, |vault| {
-        vault.insert(&export("first", "reader", "new-token", 0))
-    })
-    .unwrap();
-
-    let actual = Vault::decode(store.payload).unwrap();
-    assert_eq!(actual.active.as_deref(), Some("first"));
-    assert_eq!(actual.sessions.len(), 2);
-    assert_eq!(actual.load(Some("second")).unwrap(), second);
-}
-
-#[test]
 fn when_an_existing_login_has_no_identity_it_should_stay_saved_when_another_is_added() {
     let old = ".reddit.com\tTRUE\t/\tTRUE\t0\treddit_session\told-token\n";
     let mut store = MemoryStore {

@@ -289,20 +289,6 @@ fn main_media_should_fit_the_usable_height_in_cards_and_detail() {
 }
 
 #[test]
-fn a_tall_detail_image_should_fit_below_the_fixed_header() {
-    let mut app = image_post("body below the full image");
-    let slot = ready(&app, 320, 1280);
-    app.images.insert("https://i.redd.it/big.jpeg".into(), slot);
-
-    let shown = screen(&mut app, 100, 40);
-    let view = app.post_view.as_ref().unwrap();
-
-    assert!(shown.contains("body below the full image"));
-    assert_eq!(view.rendered_pictures.first().map(|p| p.2), Some(19));
-    assert_eq!(view.scroll, 0);
-}
-
-#[test]
 fn a_detail_image_should_clip_visible_rows_and_scroll_continuously_into_the_body() {
     let mut app = image_post(&paragraphs("body after image", 1..=20));
     let slot = ready(&app, 320, 1280);

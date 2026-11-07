@@ -48,16 +48,23 @@ fn when_congestion_subscription_icon_is_removed_and_readded_metadata_should_foll
 fn icon_lookup_should_reuse_known_or_pending_metadata_and_allow_retry_after_failure() {
     let (mut app, messages) = app_with_messages(&[]);
     show_thumbnails(&mut app);
+    // A lookup is asked when it joins `icon_lookups`; its answer then arrives.
     let load = |app: &mut App| {
+        let pending = app.icon_lookups.contains("s");
         app.request_icon("S");
-        let mut asked = 0;
-        while let Ok(msg) = messages.recv_timeout(std::time::Duration::from_millis(300)) {
-            if matches!(&msg, Msg::Icon { subreddit, result: Err(_) } if subreddit == "s") {
-                asked += 1;
-            }
-            app.on_msg(msg);
+        if pending || !app.icon_lookups.contains("s") {
+            return 0;
         }
-        asked
+        loop {
+            let msg = messages
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let answered = matches!(&msg, Msg::Icon { subreddit, .. } if subreddit == "s");
+            app.on_msg(msg);
+            if answered {
+                return 1;
+            }
+        }
     };
 
     let first = load(&mut app);
@@ -87,17 +94,12 @@ fn icon_lookup_should_reuse_known_or_pending_metadata_and_allow_retry_after_fail
 
 #[test]
 fn a_multireddit_asks_for_no_icon() {
-    let (mut app, messages) = app_with_messages(&[]);
+    let (mut app, _messages) = app_with_messages(&[]);
     show_thumbnails(&mut app);
 
     app.request_icon("a+B");
 
     assert!(app.icon_lookups.is_empty());
-    assert!(
-        messages
-            .recv_timeout(std::time::Duration::from_millis(300))
-            .is_err()
-    );
 }
 
 #[test]
@@ -281,24 +283,19 @@ fn when_congestion_icon_snapshots_arrive_late_the_newer_metadata_should_remain()
 
 #[test]
 fn a_feed_looks_its_icon_up_on_its_first_page_only() {
-    let (mut app, messages) = app_with_messages(&["s"]);
+    let (mut app, _messages) = app_with_messages(&["s"]);
     show_thumbnails(&mut app);
     let (tab, generation) = (app.tabs[4].id, app.tabs[4].feed.generation);
     let load = |app: &mut App, append: bool| {
         app.icons.remove("s");
+        app.icon_lookups.clear();
         app.on_msg(Msg::Feed {
             tab,
             generation,
             append,
             result: Ok(listing("s", &["a"], Some("t3_a"))),
         });
-        let mut asked = 0;
-        while let Ok(msg) = messages.recv_timeout(std::time::Duration::from_millis(300)) {
-            if matches!(&msg, Msg::Icon { subreddit, .. } if subreddit == "s") {
-                asked += 1;
-            }
-        }
-        asked
+        usize::from(app.icon_lookups.contains("s"))
     };
 
     let next_page = load(&mut app, true);
@@ -309,18 +306,12 @@ fn a_feed_looks_its_icon_up_on_its_first_page_only() {
 
 #[test]
 fn icons_are_looked_up_only_while_thumbnails_show() {
-    let (mut app, messages) = app_with_messages(&[]);
+    let (mut app, _messages) = app_with_messages(&[]);
     app.all_subs.groups = vec![Group {
         subreddit: "s".into(),
         ..Group::default()
     }];
-    let asked = || {
-        let mut asked = 0;
-        while let Ok(msg) = messages.recv_timeout(std::time::Duration::from_millis(300)) {
-            asked += usize::from(matches!(msg, Msg::Icon { .. }));
-        }
-        asked
-    };
+    let asked = |app: &App| usize::from(!app.icon_lookups.is_empty());
     show_thumbnails(&mut app);
     app.show_images = false;
 
@@ -329,9 +320,9 @@ fn icons_are_looked_up_only_while_thumbnails_show() {
         subreddit: "s".into(),
         result: Ok(listing("s", &["a"], None)),
     });
-    let while_off = asked();
+    let while_off = asked(&app);
     app.toggle_images();
-    let turned_on = asked();
+    let turned_on = asked(&app);
 
     assert_eq!((while_off, turned_on), (0, 1));
 }

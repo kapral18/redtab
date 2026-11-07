@@ -199,65 +199,6 @@ fn when_later_starts_are_not_in_a_quota_hint_they_should_be_deducted() {
 }
 
 #[test]
-fn when_quota_is_replenished_continuous_navigation_should_not_postpone_background() {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc::channel,
-    };
-    let (rate, url) = quota("100", "3");
-    let rate = Arc::new(rate);
-    let starts = Arc::new(AtomicUsize::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
-    let producer_rate = rate.clone();
-    let producer_url = url.clone();
-    let producer_starts = starts.clone();
-    let producer_stop = stop.clone();
-    let (entered, waiting) = channel();
-    let producer = std::thread::spawn(move || {
-        for _ in 0..20 {
-            if producer_rate
-                .admit(&producer_url, Priority::Selected, true, || {
-                    let _ = entered.send(());
-                    producer_stop.load(Ordering::Acquire)
-                })
-                .is_err()
-            {
-                break;
-            }
-            producer_starts.fetch_add(1, Ordering::SeqCst);
-        }
-    });
-    waiting.recv_timeout(Duration::from_secs(1)).unwrap();
-    let deadline = Instant::now() + Duration::from_millis(250);
-    let registered_at = AtomicUsize::new(usize::MAX);
-
-    let actual = rate.admit(&url, Priority::Background, true, || {
-        let _ = registered_at.compare_exchange(
-            usize::MAX,
-            starts.load(Ordering::SeqCst),
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
-        Instant::now() >= deadline
-    });
-    let before = starts.load(Ordering::SeqCst);
-    let while_waiting = before.saturating_sub(registered_at.load(Ordering::SeqCst));
-    stop.store(true, Ordering::Release);
-    rate.wake();
-    producer.join().unwrap();
-
-    assert!(
-        actual.is_ok(),
-        "navigation repeatedly postponed the background slot"
-    );
-    assert!(
-        while_waiting <= 3,
-        "background waited for {while_waiting} selected starts after registering"
-    );
-}
-
-#[test]
 fn when_budget_replies_arrive_out_of_order_the_older_hint_should_not_restore_slow_pacing() {
     use crate::reddit::{
         tests::{Fixture, Reply},

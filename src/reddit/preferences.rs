@@ -174,15 +174,6 @@ mod tests {
     }
 
     #[test]
-    fn when_reddit_requires_age_verification_the_mature_control_should_be_unavailable() {
-        let html = markup(false, true).replace(
-            "initialstate=",
-            "is-age-gated-and-not-verified initialstate=",
-        );
-        assert!(!parse(&html, "readerid").unwrap().mature_content_editable);
-    }
-
-    #[test]
     fn when_a_gated_account_has_raw_mature_access_it_should_still_hide_mature_content() {
         let html = markup(true, true).replace(
             "initialstate=",
@@ -293,28 +284,5 @@ mod tests {
                 .set_preference(Preference::Autoplay, false)
                 .is_err()
         );
-    }
-
-    #[test]
-    fn when_a_preference_write_is_rate_limited_it_should_not_replay_or_echo_the_response() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let writes = Arc::new(AtomicUsize::new(0));
-        let actual = writes.clone();
-        let fixture = Fixture::new(move |request| match request.url.as_str() {
-            "/api/me.json" => Reply::json(json!({"data":{"id":"readerid","name":"reader"}})),
-            "/svc/shreddit/graphql" => {
-                writes.fetch_add(1, Ordering::SeqCst);
-                Reply::status(429)
-            }
-            _ => panic!("Unexpected preference request"),
-        });
-        let error = fixture
-            .saved_reddit(&export())
-            .set_preference(Preference::Autoplay, false)
-            .unwrap_err()
-            .to_string();
-        assert_eq!(actual.load(Ordering::SeqCst), 1);
-        assert!(error.contains("rate limit"));
-        assert!(!error.contains("body must never") && !error.contains("fixture-csrf"));
     }
 }

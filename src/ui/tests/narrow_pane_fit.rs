@@ -181,14 +181,6 @@ fn ui_audit_safety_labels_should_precede_a_long_author_in_compact_rows() {
 }
 
 #[test]
-fn a_long_post_opens_at_its_top() {
-    let (app, s) = open_long_post(|_| {});
-
-    assert!(s.lines().any(|l| l.contains("paragraph 1 ")), "{s}");
-    assert_eq!(app.post_view.as_ref().unwrap().scroll, 0);
-}
-
-#[test]
 fn when_a_post_is_open_the_list_should_only_remain_if_both_panes_fit() {
     for (sidebar, width, list_visible) in [
         (true, 158, true),

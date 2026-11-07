@@ -77,10 +77,20 @@ pub enum Tile {
 
 /// Terminals budget decoded pixels and may discard old image IDs. Keep a smaller
 /// transmission window than Ghostty's default so expired IDs can be sent again.
-#[derive(Default)]
 pub struct NativeResidency {
     pub(super) uploads: VecDeque<(u32, usize)>,
     pub(super) bytes: usize,
+    pub(super) limit: usize,
+}
+
+impl Default for NativeResidency {
+    fn default() -> Self {
+        Self {
+            uploads: VecDeque::new(),
+            bytes: 0,
+            limit: NATIVE_BYTES,
+        }
+    }
 }
 
 impl NativeResidency {
@@ -94,7 +104,7 @@ impl NativeResidency {
         }
         self.uploads.push_back((id, bytes));
         self.bytes += bytes;
-        while self.bytes > NATIVE_BYTES || self.uploads.len() > CACHE_TILES {
+        while self.bytes > self.limit || self.uploads.len() > CACHE_TILES {
             let (_, bytes) = self.uploads.pop_front().unwrap();
             self.bytes -= bytes;
         }

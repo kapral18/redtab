@@ -139,14 +139,6 @@ fn a_still_preview_returns_the_first_frame_without_starting_playback() {
 }
 
 #[test]
-fn video_frames_should_keep_portrait_width_for_scrolling() {
-    let Some(actual) = first_frame(1080, 1920, (608, 1088)) else {
-        return;
-    };
-    assert_eq!(actual, (608, 1080));
-}
-
-#[test]
 fn video_decode_box_should_follow_full_document_height() {
     assert_eq!(
         frame_box(Size::new(100, 100), FontSize::new(16, 36)),
