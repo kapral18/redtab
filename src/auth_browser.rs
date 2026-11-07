@@ -80,7 +80,10 @@ pub fn helper() -> Result<()> {
 }
 
 fn discover() -> Result<Vec<Source>> {
-    let mut sources = Vec::new();
+    let mut sources: Vec<Source> = browser_executable()
+        .map(|executable| Source::Window { executable })
+        .into_iter()
+        .collect();
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         use rookie_cookies::{ExecutionControl, profiles_with, supported_browsers};
@@ -112,9 +115,6 @@ fn discover() -> Result<Vec<Source>> {
     #[cfg(target_os = "macos")]
     if let Some(root) = dia_profile_root() {
         sources.extend(dia_profiles(&root));
-    }
-    if let Some(executable) = browser_executable() {
-        sources.push(Source::Window { executable });
     }
     Ok(sources)
 }
@@ -168,7 +168,16 @@ fn dia_cookie_path(root: &Path, profile: &str) -> Option<PathBuf> {
     }
     let root = root.canonicalize().ok()?;
     let directory = root.join(profile).canonicalize().ok()?;
-    if !directory.starts_with(&root) || !directory.is_dir() {
+    if !directory.starts_with(&root) {
+        return None;
+    }
+    profile_cookie_file(&directory)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn profile_cookie_file(directory: &Path) -> Option<PathBuf> {
+    let directory = directory.canonicalize().ok()?;
+    if !directory.is_dir() {
         return None;
     }
     ["Network/Cookies", "Cookies"].into_iter().find_map(|name| {
@@ -178,17 +187,16 @@ fn dia_cookie_path(root: &Path, profile: &str) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-#[allow(deprecated)]
-fn dia_cookies(path: PathBuf) -> Result<Vec<rookie_cookies::enums::Cookie>> {
-    // The registry lacks Dia; this public API accepts its Keychain identity.
-    let config = rookie_cookies::config::Browser {
-        paths: Vec::new(),
-        channels: None,
-        unix_crypt_name: None,
-        osx_key_service: Some("Dia Safe Storage".into()),
-        osx_key_user: Some("Dia".into()),
-    };
-    rookie_cookies::chromium_based(&config, path, Some(vec!["reddit.com".into()]), false)
+fn chromium_cookie_path(browser: &str, profile: &str) -> Option<PathBuf> {
+    if browser == "dia" {
+        return dia_cookie_path(&dia_profile_root()?, profile);
+    }
+    let control = rookie_cookies::ExecutionControl::default().timeout(Duration::from_secs(3));
+    let found = rookie_cookies::profiles_with(browser, control)
+        .ok()?
+        .into_iter()
+        .find(|found| found.profile.profile_id.to_string() == profile)?;
+    profile_cookie_file(Path::new(&found.profile.path))
 }
 
 pub fn clean_label(text: &str) -> String {
@@ -198,26 +206,26 @@ pub fn clean_label(text: &str) -> String {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn import(browser: &str, profile: &str) -> Result<String> {
     use rookie_cookies::{AppBoundPolicy, ExtractRequest, extract};
-    let cookies: Result<Vec<_>> = match browser {
-        #[cfg(target_os = "macos")]
-        "dia" => {
-            let path = dia_profile_root()
-                .and_then(|root| dia_cookie_path(&root, profile))
-                .context("Dia profile is no longer available; rescan browser profiles")?;
-            dia_cookies(path)
-        }
-        _ => {
-            let request = ExtractRequest::browser(browser)
-                .profile(profile)
-                .domains(Some(vec!["reddit.com".into()]))
-                .include_session()
-                .app_bound(AppBoundPolicy::Disabled)
-                .timeout(Duration::from_secs(30));
-            extract(request).map_err(Into::into)
-        }
+    #[cfg(target_os = "macos")]
+    if let Some(keychain) = chromium::keychain(browser) {
+        let path = chromium_cookie_path(browser, profile)
+            .context("This browser profile is no longer available; rescan browser profiles")?;
+        return cookie_export(chromium::import(&path, &keychain)?);
+    }
+    let request = ExtractRequest::browser(browser)
+        .profile(profile)
+        .domains(Some(vec!["reddit.com".into()]))
+        .include_session()
+        .app_bound(AppBoundPolicy::Disabled)
+        .timeout(Duration::from_secs(30));
+    let keyring = cfg!(target_os = "linux")
+        && matches!(browser, "chrome" | "chromium" | "brave" | "edge" | "arc");
+    let advice = if keyring {
+        "Could not read this browser session. Unlock the desktop keyring, then retry. You can also use the separate login window."
+    } else {
+        "Could not read this browser session. Retry, or use the separate login window."
     };
-    let cookies = cookies.map_err(|_| anyhow::anyhow!(
-        "Could not read this browser session. Unlock the desktop keyring or allow Keychain access, then retry. You can also use the separate login window."))?;
+    let cookies = extract(request).map_err(|_| anyhow::anyhow!(advice))?;
     cookie_export(cookies.into_iter().map(|c| BrowserCookie {
         domain: c.domain,
         path: c.path,
@@ -446,5 +454,7 @@ fn read_cookies(reader: &mut impl BufRead, id: u64) -> Result<Vec<BrowserCookie>
     bail!("The login window did not answer the session request")
 }
 
+#[cfg(target_os = "macos")]
+mod chromium;
 #[cfg(test)]
 mod tests;

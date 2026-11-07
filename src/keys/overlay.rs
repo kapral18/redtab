@@ -97,7 +97,7 @@ pub(super) fn handle_overlay(app: &mut App, overlay: Overlay, key: KeyEvent) -> 
                 KeyCode::Char('d') if app.auth.can_remove() => app.auth.request_disconnect(),
                 KeyCode::Enter if app.select_auth() => return None,
                 KeyCode::Char('a') if app.auth.phase == crate::auth::Phase::Accounts => {
-                    app.auth.discover()
+                    app.auth.add()
                 }
                 KeyCode::Char('r') if !app.auth.busy() => app.auth.reconnect(),
                 _ => {}

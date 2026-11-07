@@ -135,6 +135,11 @@ impl Controller {
         }
     }
 
+    pub fn add(&mut self) {
+        self.preferred = None;
+        self.discover();
+    }
+
     pub fn reconnect(&mut self) {
         if self.busy() {
             return;
@@ -151,7 +156,7 @@ impl Controller {
     pub fn select(&mut self, show_nsfw: bool) {
         if self.phase == Phase::Accounts {
             let Some(account) = self.accounts.get(self.selected).cloned() else {
-                self.discover();
+                self.add();
                 return;
             };
             if account.expired {

@@ -253,7 +253,10 @@ pub(super) fn auth_lines(app: &App, width: usize, height: usize) -> Vec<Line<'st
             if auth.active_id.is_some() {
                 footer.extend(wrapped("d Remove from redtab", TEXT));
             }
-            let disclosure = wrapped("Only Reddit cookies; OS access may prompt.", SUBTEXT);
+            let disclosure = wrapped(
+                "Only Reddit cookies; profile import may ask for OS access.",
+                SUBTEXT,
+            );
             if lines.len() + footer.len() + disclosure.len() + 2 <= height {
                 footer.extend(disclosure);
             }
@@ -268,7 +271,7 @@ pub(super) fn auth_lines(app: &App, width: usize, height: usize) -> Vec<Line<'st
                 height.saturating_sub(footer.len() + usize::from(!auth.sources.is_empty())),
             );
             if lines.is_empty() && height > footer.len() + 1 {
-                let guidance = wrapped("Choose a profile or a new login window.", TEXT);
+                let guidance = wrapped("Choose the login window or a browser profile.", TEXT);
                 if guidance.len() < height.saturating_sub(footer.len()) {
                     lines.extend(guidance);
                 }
@@ -321,7 +324,9 @@ pub(super) fn auth_lines(app: &App, width: usize, height: usize) -> Vec<Line<'st
                 width,
                 app.loading_frame,
             ));
-            lines.extend(wrapped("Allow OS access if prompted.", TEXT));
+            if !window {
+                lines.extend(wrapped("Allow OS access if prompted.", TEXT));
+            }
             controls = wrapped("Esc cancels", TEXT);
             if auth.can_remove() {
                 controls.extend(wrapped("d Remove from redtab", TEXT));

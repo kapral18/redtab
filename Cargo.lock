@@ -2961,9 +2961,11 @@ dependencies = [
 name = "redtab"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "anyhow",
  "base64 0.22.1",
  "bytes",
+ "cbc",
  "chrono",
  "crossterm",
  "gif",
@@ -2975,14 +2977,17 @@ dependencies = [
  "libc",
  "nucleo-matcher",
  "parking_lot",
+ "pbkdf2",
  "pulldown-cmark",
  "ratatui",
  "ratatui-image",
  "rookie-cookies",
+ "rusqlite",
  "scraper",
  "security-framework",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "signal-hook 0.4.5",
  "tempfile",
@@ -2997,6 +3002,7 @@ dependencies = [
  "uuid",
  "wreq",
  "wreq-util",
+ "zeroize",
 ]
 
 [[package]]

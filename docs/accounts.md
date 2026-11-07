@@ -4,31 +4,43 @@
 
 ## Connect Reddit
 
-1. Sign in to Reddit in your browser.
-2. Start redtab and pick that browser profile in **Connect Reddit**.
-3. Allow OS credential access if asked.
-4. Check the username and press `Enter` to save. `Esc` cancels.
+**Connect Reddit** opens on first launch, and from `SPC p a` with `a` (add) or `r`
+(reconnect). It lists:
+
+- **Sign in in a new login window (recommended)**, preselected on first launch and
+  for `a`; `r` preselects the account's earlier source instead. redtab opens Chrome,
+  Chromium, Brave or Edge with an empty temporary profile. Sign in to Reddit there;
+  redtab reads that window's Reddit cookies over a private DevTools pipe, closes it
+  and deletes the profile. Your browser's own cookie store is never opened.
+- **Browser profiles** you are already signed in with: Chrome, Chromium, Firefox,
+  Brave, Edge, Zen and LibreWolf on macOS and Linux; Arc and Dia on macOS only.
+  redtab reads only Reddit cookies from the chosen profile.
+
+Check the username and press `Enter` to save. `Esc` cancels.
 
 redtab copies the session once; the browser can stay closed afterward.
 It does not renew or reimport the session in the background.
 
-Supported on macOS and Linux: Chrome, Chromium, Firefox, Brave, Edge, Zen and
-LibreWolf. Arc and Dia are supported only on macOS.
+### OS prompts
 
-- macOS: allow Keychain access.
-- Linux: saved logins require `secret-tool` and an unlocked Secret Service provider.
-  Chromium import may separately need Secret Service or KWallet to decrypt cookies.
+- Importing from a Chromium-based profile (Chrome, Chromium, Brave, Edge, Arc, Dia)
+  on macOS asks whether **redtab** may use "<Browser> Safe Storage"; macOS may also
+  ask for your login password. That key decrypts the browser's cookies and saved
+  passwords. redtab reads it in its own process, copies the profile's cookie database
+  to a private temporary folder and decrypts only reddit.com cookies.
+  **Always Allow** adds redtab to that Keychain item's access list, so later imports
+  skip the prompt; no other program is added. An updated or rebuilt redtab may ask
+  again. The login window needs no prompt.
+- After redtab is updated or rebuilt, macOS asks once whether redtab may use its own
+  saved login ("redtab"). Choose **Allow**.
+- Saving a login stores it in the macOS Keychain or Linux Secret Service. On Linux
+  this requires `secret-tool` and an unlocked Secret Service provider; Chromium
+  profile import may also need Secret Service or KWallet to decrypt cookies.
 
 ### If import fails
 
-Choose **Open a separate Reddit login window** (requires Chrome, Chromium, Brave
-or Edge). Sign in there, then confirm the account in redtab. The temporary profile
-is deleted afterward.
-
-Import can also fail when:
-
-- the browser keeps cookies only in memory, or
-- the profile holds more than one Reddit session.
+Import from a browser profile fails when the browser keeps cookies only in memory or
+the profile holds more than one Reddit session. Use the login window instead.
 
 ## Manage accounts
 
@@ -77,7 +89,7 @@ Keep cookie values out of shell arguments and logs.
 - For HTTP 429 (rate limit), wait before retrying; follow the countdown when shown.
 - If Reddit is not answering, cached content may remain readable; `r` retries
   the failed view.
-- Credential-store errors: check [OS access](#connect-reddit). redtab never falls
+- Credential-store errors: check [OS prompts](#os-prompts). redtab never falls
   back to plaintext cookie storage.
 
 `redtab --check` runs live Home and subscription diagnostics; it does not renew

@@ -170,7 +170,7 @@ Rendering: [auth UI](../src/ui/auth_dialog.rs). Phases: [auth](../src/auth.rs). 
 | --- | --- |
 | LoadingAccounts / Switching / Discovering | Progress |
 | Accounts | Names, active/expired state, Add, switch, reconnect, remove |
-| Choose | Browser profiles or separate window, OS-access note |
+| Choose | Login window first (preselected unless reconnecting), then browser profiles; OS-access note |
 | Importing | Progress, cancel |
 | Confirm | Verified username, save or keep current |
 | Saving / Disconnecting | Progress; no cancel |

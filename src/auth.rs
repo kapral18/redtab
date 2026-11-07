@@ -89,7 +89,7 @@ impl Source {
     pub fn label(&self) -> &str {
         match self {
             Self::Browser { label, .. } => label,
-            Self::Window { .. } => "Open a separate Reddit login window",
+            Self::Window { .. } => "Sign in in a new login window (recommended)",
         }
     }
 }
