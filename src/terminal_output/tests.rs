@@ -65,10 +65,6 @@ fn a_stalled_output_drain_returns_without_waiting_for_the_sink() {
     let (mut writer, output) = AsyncWriter::new(Sink(receive));
     writer.write_all(b"frame").unwrap();
     writer.flush().unwrap();
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(100));
-        release.send(()).unwrap();
-    });
     assert_eq!(
         output
             .wait_for(Duration::from_millis(30))
@@ -76,7 +72,7 @@ fn a_stalled_output_drain_returns_without_waiting_for_the_sink() {
             .kind(),
         io::ErrorKind::TimedOut
     );
-    release.join().unwrap();
+    release.send(()).unwrap();
     output.wait().unwrap();
 }
 
