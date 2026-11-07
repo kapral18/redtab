@@ -1,5 +1,9 @@
 # RedTab
 
+[![crates.io](https://img.shields.io/crates/v/redtab.svg)](https://crates.io/crates/redtab)
+[![Release](https://github.com/kapral18/redtab/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/kapral18/redtab/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Reddit in your terminal, with tabs, inline media and keyboard controls.
 
 ![Animated demo of redtab browsing Reddit in the terminal](docs/assets/terminal.gif)
