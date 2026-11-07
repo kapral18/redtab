@@ -20,52 +20,51 @@ with `cargo build --locked`.
 
 ## Releases
 
-Releases are automated with [release-plz](https://release-plz.dev) and
-[release.yml](../.github/workflows/release.yml); nobody pushes tags by hand.
+Every push to `main` runs [release.yml](../.github/workflows/release.yml). A push
+that contains a `feat`, `fix` or `perf` commit, or a breaking change, since the
+last `v*` tag releases; any other push only runs CI. Nobody bumps versions or
+pushes tags by hand. Runs are serialized, one at a time.
 
-1. Every push to `main` that changes the packaged crate updates a pull request
-   named `chore: release v<version>` that bumps `version` in `Cargo.toml` and adds
-   a `CHANGELOG.md` entry. The next version comes from the
-   [Conventional Commits](https://www.conventionalcommits.org) since the last
-   release, following Cargo's SemVer rules: while the version is `0.x`, a breaking
-   change (`feat!:` or a `BREAKING CHANGE:` footer) bumps the minor and anything
-   else bumps the patch; from `1.0`, `feat:` bumps the minor and a breaking change
-   bumps the major.
-2. Whenever the `version` in `Cargo.toml` on `main` has no tag, the workflow
-   releases that commit. Merging the release pull request is how that normally
-   happens. The workflow tests and builds the commit for the four targets, and
-   only if that passes tags it `v<version>` and publishes the GitHub release with
-   the archives, `SHA256SUMS` and build attestations. After that, two jobs run side
-   by side: one publishes the crate to crates.io through trusted publishing from
-   the `release` environment, the other rewrites `Formula/redtab.rb` in
-   [kapral18/homebrew-tap](https://github.com/kapral18/homebrew-tap) with the new
-   URLs and checksums.
+| Commits since the last tag | Next version while `0.x` | From `1.0` |
+| --- | --- | --- |
+| only `chore:`, `docs:`, `ci:`, `test:`, `refactor:`, `style:`, `build:` or non-conventional | no release | no release |
+| `fix:` or `perf:` | patch | patch |
+| `feat:` | minor | minor |
+| `<type>!:` or a `BREAKING CHANGE:` footer | minor | major |
 
-Only one run of the workflow is active at a time, and GitHub keeps only the newest
-waiting run, so a push during a release updates the release pull request only
-after that release is done. Merge the release pull request when it is up to date
-with `main`: commits that land between its last update and the start of its run
-ship in that release without a changelog line. A version that is not higher than
-the latest one on crates.io stops the workflow.
+1. **ci** runs [ci.yml](../.github/workflows/ci.yml) on the pushed commit.
+2. **plan** asks [git-cliff](https://git-cliff.org) ([cliff.toml](../cliff.toml))
+   for the next version. If it equals the last tag, the run ends.
+3. **build** sets that version in `Cargo.toml`, then tests and builds the four
+   targets. Nothing outside the run has changed yet.
+4. **release** commits `chore(release): v<version>` (version in `Cargo.toml` and
+   `Cargo.lock`, `CHANGELOG.md` regenerated) on top of the pushed commit, tags it,
+   and pushes both to `main` in one atomic push. If `main` moved in the meantime,
+   the push is rejected, nothing is released, and the run for the newer push
+   releases everything. Then it creates the GitHub release with the archives,
+   `SHA256SUMS`, build attestations and the changelog section as notes.
+5. **crate** publishes to crates.io through trusted publishing from the `release`
+   environment, and **homebrew** rewrites `Formula/redtab.rb` in
+   [kapral18/homebrew-tap](https://github.com/kapral18/homebrew-tap). They run
+   side by side from the tag.
 
-If a release job fails for a temporary reason (a network error), re-run the failed
-jobs or all jobs; a run finishes the release at the commit it tagged and skips what
-is already done. If GitHub drops a waiting run (for example because a re-run took
-its place), start the Release workflow on `main` from the Actions tab; it releases
-or updates the release pull request from the current state. If the build fails
-before tagging, push the fix to `main`; the version is still untagged, so that
-push releases it. A tag never moves: if a step after tagging needs a code fix,
-commit the fix together with a higher `version` in `Cargo.toml` and its
-`CHANGELOG.md` entry. While a tagged version is missing from crates.io, the release
-pull request job fails on every push, so re-run the failed release first;
-publishing by hand is not the fix, because the crate accepts only trusted
-publishing. Prerelease versions (with a `-`) stop the workflow, and the Homebrew
-formula is never moved back to an older version.
+The tag is the record of a release. Pull after a release: the release commit
+lands on `main` after your push. If a job fails, re-run the failed jobs: a run
+that finds its tag already pushed finishes what is missing (the GitHub release,
+the crate, the formula) and skips what is done. A failure before the tag push
+leaves no trace; fix it and push. Re-running an old run can make GitHub cancel
+a newer waiting run; if one shows as cancelled, re-run it. A tag never moves, so a problem found after it
+ships as the next version. The Homebrew formula never moves back to an older
+version. Trusted publishing is registered for `release.yml` and the `release`
+environment; renaming either breaks publishing until it is re-registered on
+crates.io.
 
-Commit messages on `main` must follow Conventional Commits. Squash-merge
-contributor pull requests and give them a conventional title, because the title
-becomes the commit message. The release pull request is opened by GitHub Actions,
-so its CI runs start only after a maintainer approves them on the pull request.
+On `main`, CI runs only inside the Release run, so a push waits for the release
+before it; when pushes pile up, only the newest is tested and released, and it
+contains the others.
+
+Squash-merge contributor pull requests and give them a conventional title,
+because the title becomes the commit message.
 
 ## Tests
 

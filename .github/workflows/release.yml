@@ -3,13 +3,12 @@ name: Release
 on:
   push:
     branches: [main]
-  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 defaults:
@@ -17,72 +16,39 @@ defaults:
     shell: bash
 
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   plan:
-    if: github.ref == 'refs/heads/main'
+    needs: ci
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
-      tag: ${{ steps.plan.outputs.tag }}
-      pending: ${{ steps.plan.outputs.pending }}
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          persist-credentials: false
-      - name: Release when the version on main has no complete release
-        id: plan
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          version=$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[0].version')
-          tag="v$version"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          skip() { echo "pending=false" >> "$GITHUB_OUTPUT"; exit 0; }
-          if tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha 2>&1); then
-            if [ "$tagged" != "$GITHUB_SHA" ]; then skip; fi
-            status=$(curl -s --retry 3 -o /dev/null -w '%{http_code}' -A "redtab-release ($GITHUB_REPOSITORY)" \
-              "https://crates.io/api/v1/crates/redtab/$version")
-            formula=$(curl -fsSL --retry 3 "https://raw.githubusercontent.com/kapral18/homebrew-tap/main/Formula/redtab.rb")
-            if [ "$status" = 200 ] && grep -qF "/releases/download/$tag/" <<<"$formula"; then skip; fi
-          elif ! grep -qE 'HTTP 4(04|22)' <<<"$tagged"; then
-            echo "::error::Could not look up $tag: $tagged"
-            exit 1
-          elif [[ "$version" == *-* ]]; then
-            echo "::error::Prerelease version $version is not supported"
-            exit 1
-          else
-            latest=$(curl -fsSL --retry 3 -A "redtab-release ($GITHUB_REPOSITORY)" \
-              "https://crates.io/api/v1/crates/redtab" | jq -er .crate.max_version)
-            if [ "$latest" = "$version" ] || [ "$(printf '%s\n%s\n' "$latest" "$version" | sort -V | tail -1)" != "$version" ]; then
-              echo "::error::Version $version is not higher than the latest release $latest"
-              exit 1
-            fi
-          fi
-          echo "pending=true" >> "$GITHUB_OUTPUT"
-
-  release-pr:
-    needs: plan
-    if: needs.plan.outputs.pending != 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: write
-      pull-requests: write
+      version: ${{ steps.next.outputs.version }}
+      tag: ${{ steps.next.outputs.tag }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Install Rust
-        run: rustup toolchain install stable --profile minimal
-      - uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
         with:
-          command: release-pr
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+          tool: git-cliff@2.14.2
+      - name: Next version from commits since the last tag
+        id: next
+        run: |
+          last=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' --exclude '*-*')
+          next=$(git-cliff --bumped-version)
+          if [ "$next" = "$last" ]; then
+            echo "::notice::No feat, fix, perf or breaking commit since $last; nothing to release"
+            exit 0
+          fi
+          echo "version=${next#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=$next" >> "$GITHUB_OUTPUT"
 
   build:
     needs: plan
-    if: needs.plan.outputs.pending == 'true'
+    if: needs.plan.outputs.version != ''
     strategy:
       fail-fast: true
       matrix:
@@ -109,6 +75,13 @@ jobs:
         run: brew list cmake >/dev/null 2>&1 || brew install cmake
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+      - name: Set version
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          awk -v v="$VERSION" '!done && /^version = "/ { $0 = "version = \"" v "\""; done = 1 } 1' Cargo.toml > Cargo.toml.new
+          mv Cargo.toml.new Cargo.toml
+          cargo +stable update --workspace
       - name: Test
         run: cargo +stable test --locked --all-targets -- --test-threads=1
       - name: Build
@@ -179,62 +152,116 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+    outputs:
+      released: ${{ steps.tag.outputs.released }}
     steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
+        with:
+          tool: git-cliff@2.14.2
+      - name: Push release commit and tag
+        id: tag
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            if [ "$(git rev-parse "$TAG^{commit}^")" != "$GITHUB_SHA" ]; then
+              echo "::notice::$TAG was released from another commit; nothing to do"
+              exit 0
+            fi
+            git checkout -q "$TAG"
+          else
+            awk -v v="$VERSION" '!done && /^version = "/ { $0 = "version = \"" v "\""; done = 1 } 1' Cargo.toml > Cargo.toml.new
+            mv Cargo.toml.new Cargo.toml
+            cargo update --workspace
+            git-cliff --tag "$TAG" --output CHANGELOG.md
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.toml Cargo.lock CHANGELOG.md
+            git commit -m "chore(release): $TAG"
+            git tag "$TAG"
+            if ! git push --atomic origin HEAD:main "refs/tags/$TAG"; then
+              main=$(git ls-remote origin refs/heads/main | cut -f1)
+              if [ -n "$main" ] && [ "$main" != "$GITHUB_SHA" ]; then
+                echo "::notice::main moved after this run started; the run for the newer push releases it"
+                exit 0
+              fi
+              echo "::error::Pushing the release commit and $TAG failed"
+              exit 1
+            fi
+          fi
+          echo "released=true" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        if: steps.tag.outputs.released == 'true'
         with:
           path: dist
           merge-multiple: true
       - name: Checksums
+        if: steps.tag.outputs.released == 'true'
         working-directory: dist
         run: sha256sum redtab-*.tar.gz > SHA256SUMS
-      - name: Find an earlier attempt
-        id: existing
+      - name: Find the GitHub release
+        id: state
+        if: steps.tag.outputs.released == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.plan.outputs.tag }}
         run: |
-          state=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq 'if .isDraft then "draft" else "published" end' 2>/dev/null || echo none)
-          echo "state=$state" >> "$GITHUB_OUTPUT"
+          if ! release=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft \
+            --jq .isDraft 2>/dev/null); then
+            echo "state=missing" >> "$GITHUB_OUTPUT"
+          elif [ "$release" = true ]; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+            echo "state=missing" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=complete" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
-        if: steps.existing.outputs.state != 'published'
+        if: steps.state.outputs.state == 'missing'
         with:
           subject-path: dist/redtab-*.tar.gz
-      - name: Publish release
-        if: steps.existing.outputs.state != 'published'
+      - name: Publish GitHub release
+        if: steps.state.outputs.state == 'missing'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.plan.outputs.tag }}
-          STATE: ${{ steps.existing.outputs.state }}
         run: |
-          if [ "$STATE" = draft ]; then
-            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
+          if [ -z "$latest" ] || [ "$(printf '%s\n%s\n' "${latest#v}" "${TAG#v}" | sort -V | tail -1)" = "${TAG#v}" ]; then
+            latest_flag=--latest
+          else
+            latest_flag=--latest=false
           fi
+          git-cliff --current --strip all > notes.md
           gh release create "$TAG" dist/redtab-*.tar.gz dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" --title "$TAG" --generate-notes
+            --verify-tag --title "$TAG" --notes-file notes.md "$latest_flag"
 
   crate:
     needs: [plan, release]
+    if: needs.release.outputs.released == 'true'
     runs-on: ubuntu-24.04
     environment: release
-    timeout-minutes: 30
+    timeout-minutes: 15
     permissions:
       contents: read
       id-token: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
+          ref: ${{ needs.plan.outputs.tag }}
           persist-credentials: false
-      - name: Install build prerequisites
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev pkg-config
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
       - name: Check crates.io
         id: published
         env:
-          TAG: ${{ needs.plan.outputs.tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
           status=$(curl -s --retry 3 -o /dev/null -w '%{http_code}' -A "redtab-release ($GITHUB_REPOSITORY)" \
-            "https://crates.io/api/v1/crates/redtab/${TAG#v}")
+            "https://crates.io/api/v1/crates/redtab/$VERSION")
           case "$status" in
             200) echo "done=true" >> "$GITHUB_OUTPUT" ;;
             404) echo "done=false" >> "$GITHUB_OUTPUT" ;;
@@ -247,10 +274,11 @@ jobs:
         if: steps.published.outputs.done == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo +stable publish --locked
+        run: cargo +stable publish --locked --no-verify
 
   homebrew:
     needs: [plan, release]
+    if: needs.release.outputs.released == 'true'
     runs-on: ubuntu-24.04
     environment: release
     timeout-minutes: 10
@@ -325,7 +353,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if ! git diff --quiet; then
-            git commit -am "redtab ${TAG#v}"
+          git add Formula/redtab.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "redtab ${TAG#v}"
             git push
           fi
