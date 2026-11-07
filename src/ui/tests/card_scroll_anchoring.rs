@@ -165,57 +165,38 @@ fn when_returning_from_fullscreen_detail_a_reloading_card_should_keep_its_scroll
 }
 
 #[test]
-fn when_scrolling_an_iterm2_card_it_should_encode_only_the_visible_image_rows() {
-    let mut app = card_with_image(320, 640);
-    app.tabs[4].feed.posts.push(post_with("tail", Media::None));
-    app.tabs[4].feed.posts.push(post_with("tail2", Media::None));
-    app.image_picker.set_protocol_type(ProtocolType::Iterm2);
-    screen(&mut app, 100, 20);
-    app.scroll_card(3);
-    app.tick_at(std::time::Instant::now() + crate::app::NAV_SETTLE);
+fn when_scrolling_an_iterm2_or_sixel_card_it_should_encode_only_the_visible_image_rows() {
+    for protocol_type in [ProtocolType::Iterm2, ProtocolType::Sixel] {
+        let mut app = card_with_image(320, 640);
+        app.tabs[4].feed.posts.push(post_with("tail", Media::None));
+        app.tabs[4].feed.posts.push(post_with("tail2", Media::None));
+        app.image_picker.set_protocol_type(protocol_type);
+        screen(&mut app, 100, 20);
+        app.scroll_card(3);
+        app.tick_at(std::time::Instant::now() + crate::app::NAV_SETTLE);
 
-    screen(&mut app, 100, 20);
+        screen(&mut app, 100, 20);
 
-    let CardImageSlot::Ready {
-        protocol: Some(protocol),
-        ..
-    } = app.card_images.get("https://i.redd.it/p1.jpeg").unwrap()
-    else {
-        panic!("card protocol");
-    };
-    assert_eq!(protocol.tiles.len(), 1);
-    assert_eq!(protocol.tiles[&(1, 0, 7, 8)].size(), Size::new(8, 7));
-    assert!(matches!(
-        *protocol.tiles[&(1, 0, 7, 8)],
-        crate::card_image::Tile::Image(ratatui_image::protocol::Protocol::ITerm2(_))
-    ));
-}
-
-#[test]
-fn when_scrolling_a_sixel_card_it_should_encode_only_the_visible_image_rows() {
-    let mut app = card_with_image(320, 640);
-    app.tabs[4].feed.posts.push(post_with("tail", Media::None));
-    app.tabs[4].feed.posts.push(post_with("tail2", Media::None));
-    app.image_picker.set_protocol_type(ProtocolType::Sixel);
-    screen(&mut app, 100, 20);
-    app.scroll_card(3);
-    app.tick_at(std::time::Instant::now() + crate::app::NAV_SETTLE);
-
-    screen(&mut app, 100, 20);
-
-    let CardImageSlot::Ready {
-        protocol: Some(protocol),
-        ..
-    } = app.card_images.get("https://i.redd.it/p1.jpeg").unwrap()
-    else {
-        panic!("card protocol");
-    };
-    assert_eq!(protocol.tiles.len(), 1);
-    assert_eq!(protocol.tiles[&(1, 0, 7, 8)].size(), Size::new(8, 7));
-    assert!(matches!(
-        *protocol.tiles[&(1, 0, 7, 8)],
-        crate::card_image::Tile::Image(ratatui_image::protocol::Protocol::Sixel(_))
-    ));
+        let CardImageSlot::Ready {
+            protocol: Some(protocol),
+            ..
+        } = app.card_images.get("https://i.redd.it/p1.jpeg").unwrap()
+        else {
+            panic!("card protocol");
+        };
+        assert_eq!(protocol.tiles.len(), 1, "{protocol_type:?}");
+        assert_eq!(protocol.tiles[&(1, 0, 7, 8)].size(), Size::new(8, 7));
+        let encoded = match &*protocol.tiles[&(1, 0, 7, 8)] {
+            crate::card_image::Tile::Image(ratatui_image::protocol::Protocol::ITerm2(_)) => {
+                ProtocolType::Iterm2
+            }
+            crate::card_image::Tile::Image(ratatui_image::protocol::Protocol::Sixel(_)) => {
+                ProtocolType::Sixel
+            }
+            _ => panic!("unexpected tile for {protocol_type:?}"),
+        };
+        assert_eq!(encoded, protocol_type);
+    }
 }
 
 #[test]

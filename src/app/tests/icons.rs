@@ -48,11 +48,19 @@ fn when_congestion_subscription_icon_is_removed_and_readded_metadata_should_foll
 fn icon_lookup_should_reuse_known_or_pending_metadata_and_allow_retry_after_failure() {
     let (mut app, messages) = app_with_messages(&[]);
     show_thumbnails(&mut app);
-    // A lookup is asked when it joins `icon_lookups`; its answer then arrives.
+    // A new lookup joins `icon_lookups` and its answer arrives; a pending one must not
+    // be asked again, which only an answer would show.
     let load = |app: &mut App| {
         let pending = app.icon_lookups.contains("s");
         app.request_icon("S");
-        if pending || !app.icon_lookups.contains("s") {
+        if pending {
+            return usize::from(
+                messages
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .is_ok(),
+            );
+        }
+        if !app.icon_lookups.contains("s") {
             return 0;
         }
         loop {

@@ -142,29 +142,21 @@ fn when_a_saved_session_expires_it_should_remain_listed_without_exposing_cookies
 }
 
 #[test]
-fn when_an_existing_login_contains_an_older_expired_cookie_it_should_still_upgrade() {
-    let text = format!(
-        "{}www.reddit.com\tFALSE\t/\tTRUE\t1\treddit_session\tolder-token\n",
-        export("first", "reader", "current-token", 0)
-    );
+fn an_account_is_expired_only_when_its_newest_login_cookie_is() {
+    for (current_expiry, expired) in [(0, false), (2, true)] {
+        let text = format!(
+            "{}www.reddit.com\tFALSE\t/\tTRUE\t1\treddit_session\tolder-token\n",
+            export("first", "reader", "current-token", current_expiry)
+        );
 
-    let actual = Vault::decode(Some(text)).unwrap().list().unwrap();
+        let actual = Vault::decode(Some(text)).unwrap().list().unwrap();
 
-    assert_eq!(actual[0].name, "u/reader");
-    assert!(!actual[0].expired);
-}
-
-#[test]
-fn when_all_saved_login_cookies_have_expired_it_should_keep_the_account_available_for_reconnect() {
-    let text = format!(
-        "{}www.reddit.com\tFALSE\t/\tTRUE\t1\treddit_session\tolder-token\n",
-        export("first", "reader", "last-token", 2)
-    );
-
-    let actual = Vault::decode(Some(text)).unwrap().list().unwrap();
-
-    assert_eq!(actual[0].name, "u/reader");
-    assert!(actual[0].expired);
+        assert_eq!(actual[0].name, "u/reader");
+        assert_eq!(
+            actual[0].expired, expired,
+            "current cookie expiry {current_expiry}"
+        );
+    }
 }
 
 #[test]
@@ -250,30 +242,18 @@ fn when_the_native_item_is_already_absent_removal_should_be_idempotent() {
 }
 
 #[test]
-fn when_a_saved_key_disagrees_with_its_account_it_should_reject_the_vault() {
+fn an_inconsistent_or_unknown_vault_is_rejected() {
     let first = export("first", "reader", "private-token", 0);
-    let store = store_with(&[("different", &first)], Some("different"));
-
-    assert!(Vault::decode(store.payload).is_err());
-}
-
-#[test]
-fn when_the_saved_version_is_unknown_it_should_reject_it_without_echoing_values() {
-    let actual = Vault::decode(Some(r#"{"version":2,"active":null,"sessions":{}}"#.into()));
-    assert!(actual.is_err());
-}
-
-#[test]
-fn when_the_active_key_was_deleted_it_should_reject_the_inconsistent_vault() {
-    let actual = Vault::decode(Some(
-        r#"{"version":1,"active":"deleted","sessions":{}}"#.into(),
-    ));
-    assert!(actual.is_err());
-}
-
-#[test]
-fn when_the_native_payload_is_empty_it_should_not_treat_it_as_a_missing_item() {
-    assert!(Vault::decode(Some(String::new())).is_err());
+    let mismatched = store_with(&[("different", &first)], Some("different")).payload;
+    for payload in [
+        mismatched,
+        Some(r#"{"version":2,"active":null,"sessions":{}}"#.into()),
+        Some(r#"{"version":1,"active":"deleted","sessions":{}}"#.into()),
+        // Empty is not a missing item.
+        Some(String::new()),
+    ] {
+        assert!(Vault::decode(payload.clone()).is_err(), "{payload:?}");
+    }
 }
 
 #[test]

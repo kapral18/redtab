@@ -13,7 +13,7 @@ cargo deny check advisories bans licenses sources
 ```
 
 CI runs these on Ubuntu 24.04 and macOS 26 as separate parallel jobs (tests,
-formatting and clippy, and the Rust 1.90.0 minimum-version check), plus
+clippy, and the Rust 1.90.0 minimum-version check; formatting on Ubuntu only), plus
 `cargo deny` on Ubuntu with [deny.toml](../deny.toml). Jobs restore a compile
 cache, and runs on `main` update it. Tests run on the default parallel test
 threads, so a test that measures real time must leave room for a busy runner.
@@ -73,6 +73,15 @@ because the title becomes the commit message.
 - Tests use synthetic data, in-memory HTTP fixtures and Ratatui's TestBackend. They
   never contact Reddit.
 - UI tests cover wide, narrow and short terminals.
+- Each test guards a behavior a user or caller relies on, with its own check. Don't
+  add one that repeats another test's check or pins private fields or wording;
+  extend that test's table instead.
+- Don't sleep for timing logic: pass the time (`App::tick_at`), age content with
+  the test clock in `ui`, or shrink the wait or budget in the test. Real waits are
+  for real processes, sockets and file locks, and stay as short as their check
+  allows.
+- Keep inputs small: use the smallest image, font or budget that still triggers the
+  behavior.
 - Check OS prompts, browser handoffs and video/audio playback by hand.
 
 ## Where things live

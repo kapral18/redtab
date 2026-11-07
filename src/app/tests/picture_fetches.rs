@@ -250,10 +250,13 @@ fn a_picture_asked_for_again_while_still_queued_should_be_fetched_once() {
     app.drop_text_picture(url);
     app.request_text_picture(url);
 
+    // Wait for the first answer, then briefly for a second one.
     let mut fetched = 0;
-    while let Ok(msg) = messages.recv_timeout(std::time::Duration::from_secs(1)) {
+    let mut wait = std::time::Duration::from_secs(5);
+    while let Ok(msg) = messages.recv_timeout(wait) {
         if matches!(&msg, Msg::Image { url: u, .. } if u == url) {
             fetched += 1;
+            wait = std::time::Duration::from_millis(200);
         }
         app.on_msg(msg);
     }

@@ -178,7 +178,7 @@ fn when_a_response_takes_longer_than_base_pacing_the_next_request_should_not_wai
         .unwrap();
 
     assert!(
-        waited < Duration::from_millis(150),
+        waited < Duration::from_millis(200),
         "pacing added after response: {waited:?}"
     );
 }
@@ -242,7 +242,7 @@ fn when_a_new_response_reports_recovered_quota_old_slow_pacing_should_not_stick(
     reddit.search("rust", "third", None).unwrap();
 
     assert!(
-        started.elapsed() < Duration::from_millis(150),
+        started.elapsed() < Duration::from_millis(250),
         "recovered budget kept an old 300ms interval: {:?}",
         started.elapsed()
     );

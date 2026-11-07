@@ -145,94 +145,70 @@ fn when_compact_thumbnails_are_pending_their_reserved_slots_should_show_activity
 }
 
 #[test]
-fn when_a_cached_thumbnail_is_refreshing_the_footer_should_show_activity_and_keep_pixels() {
-    let mut app = refreshing_thumbnail_app();
+fn a_cached_thumbnail_refresh_shows_footer_activity_only_while_it_runs_on_screen() {
+    const URL: &str = "https://i.redd.it/p1.jpeg";
+    // (case, change, pixels shown, footer activity)
+    type Case = (&'static str, fn(&mut App), bool, bool);
+    let cases: [Case; 7] = [
+        ("refreshing", |_| {}, true, true),
+        (
+            "skipped, then back on screen",
+            |app| app.on_msg(Msg::ThumbSkipped { url: URL.into() }),
+            true,
+            true,
+        ),
+        (
+            "refresh finished",
+            |app| {
+                app.on_msg(Msg::Thumb {
+                    url: URL.into(),
+                    result: Ok(image::DynamicImage::new_rgb8(32, 32)),
+                });
+            },
+            true,
+            false,
+        ),
+        (
+            "refresh failed",
+            |app| {
+                app.on_msg(Msg::Thumb {
+                    url: URL.into(),
+                    result: Err("offline".into()),
+                });
+            },
+            true,
+            false,
+        ),
+        ("images off", |app| app.show_images = false, false, false),
+        (
+            "no native graphics",
+            |app| app.image_picker = Picker::halfblocks(),
+            false,
+            false,
+        ),
+        (
+            "skipped and off screen",
+            |app| {
+                app.on_msg(Msg::ThumbSkipped { url: URL.into() });
+                app.tabs[4].feed.posts.clear();
+            },
+            false,
+            false,
+        ),
+    ];
+    for (case, change, pixels, activity) in cases {
+        let mut app = refreshing_thumbnail_app();
+        change(&mut app);
 
-    let actual = first_screen(&mut app, 100, 20);
+        let actual = first_screen(&mut app, 100, 20);
 
-    assert!(actual.contains('\u{10EEEE}'), "{actual}");
-    assert!(
-        actual.lines().last().unwrap().contains("⠋ images"),
-        "{actual}"
-    );
-}
-
-#[test]
-fn when_a_skipped_thumbnail_returns_its_first_frame_should_show_resumed_refresh_activity() {
-    let mut app = refreshing_thumbnail_app();
-    app.on_msg(Msg::ThumbSkipped {
-        url: "https://i.redd.it/p1.jpeg".into(),
-    });
-
-    let actual = first_screen(&mut app, 100, 20);
-
-    assert!(actual.contains('\u{10EEEE}'), "{actual}");
-    assert!(
-        actual.lines().last().unwrap().contains("⠋ images"),
-        "{actual}"
-    );
-}
-
-#[test]
-fn when_a_cached_thumbnail_refresh_finishes_the_footer_should_stop_activity() {
-    let mut app = refreshing_thumbnail_app();
-    app.on_msg(Msg::Thumb {
-        url: "https://i.redd.it/p1.jpeg".into(),
-        result: Ok(image::DynamicImage::new_rgb8(32, 32)),
-    });
-
-    let actual = first_screen(&mut app, 100, 20);
-
-    assert!(actual.contains('\u{10EEEE}'), "{actual}");
-    assert!(
-        !actual.lines().last().unwrap().contains("⠋ images"),
-        "{actual}"
-    );
-}
-
-#[test]
-fn when_a_cached_thumbnail_refresh_fails_the_footer_should_stop_activity_and_keep_pixels() {
-    let mut app = refreshing_thumbnail_app();
-    app.on_msg(Msg::Thumb {
-        url: "https://i.redd.it/p1.jpeg".into(),
-        result: Err("offline".into()),
-    });
-
-    let actual = first_screen(&mut app, 100, 20);
-
-    assert!(actual.contains('\u{10EEEE}'), "{actual}");
-    assert!(
-        !actual.lines().last().unwrap().contains("⠋ images"),
-        "{actual}"
-    );
-}
-
-#[test]
-fn when_images_are_disabled_thumbnail_refresh_should_not_show_activity() {
-    let mut app = refreshing_thumbnail_app();
-    app.show_images = false;
-
-    let actual = first_screen(&mut app, 100, 20);
-
-    assert!(!actual.contains('\u{10EEEE}'), "{actual}");
-    assert!(
-        !actual.lines().last().unwrap().contains("⠋ images"),
-        "{actual}"
-    );
-}
-
-#[test]
-fn when_thumbnails_are_unsupported_their_refresh_should_not_show_activity() {
-    let mut app = refreshing_thumbnail_app();
-    app.image_picker = Picker::halfblocks();
-
-    let actual = first_screen(&mut app, 100, 20);
-
-    assert!(!actual.contains('\u{10EEEE}'), "{actual}");
-    assert!(
-        !actual.lines().last().unwrap().contains("⠋ images"),
-        "{actual}"
-    );
+        assert_eq!(actual.contains('\u{10EEEE}'), pixels, "{case}: {actual}");
+        assert_eq!(
+            actual.lines().last().unwrap().contains("⠋ images"),
+            activity,
+            "{case}: {actual}"
+        );
+    }
 }
 
 #[test]
@@ -390,21 +366,4 @@ fn when_a_short_card_view_loads_pagination_it_should_keep_the_footer_status_visi
 
     assert!(actual.lines().last().unwrap().contains('⠋'), "{actual}");
     assert!(actual.contains("Existing"), "{actual}");
-}
-
-#[test]
-fn when_a_skipped_thumbnail_stays_offscreen_the_footer_should_not_show_refresh_activity() {
-    let mut app = refreshing_thumbnail_app();
-    app.on_msg(Msg::ThumbSkipped {
-        url: "https://i.redd.it/p1.jpeg".into(),
-    });
-    app.tabs[4].feed.posts.clear();
-
-    let actual = first_screen(&mut app, 100, 20);
-
-    assert!(!actual.contains('\u{10EEEE}'), "{actual}");
-    assert!(
-        !actual.lines().last().unwrap().contains("⠋ images"),
-        "{actual}"
-    );
 }

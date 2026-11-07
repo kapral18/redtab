@@ -37,7 +37,11 @@ jobs:
         env:
           TOOLCHAIN: ${{ matrix.task == 'msrv' && '1.90.0' || 'stable' }}
         run: |
-          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+          if [ "$TOOLCHAIN" = stable ]; then
+            rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          else
+            rustup toolchain install "$TOOLCHAIN" --profile minimal
+          fi
           rustup default "$TOOLCHAIN"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:

@@ -246,53 +246,52 @@ mod tests {
     }
 
     #[test]
-    fn when_linux_confirms_no_matching_items_it_should_return_a_missing_store() {
-        let (_lookup, lookup) = read_probe("", "", 1);
-        let (_search, search) = read_probe("", "", 0);
-        assert_eq!(read_with(lookup, search).unwrap(), None);
+    fn linux_reads_tell_a_missing_store_from_one_they_cannot_read() {
+        // (lookup output, stderr, exit), then the search's, then the result.
+        type Probe = (&'static str, &'static str, u8);
+        type Expected = Result<Option<&'static [u8]>, bool>;
+        let cases: [(Probe, Option<Probe>, Expected); 5] = [
+            (("", "", 1), Some(("", "", 0)), Ok(None)),
+            (
+                ("private-payload", "", 0),
+                None,
+                Ok(Some(b"private-payload")),
+            ),
+            // A locked match is not a new store; diagnostics are never echoed.
+            (
+                ("", "", 1),
+                Some(("[item/1]\nlabel = Redtab", "locked-private-diagnostic", 0)),
+                Err(true),
+            ),
+            (("", "private-provider-diagnostic", 1), None, Err(true)),
+            (("", "", 1), Some(("", "", 1)), Err(false)),
+        ];
+        for ((output, stderr, exit), search, expected) in cases {
+            let (_lookup, lookup) = read_probe(output, stderr, exit);
+            let (_search, search) = match search {
+                Some((output, stderr, exit)) => {
+                    let (guard, command) = read_probe(output, stderr, exit);
+                    (Some(guard), command)
+                }
+                None => (None, Command::new("/does/not/exist")),
+            };
+            let actual = read_with(lookup, search);
+            match expected {
+                Ok(payload) => assert_eq!(actual.unwrap(), payload.map(<[u8]>::to_vec)),
+                Err(missing) => {
+                    let error = actual.unwrap_err().to_string();
+                    assert!(!error.contains("private"), "{error}");
+                    if missing {
+                        assert_eq!(error, MISSING);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
-    fn when_linux_has_a_locked_matching_item_it_should_not_treat_it_as_a_new_store() {
-        let (_lookup, lookup) = read_probe("", "", 1);
-        let (_search, search) =
-            read_probe("[item/1]\nlabel = Redtab", "locked-private-diagnostic", 0);
-        let actual = read_with(lookup, search).unwrap_err().to_string();
-        assert_eq!(actual, MISSING);
-        assert!(!actual.contains("private-diagnostic"));
-    }
-
-    #[test]
-    fn when_linux_lookup_succeeds_it_should_read_the_payload_without_searching_again() {
-        let (_lookup, lookup) = read_probe("private-payload", "", 0);
-        let search = Command::new("/does/not/exist");
-        assert_eq!(
-            read_with(lookup, search).unwrap(),
-            Some(b"private-payload".to_vec())
-        );
-    }
-
-    #[test]
-    fn when_linux_reports_a_lookup_error_it_should_not_echo_diagnostics_or_assume_absence() {
-        let (_lookup, lookup) = read_probe("", "private-provider-diagnostic", 1);
-        let search = Command::new("/does/not/exist");
-        assert_eq!(read_with(lookup, search).unwrap_err().to_string(), MISSING);
-    }
-
-    #[test]
-    fn when_linux_search_fails_it_should_not_assume_absence() {
-        let (_lookup, lookup) = read_probe("", "", 1);
-        let (_search, search) = read_probe("", "", 1);
-        assert!(read_with(lookup, search).is_err());
-    }
-
-    #[test]
-    fn when_a_payload_fits_secret_tools_input_buffer_it_should_be_accepted() {
+    fn secret_tool_payloads_must_fit_its_input_buffer() {
         assert!(check_secret_tool_size(&vec![b'x'; 8192]).is_ok());
-    }
-
-    #[test]
-    fn when_a_payload_would_be_truncated_by_secret_tool_it_should_be_rejected_before_writing() {
         assert!(check_secret_tool_size(&vec![b'x'; 8193]).is_err());
     }
 

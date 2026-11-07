@@ -107,7 +107,11 @@ fn islands_loading_or_joining_above_keep_the_selected_island_in_place() {
 fn when_subscriptions_are_loading_empty_or_failed_all_subs_should_explain_the_state() {
     let mut app = app(&[]);
     app.all_subs.loading = true;
-    assert!(screen(&mut app, 80, 24).contains("Loading subscriptions"));
+    let loading = screen(&mut app, 80, 24);
+    assert!(
+        loading.contains("Loading subscriptions") && loading.contains('⠋'),
+        "the shared spinner: {loading}"
+    );
     app.all_subs.loading = false;
     assert!(screen(&mut app, 80, 24).contains("No joined communities"));
     app.all_subs.error = Some("offline".into());
@@ -115,19 +119,6 @@ fn when_subscriptions_are_loading_empty_or_failed_all_subs_should_explain_the_st
     assert!(
         failed.contains("Could not load subscriptions") && failed.contains("press r"),
         "{failed}"
-    );
-}
-
-#[test]
-fn when_subscriptions_first_load_the_initial_loader_should_use_the_shared_spinner() {
-    let mut app = app(&[]);
-    app.all_subs.loading = true;
-
-    let actual = screen(&mut app, 100, 30);
-
-    assert!(
-        actual.contains("Loading subscriptions") && actual.contains('⠋'),
-        "{actual}"
     );
 }
 

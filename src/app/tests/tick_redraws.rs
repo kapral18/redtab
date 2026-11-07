@@ -31,35 +31,45 @@ fn when_a_visible_append_loader_is_due_tick_should_advance_its_rendered_frame() 
 }
 
 #[test]
-fn when_the_page_finishes_tick_should_stop_the_append_loader_before_the_next_draw() {
-    let mut app = app_with_pending_pagination();
-    app.loading_since = Some(Instant::now() - Duration::from_millis(100));
-    app.on_msg(Msg::Feed {
-        tab: app.tabs[4].id,
-        generation: app.tabs[4].feed.generation,
-        append: true,
-        result: Ok(listing("s", &["next"], None)),
-    });
+fn tick_should_stop_the_append_loader_once_nothing_shows_it() {
+    type Case = (&'static str, fn(&mut App));
+    let cases: [Case; 4] = [
+        ("page arrived", |app| {
+            app.on_msg(Msg::Feed {
+                tab: app.tabs[4].id,
+                generation: app.tabs[4].feed.generation,
+                append: true,
+                result: Ok(listing("s", &["next"], None)),
+            });
+        }),
+        ("page failed", |app| {
+            app.on_msg(Msg::Feed {
+                tab: app.tabs[4].id,
+                generation: app.tabs[4].feed.generation,
+                append: true,
+                result: Err("offline".into()),
+            });
+        }),
+        ("popup open", |app| {
+            app.overlay = Some(Overlay::Picker(PickerState::default()));
+        }),
+        ("scrolled out of view", |app| app.loading_drawn(false)),
+    ];
+    for (case, apply) in cases {
+        let mut app = app_with_pending_pagination();
+        app.loading_since = Some(Instant::now() - Duration::from_millis(100));
+        apply(&mut app);
 
-    app.tick();
+        app.tick();
 
-    assert_eq!(app.loading_frame, 0);
-}
-
-#[test]
-fn when_the_page_fails_tick_should_stop_the_append_loader_before_the_next_draw() {
-    let mut app = app_with_pending_pagination();
-    app.loading_since = Some(Instant::now() - Duration::from_millis(100));
-    app.on_msg(Msg::Feed {
-        tab: app.tabs[4].id,
-        generation: app.tabs[4].feed.generation,
-        append: true,
-        result: Err("offline".into()),
-    });
-
-    app.tick();
-
-    assert_eq!(app.loading_frame, 0);
+        assert_eq!(app.loading_frame, 0, "{case}");
+        if case == "scrolled out of view" {
+            assert!(
+                app.loading_since.is_none(),
+                "an unseen loader stops for good"
+            );
+        }
+    }
 }
 
 #[test]
@@ -82,17 +92,6 @@ fn a_waiting_prefix_should_wake_and_redraw_once_then_cancel_on_context_change() 
 }
 
 #[test]
-fn when_a_popup_is_open_tick_should_pause_the_append_loader() {
-    let mut app = app_with_pending_pagination();
-    app.loading_since = Some(Instant::now() - Duration::from_millis(100));
-    app.overlay = Some(Overlay::Picker(PickerState::default()));
-
-    app.tick();
-
-    assert_eq!(app.loading_frame, 0);
-}
-
-#[test]
 fn when_the_append_loader_is_not_due_tick_should_not_advance_it_or_spin() {
     let mut app = app_with_pending_pagination();
     app.loading_drawn(true);
@@ -101,16 +100,4 @@ fn when_the_append_loader_is_not_due_tick_should_not_advance_it_or_spin() {
 
     assert_eq!(app.loading_frame, 0);
     assert!(!app.wake_in().is_zero());
-}
-
-#[test]
-fn when_the_append_loader_leaves_the_viewport_tick_should_stop_advancing_it() {
-    let mut app = app_with_pending_pagination();
-    app.loading_since = Some(Instant::now() - Duration::from_millis(100));
-    app.loading_drawn(false);
-
-    app.tick();
-
-    assert_eq!(app.loading_frame, 0);
-    assert!(app.loading_since.is_none());
 }

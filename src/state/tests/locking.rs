@@ -93,10 +93,7 @@ fn a_lock_in_use_gives_up_after_the_wait_and_stays() {
     drop(held);
 
     let message = refused.expect("a second holder must be refused");
-    assert!(
-        waited >= lock_wait() && waited < lock_wait() * 3,
-        "{waited:?}"
-    );
+    assert!(waited >= lock_wait() && waited < LOCK_WAIT, "{waited:?}");
     assert!(still_held);
     assert!(!message.contains("delete"), "{message}");
 }
@@ -128,10 +125,7 @@ fn a_save_gives_up_when_another_instance_holds_the_lock() {
     let after = state.save(&path, 1);
 
     assert!(saved.unwrap_err().to_string().contains("still saving"));
-    assert!(
-        waited >= lock_wait() && waited < lock_wait() * 3,
-        "{waited:?}"
-    );
+    assert!(waited >= lock_wait() && waited < LOCK_WAIT, "{waited:?}");
     assert!(after.is_ok(), "the lock is free again");
 }
 

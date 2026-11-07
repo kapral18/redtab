@@ -164,13 +164,15 @@ mod tests {
     }
 
     #[test]
-    fn when_native_preferences_are_incomplete_they_should_not_silently_become_defaults() {
-        assert!(parse("<settings-preferences initialstate='{\"identity\":{\"preferences\":{\"isNsfwContentShown\":true}}}'></settings-preferences>","readerid").is_err());
-    }
-
-    #[test]
-    fn when_native_preferences_are_for_another_account_they_should_be_rejected() {
-        assert!(parse(&markup(true, true), "someoneelse").is_err());
+    fn native_preferences_load_only_when_complete_and_for_this_account() {
+        let incomplete = "<settings-preferences initialstate='{\"identity\":{\"preferences\":{\"isNsfwContentShown\":true}}}'></settings-preferences>";
+        for (html, account) in [
+            (incomplete.to_string(), "readerid"),
+            (markup(true, true), "someoneelse"),
+            ("<html>Sign in</html>".to_string(), "readerid"),
+        ] {
+            assert!(parse(&html, account).is_err(), "{account}: {html}");
+        }
     }
 
     #[test]
@@ -182,11 +184,6 @@ mod tests {
         let actual = parse(&html, "readerid").unwrap();
         assert!(!actual.show_nsfw);
         assert!(!actual.mature_content_editable);
-    }
-
-    #[test]
-    fn when_native_markup_has_a_login_page_it_should_not_claim_account_preferences_loaded() {
-        assert!(parse("<html>Sign in</html>", "readerid").is_err());
     }
 
     #[test]
