@@ -4,13 +4,18 @@
 
 ## Install
 
-Build requirements: Rust 1.90+, CMake, a C/C++ compiler and libclang.
-On macOS, install the Command Line Tools and CMake. On Debian/Ubuntu, the build
-packages are `build-essential cmake clang libclang-dev pkg-config`.
+Homebrew (macOS and Linux) installs the release build for your platform:
 
 ```sh
-cargo install --git https://github.com/kapral18/redtab --locked
-redtab
+brew install kapral18/tap/redtab
+```
+
+To build from crates.io instead, you need Rust 1.90+, CMake, a C/C++ compiler and
+libclang. On macOS, install the Command Line Tools and CMake. On Debian/Ubuntu, the
+build packages are `build-essential cmake clang libclang-dev pkg-config`.
+
+```sh
+cargo install redtab --locked
 ```
 
 On first launch, press `Enter` on **Sign in in a new login window** (needs Chrome,

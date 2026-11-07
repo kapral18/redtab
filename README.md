@@ -26,15 +26,16 @@ No Reddit API registration is needed.
 
 ## Get started
 
-Download a build for macOS or Linux (x86_64, arm64) from
-[Releases](https://github.com/kapral18/redtab/releases) and
-[verify it](docs/guide.md#prebuilt-binaries), or build from source with Rust 1.90+,
-CMake, a C/C++ compiler and libclang:
+Install with Homebrew on macOS or Linux:
 
 ```sh
-cargo install --git https://github.com/kapral18/redtab --locked
+brew install kapral18/tap/redtab
 redtab
 ```
+
+Or download a build from [Releases](https://github.com/kapral18/redtab/releases)
+and [verify it](docs/guide.md#prebuilt-binaries), or build from source with
+Rust 1.90+, CMake, a C/C++ compiler and libclang: `cargo install redtab --locked`.
 
 On first launch, **Connect Reddit** preselects **Sign in in a new login window**
 (needs Chrome, Chromium, Brave or Edge). Press `Enter`, sign in there and confirm

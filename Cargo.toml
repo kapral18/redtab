@@ -6,7 +6,10 @@ rust-version = "1.90"
 description = "Terminal Reddit reader with tabs and browser-session sign-in"
 license = "MIT"
 repository = "https://github.com/kapral18/redtab"
-publish = false
+readme = "README.md"
+keywords = ["reddit", "tui", "terminal", "ratatui", "cli"]
+categories = ["command-line-utilities"]
+exclude = [".github/", "deny.toml", "docs/"]
 
 [dependencies]
 anyhow = "1"
