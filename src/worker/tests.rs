@@ -26,23 +26,18 @@ fn next_message(messages: &Receiver<Msg>) -> Msg {
     }
 }
 
-fn data_request(server: &tiny_http::Server) -> Option<tiny_http::Request> {
-    loop {
-        let request = server
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap()?;
-        if request.method() == &tiny_http::Method::Head {
-            request.respond(tiny_http::Response::empty(200)).unwrap();
-        } else {
-            return Some(request);
-        }
-    }
+fn data_request(
+    server: &crate::reddit::tests::served::Server,
+) -> Option<crate::reddit::tests::served::Request> {
+    server
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap()
 }
 
-fn poster_reply(request: tiny_http::Request) {
+fn poster_reply(request: crate::reddit::tests::served::Request) {
     let png = encode_png(&DynamicImage::new_rgb8(2, 2)).unwrap();
     request
-        .respond(tiny_http::Response::from_data(png))
+        .respond(crate::reddit::tests::served::Response::from_data(png))
         .unwrap();
 }
 
@@ -72,6 +67,8 @@ fn queued_image_pool() -> (Pool, Receiver<Work>) {
                 group_cache: sender.clone(),
                 images: sender.clone(),
                 thumbs: sender.clone(),
+                foreground_frames: sender.clone(),
+                frames: sender.clone(),
                 icons: sender,
             },
             wanted: Arc::default(),

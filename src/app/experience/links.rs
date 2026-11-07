@@ -6,6 +6,12 @@ impl App {
         self.pool.want_experience(None);
     }
 
+    /// Closes the overlay with its screens, so the next menu starts on an empty stack.
+    pub(crate) fn leave_experience(&mut self) {
+        self.clear_experience();
+        self.overlay = None;
+    }
+
     pub fn show_open_link(&mut self) {
         if self.experience.writing() {
             return;

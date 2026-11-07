@@ -177,7 +177,7 @@ pub(super) fn handle_overlay(app: &mut App, overlay: Overlay, key: KeyEvent) -> 
                 }
                 KeyCode::Char('H') => Some(Sort::Hot),
                 KeyCode::Char('b') if sorts.contains(&Sort::Best) => Some(Sort::Best),
-                KeyCode::Char('n') => Some(Sort::New),
+                KeyCode::Char('n') if sorts.contains(&Sort::New) => Some(Sort::New),
                 KeyCode::Char('t') => Some(Sort::Top),
                 KeyCode::Char('r') if sorts.contains(&Sort::Rising) => Some(Sort::Rising),
                 KeyCode::Char('c') => Some(Sort::Controversial),

@@ -311,7 +311,7 @@ impl Plan {
         let lock = options
             .open(lock_path)
             .context("Cannot open config save lock")?;
-        lock.try_lock().context("Config is busy; retry saving")?;
+        super::store::wait_for_save_lock(&lock)?;
         self.source.unchanged()?;
         self.target.unchanged()?;
         if self.tool.source(&self.target.path)?.as_deref() != Some(&self.source.path) {

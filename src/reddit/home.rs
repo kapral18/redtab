@@ -24,18 +24,20 @@ pub(super) struct Page {
 }
 
 pub(super) fn url(api: &Url, cursor: &str) -> Result<Url> {
-    let url = api
-        .join(cursor)
-        .map_err(|_| anyhow::anyhow!("invalid Home cursor"))?;
-    if url.origin() != api.origin()
-        || url.path() != PATH
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
-        bail!("invalid Home cursor origin or path");
-    }
-    Ok(url)
+    cursor_url(api, cursor, PATH)
+        .ok_or_else(|| anyhow::anyhow!("invalid Home cursor origin or path"))
+}
+
+/// A next-page link from a page Reddit rendered, kept to `path` on the session's origin:
+/// it is fetched with the session cookies.
+pub(in crate::reddit) fn cursor_url(api: &Url, cursor: &str, path: &str) -> Option<Url> {
+    let url = api.join(cursor).ok()?;
+    (url.origin() == api.origin()
+        && url.path() == path
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none())
+    .then_some(url)
 }
 
 /// Publish only closed cards; the HTML tokenizer keeps quoted tags, comments and

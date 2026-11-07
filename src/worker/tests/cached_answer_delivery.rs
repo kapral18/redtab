@@ -296,16 +296,11 @@ fn when_a_feed_ends_with_incomplete_json_it_should_publish_posts_without_caching
     let (pool, messages) = Pool::start(reddit, 3, Some(Cache::new(dir.path().to_path_buf())));
     pool.submit(job);
     let request = data_request(&server).unwrap();
-    let mut writer = request.into_writer();
     let body = r#"{"kind":"Listing","data":{"children":[{"kind":"t3","data":{"id":"arrived","title":"arrived","subreddit":"s","permalink":"/comments/arrived/"}},"#;
-    write!(
-        writer,
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    )
-    .unwrap();
-    writer.flush().unwrap();
-    drop(writer);
+    request
+        .stream(Some(body.len()))
+        .write_all(body.as_bytes())
+        .unwrap();
 
     let progress = next_message(&messages);
     let terminal = next_message(&messages);

@@ -17,7 +17,7 @@ pub enum TabKind {
     Home,
     Bookmarks,
     AllSubs,
-    /// Live search over posts, communities and people; Explore when the query is empty.
+    /// Live search over posts, communities, comments, media and people; Explore when the query is empty.
     Search,
     /// `pinned` tabs come from subscriptions; others were opened with the picker.
     Subreddit {
@@ -54,6 +54,12 @@ impl Tab {
             &[Sort::New, Sort::Hot, Sort::Top, Sort::Controversial]
         } else if matches!(self.kind, TabKind::Home) {
             &Sort::ALL
+        } else if self
+            .subreddit()
+            .is_some_and(|name| name.eq_ignore_ascii_case("all"))
+        {
+            // Reddit refuses r/all New and Rising on every host.
+            &[Sort::Hot, Sort::Top, Sort::Controversial]
         } else {
             &Sort::ALL[1..]
         }
@@ -91,7 +97,6 @@ pub struct Group {
     pub(crate) stream: Option<Source>,
     /// The latest first page while it ranks unseen posts above shown ones; `r` applies it.
     pub arrivals: Option<Vec<Post>>,
-    pub(crate) stable_arrivals: bool,
     /// `r` asked for this group: its next live answer applies whole.
     pub manual: bool,
 }
@@ -103,7 +108,6 @@ impl Group {
             return false;
         };
         self.posts = posts;
-        self.stable_arrivals = false;
         true
     }
 }
@@ -144,18 +148,6 @@ pub(super) fn thread_roots(comments: &[Comment]) -> &[Comment] {
         [root] if root.id.starts_with(THREAD_ROOT) => &root.replies,
         _ => comments,
     }
-}
-
-pub(super) fn island_changed(config: &Config, shown: &[Post], incoming: &[Post]) -> bool {
-    let ids = |posts: &[Post]| {
-        config
-            .visible(posts)
-            .filter(|post| !post.stickied)
-            .take(config.all_subs_posts_per_group)
-            .map(|post| post.id.clone())
-            .collect::<Vec<_>>()
-    };
-    ids(shown) != ids(incoming)
 }
 
 /// Islands never show pinned posts, so they lead with their first unpinned one.
@@ -365,8 +357,15 @@ impl App {
             | TabKind::User {
                 followed: false, ..
             } => {
+                // A feed opened beside the Search results closes back to them.
+                let from_search = self.search.opened_feed == Some(self.active_tab().id);
                 self.tabs.remove(self.active);
-                self.enter_tab(self.active.min(self.tabs.len() - 1), false);
+                let next = if from_search {
+                    SEARCH_TAB
+                } else {
+                    self.active.min(self.tabs.len() - 1)
+                };
+                self.enter_tab(next, false);
             }
             TabKind::User { followed: true, .. } => {
                 self.info("Following this user — press SPC m to unfollow")

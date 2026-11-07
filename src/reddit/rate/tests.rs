@@ -19,9 +19,12 @@ fn quota(remaining: &str, reset: &str) -> (Rate, Url) {
         headers: headers.clone(),
     });
     let transport = Transport::new().unwrap();
-    let response = transport::wait(transport.client.get(&fixture.base).send(), None)
-        .unwrap()
-        .unwrap();
+    let response = transport::wait(
+        transport::send(transport.client.get(&fixture.base), None),
+        None,
+    )
+    .unwrap()
+    .unwrap();
     let rate = Rate::new(Duration::ZERO);
     let url = Url::parse(&fixture.base).unwrap();
     rate.observe(&response, &url, Instant::now(), 0, 0);

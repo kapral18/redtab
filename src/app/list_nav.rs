@@ -82,10 +82,12 @@ impl App {
         }
         let feed = &tab.feed;
         let len = self.config.visible(&feed.posts).count();
+        // A load in progress only delays the next page: it is asked for once that answers.
+        if feed.loading() || feed.loading_more() || feed.receiving() {
+            self.list_prefetch = Some((tab.id, last_visible));
+            return;
+        }
         if feed.after.is_none()
-            || feed.loading()
-            || feed.loading_more()
-            || feed.receiving()
             || !feed.shows_current_query()
             || feed.pages.iter().any(|page| page.cursor == feed.after)
             || feed.page_failed()

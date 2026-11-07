@@ -5,49 +5,49 @@
 ## Connect Reddit
 
 1. Sign in to Reddit in your browser.
-2. Start redtab and select that browser profile in **Connect Reddit**.
-3. Allow OS credential access if prompted.
-4. Check the verified username, then press `Enter` to save. `Esc` cancels.
+2. Start redtab and pick that browser profile in **Connect Reddit**.
+3. Allow OS credential access if asked.
+4. Check the username and press `Enter` to save. `Esc` cancels.
 
-redtab imports the session without a browser extension. Your browser can stay
-closed afterward. Sessions are not renewed or reimported in the background.
+redtab copies the session once; the browser can stay closed afterward.
+It does not renew or reimport the session in the background.
 
-Supported browsers on macOS/Linux: Chrome, Chromium, Firefox, Brave, Edge, Arc,
-Zen and LibreWolf. Dia is also supported on macOS. The browser's session store
-must be accessible; cookies held only in memory may be unavailable. A profile
-with conflicting Reddit sessions is rejected.
+Supported on macOS and Linux: Chrome, Chromium, Firefox, Brave, Edge, Zen and
+LibreWolf. Arc and Dia are supported only on macOS.
 
-On macOS, allow Keychain access. On Linux, install `secret-tool` and unlock
-Secret Service/KWallet before importing.
+- macOS: allow Keychain access.
+- Linux: saved logins require `secret-tool` and an unlocked Secret Service provider.
+  Chromium import may separately need Secret Service or KWallet to decrypt cookies.
 
-If import fails, choose **Open a separate Reddit login window**. This needs a
-Chrome/Chromium-compatible browser. Complete sign-in and confirm the verified
-account in redtab. The temporary profile is closed and removed on completion or
-cancellation. Browser challenges can still prevent sign-in.
-The separate window communicates over private inherited pipes; it does not open
-a browser debugging TCP port.
+### If import fails
 
-## Manage saved accounts
+Choose **Open a separate Reddit login window** (requires Chrome, Chromium, Brave
+or Edge). Sign in there, then confirm the account in redtab. The temporary profile
+is deleted afterward.
 
-Press `SPC p a` to open **Accounts**. Use `j`/`k` or the arrows to select a row.
+Import can also fail when:
 
-| Action | Control | Result |
-| --- | --- | --- |
-| Switch | `Enter` on an account | Verify and restore that account's bookmarks and history |
-| Add | `a` or **Add account** | Import a browser session and confirm its username |
-| Reconnect | `r` on an account | Reimport an expired session; the current account keeps its reading position |
-| Remove | `d`, then `Enter` | Delete the saved login; removing the active one also disconnects redtab |
+- the browser keeps cookies only in memory, or
+- the profile holds more than one Reddit session.
 
-Failed verification, saving or removal keeps the current connection. Switching
-waits for pending Reddit writes. Removing a login leaves bookmarks, history,
-caches and the browser session intact.
+## Manage accounts
 
-Startup restores the last saved account. **Existing connection** verifies an
-older login whose account identity has not been saved.
+Press `SPC p a`.
 
-Credentials are stored in macOS Keychain or Linux Secret Service. The vault holds
-up to 32 accounts and 4 MiB; Linux's `secret-tool` also limits the encoded entry
-to 8 KiB. An import that exceeds a limit leaves saved logins intact.
+| Key | Action |
+| --- | --- |
+| `Enter` | Switch to the selected account |
+| `a` | Add an account |
+| `r` | Reconnect an expired session |
+| `d`, then `Enter` | Remove the saved login |
+
+- Switching restores that account's bookmarks and history.
+- A failed switch, save or removal keeps the current connection.
+- Removing a login keeps bookmarks, history, cache and the browser session.
+  Removing the active account disconnects redtab.
+- Startup restores the last account.
+- Up to 32 accounts can be saved. On Linux, the encoded data for all saved logins
+  must also fit `secret-tool`'s 8 KiB input limit.
 
 ## Sign in from the command line
 
@@ -57,58 +57,77 @@ redtab --signin --browser firefox --profile Work
 redtab --signin --browser dia --profile Default  # macOS
 ```
 
-`--profile` requires `--browser`; both require `--signin`. Sign-in cannot be
-combined with `--check`, `--config` or `--subreddit`.
+`--profile` needs `--browser`. `--signin` cannot be combined with `--check`,
+`--config` or `--subreddit`.
 
-To import an existing Netscape cookie export, include HttpOnly cookies and a valid
-`reddit_session`. Keep cookie values out of shell arguments, terminal output and logs.
+To import a Netscape cookie export, pipe it in. Include `reddit_session` and enable
+HttpOnly cookies in the export:
 
 ```sh
 redtab --signin < /path/to/your/reddit-cookies.txt
 ```
 
-Piped imports verify the account before saving it. Browser/profile selection
-requires an interactive terminal.
+Keep cookie values out of shell arguments and logs.
+
+## Connection recovery
+
+- If Reddit requires sign-in, connect with `SPC p a`.
+- For HTTP 403, check sign-in and content access in your browser. Reconnect with
+  `SPC p a` if needed; reloading a feed does not replace the saved session.
+- For HTTP 429 (rate limit), wait before retrying; follow the countdown when shown.
+- If Reddit is not answering, cached content may remain readable; `r` retries
+  the failed view.
+- Credential-store errors: check [OS access](#connect-reddit). redtab never falls
+  back to plaintext cookie storage.
+
+`redtab --check` runs live Home and subscription diagnostics; it does not renew
+cookies or reconnect accounts.
 
 ## Data and privacy
 
 | Data | Location |
 | --- | --- |
-| Bookmarks and reading history | `$XDG_STATE_HOME/redtab/accounts/<account-id>/state.json` |
-| Unidentified legacy connection state | `$XDG_STATE_HOME/redtab/state.json` |
-| Cached posts and previews | `$XDG_CACHE_HOME/redtab` |
+| Bookmarks and reading history | `~/.local/state/redtab/accounts/<account-id>/state.json` |
+| Cached posts and previews | `~/.cache/redtab` |
+| Images opened externally | Private `redtab-media-<pid>-…` folders in the OS temporary directory (`$TMPDIR` when set) |
+| Browser-import copies and login profiles | Private `redtab-auth-*` folders in the OS temporary directory |
+| Saved logins | macOS Keychain or Linux Secret Service |
 
-Defaults are `~/.local/state` for state and `~/.cache` for cache. Clearing the
-cache keeps bookmarks and history. Reading state and content caches are separated
-by account; unidentified sessions use a session fingerprint for their cache.
-Reader filters and highlights are also account-specific, stored in the shared
-TOML file under Reddit usernames. Reddit preferences stay on Reddit; terminal
-settings stay shared across accounts. See [Settings](configuration.md).
-Reconnecting preserves the current reading state when redtab recognizes the same
-account, or the same cookie for an unidentified account.
+Absolute `$XDG_STATE_HOME` and `$XDG_CACHE_HOME` override these defaults.
+Clearing the cache keeps bookmarks and history. Under the state root, signed-out
+sessions use `redtab/signed-out/state.json`; unidentified legacy connections use
+`redtab/state.json`.
 
-Saved sessions are encrypted by the OS credential store. Loaded cookies stay in
-memory and are sent only to `https://www.reddit.com`, `https://api.reddit.com`
-and `https://old.reddit.com`. The latter two receive only domain-wide `.reddit.com`
-cookies. Cookies are never logged,
-cached or passed to media players. Browser imports may create private temporary
-database snapshots; redtab removes its helper directory on completion or cancellation.
-Cached content can include private posts your account can access.
+Read marks and feed observations expire after 90 days; bookmarks do not. State
+saves run every minute and on exit, including after a crash; bookmark changes also save immediately.
+Saves merge other windows' saved changes.
+Invalid JSON moves to `state.json.bad`, with a unique backup name if needed.
+Unreadable files stay intact; state saves stop for that session.
 
-redtab connects directly, ignoring `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and
-`NO_PROXY`. External video players receive a loopback stream, so keep redtab open
-while they play. With available quota, authenticated requests can start 100 ms
-apart; background requests stay at least 500 ms apart. Without quota information,
-native-page/GraphQL requests and classic JSON requests each stay at least one
-second apart. Consumed credits
-refill no faster than once per second and stay capped by the reported remaining
-budget. Media uses a separate path.
+The disk cache has a 256 MiB / 4,096-entry budget. Listings and threads stay fresh
+for five minutes; images for seven days. Stale content may appear during refresh.
+Entries become unreadable 30 days after fetching. Later writes prune old files
+and enforce the budget; the cache is not a permanent offline archive.
 
-On a rate limit, safe background reads stay pending until Reddit's wait expires
-(60 seconds when no interval is supplied). Foreground work takes priority. Writes
-are never automatically replayed. The footer shows the countdown and triggering
-operation, HTTP status and quota when available; diagnostics omit queries and cookies.
+External-image downloads are outside the cache budget. Before each download,
+redtab removes files at least 24 hours old from its process's temporary folder.
+Startup removes folders from exited redtab processes once unchanged for 24 hours.
+Nothing is removed at exit or on a timer.
 
-Community membership loads at startup. Offscreen listings and icons use cached
-data; live community listings load when shown. Reloading All subs marks communities
-for refresh as they enter view, avoiding a request for every subscription at once.
+Bookmarks, history, reader filters, highlights and cached entries are account-scoped;
+accounts share the cache directory, not its entries. Device settings apply to all accounts.
+Reddit preferences stay on Reddit.
+
+Cookies:
+
+- are sent only to `www.reddit.com`, `api.reddit.com` and `old.reddit.com`;
+- are excluded from redtab's logs and content cache, and never passed to media players.
+
+Browser import can make temporary copies of cookie databases. Cleanup runs when
+the sign-in helper finishes or is cancelled. The content cache can contain private
+posts your account can see.
+
+redtab ignores `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY`.
+`O` on a Reddit video gives `commands.video` a `http://127.0.0.1:<port>/…` URL.
+redtab fetches the video from Reddit and serves it at that URL, so the player never
+receives your cookies. Quitting redtab closes that URL and ends the player's stream.

@@ -16,8 +16,9 @@ fn abandoned_collections_release_workers_during_cooldown() {
     let request = data_request(&server).unwrap();
     request
         .respond(
-            tiny_http::Response::empty(429)
-                .with_header(tiny_http::Header::from_bytes("Retry-After", "10").unwrap()),
+            crate::reddit::tests::served::Response::empty(429).with_header(
+                crate::reddit::tests::served::Header::new("Retry-After", "10"),
+            ),
         )
         .unwrap();
     pool.want_experience(None);
@@ -53,12 +54,12 @@ fn a_first_frame_job_cancels_when_its_video_leaves_the_viewport() {
                 .unwrap()
                 .unwrap();
             if request.url() != "/slow.mp4" {
-                let _ = request.respond(tiny_http::Response::empty(200));
+                let _ = request.respond(crate::reddit::tests::served::Response::empty(200));
                 continue;
             }
             started.send(()).unwrap();
             let _ = wait.recv_timeout(std::time::Duration::from_secs(2));
-            let _ = request.respond(tiny_http::Response::empty(200));
+            let _ = request.respond(crate::reddit::tests::served::Response::empty(200));
             break;
         }
     });
@@ -98,8 +99,9 @@ fn when_a_paused_community_is_refreshed_the_old_generation_should_release_the_wo
     data_request(&server)
         .unwrap()
         .respond(
-            tiny_http::Response::empty(429)
-                .with_header(tiny_http::Header::from_bytes("Retry-After", "1").unwrap()),
+            crate::reddit::tests::served::Response::empty(429).with_header(
+                crate::reddit::tests::served::Header::new("Retry-After", "1"),
+            ),
         )
         .unwrap();
     pool.submit(Job::Group {
@@ -119,9 +121,9 @@ fn when_a_paused_community_is_refreshed_the_old_generation_should_release_the_wo
     );
     data_request(&server)
         .unwrap()
-        .respond(tiny_http::Response::from_string(include_str!(
-            "../../../tests/fixtures/sub.json"
-        )))
+        .respond(crate::reddit::tests::served::Response::from_string(
+            include_str!("../../../tests/fixtures/sub.json"),
+        ))
         .unwrap();
     assert!(
         matches!(next_message(&messages), Msg::Snapshot { message, .. } if matches!(*message, Msg::Group { generation: 2, result: Ok(_), .. }))
@@ -142,8 +144,9 @@ fn when_missing_icons_leave_the_view_queued_and_waiting_lookups_should_be_releas
     let first = data_request(&server).unwrap();
     first
         .respond(
-            tiny_http::Response::empty(429)
-                .with_header(tiny_http::Header::from_bytes("Retry-After", "1").unwrap()),
+            crate::reddit::tests::served::Response::empty(429).with_header(
+                crate::reddit::tests::served::Header::new("Retry-After", "1"),
+            ),
         )
         .unwrap();
     pool.set_visible_icons(&["new"]);
@@ -169,7 +172,7 @@ fn when_missing_icons_leave_the_view_queued_and_waiting_lookups_should_be_releas
         "{}",
         next.url()
     );
-    next.respond(tiny_http::Response::from_string(
+    next.respond(crate::reddit::tests::served::Response::from_string(
         "{\"data\":{\"icon_img\":\"https://styles.redditmedia.com/new.png\"}}",
     ))
     .unwrap();
@@ -192,8 +195,9 @@ fn when_waiting_communities_leave_the_view_the_current_group_should_get_the_work
     for request in [first, second] {
         request
             .respond(
-                tiny_http::Response::empty(429)
-                    .with_header(tiny_http::Header::from_bytes("Retry-After", "1").unwrap()),
+                crate::reddit::tests::served::Response::empty(429).with_header(
+                    crate::reddit::tests::served::Header::new("Retry-After", "1"),
+                ),
             )
             .unwrap();
     }
@@ -217,9 +221,9 @@ fn when_waiting_communities_leave_the_view_the_current_group_should_get_the_work
     }
     let next = data_request(&server).unwrap();
     assert!(next.url().starts_with("/r/new/"), "{}", next.url());
-    next.respond(tiny_http::Response::from_string(include_str!(
-        "../../../tests/fixtures/sub.json"
-    )))
+    next.respond(crate::reddit::tests::served::Response::from_string(
+        include_str!("../../../tests/fixtures/sub.json"),
+    ))
     .unwrap();
     assert!(
         matches!(next_message(&messages), Msg::Snapshot { message, .. } if matches!(*message, Msg::Group { generation: 2, result: Ok(_), .. }))

@@ -211,7 +211,7 @@ fn search_rows_should_stop_paging_after_a_failure_and_drop_a_page_for_an_old_que
 
     press(&mut app, crossterm::event::KeyCode::Tab);
     let _ = app.tick_at(Instant::now());
-    assert_eq!(app.search.kind, SearchKind::People);
+    assert_eq!(app.search.kind, SearchKind::Comments);
     app.on_search(failed, page(&["late"], None));
     assert!(
         app.search.rows().iter().all(|row| row.label != "r/late"),
@@ -228,8 +228,7 @@ fn search_rows_should_stop_paging_after_a_failure_and_drop_a_page_for_an_old_que
         app.search.results_query(),
         Some(&Query::Search {
             text: "rust next".into(),
-            kind: crate::reddit::experience::ListSearch::People,
-            time: TimeRange::All,
+            kind: crate::reddit::experience::ListSearch::Comments,
         }),
         "returning during a debounce must search the edited query"
     );

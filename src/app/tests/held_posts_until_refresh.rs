@@ -108,7 +108,7 @@ fn a_held_island_keeps_its_order_and_selection_until_r() {
 }
 
 #[test]
-fn reported_cached_reordering_should_wait_without_announcing_new_posts() {
+fn a_cached_island_reordered_by_the_live_answer_should_show_the_new_order_at_once() {
     let mut app = app_with(&["vim"]);
     app.switch_tab(ALL_SUBS_TAB);
     app.on_msg(ordered_snapshot(
@@ -123,14 +123,12 @@ fn reported_cached_reordering_should_wait_without_announcing_new_posts() {
         false,
         false,
     ));
-    assert_eq!(island_ids(&app), ["a", "b"]);
-    assert!(!app.all_subs.has_new_posts(&app.config));
-    app.reload();
     assert_eq!(island_ids(&app), ["b", "a"]);
+    assert!(!app.all_subs.has_new_posts(&app.config));
 }
 
 #[test]
-fn reported_cached_then_live_lists_should_keep_posts_until_refresh() {
+fn a_cached_list_should_reorder_live_while_new_leading_posts_wait_for_refresh() {
     let mut app = app_with(&["vim"]);
     let i = tab_index(&app, "vim");
     app.switch_tab(i);
@@ -165,8 +163,8 @@ fn reported_cached_then_live_lists_should_keep_posts_until_refresh() {
             .collect::<Vec<_>>()
             .join(",")
     };
-    assert_eq!(ids(&app), "a,b");
-    assert_eq!(app.tabs[i].feed.posts[0].score, Some(123));
+    assert_eq!(ids(&app), "b,a");
+    assert_eq!(app.tabs[i].feed.posts[1].score, Some(123));
     assert!(app.tabs[i].feed.has_new_posts(&app.config));
     app.reload();
     assert_eq!(ids(&app), "n,b,a");

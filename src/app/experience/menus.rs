@@ -125,6 +125,8 @@ pub(super) fn search_choices() -> Vec<Choice> {
     [
         ("sp", "Search posts across Reddit", SearchKind::Posts),
         ("sc", "Search communities", SearchKind::Communities),
+        ("sC", "Search comments", SearchKind::Comments),
+        ("sm", "Search media posts", SearchKind::Media),
         ("su", "Search people", SearchKind::People),
     ]
     .into_iter()
@@ -179,8 +181,6 @@ impl App {
         ]);
         choices.extend(search_choices());
         choices.extend([
-            native("sC", "Search comments", "/search/?type=comment"),
-            native("sm", "Search media", "/search/?type=media"),
             choice(
                 "gu",
                 "Open a user profile",
@@ -262,6 +262,7 @@ impl App {
     }
 
     pub fn show_actions(&mut self) {
+        self.cancel_collection_refresh();
         if self.experience.pending.is_some() {
             self.info("Wait for the pending Reddit request");
             return;
@@ -297,6 +298,7 @@ impl App {
     }
 
     pub fn quick_action(&mut self, shortcut: &'static str) {
+        self.cancel_collection_refresh();
         if self.experience.pending.is_some() {
             self.info("Wait for the pending Reddit request");
             return;

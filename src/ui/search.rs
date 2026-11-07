@@ -11,14 +11,8 @@ mod rows;
 pub(in crate::ui) use preview::*;
 pub(in crate::ui) use rows::*;
 
-const KINDS: [(SearchKind, &str); 3] = [
-    (SearchKind::Posts, "Posts"),
-    (SearchKind::Communities, "Communities"),
-    (SearchKind::People, "People"),
-];
-
 /// Below this width the kind tabs move under the query.
-const ONE_BAR: u16 = 64;
+const ONE_BAR: u16 = 84;
 const TEXT_START: usize = ICON_COLS as usize + 3;
 
 /// The query and kind tabs across the whole tab, above the list and the preview;
@@ -60,16 +54,12 @@ pub(super) fn draw(
     }
 }
 
-fn kind_label(kind: SearchKind) -> &'static str {
-    KINDS
-        .iter()
-        .find(|(candidate, _)| *candidate == kind)
-        .map_or("Posts", |(_, label)| label)
-}
-
 fn kinds_width() -> u16 {
-    let labels: usize = KINDS.iter().map(|(_, label)| label.width() + 2).sum();
-    (labels + KINDS.len() - 1 + 1) as u16
+    let labels: usize = SearchKind::ALL
+        .iter()
+        .map(|kind| kind.label().width() + 2)
+        .sum();
+    (labels + SearchKind::ALL.len() - 1 + 1) as u16
 }
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
@@ -86,7 +76,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(
             format!(
                 "Search {}{}",
-                kind_label(app.search.kind).to_lowercase(),
+                app.search.kind.label().to_lowercase(),
                 if app.active == crate::app::SEARCH_TAB {
                     " (/ to type)"
                 } else {
@@ -98,7 +88,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     } else if field.value.is_empty() {
         spans.push(Span::styled("▏", style.fg(ACCENT)));
         spans.push(Span::styled(
-            format!("Search {}", kind_label(app.search.kind).to_lowercase()),
+            format!("Search {}", app.search.kind.label().to_lowercase()),
             style.fg(OVERLAY),
         ));
     } else {
@@ -117,11 +107,14 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// The kinds read as tabs: the one a query searches is lit, Tab / S-Tab move it.
-/// Explore shows no kind's results, so there the chosen kind is only bold.
+/// Explore shows no kind's results, so there the chosen kind is only bold. Kinds lose
+/// their padding where the padded row does not fit.
 fn draw_kinds(f: &mut Frame, app: &App, area: Rect) {
     let exploring = app.search.exploring();
+    let padded = area.width >= kinds_width();
     let mut spans = vec![Span::raw(" ")];
-    for (i, (kind, label)) in KINDS.into_iter().enumerate() {
+    for (i, kind) in SearchKind::ALL.into_iter().enumerate() {
+        let label = kind.label();
         if i > 0 {
             spans.push(Span::styled("│", Style::new().fg(SURFACE1)));
         }
@@ -134,7 +127,14 @@ fn draw_kinds(f: &mut Frame, app: &App, area: Rect) {
         } else {
             Style::new().fg(SUBTEXT)
         };
-        spans.push(Span::styled(format!(" {label} "), style));
+        spans.push(Span::styled(
+            if padded {
+                format!(" {label} ")
+            } else {
+                label.to_string()
+            },
+            style,
+        ));
     }
     f.render_widget(
         Paragraph::new(Line::from(fit_spans(spans, area.width.into()))),
@@ -160,7 +160,7 @@ fn draw_title(f: &mut Frame, app: &App, area: Rect) {
     } else {
         vec![
             Span::styled(
-                format!(" {}", kind_label(search.kind)),
+                format!(" {}", search.kind.label()),
                 Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(

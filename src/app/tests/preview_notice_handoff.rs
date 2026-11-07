@@ -85,6 +85,7 @@ fn post_notice_handoff_should_preserve_newer_feeds_and_distinct_queries() {
     app.open_search(None);
     app.search.discovered.entries.push(search::Row {
         profile: None,
+        comment: None,
         label: "r/rust".into(),
         detail: String::new(),
         target: FeedTarget::Subreddit("rust".into()),
@@ -161,6 +162,7 @@ fn post_notice_preview_should_remember_loaded_feed_pages_when_ranking_changes() 
     app.open_search(None);
     app.search.discovered.entries.push(search::Row {
         profile: None,
+        comment: None,
         label: "r/rust".into(),
         detail: String::new(),
         target: FeedTarget::Subreddit("rust".into()),
@@ -223,6 +225,7 @@ fn post_notice_return_should_not_erase_a_newer_preview_failure() {
     app.open_search(None);
     app.search.discovered.entries.push(search::Row {
         profile: None,
+        comment: None,
         label: "r/rust".into(),
         detail: String::new(),
         target: FeedTarget::Subreddit("rust".into()),
@@ -325,6 +328,7 @@ fn preview_refresh_should_apply_waiting_posts_without_resetting_selected_rows() 
         app.open_search(None);
         let row = search::Row {
             profile: None,
+            comment: None,
             label: "r/rust".into(),
             detail: String::new(),
             target: FeedTarget::Subreddit("rust".into()),

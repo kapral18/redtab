@@ -103,9 +103,9 @@ pub(crate) enum ListingEvent<'a> {
 
 const API: &str = "https://www.reddit.com/";
 /// Reddit answers every `search.json` on www.reddit.com with HTTP 403, even signed in;
-/// api.reddit.com serves the same search listings as JSON.
+/// api.reddit.com serves Posts search and community listings as JSON.
 const CLASSIC_API: &str = "https://api.reddit.com/";
-/// www.reddit.com answers `r/all` with 403 and api.reddit.com with an empty listing;
+/// www.reddit.com answers `r/all` with 403 and api.reddit.com redirects it;
 /// old.reddit.com still serves it.
 const OLD_API: &str = "https://old.reddit.com/";
 const CLASSIC_SESSION: &str =
@@ -133,7 +133,8 @@ struct RequestContext {
 struct Inner {
     transport: Transport,
     api: Url,
-    /// Search origin: `CLASSIC_API` beside the real `API`, otherwise the fixture `api`.
+    /// Posts search and community listing origin: `CLASSIC_API` beside the real `API`,
+    /// otherwise the fixture `api`.
     classic: Url,
     /// r/all origin: `OLD_API` beside the real `API`, otherwise the fixture `api`.
     old: Url,

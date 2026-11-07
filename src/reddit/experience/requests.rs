@@ -43,12 +43,7 @@ impl Reddit {
 
     pub(in crate::reddit) fn read_url(&self, query: &Query, after: Option<&str>) -> Result<Url> {
         let (path, params) = query.route()?;
-        let base = if matches!(query, Query::Search { .. }) {
-            &self.0.classic
-        } else {
-            &self.0.api
-        };
-        let mut url = base.join(&path)?;
+        let mut url = self.0.api.join(&path)?;
         url.query_pairs_mut()
             .extend_pairs(params)
             .append_pair("raw_json", "1")
@@ -63,6 +58,9 @@ impl Reddit {
         if let Query::Inspect(target) = query {
             let value = self.thread_json(&target.inspection_permalink()?, "", target.comment())?;
             return inspect(value, target).map(Response::Details);
+        }
+        if let Query::Search { text, kind } = query {
+            return self.search_rows(text, *kind, after).map(Response::Page);
         }
         let value = match self.get(self.read_url(query, after)?) {
             Ok(value) => value,

@@ -42,7 +42,7 @@ impl App {
                 self.auth.cancel();
                 return true;
             }
-            if let Err(error) = self.persist_checked() {
+            if let Err(error) = self.save_before_switch() {
                 self.auth.message = Some(format!(
                     "Could not save the current reading state; connection unchanged: {error}"
                 ));
@@ -75,11 +75,11 @@ impl App {
         if !matches!(self.auth.phase, Phase::Confirm | Phase::DisconnectConfirm) {
             return;
         }
-        match self.persist_checked() {
-            Ok(_) if self.auth.phase == Phase::DisconnectConfirm => {
+        match self.save_before_switch() {
+            Ok(()) if self.auth.phase == Phase::DisconnectConfirm => {
                 self.auth.disconnect(self.config.show_nsfw)
             }
-            Ok(_) => self.auth.confirm(),
+            Ok(()) => self.auth.confirm(),
             Err(error) => {
                 self.auth.message = Some(format!(
                     "Could not save the current reading state; connection unchanged: {error}"
@@ -92,7 +92,19 @@ impl App {
         self.replacement_messages.take()
     }
 
+    /// A state file this session cannot write does not hold the connection change back.
+    fn save_before_switch(&mut self) -> anyhow::Result<()> {
+        if self.state.read_only() {
+            return Ok(());
+        }
+        self.persist_checked().map(drop)
+    }
+
     pub(super) fn install_connection(&mut self, reddit: Reddit) {
+        // Reads and marks observed while the switch ran belong to the account being left.
+        if !self.state.read_only() {
+            self.persist();
+        }
         self.ancestor_follow = None;
         let disconnected = reddit.needs_sign_in();
         let same_account = !disconnected
@@ -109,6 +121,8 @@ impl App {
                 .zip(account.as_ref())
                 .is_some_and(|(name, account)| name.eq_ignore_ascii_case(&account.name));
         let show_nsfw = same_settings_scope && self.config.show_nsfw;
+        // Content read under another adult-content policy is not kept, as on an F2 change.
+        let keep_app = same_account && show_nsfw == self.config.show_nsfw;
         let reddit = reddit.with_nsfw(show_nsfw);
         let confirmed = same_settings_scope
             .then(|| self.settings.account.values.take())
@@ -186,7 +200,7 @@ impl App {
                 ));
             }
         }
-        if same_account {
+        if keep_app {
             self.config = config;
             if self
                 .post_view
@@ -197,7 +211,18 @@ impl App {
             }
             self.pool = pool;
             self.reddit = reddit;
+            // A moved state file merges in at once: its bookmarks show now, not at the
+            // next periodic save.
+            let moved = state_path != self.state_path;
             self.state_path = state_path;
+            if moved {
+                self.state.move_to_new_file();
+                // Reported with the connection message, which would replace a status.
+                if let Err(error) = self.persist_checked() {
+                    state_warning =
+                        state_warning.or_else(|| Some(format!("cannot save state: {error:#}")));
+                }
+            }
             self.reset_pending_loads();
             self.reset_search_loads();
             self.overlay = None;
@@ -260,7 +285,9 @@ impl App {
         let mut feeds = Vec::new();
         for (index, tab) in self.tabs.iter_mut().enumerate() {
             let community = tab.subreddit().is_some();
-            let cursors: HashSet<_> = tab
+            // A held answer is dropped with the pool: its first page is asked for again.
+            let held = tab.feed.update.take().is_some();
+            let mut cursors: HashSet<_> = tab
                 .feed
                 .requests
                 .iter()
@@ -270,6 +297,9 @@ impl App {
                 .chain(tab.feed.deferred.keys())
                 .cloned()
                 .collect();
+            if held {
+                cursors.insert(None);
+            }
             feeds.extend(cursors.into_iter().map(|cursor| (index, cursor)));
             tab.feed.pending.clear();
             tab.feed.refreshing.clear();
@@ -277,7 +307,6 @@ impl App {
             tab.feed.forced.clear();
             tab.feed.manual.clear();
             tab.feed.deferred.clear();
-            tab.feed.update = None;
             tab.feed
                 .failures
                 .retain(|_, failure| community && failure.error.access().is_some());
@@ -299,10 +328,17 @@ impl App {
         self.icon_demands.clear();
         self.profile_loading.clear();
         self.profile_failed.clear();
-        self.images
-            .retain(|_, slot| matches!(slot, ImageSlot::Ready { .. }));
-        self.thumbs
-            .retain(|_, slot| matches!(slot, ImageSlot::Ready { .. }));
+        // The old pool's refreshes never answer: the next draw asks again.
+        for slots in [&mut self.images, &mut self.thumbs] {
+            slots.retain(|_, slot| matches!(slot, ImageSlot::Ready { .. }));
+            for slot in slots.values_mut() {
+                if let ImageSlot::Ready { refresh, .. } = slot
+                    && *refresh == ImageRefresh::Loading
+                {
+                    *refresh = ImageRefresh::Needed;
+                }
+            }
+        }
         self.card_images.retain(|_, slot| {
             matches!(
                 slot,

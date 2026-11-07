@@ -8,6 +8,7 @@ fn search_key_audit_ownership_sidebar_should_keep_the_active_nested_feed() {
     app.search.discovered.loading = false;
     app.search.discovered.entries.push(crate::app::search::Row {
         profile: None,
+        comment: None,
         label: "r/rust".into(),
         detail: String::new(),
         target: crate::worker::FeedTarget::Subreddit("rust".into()),
@@ -76,6 +77,7 @@ fn search_key_audit_ownership_empty_feeds_should_focus_list_for_local_controls()
     app.search.discovered.loading = false;
     app.search.discovered.entries.push(crate::app::search::Row {
         profile: None,
+        comment: None,
         label: "r/rust".into(),
         detail: String::new(),
         target: crate::worker::FeedTarget::Subreddit("rust".into()),
@@ -394,6 +396,7 @@ fn keys_in_a_feed_opened_from_search_should_stay_in_search() {
         app.search.discovered.loading = false;
         app.search.discovered.entries.push(crate::app::search::Row {
             profile: None,
+            comment: None,
             label: "r/rust".into(),
             detail: String::new(),
             target: crate::worker::FeedTarget::Subreddit("rust".into()),

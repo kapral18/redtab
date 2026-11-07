@@ -33,7 +33,10 @@ impl Controller {
                     .unwrap_or(0);
                 self.phase = Phase::Accounts;
                 if self.accounts.is_empty() {
+                    // The scan starts on its own: why sign-in is needed stays on screen.
+                    let message = self.message.take();
                     self.discover();
+                    self.message = message;
                 }
             }
             Event::Sources(Ok(sources)) => {

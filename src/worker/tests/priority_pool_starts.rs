@@ -25,14 +25,14 @@ fn when_subscription_preloads_are_blocked_a_card_image_should_still_start() {
     let poster = data_request(&server);
 
     first
-        .respond(tiny_http::Response::from_string(include_str!(
-            "../../../tests/fixtures/sub.json"
-        )))
+        .respond(crate::reddit::tests::served::Response::from_string(
+            include_str!("../../../tests/fixtures/sub.json"),
+        ))
         .unwrap();
     second
-        .respond(tiny_http::Response::from_string(include_str!(
-            "../../../tests/fixtures/sub.json"
-        )))
+        .respond(crate::reddit::tests::served::Response::from_string(
+            include_str!("../../../tests/fixtures/sub.json"),
+        ))
         .unwrap();
     let poster = poster.expect("visible media must not wait for subscription group requests");
     assert_eq!(poster.url(), "/poster.png");
@@ -82,17 +82,17 @@ fn when_feed_workers_are_occupied_selected_post_and_media_should_start_independe
             poster_reply(request);
         } else {
             request
-                .respond(tiny_http::Response::from_string(include_str!(
-                    "../../../tests/fixtures/post.json"
-                )))
+                .respond(crate::reddit::tests::served::Response::from_string(
+                    include_str!("../../../tests/fixtures/post.json"),
+                ))
                 .unwrap();
         }
     }
     for request in [first, second] {
         request
-            .respond(tiny_http::Response::from_string(include_str!(
-                "../../../tests/fixtures/sub.json"
-            )))
+            .respond(crate::reddit::tests::served::Response::from_string(
+                include_str!("../../../tests/fixtures/sub.json"),
+            ))
             .unwrap();
     }
     assert_eq!(

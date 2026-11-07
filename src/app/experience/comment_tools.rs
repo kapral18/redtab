@@ -159,7 +159,7 @@ impl App {
         view.scroll = 0;
         view.free_scroll = true;
         let url = view.preview_image().map(std::borrow::Cow::into_owned);
-        if let Some(url) = url {
+        if let Some(url) = url.filter(|_| self.inline_images_on()) {
             self.request_image(&url);
         }
     }

@@ -19,6 +19,7 @@ fn search_key_audit_source_links_should_include_explore_feeds() {
         key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         app.search.discovered.entries.push(crate::app::search::Row {
             profile: None,
+            comment: None,
             label: "selected source".into(),
             detail: String::new(),
             target,
@@ -206,6 +207,7 @@ fn reported_search_reverse_navigation_should_keep_the_viewport() {
     app.search.discovered.entries = (0..60)
         .map(|i| crate::app::search::Row {
             profile: None,
+            comment: None,
             label: format!("r/community{i:02}"),
             detail: String::new(),
             target: crate::worker::FeedTarget::Subreddit(format!("community{i:02}")),
@@ -239,6 +241,7 @@ fn search_key_audit_rows_should_use_row_motions_after_post_cards() {
         app.search.discovered.entries = (0..30)
             .map(|i| crate::app::search::Row {
                 profile: None,
+                comment: None,
                 label: format!("r/source{i}"),
                 detail: String::new(),
                 target: crate::worker::FeedTarget::Subreddit(format!("source{i}")),
@@ -281,6 +284,7 @@ fn search_key_audit_source_commands_should_keep_the_parent() {
             key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
             app.search.discovered.entries.push(crate::app::search::Row {
                 profile: None,
+                comment: None,
                 label: "selected source".into(),
                 detail: String::new(),
                 target: target.clone(),
@@ -306,4 +310,70 @@ fn search_key_audit_source_commands_should_keep_the_parent() {
             assert_eq!(app.search.selected, 2);
         }
     }
+}
+
+#[test]
+fn reported_q_should_close_the_right_pane_beside_search_results_until_a_row_is_opened() {
+    use crate::reddit::experience::{Entry, Page, Query, Response};
+    let mut app = app(&[]);
+    app.open_search(None);
+    key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    let pane = |app: &mut App| screen(app, 200, 24).contains("Enter opens");
+    assert!(pane(&mut app), "the preview shows beside the rows");
+
+    press(&mut app, 'q');
+    assert!(!app.quit && !pane(&mut app), "q closes the preview first");
+    press(&mut app, 'j');
+    assert!(!pane(&mut app), "moving keeps the pane closed");
+    // A typed query, its rows and a kind switch keep it closed.
+    press(&mut app, '/');
+    press_keys(&mut app, "rust");
+    key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    app.on_msg(Msg::Search {
+        generation: app.search.results_generation(),
+        result: Ok(Response::Page(Page {
+            title: String::new(),
+            text: String::new(),
+            url: "/".into(),
+            after: None,
+            entries: ["rust", "zig"]
+                .map(|name| Entry {
+                    title: format!("r/{name}"),
+                    body: String::new(),
+                    icon: Default::default(),
+                    query: Some(Query::Community(name.into())),
+                    target: None,
+                    post: None,
+                })
+                .to_vec(),
+        })),
+    });
+
+    assert!(
+        app.search.rows().len() == 2 && !pane(&mut app),
+        "new rows keep it closed"
+    );
+    press(&mut app, 'j');
+    assert!(!pane(&mut app), "moving through new rows keeps it closed");
+    // Leaving Search and coming back keeps it closed.
+    app.switch_tab(0);
+    app.switch_tab(crate::app::SEARCH_TAB);
+    assert!(!pane(&mut app), "returning to Search keeps it closed");
+
+    for open in ["\r", "\u{17}l"] {
+        press_keys(&mut app, open);
+        assert!(
+            app.search_feed_open(),
+            "{open:?} opens the row beside the results"
+        );
+        press(&mut app, 'q');
+        assert_eq!(app.active, crate::app::SEARCH_TAB);
+        assert!(
+            !pane(&mut app),
+            "q closes the opened feed and leaves no preview"
+        );
+    }
+    press(&mut app, 'q');
+    assert!(app.quit, "with no right pane, q quits");
 }

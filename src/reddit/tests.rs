@@ -3,12 +3,11 @@ use crate::model::MembershipTarget;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tiny_http::{Header, Response, Server};
 
 mod community_icon_lookups;
 mod home_listings;
 mod listing_request_urls;
-mod media_request_headers;
+mod media_hosts;
 mod membership;
 mod post_listings;
 mod private_community_denials;
@@ -18,6 +17,7 @@ mod relay;
 mod request_lifecycle;
 mod saved_account_verification;
 mod scoped_cookie_policy;
+pub(crate) mod served;
 mod subscription_listings;
 mod threads;
 
@@ -66,82 +66,167 @@ impl Reply {
 
 pub(crate) struct Fixture {
     pub(crate) base: String,
-    stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    host: String,
 }
 
-/// The macOS application firewall can hold a freshly built test binary's first
-/// connections to its own listener for longer than the client's connect timeout, so
-/// each test server is connected to once, and waited for, before a test uses it.
-const FIREWALL_HOLD: Duration = Duration::from_secs(30);
+type Handler = Box<dyn Fn(Request) -> Reply + Send>;
 
-pub(crate) fn local_http_server() -> Server {
-    let server = Server::http("127.0.0.1:0").unwrap();
-    let address = server.server_addr().to_ip().unwrap();
-    let _ = std::net::TcpStream::connect_timeout(&address, FIREWALL_HOLD);
-    server
+enum Answers {
+    Handler(std::sync::Mutex<Handler>, AtomicBool),
+    Served(std::sync::Mutex<std::sync::mpsc::Sender<served::Request>>),
 }
 
-/// Like [`local_http_server`]; the warm-up connection is accepted and dropped here, so
-/// callers that count accepted connections see only their own.
-pub(crate) fn local_listener() -> std::net::TcpListener {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    if std::net::TcpStream::connect_timeout(&address, FIREWALL_HOLD).is_ok() {
-        let _ = listener.accept();
+/// Fixture hosts by name; the transport answers their requests in memory.
+static FIXTURES: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Arc<Answers>>>> =
+    std::sync::LazyLock::new(Default::default);
+static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+fn register(answers: Answers) -> String {
+    let host = format!(
+        "fixture-{}.test",
+        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+    );
+    FIXTURES
+        .lock()
+        .unwrap()
+        .insert(host.clone(), Arc::new(answers));
+    host
+}
+
+/// The transport's answer in tests: a fixture host or live relay answers in memory and
+/// any other request fails as if the connection did. Answers run on their own thread, as a
+/// server would, so a test can hold one while the client times out or is cancelled.
+pub(crate) fn answer(
+    request: wreq::RequestBuilder,
+    timeout: Option<Duration>,
+) -> transport::Sending {
+    let answering = request
+        .build()
+        .ok()
+        .and_then(|request| answer_request(request));
+    Box::pin(async move {
+        let answer = answering.ok_or(())?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(answer());
+        });
+        let answer = async { rx.await.ok().flatten().ok_or(()) };
+        match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, answer)
+                .await
+                .map_err(|_| ())?,
+            None => answer.await,
+        }
+    })
+}
+
+type Answer = Box<dyn FnOnce() -> Option<wreq::Response> + Send>;
+
+fn answer_request(request: wreq::Request) -> Option<Answer> {
+    let uri = request.uri().clone();
+    let url = uri.to_string();
+    let header = |name: &str| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    if let Some(relayed) = super::relay::answer_local(&url, header("range")) {
+        return Some(Box::new(move || {
+            let relayed = relayed();
+            let response = served::Response {
+                status: relayed.status,
+                headers: relayed
+                    .headers
+                    .into_iter()
+                    .map(|(name, value)| (name.to_owned(), value))
+                    .collect(),
+                body: relayed.body,
+                len: relayed.len.map(|len| len as usize),
+            };
+            Some(response.into_http(uri))
+        }));
     }
-    listener
+    let answers = FIXTURES.lock().unwrap().get(uri.host()?)?.clone();
+    let path = uri
+        .path_and_query()
+        .map_or_else(|| "/".into(), |path| path.to_string());
+    let headers: Vec<(String, String)> = request
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_ascii_lowercase(),
+                value.to_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    let method = request.method().as_str().to_owned();
+    let body = request
+        .body()
+        .and_then(|body| body.as_bytes())
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .unwrap_or_default();
+    Some(Box::new(move || match &*answers {
+        Answers::Handler(handler, panicked) => {
+            let input = Request {
+                url: path,
+                method,
+                body,
+                headers: headers.into_iter().collect(),
+            };
+            let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (handler.lock().unwrap_or_else(|e| e.into_inner()))(input)
+            }))
+            .unwrap_or_else(|_| {
+                panicked.store(true, Ordering::Relaxed);
+                Reply::status(500)
+            });
+            let mut response =
+                served::Response::from_string(reply.body).with_status_code(reply.status);
+            response.headers = reply.headers;
+            Some(response.into_http(uri))
+        }
+        Answers::Served(requests) => {
+            let (reply, replied) = std::sync::mpsc::channel();
+            let request = served::Request {
+                url: path,
+                method,
+                headers: headers
+                    .into_iter()
+                    .map(|(field, value)| served::Header { field, value })
+                    .collect(),
+                reply,
+            };
+            requests.lock().unwrap().send(request).ok()?;
+            Some(replied.recv().ok()?.into_http(uri))
+        }
+    }))
+}
+
+/// A server the test answers by hand, request by request, in memory.
+pub(crate) fn local_http_server() -> served::Server {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let host = register(Answers::Served(std::sync::Mutex::new(tx)));
+    served::Server {
+        fixture: Fixture {
+            base: format!("http://{host}/"),
+            host,
+        },
+        requests: std::sync::Mutex::new(rx),
+    }
 }
 
 impl Fixture {
     pub(crate) fn new(handler: impl Fn(Request) -> Reply + Send + 'static) -> Self {
-        let server = local_http_server();
-        let base = format!("http://{}/", server.server_addr());
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = stop.clone();
-        let thread = std::thread::spawn(move || {
-            while !stopped.load(Ordering::Relaxed) {
-                if let Some(mut request) = server.recv_timeout(Duration::from_millis(20)).unwrap() {
-                    // The host's portkeeper probes new listeners; redtab never sends HEAD /.
-                    if request.method() == &tiny_http::Method::Head && request.url() == "/" {
-                        let _ = request.respond(Response::empty(200));
-                        continue;
-                    }
-                    let mut body = String::new();
-                    request
-                        .as_reader()
-                        .take(1024 * 1024)
-                        .read_to_string(&mut body)
-                        .unwrap();
-                    let input = Request {
-                        url: request.url().to_owned(),
-                        method: request.method().as_str().to_owned(),
-                        body,
-                        headers: request
-                            .headers()
-                            .iter()
-                            .map(|h| {
-                                (
-                                    h.field.to_string().to_ascii_lowercase(),
-                                    h.value.to_string(),
-                                )
-                            })
-                            .collect(),
-                    };
-                    let reply = handler(input);
-                    let mut response =
-                        Response::from_string(reply.body).with_status_code(reply.status);
-                    for (name, value) in reply.headers {
-                        response.add_header(Header::from_bytes(name, value).unwrap());
-                    }
-                    let _ = request.respond(response);
-                }
-            }
-        });
+        let host = register(Answers::Handler(
+            std::sync::Mutex::new(Box::new(handler)),
+            AtomicBool::new(false),
+        ));
         Self {
-            base,
-            stop,
-            thread: Some(thread),
+            base: format!("http://{host}/"),
+            host,
         }
     }
     pub(crate) fn reddit(&self) -> Reddit {
@@ -160,10 +245,21 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        let result = self.thread.take().unwrap().join();
-        if !std::thread::panicking() {
-            result.expect("fixture server");
+        let answers = FIXTURES.lock().unwrap().remove(&self.host);
+        // Requests still being answered hold their own reference; a panic there counts too.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while answers
+            .as_ref()
+            .is_some_and(|a| matches!(**a, Answers::Handler(..)) && Arc::strong_count(a) > 1)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !std::thread::panicking()
+            && let Some(Answers::Handler(_, panicked)) = answers.as_deref()
+            && panicked.load(Ordering::Relaxed)
+        {
+            panic!("fixture handler panicked");
         }
     }
 }
@@ -182,95 +278,105 @@ fn truncating_upstream(
     body: Vec<u8>,
     refuse: bool,
 ) -> (String, std::thread::JoinHandle<Vec<Option<usize>>>) {
-    use std::io::{BufRead, Write};
-    let listener = local_listener();
-    let base = format!("http://{}/", listener.local_addr().unwrap());
+    use served::{Header, Response};
+    let server = local_http_server();
+    let base = format!("http://{}/", server.server_addr());
     let handle = std::thread::spawn(move || {
         let mut ranges = Vec::new();
         for attempt in 0..2 {
-            let Ok((mut stream, _)) = listener.accept() else {
+            let Ok(Some(request)) = server.recv_timeout(Duration::from_secs(5)) else {
                 break;
             };
-            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-            let mut range = None;
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" || line.is_empty() {
-                    break;
-                }
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
-                    range = value
-                        .trim()
-                        .split('-')
-                        .next()
-                        .unwrap()
-                        .parse::<usize>()
-                        .ok();
-                }
-            }
+            let range = request
+                .headers()
+                .iter()
+                .find(|header| header.field == "range")
+                .and_then(|header| header.value.strip_prefix("bytes="))
+                .and_then(|value| value.split('-').next()?.parse::<usize>().ok());
             ranges.push(range);
             let total = body.len();
             let from = range.unwrap_or(0);
-            if attempt == 0 {
-                let cut = from + (total - from) / 3;
-                if range.is_some() {
-                    write!(
-                        stream,
-                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {from}-{}/{total}\r\nContent-Length: {}\r\n\r\n",
-                        total - 1,
-                        total - from
-                    )
-                    .unwrap();
-                } else {
-                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n").unwrap();
-                }
-                stream.write_all(&body[from..cut]).unwrap();
-                stream.flush().unwrap();
-                // A close in the same packet fails the relay's first read, not a later one.
-                std::thread::sleep(Duration::from_millis(200));
-            } else if refuse {
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n").unwrap();
-                stream.write_all(&body).unwrap();
-            } else {
-                write!(
-                    stream,
-                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {from}-{}/{total}\r\nContent-Length: {}\r\n\r\n",
-                    total - 1,
-                    total - from
+            let partial = |from: usize, to: usize| {
+                let headers = vec![Header::new(
+                    "Content-Range",
+                    &format!("bytes {from}-{}/{total}", total - 1),
+                )];
+                Response::new(
+                    206,
+                    headers,
+                    std::io::Cursor::new(body[from..to].to_vec()),
+                    Some(total - from),
                 )
-                .unwrap();
-                stream.write_all(&body[from..]).unwrap();
-            }
-            stream.shutdown(std::net::Shutdown::Both).unwrap();
+            };
+            let whole = |to: usize| {
+                Response::new(
+                    200,
+                    vec![],
+                    std::io::Cursor::new(body[..to].to_vec()),
+                    Some(total),
+                )
+            };
+            let response = match (attempt, range.is_some()) {
+                (0, true) => partial(from, from + (total - from) / 3),
+                (0, false) => whole(total / 3),
+                _ if refuse => whole(total),
+                _ => partial(from, total),
+            };
+            request.respond(response).unwrap();
         }
         ranges
     });
     (base, handle)
 }
 
+pub(crate) struct Relayed {
+    pub(crate) status: u16,
+    pub(crate) headers: Vec<(&'static str, String)>,
+    pub(crate) body: Vec<u8>,
+}
+
+/// What a player receives from the relay for `url`, a relay URL, as far as its body reads.
+pub(crate) fn relayed(url: &str, range: Option<&str>) -> Relayed {
+    use std::io::Read;
+    let response =
+        super::relay::answer_local(url, range.map(str::to_owned)).expect("a live relay URL")();
+    let mut body = Vec::new();
+    let _ = match response.len {
+        Some(len) => response.body.take(len).read_to_end(&mut body),
+        None => {
+            let mut reader = response.body;
+            reader.read_to_end(&mut body)
+        }
+    };
+    Relayed {
+        status: response.status,
+        headers: response.headers,
+        body,
+    }
+}
+
 /// The relayed body for a GET with an optional `Range` header.
 fn relayed_body(reddit: &Reddit, url: &str, range: Option<&str>) -> Vec<u8> {
-    use std::io::{Read, Write};
-    let local = url::Url::parse(&reddit.media_url(url).unwrap()).unwrap();
-    let mut client =
-        std::net::TcpStream::connect(format!("127.0.0.1:{}", local.port().unwrap())).unwrap();
-    client
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let range = range.map_or(String::new(), |range| format!("Range: {range}\r\n"));
-    write!(
-        client,
-        "GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\n{range}\r\n",
-        local.path()
+    relayed(&reddit.media_url(url).unwrap(), range).body
+}
+
+/// The video player's playlist GET, answered in memory.
+pub(crate) fn fetch_text(url: &str) -> Result<String, ureq::Error> {
+    use std::io::Read;
+    let transport = Transport::new().unwrap();
+    let failed = || ureq::Error::Io(std::io::Error::other("connection failed"));
+    let response = transport::wait(
+        transport::send(transport.client.get(url), Some(Duration::from_secs(15))),
+        None,
     )
-    .unwrap();
-    let mut response = Vec::new();
-    let _ = client.read_to_end(&mut response);
-    let start = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .unwrap()
-        + 4;
-    response[start..].to_vec()
+    .map_err(|_| failed())?
+    .map_err(|_| failed())?;
+    if !response.status().is_success() {
+        return Err(ureq::Error::StatusCode(response.status().as_u16()));
+    }
+    let mut text = String::new();
+    transport::Reader::new(response, 1 << 20, None)
+        .read_to_string(&mut text)
+        .map_err(ureq::Error::Io)?;
+    Ok(text)
 }

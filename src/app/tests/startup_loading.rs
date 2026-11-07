@@ -102,10 +102,6 @@ fn when_the_app_starts_it_should_load_home_and_account_subscriptions_in_backgrou
                 .recv_timeout(Duration::from_secs(5))
                 .unwrap()
                 .unwrap();
-            if request.method() == &tiny_http::Method::Head {
-                request.respond(tiny_http::Response::empty(200)).unwrap();
-                continue;
-            }
             let path = request.url().split('?').next().unwrap();
             let body = match path {
                 "/svc/shreddit/feeds/home-feed" => {
@@ -120,7 +116,7 @@ fn when_the_app_starts_it_should_load_home_and_account_subscriptions_in_backgrou
                 _ => panic!("unexpected API path: {path}"),
             };
             request
-                .respond(tiny_http::Response::from_string(body))
+                .respond(crate::reddit::tests::served::Response::from_string(body))
                 .unwrap();
             completed += 1;
         }

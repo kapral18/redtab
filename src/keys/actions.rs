@@ -11,7 +11,7 @@ pub(super) fn execute(app: &mut App, action: map::Action) {
                 dispatch_overlay(app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
             } else if app.post_view.is_some() {
                 app.close_post();
-            } else if !app.return_to_search() {
+            } else if !app.close_search_feed() && !app.close_search_preview() {
                 app.quit = true;
             }
         }
@@ -61,7 +61,10 @@ pub(super) fn execute(app: &mut App, action: map::Action) {
         NextImage | PreviousImage => app.gallery_step(action == NextImage),
         Fold => app.activate_comment(),
         FocusLeft => {
-            if app.post_focused() {
+            if app.post_focused() && !app.detail_fits() {
+                // Narrow: the post fills the window, so the pane to the left is behind it.
+                navigate(app, map::Action::Left);
+            } else if app.post_focused() {
                 app.focus_main();
             } else if app.focus == Focus::List
                 && app.search_feed_open()
@@ -97,11 +100,14 @@ pub(super) fn execute(app: &mut App, action: map::Action) {
                 app.open_search(None);
             }
         }
-        SearchPosts | SearchCommunities | SearchPeople => app.open_search(Some(match action {
-            SearchPosts => crate::reddit::experience::SearchKind::Posts,
-            SearchCommunities => crate::reddit::experience::SearchKind::Communities,
-            _ => crate::reddit::experience::SearchKind::People,
-        })),
+        SearchPosts | SearchCommunities | SearchComments | SearchMedia | SearchPeople => app
+            .open_search(Some(match action {
+                SearchPosts => crate::reddit::experience::SearchKind::Posts,
+                SearchCommunities => crate::reddit::experience::SearchKind::Communities,
+                SearchComments => crate::reddit::experience::SearchKind::Comments,
+                SearchMedia => crate::reddit::experience::SearchKind::Media,
+                _ => crate::reddit::experience::SearchKind::People,
+            })),
         Explore => app.open_search(None),
         Sort if context == Context::Post => app.comment_tools(),
         Sort if app.overlay.is_none() && app.active_tab().feed.search.is_some() => {
@@ -147,7 +153,7 @@ pub(super) fn focus_right(app: &mut App) {
             app.focus_main();
         }
     } else if app.post_view.is_some() {
-        app.focus = Focus::Post;
+        app.focus_open_post();
     } else if app.search_shows_rows() && app.detail_fits() {
         app.open_search_row();
     }

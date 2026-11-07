@@ -258,12 +258,20 @@ impl App {
         self.images.clear();
         self.thumbs.clear();
         self.card_renderer.clear();
+        // Encoding failures belong to the old protocol: those pictures load again.
+        self.card_images
+            .retain(|_, slot| !matches!(slot, CardImageSlot::Failed(_)));
         for slot in self.card_images.values_mut() {
             if let CardImageSlot::Ready { protocol, .. } | CardImageSlot::Cached { protocol, .. } =
                 slot
             {
                 *protocol = None;
             }
+        }
+        // Players size frames from the font they started with; they restart where they were.
+        self.retire_video(Instant::now());
+        for preview in &mut self.video_previews {
+            preview.player = None;
         }
         self.reload_image_sources();
     }

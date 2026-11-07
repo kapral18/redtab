@@ -53,30 +53,19 @@ fn when_offscreen_cache_is_requested_it_should_deliver_stale_data_without_any_ht
 
 #[test]
 fn a_warm_feed_is_readable_after_the_server_shuts_down() {
-    use std::io::{BufRead, BufReader, Write};
     let dir = tempfile::tempdir().unwrap();
-    let listener = crate::reddit::tests::local_listener();
-    let reddit = Reddit::test_at(&format!("http://{}", listener.local_addr().unwrap()), false);
+    let served = crate::reddit::tests::local_http_server();
+    let reddit = Reddit::test_at(&format!("http://{}", served.server_addr()), false);
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        let request = served
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
             .unwrap();
-        let mut reader = BufReader::new(&mut stream);
-        let mut line = String::new();
-        while reader.read_line(&mut line).unwrap() != 0 {
-            if line == "\r\n" {
-                break;
-            }
-            line.clear();
-        }
-        let body = include_str!("../../../tests/fixtures/sub.json");
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .unwrap();
+        request
+            .respond(crate::reddit::tests::served::Response::from_string(
+                include_str!("../../../tests/fixtures/sub.json"),
+            ))
+            .unwrap();
     });
     let job = || Job::Group {
         subreddit: "popular".into(),

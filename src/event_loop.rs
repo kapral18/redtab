@@ -169,16 +169,19 @@ pub(super) fn run() -> Result<()> {
             if quit_signal.load(Ordering::Relaxed) {
                 return Ok(false);
             }
-            if output.ready()? {
-                draw_synchronized(&mut terminal, |f| {
+            if output.ready()?
+                && drawn(draw_synchronized(&mut terminal, |f| {
                     ui::draw_startup(f, phase);
                     if no_color {
                         ui::strip_colors(f.buffer_mut());
                     }
-                })?;
+                }))?
+            {
                 phase += 1;
             }
             match input.recv_timeout(Duration::from_millis(80)) {
+                // Raw mode turns C-c into a key; it quits here as it does later.
+                Ok(event) if quit_key(&event) => return Ok(false),
                 Ok(event) => early_events.push(event),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
@@ -189,6 +192,9 @@ pub(super) fn run() -> Result<()> {
         Ok(true)
     })();
     if !matches!(waited, Ok(true)) {
+        // The shutdown flag stops the credential helper; joining lets it remove its files.
+        quit_signal.store(true, Ordering::Relaxed);
+        let _ = signin.join();
         let _ = output.wait();
         // As on the main exit: Terminal's drop would only error on a dead tty.
         std::mem::forget(terminal);
@@ -230,18 +236,21 @@ pub(super) fn run() -> Result<()> {
 
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
         let mut dirty = true;
+        let mut backlog = false;
         while !app.quit {
             if quit_signal.load(Ordering::Relaxed) {
                 break;
             }
             let output_ready = output.ready()?;
-            if dirty && output_ready {
-                draw_synchronized(&mut terminal, |f| {
+            if dirty
+                && output_ready
+                && drawn(draw_synchronized(&mut terminal, |f| {
                     ui::draw(f, &mut app);
                     if no_color {
                         ui::strip_colors(f.buffer_mut());
                     }
-                })?;
+                }))?
+            {
                 dirty = false;
                 // Keys typed on the startup screen, once the first draw sized the layout.
                 for ev in early_events.drain(..) {
@@ -274,7 +283,18 @@ pub(super) fn run() -> Result<()> {
             if graphics_watch.is_some() {
                 wait = wait.min(TmuxGraphicsWatch::POLL);
             }
+            if backlog {
+                wait = Duration::ZERO;
+            }
             match input.recv_timeout(wait) {
+                // Keys keep their order behind the startup ones until the first draw.
+                Ok(first) if !early_events.is_empty() => {
+                    for ev in std::iter::once(first).chain(input.try_iter()) {
+                        // C-c quits even while output stalls before the first draw.
+                        app.quit |= quit_key(&ev);
+                        early_events.push(ev);
+                    }
+                }
                 Ok(first) => {
                     for ev in std::iter::once(first).chain(input.try_iter()) {
                         // Keys after a quit key do nothing.
@@ -298,7 +318,9 @@ pub(super) fn run() -> Result<()> {
             if let Some(replacement) = app.take_replacement_messages() {
                 messages = replacement;
             }
-            dirty |= drain_messages(&mut app, &messages);
+            let drained = drain_messages(&mut app, &messages);
+            dirty |= drained.changed;
+            backlog = drained.more;
             dirty |= app.tick();
         }
         Ok(())
@@ -375,6 +397,16 @@ pub(super) fn handle_input(app: &mut App, event: Event, watch: Option<&TmuxGraph
     handle_event(app, event);
 }
 
+/// A terminal command (an OSC 52 copy) queued between the readiness check and the frame's
+/// flush holds the frame back; it stays buffered and goes out with the next draw.
+pub(super) fn drawn(result: std::io::Result<()>) -> std::io::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Hold text/placeholder changes until the complete draw has been written.
 pub(super) fn draw_synchronized<W: std::io::Write>(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<W>>,
@@ -400,21 +432,36 @@ pub(super) fn open_startup_subreddit(app: &mut App, pending: &mut Option<String>
     false
 }
 
+pub(super) fn quit_key(event: &Event) -> bool {
+    matches!(event, Event::Key(key) if key.modifiers == crossterm::event::KeyModifiers::CONTROL
+        && key.code == crossterm::event::KeyCode::Char('c'))
+}
+
+pub(super) struct Drained {
+    pub(super) changed: bool,
+    /// The burst ended before the queue did: the next pass does not wait.
+    pub(super) more: bool,
+}
+
 /// Return to input between bursts of worker completions.
-pub(super) fn drain_messages(app: &mut App, messages: &Receiver<worker::Msg>) -> bool {
+pub(super) fn drain_messages(app: &mut App, messages: &Receiver<worker::Msg>) -> Drained {
     let started = Instant::now();
-    let mut changed = false;
+    let mut drained = Drained {
+        changed: false,
+        more: false,
+    };
     for _ in 0..8 {
         let Ok(message) = messages.try_recv() else {
-            break;
+            return drained;
         };
         app.on_msg(message);
-        changed = true;
+        drained.changed = true;
         if started.elapsed() >= Duration::from_millis(4) {
             break;
         }
     }
-    changed
+    drained.more = true;
+    drained
 }
 
 pub(super) fn handle_event(app: &mut App, event: Event) {

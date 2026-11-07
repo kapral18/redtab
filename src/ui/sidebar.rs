@@ -285,7 +285,7 @@ pub(super) fn sidebar_item(app: &App, index: usize, width: usize) -> Line<'stati
         Span::styled(
             match (active, focused) {
                 (true, true) => "▌",
-                (true, false) => "●",
+                (true, false) => "▏",
                 _ => " ",
             },
             base.fg(if focused { ACCENT } else { SUBTEXT }),

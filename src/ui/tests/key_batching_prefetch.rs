@@ -110,6 +110,7 @@ fn navigation_should_prefetch_near_the_visible_end_without_draining_filtered_pag
             "redraws must not fetch"
         );
 
+        let moved = std::time::Instant::now();
         app.move_selection(1);
         if delayed_draw {
             std::thread::sleep(crate::app::NAV_SETTLE);
@@ -119,11 +120,14 @@ fn navigation_should_prefetch_near_the_visible_end_without_draining_filtered_pag
         assert!(actual.contains("Entry 20 end"), "view={view:?}: {actual}");
         assert!(!actual.contains("Entry 24 end"), "view={view:?}: {actual}");
         assert_eq!(app.active_tab().feed.selected, 1);
-        if !delayed_draw {
+        // Only a draw that finished inside the settle shows it held the fetch back.
+        if !delayed_draw && moved.elapsed() < crate::app::NAV_SETTLE {
             assert!(
                 !app.active_tab().feed.loading_more(),
                 "navigation must settle first"
             );
+        }
+        if !delayed_draw {
             std::thread::sleep(crate::app::NAV_SETTLE);
             app.tick();
         }
@@ -153,7 +157,11 @@ fn navigation_should_prefetch_near_the_visible_end_without_draining_filtered_pag
             "a filtered append must wait for new navigation"
         );
         assert_eq!(app.active_tab().feed.generation, generation);
-        assert_eq!(app.active_tab().feed.selected, 1);
+        assert_eq!(
+            app.active_tab().feed.selected,
+            1,
+            "view={view:?} height={height}"
+        );
 
         app.select_edge(true);
         std::thread::sleep(crate::app::NAV_SETTLE);

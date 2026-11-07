@@ -353,7 +353,8 @@ mod tests {
         };
 
         let decoded = |served: usize| {
-            let listener = crate::reddit::tests::local_listener();
+            // ffmpeg connects here; the test binary only listens.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("http://{}/a.webm", listener.local_addr().unwrap());
             let body = file.clone();
             let done = Arc::new(std::sync::atomic::AtomicBool::new(false));

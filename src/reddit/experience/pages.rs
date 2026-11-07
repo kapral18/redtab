@@ -180,14 +180,6 @@ pub(super) fn read_page(query: &Query, value: Value, show_nsfw: bool) -> Result<
                 .as_array()
                 .context("Listing has no children")?;
             page.title = match query {
-                Query::Search { text, kind, time } => format!(
-                    "{}: {text} · {}",
-                    match kind {
-                        ListSearch::Communities => "Communities",
-                        ListSearch::People => "People",
-                    },
-                    time.as_str()
-                ),
                 Query::User { name, feed } => format!("u/{name} · {}", feed.label()),
                 Query::Inbox(kind) => kind.label().into(),
                 Query::Multi { owner, name } => format!("u/{owner}/m/{name}"),
@@ -218,7 +210,7 @@ pub(super) fn nsfw(data: &Value) -> bool {
     data["over_18"] == true || data["over18"] == true || data["subreddit"]["over_18"] == true
 }
 
-/// The profile page's summary; a People search result is the same account object.
+/// The profile page's summary.
 pub(super) fn profile_text(data: &Value) -> String {
     if data["is_suspended"] == true {
         return "Suspended account".into();
@@ -310,14 +302,6 @@ pub(super) fn entry(thing: &Value) -> Result<Option<Entry>> {
             entry.body = text::body("", data["public_description"].as_str().unwrap_or_default());
             entry.query = Some(Query::Community(sub.into()));
             entry.icon = parse::community_icon(data);
-        }
-        Some("t2") => {
-            let user = data["name"].as_str().context("User has no name")?;
-            name(user)?;
-            entry.title = format!("u/{user}");
-            entry.body = profile_text(data);
-            entry.query = Some(Query::Profile(user.into()));
-            entry.icon = parse::user_icon(data);
         }
         _ => return Ok(None),
     }

@@ -130,22 +130,34 @@ impl App {
         self.cancel_reveal();
         if let Some(post) = self.current_post() {
             let permalink = post.permalink.clone();
-            if let Some(generation) = self
+            if self
                 .post_view
                 .as_ref()
-                .filter(|view| view.post.permalink == permalink)
-                .map(|view| view.generation)
+                .is_some_and(|view| view.post.permalink == permalink)
             {
-                self.focus = Focus::Post;
-                // A post previewed in a quick run of list moves loads now.
-                if self.post_settle.take() == Some(generation) {
-                    self.load_post(permalink);
-                }
+                self.focus_open_post();
                 return;
             }
             self.open_post_permalink(post, permalink);
         } else if self.post_view.is_some() {
             self.focus = Focus::Post;
+        }
+    }
+
+    /// Focuses the open post; one previewed in a quick run of list moves loads now.
+    pub fn focus_open_post(&mut self) {
+        let Some(view) = &self.post_view else {
+            return;
+        };
+        let (generation, permalink) = (view.generation, view.post.permalink.clone());
+        self.focus = Focus::Post;
+        if self
+            .post_settle
+            .waiting
+            .is_some_and(|(waiting, _)| waiting == generation)
+        {
+            self.post_settle.take();
+            self.load_post(permalink);
         }
     }
 
@@ -155,6 +167,12 @@ impl App {
             self.focus = Focus::Post;
             self.load_post(permalink);
         }
+    }
+
+    /// Motions inside the open post hold pictures back, not the post's own load.
+    pub(super) fn moving_in_post(&mut self) {
+        self.picture_settle.defer((), Instant::now());
+        self.cancel_reveal();
     }
 
     pub(super) fn moving(&mut self) {
@@ -212,11 +230,11 @@ impl App {
     pub(super) fn settle_arrivals(&mut self) {
         for index in 0..self.tabs.len() {
             let feed = &mut self.tabs[index].feed;
-            if feed.update.as_ref().is_some_and(|update| {
-                !feed.leads_with_new(&update.listing.posts, &self.config)
-                    && (!update.stable
-                        || !feed.first_page_changed(&update.listing.posts, &self.config))
-            }) && let Some(update) = feed.update.take()
+            if feed
+                .update
+                .as_ref()
+                .is_some_and(|update| !feed.leads_with_new(&update.listing.posts, &self.config))
+                && let Some(update) = feed.update.take()
             {
                 self.apply_update(index, update, false);
             }
@@ -236,10 +254,7 @@ impl App {
                 .flatten();
             let group = &mut self.all_subs.groups[index];
             let settled = group.arrivals.as_ref().is_some_and(|arrivals| {
-                !displayed
-                    || (!island_has_new(&self.config, &group.posts, arrivals)
-                        && (!group.stable_arrivals
-                            || !island_changed(&self.config, &group.posts, arrivals)))
+                !displayed || !island_has_new(&self.config, &group.posts, arrivals)
             });
             if settled {
                 group.posts = group.arrivals.take().unwrap_or_default();

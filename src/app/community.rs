@@ -143,6 +143,9 @@ impl App {
     }
 
     pub fn open_current_community(&mut self) {
+        if self.open_search_result_post() {
+            return;
+        }
         let search_row = self.search_row_path().is_some();
         let target = self.membership_target();
         if matches!(self.overlay, Some(Overlay::Experience)) {
@@ -152,7 +155,7 @@ impl App {
         self.close_post();
         self.focus_main();
         if search_row {
-            self.open_search_row();
+            self.open_search_row_feed();
             return;
         }
         match target {
@@ -160,6 +163,43 @@ impl App {
             Some(MembershipTarget::User(name)) => self.open_user(&name),
             None => {}
         }
+    }
+
+    /// `gc` on a Search result with a post opens that post in its community or profile tab;
+    /// a comment opens its thread there at the comment.
+    fn open_search_result_post(&mut self) -> bool {
+        if self.active != SEARCH_TAB || self.overlay.is_some() {
+            return false;
+        }
+        if self.search.shows_rows() {
+            let Some(comment) = self.search.selected_row().and_then(|row| row.comment) else {
+                return false;
+            };
+            self.close_post();
+            self.focus_main();
+            self.search.reading_comment = None;
+            self.read_experience(
+                crate::reddit::experience::Query::Thread(comment.permalink),
+                None,
+            );
+            return true;
+        }
+        let post = match &self.post_view {
+            Some(view) if self.post_focused() => Some(view.post.clone()),
+            _ => self.list_post(self.active),
+        };
+        let Some(post) = post.filter(|post| !post.permalink.is_empty()) else {
+            return false;
+        };
+        self.close_post();
+        self.focus_main();
+        match post.profile_user() {
+            Some(user) => self.open_user(user),
+            None => self.open_subreddit(&post.subreddit),
+        }
+        let permalink = post.permalink.clone();
+        self.open_post_permalink(post, permalink);
+        true
     }
 
     pub fn mark_community_read(&mut self, name: &str) {

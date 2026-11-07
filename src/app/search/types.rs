@@ -7,6 +7,16 @@ pub struct Row {
     pub target: FeedTarget,
     /// A People result's avatar and profile summary; communities use the shared icon map.
     pub profile: Option<UserProfile>,
+    /// A Comments result: `target` is its community, this the comment it opens at.
+    pub comment: Option<CommentRow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommentRow {
+    pub permalink: String,
+    /// Community, author and votes on one line.
+    pub meta: String,
+    pub text: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,17 +105,21 @@ pub struct Search {
     pub(super) due: Option<Instant>,
     /// The query and kind the shown results answer.
     pub(super) searched: Option<(String, SearchKind)>,
-    /// The text of the last Posts search; the same text keeps its sort and time range.
+    /// The text of the last Posts or Media search; the same text keeps its sort and time range.
     pub(super) posts_text: Option<String>,
     pub results: Rows,
     /// Communities from Reddit's discovery list, shown under Popular and All Reddit.
     pub discovered: Rows,
     pub preview: Preview,
     pub(in crate::app) opened_feed: Option<u64>,
+    /// The comment link a Comments row asked to read; its thread opens beside the rows.
+    pub(in crate::app) reading_comment: Option<String>,
     /// The last frame drew the preview pane; a hidden pane loads nothing.
     pub(super) preview_shown: bool,
     /// `r` asked for the next preview from Reddit rather than the cache.
     pub(super) preview_forced: bool,
+    /// `q` closed the right pane: the rows fill the width until a row is opened again.
+    pub(super) preview_closed: bool,
     /// Empty answers to the current results query so far, and when the next ask is due.
     pub(super) empty_retry: Option<EmptyRetry>,
 }
@@ -136,8 +150,10 @@ impl Default for Search {
             discovered: Rows::default(),
             preview: Preview::default(),
             opened_feed: None,
+            reading_comment: None,
             preview_shown: false,
             preview_forced: false,
+            preview_closed: false,
             empty_retry: None,
         }
     }
@@ -148,9 +164,10 @@ impl Search {
         self.query.value.trim()
     }
 
-    /// An empty query explores; communities and people list as rows; posts are feed cards.
+    /// An empty query explores; communities, comments and people list as rows; posts and
+    /// media are feed cards.
     pub fn shows_rows(&self) -> bool {
-        self.text().is_empty() || self.kind != SearchKind::Posts
+        self.text().is_empty() || !self.kind.feed()
     }
 
     pub fn exploring(&self) -> bool {
@@ -169,6 +186,7 @@ impl Search {
                 detail: detail.into(),
                 target: FeedTarget::Subreddit(name.into()),
                 profile: None,
+                comment: None,
             })
             .chain(self.discovered.entries.iter().cloned())
             .collect()
@@ -184,9 +202,10 @@ impl Search {
     /// Whether the rows the user sees are still on their way.
     pub fn rows_loading(&self) -> bool {
         if self.exploring() {
-            self.discovered.loading
+            self.discovered.loading || self.discovered.suspended
         } else {
             self.results.loading
+                || self.results.suspended
                 || self.due.is_some()
                 || self
                     .empty_retry
@@ -253,6 +272,27 @@ impl Search {
 }
 
 pub(super) fn row(entry: &crate::reddit::experience::Entry) -> Option<Row> {
+    if let (Some(Query::Thread(permalink)), Some(target)) = (&entry.query, &entry.target) {
+        let (meta, text) = entry.body.split_once('\n').unwrap_or((&entry.body, ""));
+        let text = crate::model::unformatted(text).trim().to_string();
+        return Some(Row {
+            label: entry.title.clone(),
+            detail: text
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .map_or_else(
+                    || meta.to_string(),
+                    |line| format!("{meta} · {}", line.trim()),
+                ),
+            target: FeedTarget::Subreddit(target.subreddit.clone()),
+            profile: None,
+            comment: Some(CommentRow {
+                permalink: permalink.clone(),
+                meta: meta.to_string(),
+                text,
+            }),
+        });
+    }
     let summary = UserProfile::new(
         match &entry.icon {
             SubscriptionIcon::Url(url) => Some(url.clone()),
@@ -271,5 +311,6 @@ pub(super) fn row(entry: &crate::reddit::experience::Entry) -> Option<Row> {
         detail,
         target,
         profile,
+        comment: None,
     })
 }

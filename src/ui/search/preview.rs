@@ -39,6 +39,12 @@ pub(in crate::ui) fn draw_preview(
     let search = &app.search;
     // With no rows the list pane says why; the preview stays blank beside it.
     let row = search.selected_row()?;
+    // While typing, Enter leaves the query; it opens only from the results.
+    let opens = app.focus == Focus::List && app.overlay.is_none() && !app.search_editing();
+    if let Some(comment) = &row.comment {
+        draw_comment(f, area, &row, comment, opens);
+        return None;
+    }
     let name = match &row.target {
         FeedTarget::Subreddit(name) => format!("r/{name}"),
         FeedTarget::User(name) => format!("u/{name}"),
@@ -46,8 +52,6 @@ pub(in crate::ui) fn draw_preview(
     };
     let preview = &search.preview;
     let current = preview.target.as_ref() == Some(&row.target);
-    // While typing, Enter leaves the query; it opens only from the results.
-    let opens = app.focus == Focus::List && app.overlay.is_none() && !app.search_editing();
     let mut chips = vec![
         chip("hot", SUBTEXT, SURFACE0),
         chip(
@@ -81,7 +85,11 @@ pub(in crate::ui) fn draw_preview(
         );
     }
     let mut body = view_header(f, area, &name, chips);
-    if let Some(profile) = &row.profile {
+    let known = match &row.target {
+        FeedTarget::User(name) => app.user_profile(name),
+        _ => None,
+    };
+    if let Some(profile) = known.or(row.profile.as_ref()) {
         body = draw_profile(f, app, body, profile, pictures, None);
     }
     if !current || (preview.loading && preview.posts.is_empty()) {
@@ -123,4 +131,42 @@ pub(in crate::ui) fn draw_preview(
     };
     draw_post_list(f, app, body, &mut spec, pictures);
     None
+}
+
+/// A Comments result in full: its post's title, where and who, then the comment.
+fn draw_comment(
+    f: &mut Frame,
+    area: Rect,
+    row: &crate::app::search::Row,
+    comment: &crate::app::search::CommentRow,
+    opens: bool,
+) {
+    let chips = vec![chip(
+        if opens {
+            "Enter opens the thread"
+        } else {
+            "focus results"
+        },
+        OVERLAY,
+        SURFACE0,
+    )];
+    let body = view_header(f, area, "Comment", chips);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            row.label.clone(),
+            Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(comment.meta.clone(), Style::new().fg(SUBTEXT))),
+        Line::from(""),
+    ];
+    lines.extend(
+        comment
+            .text
+            .lines()
+            .map(|line| Line::from(Span::styled(line.to_string(), Style::new().fg(TEXT)))),
+    );
+    f.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+        body.inner(Margin::new(1, 0)),
+    );
 }

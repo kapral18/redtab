@@ -160,42 +160,33 @@ fn when_home_filters_nsfw_it_should_keep_the_browser_cursor() {
 
 #[test]
 fn when_a_short_best_home_continues_its_posts_should_arrive_before_the_continuation_ends() {
-    use std::io::{BufRead, Write};
-    let listener = local_listener();
-    let base = format!("http://{}/", listener.local_addr().unwrap());
+    use std::io::Write;
+    let served = local_http_server();
+    let base = format!("http://{}/", served.server_addr());
     let (shown, shown_rx) = std::sync::mpsc::channel::<()>();
     let server = std::thread::spawn(move || {
         for continuation in [false, true] {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" || line.is_empty() {
-                    break;
-                }
-            }
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/vnd.reddit.partial+html\r\nTransfer-Encoding: chunked\r\n\r\n"
-            )
-            .unwrap();
-            let mut chunk = |text: &str| {
-                write!(stream, "{:x}\r\n{text}\r\n", text.len()).unwrap();
-                stream.flush().unwrap();
-            };
+            let request = served
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            let mut stream = request.stream(None);
             if continuation {
-                chunk(&native_post("second", "rust"));
+                stream
+                    .write_all(native_post("second", "rust").as_bytes())
+                    .unwrap();
                 let streamed = shown_rx.recv_timeout(Duration::from_secs(5)).is_ok();
-                chunk(&native_post("third", "rust"));
-                chunk("");
+                stream
+                    .write_all(native_post("third", "rust").as_bytes())
+                    .unwrap();
                 return streamed;
             }
-            chunk(&format!(
-                "{}<faceplate-partial id='feed-next-page-partial' src='/svc/shreddit/feeds/home-feed?sort=BEST&amp;after=t3_first'></faceplate-partial>",
-                native_post("first", "rust")
-            ));
-            chunk("");
+            stream
+                .write_all(format!(
+                    "{}<faceplate-partial id='feed-next-page-partial' src='/svc/shreddit/feeds/home-feed?sort=BEST&amp;after=t3_first'></faceplate-partial>",
+                    native_post("first", "rust")
+                ).as_bytes())
+                .unwrap();
         }
         unreachable!()
     });

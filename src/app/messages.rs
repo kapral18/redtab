@@ -31,6 +31,12 @@ impl App {
         };
         self.on_result(msg, Source::default(), false);
         if list_data {
+            if let Some((tab, last)) = self.list_prefetch
+                && tab == self.active_tab().id
+                && !self.popup_open()
+            {
+                self.prefetch_list(last);
+            }
             self.prefetch_short_home();
             self.preview_selection();
             self.sync_feed_demand();

@@ -119,6 +119,7 @@ fn search_source_motions_should_use_shown_sources_without_opened_subreddit_tabs(
             .into_iter()
             .map(|name| crate::app::search::Row {
                 profile: None,
+                comment: None,
                 label: name.into(),
                 detail: String::new(),
                 target: if kind == SearchKind::People {

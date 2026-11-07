@@ -39,14 +39,17 @@ fn when_an_older_request_finishes_before_a_delayed_newer_hint_its_reservation_sh
         .admit(&url, Priority::Selected, true, || false)
         .unwrap();
     let new_sent = Instant::now();
-    let delayed = transport::wait(transport.client.get(&fixture.base).send(), None)
-        .unwrap()
-        .unwrap();
+    let delayed = transport::wait(
+        transport::send(transport.client.get(&fixture.base), None),
+        None,
+    )
+    .unwrap()
+    .unwrap();
     let no_quota = transport::wait(
-        transport
-            .client
-            .get(url.join("no-quota").unwrap().as_str())
-            .send(),
+        transport::send(
+            transport.client.get(url.join("no-quota").unwrap().as_str()),
+            None,
+        ),
         None,
     )
     .unwrap()
@@ -87,17 +90,20 @@ fn when_a_later_request_finishes_without_quota_its_debit_should_survive_an_older
     let url = Url::parse(&fixture.base).unwrap();
     let older = rate.admit(&url, Priority::Listing, true, || false).unwrap();
     let sent = Instant::now();
-    let old_response = transport::wait(transport.client.get(&fixture.base).send(), None)
-        .unwrap()
-        .unwrap();
+    let old_response = transport::wait(
+        transport::send(transport.client.get(&fixture.base), None),
+        None,
+    )
+    .unwrap()
+    .unwrap();
     let later = rate
         .admit(&url, Priority::Selected, true, || false)
         .unwrap();
     let no_quota = transport::wait(
-        transport
-            .client
-            .get(url.join("no-quota").unwrap().as_str())
-            .send(),
+        transport::send(
+            transport.client.get(url.join("no-quota").unwrap().as_str()),
+            None,
+        ),
         None,
     )
     .unwrap()
@@ -136,9 +142,12 @@ fn when_an_older_request_is_pending_a_newer_hint_should_reserve_its_quota() {
     let newer = rate
         .admit(&url, Priority::Selected, true, || false)
         .unwrap();
-    let response = transport::wait(transport.client.get(&fixture.base).send(), None)
-        .unwrap()
-        .unwrap();
+    let response = transport::wait(
+        transport::send(transport.client.get(&fixture.base), None),
+        None,
+    )
+    .unwrap()
+    .unwrap();
     rate.observe(&response, &url, Instant::now(), newer.sequence, newer.older);
     let deadline = Instant::now() + Duration::from_millis(50);
 
@@ -172,9 +181,12 @@ fn when_later_starts_are_not_in_a_quota_hint_they_should_be_deducted() {
     let _second = rate
         .admit(&url, Priority::Selected, true, || false)
         .unwrap();
-    let response = transport::wait(transport.client.get(&fixture.base).send(), None)
-        .unwrap()
-        .unwrap();
+    let response = transport::wait(
+        transport::send(transport.client.get(&fixture.base), None),
+        None,
+    )
+    .unwrap()
+    .unwrap();
     rate.observe(&response, &url, sent, first.sequence, first.older);
     let deadline = Instant::now() + Duration::from_millis(50);
 
@@ -265,10 +277,10 @@ fn when_budget_replies_arrive_out_of_order_the_older_hint_should_not_restore_slo
     let transport = Transport::new().unwrap();
     let response = |path| {
         transport::wait(
-            transport
-                .client
-                .get(format!("{}{path}", fixture.base))
-                .send(),
+            transport::send(
+                transport.client.get(format!("{}{path}", fixture.base)),
+                None,
+            ),
             None,
         )
         .unwrap()

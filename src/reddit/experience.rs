@@ -6,11 +6,13 @@ use url::Url;
 use wreq::header::HeaderValue;
 
 use super::{Reddit, parse, text, transport};
-use crate::model::{Post, PostPage, TimeRange};
+use crate::model::{Post, PostPage};
 
 mod actions;
 mod pages;
 mod requests;
+mod search;
+pub(in crate::reddit) use search::PATH as SEARCH_PATH;
 mod types;
 
 pub use actions::*;

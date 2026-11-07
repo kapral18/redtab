@@ -42,7 +42,9 @@ fn bookmark_and_search_preview_videos_load_their_first_frame_with_autoplay_off()
     let serving = std::thread::spawn(move || {
         while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
             if let Some(request) = server.recv_timeout(Duration::from_millis(20)).unwrap() {
-                let _ = request.respond(tiny_http::Response::from_data(bytes.clone()));
+                let _ = request.respond(crate::reddit::tests::served::Response::from_data(
+                    bytes.clone(),
+                ));
             }
         }
     });

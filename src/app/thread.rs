@@ -60,7 +60,7 @@ impl App {
     }
 
     pub fn move_comment_cursor(&mut self, delta: isize) {
-        self.moving();
+        self.moving_in_post();
         let Some(view) = &mut self.post_view else {
             return;
         };
@@ -96,7 +96,7 @@ impl App {
     }
 
     pub fn post_top(&mut self) {
-        self.moving();
+        self.moving_in_post();
         if let Some(view) = &mut self.post_view {
             view.cursor = 0;
             view.go_to_top();
@@ -104,7 +104,7 @@ impl App {
     }
 
     pub fn post_bottom(&mut self) {
-        self.moving();
+        self.moving_in_post();
         if let Some(view) = &mut self.post_view {
             let len = view.rows().len();
             // A hidden spoiler post has no comments to select.
@@ -127,7 +127,7 @@ impl App {
     }
 
     pub fn scroll_post(&mut self, delta: isize) {
-        self.moving();
+        self.moving_in_post();
         if let Some(view) = &mut self.post_view {
             if delta < 0 && view.scroll <= delta.unsigned_abs() {
                 view.go_to_top();
@@ -150,7 +150,7 @@ impl App {
     }
 
     pub fn jump_top_level(&mut self, forward: bool) {
-        self.moving();
+        self.moving_in_post();
         let Some(view) = &mut self.post_view else {
             return;
         };

@@ -19,8 +19,9 @@ fn when_reply_expansions_are_replaced_they_should_release_workers_during_cooldow
     for request in [first, second] {
         request
             .respond(
-                tiny_http::Response::empty(429)
-                    .with_header(tiny_http::Header::from_bytes("Retry-After", "1").unwrap()),
+                crate::reddit::tests::served::Response::empty(429).with_header(
+                    crate::reddit::tests::served::Header::new("Retry-After", "1"),
+                ),
             )
             .unwrap();
     }
@@ -53,9 +54,9 @@ fn when_reply_expansions_are_replaced_they_should_release_workers_during_cooldow
         "{}",
         next.url()
     );
-    next.respond(tiny_http::Response::from_string(include_str!(
-        "../../../tests/fixtures/post.json"
-    )))
+    next.respond(crate::reddit::tests::served::Response::from_string(
+        include_str!("../../../tests/fixtures/post.json"),
+    ))
     .unwrap();
     let message = next_message(&messages);
     assert!(
@@ -86,14 +87,14 @@ fn when_active_detail_reads_are_superseded_the_next_post_should_not_wait_for_the
     });
     let selected = data_request(&server);
     for request in held {
-        let _ = request.respond(tiny_http::Response::empty(200));
+        let _ = request.respond(crate::reddit::tests::served::Response::empty(200));
     }
     let selected = selected.expect("superseded active reads must release selected workers");
     assert!(selected.url().starts_with("/comments/new.json"));
     selected
-        .respond(tiny_http::Response::from_string(include_str!(
-            "../../../tests/fixtures/post.json"
-        )))
+        .respond(crate::reddit::tests::served::Response::from_string(
+            include_str!("../../../tests/fixtures/post.json"),
+        ))
         .unwrap();
     for _ in 0..3 {
         let message = match next_message(&messages) {

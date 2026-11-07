@@ -234,7 +234,11 @@ pub fn available(app: &App, action: Action) -> bool {
         Browser => match context {
             Context::Browse => true,
             Context::Sidebar => app.source_browser_path().is_some(),
-            Context::List | Context::Post => app.current_post().is_some() || app.source_browser_path().is_some(),
+            Context::List | Context::Post => {
+                app.current_post().is_some()
+                    || app.search_comment_link().is_some()
+                    || app.source_browser_path().is_some()
+            }
             _ => false,
         },
         Sort => context == Context::Post || (app.overlay.is_none() && feed),

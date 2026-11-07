@@ -166,8 +166,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         body
     };
-    let wants_preview =
-        app.post_view.is_none() && app.active == crate::app::SEARCH_TAB && app.search.shows_rows();
+    let wants_preview = app.post_view.is_none()
+        && app.active == crate::app::SEARCH_TAB
+        && app.search.shows_rows()
+        && !app.search_preview_closed();
     let preview_beside = wants_preview && app.detail_fits();
     let search_feed_beside = search_feed && app.detail_fits();
     if app.active == crate::app::SEARCH_TAB {

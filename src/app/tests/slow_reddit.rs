@@ -15,15 +15,11 @@ pub(super) fn assert_feed_arrives_before_tail(home: bool, append: bool) {
                 .recv_timeout(Duration::from_secs(5))
                 .unwrap()
                 .unwrap();
-            if request.method() == &tiny_http::Method::Head {
-                request.respond(tiny_http::Response::empty(200)).unwrap();
-                continue;
-            }
             let path = request.url().to_string();
             log.lock().unwrap().push(path.clone());
             if home && path.contains("cursor=next") {
                 request
-                    .respond(tiny_http::Response::from_string(
+                    .respond(crate::reddit::tests::served::Response::from_string(
                         ["d", "e"]
                             .map(|id| crate::reddit::tests::native_post(id, "s"))
                             .join(""),
@@ -33,7 +29,9 @@ pub(super) fn assert_feed_arrives_before_tail(home: bool, append: bool) {
             }
             if path.contains("about.json") {
                 request
-                    .respond(tiny_http::Response::from_string(r#"{"data":{}}"#))
+                    .respond(crate::reddit::tests::served::Response::from_string(
+                        r#"{"data":{}}"#,
+                    ))
                     .unwrap();
                 continue;
             }
@@ -66,15 +64,8 @@ pub(super) fn assert_feed_arrives_before_tail(home: bool, append: bool) {
             } else {
                 (first, rest)
             };
-            let mut writer = request.into_writer();
-            write!(
-                writer,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                first.len() + rest.len(),
-                first
-            )
-            .unwrap();
-            writer.flush().unwrap();
+            let mut writer = request.stream(Some(first.len() + rest.len()));
+            writer.write_all(first.as_bytes()).unwrap();
             sent.send(()).unwrap();
             let _ = tail.recv_timeout(Duration::from_secs(3));
             writer.write_all(rest.as_bytes()).unwrap();
@@ -158,23 +149,15 @@ pub(super) struct SlowReddit {
 
 impl SlowReddit {
     pub(super) fn start(delay: Duration) -> Self {
-        use std::io::{BufRead, BufReader, Write};
-        let listener = crate::reddit::tests::local_listener();
-        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = crate::reddit::tests::local_http_server();
+        let url = format!("http://{}", server.server_addr());
         let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = std::sync::Arc::clone(&asked);
         std::thread::spawn(move || {
-            for mut stream in listener.incoming().flatten() {
+            while let Ok(request) = server.recv() {
                 let log = std::sync::Arc::clone(&log);
                 std::thread::spawn(move || {
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut request = String::new();
-                    let _ = reader.read_line(&mut request);
-                    let mut line = String::new();
-                    while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
-                        line.clear();
-                    }
-                    let path = request.split(' ').nth(1).unwrap_or_default();
+                    let path = request.url().to_owned();
                     let body = match path
                         .split('/')
                         .nth(2)
@@ -188,11 +171,8 @@ impl SlowReddit {
                         }
                         None => String::new(),
                     };
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
+                    let _ =
+                        request.respond(crate::reddit::tests::served::Response::from_string(body));
                 });
             }
         });

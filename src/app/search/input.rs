@@ -1,7 +1,7 @@
 use super::*;
 
 impl App {
-    /// The tab key and command for F3, `SPC s e`, `SPC s p/c/u` and `/` outside communities.
+    /// The tab key and command for F3, `SPC s e`, `SPC s p/c/C/m/u` and `/` outside communities.
     pub fn open_search(&mut self, kind: Option<SearchKind>) {
         if self.experience.writing() {
             return;
@@ -39,9 +39,19 @@ impl App {
     pub(in crate::app) fn search_departed(&mut self) {
         self.retire_search_rows(false);
         self.retire_search_rows(true);
+        // A pending ask-again waits for the return, like a request in flight.
+        if self
+            .search
+            .empty_retry
+            .as_mut()
+            .is_some_and(|retry| retry.due.take().is_some())
+        {
+            self.search.results.suspended = true;
+        }
         self.search.due = None;
         self.search.preview.due = None;
         self.search.preview_shown = false;
+        self.search.preview_forced = false;
         if self.search.preview.loading {
             self.search.preview = Preview::default();
         }
@@ -189,11 +199,7 @@ impl App {
     pub fn cycle_search_kind(&mut self, forward: bool) {
         // From a feed opened beside the results, the switch happens back in Search.
         self.return_to_search();
-        let kinds = [
-            SearchKind::Posts,
-            SearchKind::Communities,
-            SearchKind::People,
-        ];
+        let kinds = SearchKind::ALL;
         let at = kinds
             .iter()
             .position(|kind| *kind == self.search.kind)
@@ -228,19 +234,33 @@ impl App {
             .min(len - 1);
         if selected != self.search.selected {
             self.search.selected = selected;
+            // A comment's thread beside the rows gives way to the next row's preview.
+            if self.active == SEARCH_TAB {
+                self.close_post();
+            }
             self.schedule_preview(Instant::now());
         }
         self.load_more_rows();
     }
 
-    /// The community or person a selected row stands for, for `SPC c` and `SPC m`.
-    pub(in crate::app) fn search_row_target(&self) -> Option<FeedTarget> {
+    /// The selected row while the Search rows have focus.
+    fn search_row(&self) -> Option<Row> {
         (self.active == SEARCH_TAB
             && self.search.shows_rows()
             && self.focus == super::super::Focus::List
             && self.post_view.is_none())
-        .then(|| self.search.selected_row().map(|row| row.target))
+        .then(|| self.search.selected_row())
         .flatten()
+    }
+
+    /// The community or person a selected row stands for, for `SPC c` and `SPC m`.
+    pub(in crate::app) fn search_row_target(&self) -> Option<FeedTarget> {
+        self.search_row().map(|row| row.target)
+    }
+
+    /// The selected Comments row's comment link; `search_row_path` stays its community.
+    pub(crate) fn search_comment_link(&self) -> Option<String> {
+        self.search_row()?.comment.map(|comment| comment.permalink)
     }
 
     pub(crate) fn search_row_path(&self) -> Option<String> {
@@ -267,6 +287,25 @@ impl App {
         self.search_shows_rows() || self.search_feed_open()
     }
 
+    /// `q` on a feed opened beside the results closes it, preview included.
+    pub fn close_search_feed(&mut self) -> bool {
+        let closed = self.return_to_search();
+        self.search.preview_closed |= closed;
+        closed
+    }
+
+    /// `q` on the results closes the preview beside them before `q` can quit.
+    pub fn close_search_preview(&mut self) -> bool {
+        let open =
+            self.active == SEARCH_TAB && self.search.preview_shown && !self.search.preview_closed;
+        self.search.preview_closed |= open;
+        open
+    }
+
+    pub fn search_preview_closed(&self) -> bool {
+        self.search.preview_closed
+    }
+
     pub fn return_to_search(&mut self) -> bool {
         if self.search.opened_feed != Some(self.active_tab().id) {
             return false;
@@ -278,12 +317,27 @@ impl App {
         true
     }
 
-    /// Enter or `l` on a row opens its feed as a tab.
+    /// Enter or `l` on a row opens its feed as a tab; a comment opens its thread at it,
+    /// beside the rows.
     pub fn open_search_row(&mut self) {
+        match self.search.selected_row().and_then(|row| row.comment) {
+            Some(comment) => {
+                self.search.editing = false;
+                self.search.preview_closed = false;
+                self.search.reading_comment = Some(comment.permalink.clone());
+                self.read_experience(Query::Thread(comment.permalink), None);
+            }
+            None => self.open_search_row_feed(),
+        }
+    }
+
+    /// The row's feed as a tab: a comment's community.
+    pub fn open_search_row_feed(&mut self) {
         let Some(row) = self.search.selected_row() else {
             return;
         };
         self.search.editing = false;
+        self.search.preview_closed = false;
         match row.target {
             FeedTarget::Subreddit(name) => self.open_subreddit(&name),
             FeedTarget::User(name) => self.open_user(&name),

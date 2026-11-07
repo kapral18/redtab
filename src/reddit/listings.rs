@@ -29,7 +29,20 @@ impl Reddit {
 
     pub(super) fn listing_url(&self, subreddit: &str, sort: Sort) -> Result<Url> {
         if subreddit.eq_ignore_ascii_case("all") {
-            return self.subreddit_at(&self.0.old, subreddit, &format!("{}.json", sort.as_str()));
+            // old.reddit refuses `r/all/hot.json`, `new.json` and `rising.json` (HTTP 403) but
+            // serves Hot at `r/all.json`; no host serves New or Rising for r/all.
+            return match sort {
+                Sort::Hot => Ok(self.0.old.join("r/all.json")?),
+                Sort::New => {
+                    bail!("Reddit refuses All Reddit sorted by New; use Hot, Top or Controversial")
+                }
+                Sort::Rising => {
+                    bail!(
+                        "Reddit refuses All Reddit sorted by Rising; use Hot, Top or Controversial"
+                    )
+                }
+                _ => self.subreddit_at(&self.0.old, subreddit, &format!("{}.json", sort.as_str())),
+            };
         }
         self.subreddit_at(&self.0.classic, subreddit, sort.as_str())
     }

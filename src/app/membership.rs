@@ -114,6 +114,8 @@ impl App {
     }
 
     pub(super) fn sync_islands(&mut self, names: Vec<String>) {
+        // Drawn indices point into the old island list; the next draw records new ones.
+        self.all_subs.shown.clear();
         let selected = self
             .all_subs
             .groups
@@ -169,16 +171,22 @@ impl App {
         freshness: Freshness,
         refreshing: bool,
     ) {
-        if generation != self.all_subs.generation
-            || self
-                .membership
-                .as_ref()
-                .is_some_and(|change| !change.checking || freshness.source.cached)
+        if generation != self.all_subs.generation {
+            return;
+        }
+        if self
+            .membership
+            .as_ref()
+            .is_some_and(|change| !change.checking || freshness.source.cached)
             || self
                 .all_subs
                 .freshness
                 .is_some_and(|current| !freshness.source.may_replace(current.source))
         {
+            // A final answer the list keeps out still ends this request.
+            if !refreshing {
+                self.all_subs.loading = false;
+            }
             return;
         }
         self.all_subs.loading = refreshing;
@@ -256,6 +264,17 @@ impl App {
         }
         change.checking = true;
         change.error = result.err();
+        // A rejected session cannot read the list back, so nothing would settle the change.
+        if self.reddit.needs_sign_in() {
+            let change = self.membership.take().expect("checked pending membership");
+            self.error(change.error.unwrap_or_else(|| {
+                format!(
+                    "Reddit signed this session out; reconnect to confirm membership for {}",
+                    change.target.label()
+                )
+            }));
+            return;
+        }
         self.load_subscriptions(true);
     }
 
@@ -337,6 +356,7 @@ impl App {
             self.info(progress);
             return;
         }
+        self.cancel_collection_refresh();
         if self.experience.pending.is_some() {
             self.info("Wait for the pending Reddit request");
             return;

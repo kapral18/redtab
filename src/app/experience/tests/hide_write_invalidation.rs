@@ -19,7 +19,6 @@ fn a_removed_post_stays_out_of_later_listings_and_waiting_island_posts() {
         needs_refresh: false,
         stream: None,
         arrivals: Some(vec![named("gone"), named("kept")]),
-        stable_arrivals: false,
         manual: false,
     });
     app.tabs[BOOKMARKS_TAB].feed.selected = 1;
@@ -119,7 +118,6 @@ fn a_write_before_r_answers_leaves_island_arrivals_behind_the_notice() {
         needs_refresh: true,
         stream: None,
         arrivals: None,
-        stable_arrivals: false,
         manual: true,
     });
 
@@ -255,7 +253,6 @@ fn when_a_write_restarts_a_group_the_next_refresh_should_receive_a_distinct_gene
         needs_refresh: false,
         stream: None,
         arrivals: None,
-        stable_arrivals: false,
         manual: false,
     });
     app.after_experience_write(&Action::Save {

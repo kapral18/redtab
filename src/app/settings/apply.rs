@@ -288,6 +288,7 @@ impl App {
                 sort: old.sort,
                 time: old.time,
                 search: old.search.take(),
+                search_media: old.search_media,
                 search_sort: old.search_sort,
                 search_time: old.search_time,
                 ..Feed::default()
@@ -299,10 +300,18 @@ impl App {
                 ..Group::default()
             };
         }
+        // Fresh islands keep what is known about private or banned communities.
+        self.sync_community_access();
         self.all_subs.loading = false;
         self.all_subs.error = None;
         self.all_subs.generation += 1;
         self.reset_search_loads();
+        // Requests of the stopped pool never answer, as on an account switch.
+        self.pending_posts.clear();
+        if let Some(view) = &mut self.post_view {
+            view.loading = false;
+            view.loading_more.clear();
+        }
         self.post_settle = super::super::Settle::default();
         self.feed_settle = super::super::Settle::default();
         if !self.reddit.needs_sign_in() {

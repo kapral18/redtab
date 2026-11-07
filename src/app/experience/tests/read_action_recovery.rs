@@ -78,7 +78,6 @@ fn ui_audit_read_errors_should_offer_the_reload_key() {
             query: Query::Search {
                 text: "rust".into(),
                 kind: ListSearch::Communities,
-                time: TimeRange::All,
             },
             after: Some("next".into()),
         },

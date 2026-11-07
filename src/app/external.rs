@@ -15,8 +15,12 @@ impl App {
             self.open_reddit_link(&format!("/r/{name}/"));
             return;
         }
-        if let Some(target) = self.comment_target() {
-            self.open_reddit_link(&target.permalink);
+        if let Some(link) = self
+            .comment_target()
+            .map(|target| target.permalink)
+            .or_else(|| self.search_comment_link())
+        {
+            self.open_reddit_link(&link);
             return;
         }
         let Some(post) = self.current_post() else {
@@ -42,6 +46,8 @@ impl App {
     pub(crate) fn copy_link_target(&self) -> anyhow::Result<(String, bool)> {
         if let Some(target) = self.comment_target() {
             Ok((target.url()?, true))
+        } else if let Some(link) = self.search_comment_link() {
+            Ok((crate::reddit::experience::reddit_url(&link)?, true))
         } else if let Some(post) = self.current_post() {
             Ok((post.reddit_url(), false))
         } else if let Some(path) = self.search_row_path() {
@@ -66,6 +72,8 @@ impl App {
     }
 
     pub(super) fn hand_off_media(&mut self, permalink: &str, media: Media) {
+        // Only the player showing this media pauses, not a card the selection just left.
+        let playing = media.video_url().and_then(|url| self.playback_url(url));
         let commands = &self.config.commands;
         let video = media.video_url().is_some();
         let result = if let Some(url) = media.youtube_url() {
@@ -103,6 +111,7 @@ impl App {
         if video
             && result.is_ok()
             && let Some(player) = &mut self.video
+            && playing.as_deref() == Some(player.url.as_str())
             && !player.paused()
         {
             player.toggle_pause(Instant::now());

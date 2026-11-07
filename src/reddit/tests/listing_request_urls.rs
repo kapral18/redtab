@@ -13,19 +13,6 @@ fn searches_and_community_listings_should_use_scoped_hosts_and_refuse_other_orig
         .unwrap(),
     )
     .unwrap();
-    for kind in [
-        experience::ListSearch::Communities,
-        experience::ListSearch::People,
-    ] {
-        let query = experience::Query::Search {
-            text: "rust".into(),
-            kind,
-            time: crate::model::TimeRange::All,
-        };
-        let url = reddit.read_url(&query, None).unwrap();
-        assert_eq!(url.host_str(), Some("api.reddit.com"));
-        assert!(!url.path().ends_with(".json"), "{url}");
-    }
     let url = reddit
         .search_url(
             "rust",
@@ -51,8 +38,11 @@ fn searches_and_community_listings_should_use_scoped_hosts_and_refuse_other_orig
     let all = reddit.listing_url("all", crate::model::Sort::Hot).unwrap();
     assert_eq!(
         (all.host_str(), all.path()),
-        (Some("old.reddit.com"), "/r/all/hot.json")
+        (Some("old.reddit.com"), "/r/all.json")
     );
+    for refused in [crate::model::Sort::New, crate::model::Sort::Rising] {
+        assert!(reddit.listing_url("all", refused).is_err(), "{refused:?}");
+    }
     let rust = reddit.listing_url("rust", crate::model::Sort::Hot).unwrap();
     assert_eq!(
         (rust.host_str(), rust.path()),

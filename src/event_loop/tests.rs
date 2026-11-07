@@ -87,7 +87,8 @@ fn when_worker_results_arrive_in_a_burst_input_should_get_another_turn() {
             .unwrap();
     }
 
-    assert!(drain_messages(&mut app, &messages));
+    let drained = drain_messages(&mut app, &messages);
+    assert!(drained.changed && drained.more);
 
     assert!(
         (24..32).contains(&messages.try_iter().count()),

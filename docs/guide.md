@@ -21,12 +21,12 @@ Optional programs:
 | Program | Used for |
 | --- | --- |
 | `ffmpeg` | Inline video and GIF playback (8.1 or newer seeks YouTube faster) |
-| `yt-dlp` (2026.08.19 or newer) and Deno 2.3+ or Node.js 22+ | Inline public YouTube videos and Shorts |
+| `yt-dlp` (2026.08.19 or newer) and Deno 2.3+ or Node.js 22+ | Inline public and unlisted YouTube videos and Shorts |
 | `ffplay` | Sound during inline playback |
 | `mpv` | Opening videos with `O` |
 | `secret-tool` | Saved sessions on Linux; included in Debian/Ubuntu's `libsecret-tools` |
 
-## Find what you need
+## Documentation
 
 - [Using redtab](usage.md): feeds, comments, media and posting.
 - [Keyboard reference](keybindings.md): Vim navigation and mnemonic action groups.
@@ -34,15 +34,25 @@ Optional programs:
 - [Settings](configuration.md): the settings dialog, TOML file and save conflicts.
 - [Development](development.md): build checks and the [UI reference](ui.md).
 
-## Startup options
+## Command line
 
 ```sh
 redtab                   # personalized Home feed
 redtab -s neovim         # start on r/neovim
 redtab -c ~/redtab.toml  # use another config file
-redtab --check           # print connection diagnostics
+redtab --check           # live connection diagnostics
 ```
 
-`--check` prints configuration, Home status, subscription count and the state-file
-path. It exits with status 1 if Home or subscriptions cannot load. Use
-`redtab --help` for all options.
+| Flag | Behavior |
+| --- | --- |
+| `-c`, `--config PATH` | Use this config file |
+| `-s`, `--subreddit NAME` | Open this community at startup |
+| `--signin` | [Connect a browser session](accounts.md#sign-in-from-the-command-line) or import cookies from stdin |
+| `--browser NAME` | Browser for `--signin` |
+| `--profile NAME` | Browser profile; requires `--signin --browser` |
+| `--check` | Print config, Home status, subscription count and state path; exit |
+| `-h`, `--help` | Print help and exit |
+| `-V`, `--version` | Print version and exit |
+
+`--check` contacts Reddit and exits with status 1 unless Home reports up and subscriptions load.
+`--signin` cannot be combined with `--check`, `--config` or `--subreddit`.

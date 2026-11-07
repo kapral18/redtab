@@ -117,10 +117,6 @@ fn when_home_starts_with_three_posts_it_should_fill_without_a_tab_switch() {
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .unwrap()
                 .unwrap();
-            if request.method() == &tiny_http::Method::Head {
-                request.respond(tiny_http::Response::empty(200)).unwrap();
-                continue;
-            }
             let url = url::Url::parse(&format!("http://fixture{}", request.url())).unwrap();
             let body: String = match url.path() {
                 "/svc/shreddit/feeds/home-feed" => {
@@ -143,7 +139,7 @@ fn when_home_starts_with_three_posts_it_should_fill_without_a_tab_switch() {
                 path => panic!("unexpected path: {path}"),
             };
             request
-                .respond(tiny_http::Response::from_string(body))
+                .respond(crate::reddit::tests::served::Response::from_string(body))
                 .unwrap();
             completed += 1;
         }

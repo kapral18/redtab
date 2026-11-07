@@ -4,46 +4,62 @@ pub(crate) const PAGE_LIMIT: usize = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Query {
-    Search {
-        text: String,
-        kind: ListSearch,
-        time: TimeRange,
-    },
-    User {
-        name: String,
-        feed: UserFeed,
-    },
+    Search { text: String, kind: ListSearch },
+    User { name: String, feed: UserFeed },
     Profile(String),
     Inbox(Inbox),
     Communities,
     Community(String),
     Rules(String),
     Moderators(String),
-    Wiki {
-        subreddit: String,
-        page: String,
-    },
+    Wiki { subreddit: String, page: String },
     Multis,
-    Multi {
-        owner: String,
-        name: String,
-    },
+    Multi { owner: String, name: String },
     Inspect(Target),
     Thread(String),
 }
 
-/// Searches whose results list in the popup; post searches open as feeds.
+/// Searches whose results list as rows; post and media searches show as feeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListSearch {
     Communities,
+    Comments,
     People,
 }
 
+/// The kinds in reddit.com's search tab order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchKind {
     Posts,
     Communities,
+    Comments,
+    Media,
     People,
+}
+
+impl SearchKind {
+    pub const ALL: [Self; 5] = [
+        Self::Posts,
+        Self::Communities,
+        Self::Comments,
+        Self::Media,
+        Self::People,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Posts => "Posts",
+            Self::Communities => "Communities",
+            Self::Comments => "Comments",
+            Self::Media => "Media",
+            Self::People => "People",
+        }
+    }
+
+    /// Posts and Media results are post feeds; the other kinds list as rows.
+    pub fn feed(self) -> bool {
+        matches!(self, Self::Posts | Self::Media)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
@@ -226,17 +242,7 @@ impl Query {
     pub(super) fn route(&self) -> Result<(String, Vec<(&'static str, String)>)> {
         let mut params = Vec::new();
         let path = match self {
-            Self::Search { text, kind, time } => {
-                if text.trim().is_empty() {
-                    bail!("Enter a search query");
-                }
-                params.push(("q", text.clone()));
-                params.push(("t", time.as_str().into()));
-                match kind {
-                    ListSearch::Communities => "subreddits/search".into(),
-                    ListSearch::People => "users/search".into(),
-                }
-            }
+            Self::Search { .. } => bail!("Searches use the search pages"),
             Self::User { name: user, feed } => {
                 params.push(("sort", "new".into()));
                 format!("user/{}/{}.json", name(user)?, feed.as_str())
@@ -272,6 +278,13 @@ impl Query {
             Self::Profile(user) => return reddit_url(&format!("user/{}", name(user)?)),
             Self::Community(sub) => return reddit_url(&format!("r/{}", name(sub)?)),
             Self::Multis => return reddit_url("/"),
+            Self::Search { text, kind } => {
+                let mut url = Url::parse(&reddit_url("search/")?)?;
+                url.query_pairs_mut()
+                    .append_pair("q", text)
+                    .append_pair("type", kind.param());
+                return Ok(url.into());
+            }
             _ => {}
         }
         let (path, params) = self.route()?;

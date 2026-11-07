@@ -38,6 +38,7 @@ pub(super) fn resolve(
     if !base.path().ends_with(".m3u8") {
         return Ok(Sources::file(url));
     }
+    #[cfg(not(test))]
     let agent: ureq::Agent = ureq::Agent::config_builder()
         // Inputs come from the loopback relay; upstream routing belongs to it.
         .proxy(None)
@@ -45,6 +46,9 @@ pub(super) fn resolve(
         .build()
         .into();
     let fetch = |at: &url::Url| {
+        #[cfg(test)]
+        return crate::reddit::tests::fetch_text(at.as_str());
+        #[cfg(not(test))]
         agent
             .get(at.as_str())
             .call()

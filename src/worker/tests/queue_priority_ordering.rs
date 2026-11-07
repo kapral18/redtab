@@ -6,6 +6,8 @@ fn pictures_in_text_should_wait_on_the_background_queue_not_the_one_the_reader_w
     let (background, _background_rx) = channel();
     let (thumbs, _thumbs_rx) = channel();
     let (icons, _icons_rx) = channel();
+    let (foreground_frames, foreground_frames_rx) = channel();
+    let (frames, frames_rx) = channel();
     let (images, images_rx) = channel();
     let queues = Queues {
         foreground_images: priority.clone(),
@@ -16,6 +18,8 @@ fn pictures_in_text_should_wait_on_the_background_queue_not_the_one_the_reader_w
         group_cache: background.clone(),
         background,
         thumbs,
+        foreground_frames,
+        frames,
         icons,
     };
     let image = |background| Work {
@@ -55,6 +59,28 @@ fn pictures_in_text_should_wait_on_the_background_queue_not_the_one_the_reader_w
         priority_rx.try_recv().is_err(),
         "the text picture is not on it"
     );
+    for background in [true, false] {
+        queues.submit(Work {
+            job: Job::VideoFrame {
+                url: "https://v.redd.it/x/DASH_360.mp4".into(),
+                background,
+            },
+            ..image(background)
+        });
+    }
+    assert!(
+        images_rx.try_recv().is_err() && priority_rx.try_recv().is_err(),
+        "ffmpeg stills never wait in a picture queue"
+    );
+    let frame = |work: Result<Work, _>| match work {
+        Ok(Work {
+            job: Job::VideoFrame { background, .. },
+            ..
+        }) => Some(background),
+        _ => None,
+    };
+    assert_eq!(frame(frames_rx.try_recv()), Some(true));
+    assert_eq!(frame(foreground_frames_rx.try_recv()), Some(false));
 }
 
 #[test]
@@ -63,6 +89,7 @@ fn an_icon_lookup_waits_on_neither_home_group_loads_nor_thumbnails() {
     let (background, background_rx) = channel();
     let (thumbs, thumbs_rx) = channel();
     let (icons, icons_rx) = channel();
+    let (priority_frames, _frames_rx) = channel();
     let (images, _images_rx) = channel();
     let queues = Queues {
         foreground_images: priority.clone(),
@@ -73,6 +100,8 @@ fn an_icon_lookup_waits_on_neither_home_group_loads_nor_thumbnails() {
         group_cache: background.clone(),
         background,
         thumbs,
+        foreground_frames: priority_frames.clone(),
+        frames: priority_frames,
         icons,
     };
 
@@ -121,7 +150,6 @@ fn the_search_tabs_preview_and_discovery_should_stay_wanted_beside_other_request
         query: Query::Search {
             text: "rust".into(),
             kind: ListSearch::Communities,
-            time: crate::model::TimeRange::All,
         },
         after: None,
     };
@@ -192,9 +220,9 @@ fn denied_group_responses_should_keep_their_order_after_a_newer_feed_succeeds() 
             after: None,
         });
         let feed = data_request(&server).unwrap();
-        feed.respond(tiny_http::Response::from_string(include_str!(
-            "../../../tests/fixtures/sub.json"
-        )))
+        feed.respond(crate::reddit::tests::served::Response::from_string(
+            include_str!("../../../tests/fixtures/sub.json"),
+        ))
         .unwrap();
         let successful = loop {
             let message = next_message(&messages);
@@ -213,7 +241,8 @@ fn denied_group_responses_should_keep_their_order_after_a_newer_feed_succeeds() 
         assert!(matches!(*message, Msg::Feed { result: Ok(_), .. }));
         group
             .respond(
-                tiny_http::Response::from_string(r#"{"reason":"private"}"#).with_status_code(403),
+                crate::reddit::tests::served::Response::from_string(r#"{"reason":"private"}"#)
+                    .with_status_code(403),
             )
             .unwrap();
 

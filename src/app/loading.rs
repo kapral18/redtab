@@ -340,7 +340,7 @@ impl App {
             self.info("Search runs inside a subreddit tab");
             return;
         }
-        self.tabs[self.active].feed.set_search(query);
+        self.tabs[self.active].feed.set_search(query, false);
         self.load_feed(self.active, false);
     }
 

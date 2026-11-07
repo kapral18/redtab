@@ -21,7 +21,7 @@ fn search_tab_rows_should_keep_the_preview_beside_them_at_common_widths() {
         .find(|line| line.contains("Search posts"))
         .unwrap();
     assert!(
-        bar.contains("Posts │ Communities │ People"),
+        bar.contains("Posts │ Communities │ Comments │ Media │ People"),
         "query and kinds share one bar above the list and preview: {shown}"
     );
 

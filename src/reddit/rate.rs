@@ -108,7 +108,8 @@ fn budget_index(url: &Url) -> usize {
         matches!(
             url.path(),
             "/settings/preferences" | "/svc/shreddit/graphql"
-        ) || url.path() == super::home::PATH,
+        ) || url.path() == super::home::PATH
+            || url.path() == super::experience::SEARCH_PATH,
     )
 }
 
@@ -410,6 +411,7 @@ impl Rate {
 fn operation(url: &Url) -> String {
     let parts: Vec<_> = url.path().split('/').filter(|p| !p.is_empty()).collect();
     match parts.as_slice() {
+        ["r", "all.json"] => "r/all listing".into(),
         ["r", name, rest @ ..] if crate::config::is_subreddit_name(name) => {
             format!(
                 "r/{name} {}",
@@ -424,6 +426,7 @@ fn operation(url: &Url) -> String {
         ["comments", ..] => "post/comments".into(),
         ["by_id", ..] => "post details".into(),
         ["settings", "preferences"] | ["svc", "shreddit", "graphql"] => "account settings".into(),
+        ["svc", "shreddit", "search", ..] => "search".into(),
         ["svc", "shreddit", ..] => "Home".into(),
         ["api", ..] => "account/action".into(),
         _ => "Reddit content".into(),

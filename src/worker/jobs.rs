@@ -11,6 +11,12 @@ pub enum FeedQuery {
         sort: crate::reddit::experience::SearchSort,
         time: TimeRange,
     },
+    /// Reddit-wide media search: posts with pictures or video.
+    Media {
+        query: String,
+        sort: crate::reddit::experience::SearchSort,
+        time: TimeRange,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +64,10 @@ impl FeedQuery {
             (FeedTarget::User(name), Self::Listing { sort, time }) => {
                 reddit.user_posts_progress(name, *sort, *time, after, progress)
             }
-            (FeedTarget::Home | FeedTarget::User(_), Self::Search { .. }) => {
+            (FeedTarget::Subreddit(_), Self::Media { query, sort, time }) => {
+                reddit.media_search_progress(query, *sort, *time, after, progress)
+            }
+            (FeedTarget::Home | FeedTarget::User(_), Self::Search { .. } | Self::Media { .. }) => {
                 anyhow::bail!("search runs inside a subreddit")
             }
         }

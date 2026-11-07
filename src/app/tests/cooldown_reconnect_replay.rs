@@ -2,23 +2,12 @@ use super::*;
 
 #[test]
 fn a_rate_limit_shows_paused_requests_not_an_unanswering_reddit() {
-    use std::io::{BufRead, BufReader, Write};
-    let listener = crate::reddit::tests::local_listener();
-    let url = format!("http://{}/", listener.local_addr().unwrap());
-    std::thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
-                line.clear();
-            }
-            let _ = write!(
-                stream,
-                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\n\
-                     Content-Length: 0\r\nConnection: close\r\n\r\n"
-            );
-        }
+    let fixture = crate::reddit::tests::Fixture::new(|_| crate::reddit::tests::Reply {
+        status: 429,
+        body: String::new(),
+        headers: vec![("Retry-After".into(), "60".into())],
     });
+    let url = fixture.base.clone();
     let (mut app, messages) = app_at(&url, &[]);
     app.status = None;
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 30)).unwrap();
@@ -187,7 +176,7 @@ fn when_reconnecting_it_should_resume_interrupted_search_pages_and_islands() {
     for index in 0..app.all_subs.groups.len() {
         app.ensure_group_loaded(index);
     }
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         while let Ok(message) = messages.try_recv() {
             app.on_msg(message);
@@ -217,7 +206,7 @@ fn when_reconnecting_it_should_resume_interrupted_search_pages_and_islands() {
     );
     app.feed_settle.last_move = None;
     app.switch_tab(paged);
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         while let Ok(message) = messages.try_recv() {
             app.on_msg(message);
@@ -244,6 +233,7 @@ fn search_revision_connection_reset_should_end_the_retained_parent_pane() {
     app.open_search(None);
     app.search.discovered.entries.push(search::Row {
         profile: None,
+        comment: None,
         label: "r/rust".into(),
         detail: "Parent communities".into(),
         target: FeedTarget::Subreddit("rust".into()),

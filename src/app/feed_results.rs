@@ -96,10 +96,7 @@ impl App {
             return;
         }
         feed.pending.remove(&generation);
-        let cached_refresh = feed.refreshing.remove(&generation)
-            || (!append
-                && !freshness.source.cached
-                && feed.pages.first().is_some_and(|page| page.source.cached));
+        feed.refreshing.remove(&generation);
         let forced = feed.forced.contains(&generation);
         let manual = feed.manual.contains(&generation);
         if !refreshing {
@@ -179,13 +176,7 @@ impl App {
                 {
                     let page = &feed.pages[index];
                     let start: usize = feed.pages[..index].iter().map(|page| page.len).sum();
-                    let hold = !manual
-                        && cursor.is_none()
-                        && (leads
-                            || cached_refresh
-                                && self.config.visible(&feed.posts).next().is_some()
-                                && feed.first_page_changed(&listing.posts, &self.config));
-                    let stable = hold && cached_refresh;
+                    let hold = !manual && cursor.is_none() && leads;
                     let known: HashSet<_> = feed.posts.iter().map(|post| post.id.clone()).collect();
                     let lost_at = selected
                         .as_ref()
@@ -197,7 +188,7 @@ impl App {
                         });
                     lost = lost_at.is_some();
                     let dropped = lost_at
-                        .filter(|_| !stable && read.is_some())
+                        .filter(|_| read.is_some())
                         .map(|at| (at, feed.posts[start + at].clone()));
                     // Rows missing from a page may have moved onto the next one, loaded or
                     // requested before they did: they stay until that page answers again.
@@ -213,10 +204,8 @@ impl App {
                             })
                             .map(Some),
                     };
-                    let later = !stable
-                        && ranked
-                        && listing.after.is_some()
-                        && (cursor.is_some() || next.is_some());
+                    let later =
+                        ranked && listing.after.is_some() && (cursor.is_some() || next.is_some());
                     if hold || later {
                         let incoming: HashSet<_> =
                             listing.posts.iter().map(|post| post.id.as_str()).collect();
@@ -241,35 +230,15 @@ impl App {
                             feed.update = Some(FeedUpdate {
                                 listing: listing.clone(),
                                 freshness,
-                                stable,
                             });
                             // Everything unseen waits with them, so nothing new shows
                             // above the rows kept below.
-                            if stable {
-                                let fresh: HashMap<_, _> = listing
-                                    .posts
-                                    .iter()
-                                    .map(|post| (post.id.as_str(), post))
-                                    .collect();
-                                listing.posts = feed.posts[start..start + page.len]
-                                    .iter()
-                                    .map(|post| {
-                                        fresh
-                                            .get(post.id.as_str())
-                                            .map_or_else(|| post.clone(), |post| (*post).clone())
-                                    })
-                                    .collect();
-                                listing.after = page.after.clone();
-                            } else {
-                                listing.posts.retain(|post| known.contains(&post.id));
-                            }
+                            listing.posts.retain(|post| known.contains(&post.id));
                         }
                         if later {
                             next_page = next.map(|next| (next, !displaced.is_empty()));
                         }
-                        if !stable {
-                            listing.posts.extend(displaced);
-                        }
+                        listing.posts.extend(displaced);
                     }
                     if let Some((at, post)) = dropped {
                         listing.posts.insert(at.min(listing.posts.len()), post);

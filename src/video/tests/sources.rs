@@ -119,30 +119,13 @@ fn native_hls_denial_should_recover_video_and_audio_through_the_relay() {
         .as_deref()
     );
     assert!(!sources.audio_in_file);
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .proxy(None)
-        .timeout_global(Some(Duration::from_secs(5)))
-        .build()
-        .into();
     assert_eq!(
-        agent
-            .get(&sources.video)
-            .call()
-            .unwrap()
-            .body_mut()
-            .read_to_string()
-            .unwrap(),
-        "video"
+        crate::reddit::tests::relayed(&sources.video, None).body,
+        b"video"
     );
     assert_eq!(
-        agent
-            .get(sources.audio.as_ref().unwrap())
-            .call()
-            .unwrap()
-            .body_mut()
-            .read_to_string()
-            .unwrap(),
-        "audio"
+        crate::reddit::tests::relayed(sources.audio.as_ref().unwrap(), None).body,
+        b"audio"
     );
 }
 
@@ -171,7 +154,9 @@ fn media_failure_should_explain_playlist_denial_without_exposing_the_url() {
                 .recv_timeout(Duration::from_secs(5))
                 .unwrap()
                 .unwrap();
-            request.respond(tiny_http::Response::empty(status)).unwrap();
+            request
+                .respond(crate::reddit::tests::served::Response::empty(status))
+                .unwrap();
         }
     });
     for (status, expected) in [

@@ -156,6 +156,11 @@ impl App {
                 self.settings.message = Some("This value changed on disk while editing. Esc to review it; your draft has not been applied.".into());
                 return;
             }
+            if !self.settings_allowed() {
+                self.settings.message =
+                    Some("Saving is paused right now; your draft has not been applied".into());
+                return;
+            }
             self.change_setting(field.key, value);
             if self.settings.message.is_none() {
                 self.settings.editing = None;

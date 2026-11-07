@@ -2,12 +2,11 @@ use super::*;
 
 #[test]
 fn when_a_safe_read_becomes_obsolete_it_should_release_header_and_body_waits() {
-    use std::io::{BufRead, Write};
     use std::sync::mpsc::channel;
     for media in [false, true] {
         for body in [false, true] {
-            let listener = crate::reddit::tests::local_listener();
-            let base = format!("http://{}/", listener.local_addr().unwrap());
+            let served = crate::reddit::tests::local_http_server();
+            let base = format!("http://{}/", served.server_addr());
             let reddit = Reddit::test_at(&base, false);
             let obsolete = Arc::new(AtomicBool::new(false));
             let cancelled = obsolete.clone();
@@ -15,28 +14,20 @@ fn when_a_safe_read_becomes_obsolete_it_should_release_header_and_body_waits() {
                 cancelled.load(Ordering::Acquire)
             });
             let (started_tx, started_rx) = channel();
-            let (release_tx, release_rx) = channel();
+            let (release_tx, release_rx) = channel::<()>();
             let server = std::thread::spawn(move || {
-                let (mut socket, _) = listener.accept().unwrap();
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(3)))
+                let request = served
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
                     .unwrap();
-                let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
-                loop {
-                    let mut line = String::new();
-                    assert!(reader.read_line(&mut line).unwrap() > 0);
-                    if line == "\r\n" {
-                        break;
-                    }
-                }
-                if body {
-                    socket
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
-                        .unwrap();
-                    socket.flush().unwrap();
-                }
+                let held = if body {
+                    Ok(request.stream(Some(100)))
+                } else {
+                    Err(request)
+                };
                 started_tx.send(()).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                drop(held);
             });
             let (done_tx, done_rx) = channel();
             let read = std::thread::spawn(move || {

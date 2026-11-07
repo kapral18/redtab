@@ -71,6 +71,16 @@ pub struct State {
 }
 
 impl State {
+    /// The file was unreadable at startup, so this session never writes it.
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// The state moves to another file: saving there merges it, and refuses an invalid one.
+    pub fn move_to_new_file(&mut self) {
+        self.read_only = false;
+    }
+
     pub fn list_view(&self) -> ListView {
         self.list_view
     }

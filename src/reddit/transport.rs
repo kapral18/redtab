@@ -24,6 +24,24 @@ impl std::fmt::Display for MediaStatus {
 
 impl std::error::Error for MediaStatus {}
 
+pub(super) type Sending = std::pin::Pin<Box<dyn Future<Output = Result<Response, ()>> + Send>>;
+
+/// Sends `request`. In tests fixture hosts and live relays answer in memory and anything
+/// else fails: the test binary opens no socket, which a host firewall would hold for every
+/// newly built test binary.
+pub(super) fn send(request: wreq::RequestBuilder, timeout: Option<Duration>) -> Sending {
+    #[cfg(test)]
+    return super::tests::answer(request, timeout);
+    #[cfg(not(test))]
+    {
+        let request = match timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        };
+        Box::pin(async move { request.send().await.map_err(|_| ()) })
+    }
+}
+
 /// Keep one HTTP future across polls; dropping it releases an obsolete request.
 pub(super) fn wait<F: Future>(future: F, cancelled: Option<&Cancellation>) -> Result<F::Output> {
     RUNTIME.block_on(async {
@@ -53,6 +71,10 @@ pub(super) static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| 
 #[derive(Clone)]
 pub(super) struct Transport {
     pub client: Client,
+    /// Media over HTTP/1.1, one connection per request. On one shared HTTP/2 connection,
+    /// videos read at playback pace hold its receive window and stall every other
+    /// request until it times out (measured: playlists failing after 20 s).
+    media_client: Client,
     #[cfg(test)]
     pub media_origin: Option<Url>,
 }
@@ -60,16 +82,20 @@ pub(super) struct Transport {
 impl Transport {
     pub fn new() -> Result<Self> {
         let _enter = RUNTIME.enter();
-        Ok(Self {
-            client: Client::builder()
-                .emulation(wreq_util::Emulation::Chrome145)
+        let client = |http1: bool| {
+            let builder = Client::builder().emulation(wreq_util::Emulation::Chrome145);
+            if http1 { builder.http1_only() } else { builder }
                 .no_proxy()
                 .redirect(wreq::redirect::Policy::none())
                 .retry(wreq::retry::Policy::never())
                 .connect_timeout(Duration::from_secs(10))
                 .read_timeout(Duration::from_secs(20))
                 .build()
-                .map_err(|_| anyhow::anyhow!("cannot build HTTP transport"))?,
+                .map_err(|_| anyhow::anyhow!("cannot build HTTP transport"))
+        };
+        Ok(Self {
+            client: client(false)?,
+            media_client: client(true)?,
             #[cfg(test)]
             media_origin: None,
         })
@@ -112,7 +138,7 @@ impl Transport {
             // Without the browser defaults: media hosts send a page load (`Accept:
             // text/html`, `sec-fetch-mode: navigate`) to a reddit.com viewer page.
             let mut request = self
-                .client
+                .media_client
                 .get(url.as_str())
                 .default_headers(false)
                 .header("User-Agent", super::USER_AGENT)
@@ -120,7 +146,7 @@ impl Transport {
             if let Some(range) = range {
                 request = request.header("Range", range);
             }
-            let response = wait(request.send(), cancelled)?.map_err(|_| network_error())?;
+            let response = wait(send(request, None), cancelled)?.map_err(|_| network_error())?;
             if response.status().is_redirection() {
                 let location = response
                     .headers()

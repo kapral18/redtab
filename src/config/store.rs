@@ -319,7 +319,7 @@ impl Store {
         let lock = options
             .open(lock_path)
             .context("Cannot open config save lock")?;
-        lock.try_lock().context("Config is busy; retry saving")?;
+        wait_for_save_lock(&lock)?;
         // Re-read while holding the cooperating-instance lock.
         let (_, original, disk) = self.read()?;
         self.merge(&disk)?;
@@ -373,6 +373,26 @@ impl Store {
         })();
         if let Err(error) = result {
             self.failed(error);
+        }
+    }
+}
+
+/// Another instance holds the save lock only while it writes, and a child process forked
+/// elsewhere in redtab keeps a copy of the descriptor until it execs: wait briefly.
+pub(in crate::config) fn wait_for_save_lock(lock: &File) -> Result<()> {
+    let started = std::time::Instant::now();
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(fs::TryLockError::WouldBlock)
+                if started.elapsed() < std::time::Duration::from_secs(1) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(fs::TryLockError::WouldBlock) => bail!("Config is busy; retry saving"),
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(error).context("Cannot lock config for saving");
+            }
         }
     }
 }

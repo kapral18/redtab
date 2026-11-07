@@ -111,13 +111,15 @@ impl App {
             self.enter_tab(index, false);
         }
         match target.post {
+            // A post of Posts results does not cover the Communities or People rows.
+            Some(_) if index == super::SEARCH_TAB && self.search.shows_rows() => self.close_post(),
             Some(post) => {
                 if self
                     .post_view
                     .as_ref()
                     .is_some_and(|view| view.post.permalink == post.permalink)
                 {
-                    self.focus = Focus::Post;
+                    self.focus_open_post();
                 } else {
                     let permalink = post.permalink.clone();
                     self.open_post_permalink(post, permalink);

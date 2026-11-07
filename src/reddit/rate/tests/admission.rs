@@ -32,18 +32,24 @@ fn background_burst_should_stay_bounded_without_pacing_browsing() {
     let transport = Transport::new().unwrap();
     let url = Url::parse(&fixture.base).unwrap();
     let rate = Rate::new(Duration::ZERO);
-    let response = transport::wait(transport.client.get(&fixture.base).send(), None)
-        .unwrap()
-        .unwrap();
+    let response = transport::wait(
+        transport::send(transport.client.get(&fixture.base), None),
+        None,
+    )
+    .unwrap()
+    .unwrap();
     rate.observe(&response, &url, Instant::now(), 0, 0);
     for _ in 0..16 {
         let ticket = rate
             .admit(&url, Priority::Browsing, true, || false)
             .unwrap();
         let sent = Instant::now();
-        let response = transport::wait(transport.client.get(&fixture.base).send(), None)
-            .unwrap()
-            .unwrap();
+        let response = transport::wait(
+            transport::send(transport.client.get(&fixture.base), None),
+            None,
+        )
+        .unwrap()
+        .unwrap();
         rate.observe(&response, &url, sent, ticket.sequence, ticket.older);
     }
 
@@ -99,7 +105,7 @@ fn when_congestion_native_settings_reply_arrives_json_quota_should_remain_indepe
         .join("settings/preferences")
         .unwrap();
     let response = transport::wait(
-        Transport::new().unwrap().client.get(native.as_str()).send(),
+        transport::send(Transport::new().unwrap().client.get(native.as_str()), None),
         None,
     )
     .unwrap()

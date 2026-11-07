@@ -149,38 +149,56 @@ fn when_the_connection_is_retired_no_collection_or_write_should_contact_reddit()
 }
 
 #[test]
-fn when_searching_communities_the_query_time_and_cursor_should_be_encoded() {
+fn when_searching_communities_it_should_read_the_search_page_and_follow_only_its_own_cursor() {
     let fixture = Fixture::new(|request| {
         let url = Url::parse(&format!("http://fixture{}", request.url)).unwrap();
-        assert_eq!(url.path(), "/subreddits/search");
+        assert_eq!(url.path(), "/svc/shreddit/search/");
         let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
         assert_eq!(params["q"], "Հայերեն & rust");
-        assert_eq!(params["t"], "week");
-        assert_eq!(params["after"], "cursor&next");
-        assert!(!params.contains_key("restrict_sr"));
-        Reply::json(json!({"kind":"Listing","data":{"children":[
-                {"kind":"t5","data":{"display_name":"rust","community_icon":"https://styles.redditmedia.com/rust.png"}}
-            ],"after":null}}))
+        assert_eq!(params["type"], "communities");
+        let next = if params.contains_key("cursor") {
+            ""
+        } else {
+            r#"<faceplate-partial loading="lazy" src="/svc/shreddit/search/?q=%D5%80%D5%A1%D5%B5%D5%A5%D6%80%D5%A5%D5%B6+%26+rust&amp;type=communities&amp;cursor=next"></faceplate-partial>"#
+        };
+        Reply {
+            status: 200,
+            body: format!(
+                r#"<div data-testid="search-community"><search-telemetry-tracker data-faceplate-tracking-context='{{"subreddit":{{"name":"rust","nsfw":false}}}}'></search-telemetry-tracker><img src="https://styles.redditmedia.com/rust.png"><p data-testid="search-subreddit-desc-text">Rust</p></div>{next}"#
+            ),
+            headers: vec![],
+        }
     });
-    let Response::Page(page) = fixture
-        .reddit()
-        .experience(&Request::Read {
+    let reddit = fixture.reddit();
+    let search = |after: Option<String>| {
+        reddit.experience(&Request::Read {
             query: Query::Search {
                 text: "Հայերեն & rust".into(),
                 kind: ListSearch::Communities,
-                time: TimeRange::Week,
             },
-            after: Some("cursor&next".into()),
+            after,
         })
-        .unwrap()
-    else {
+    };
+    let Ok(Response::Page(page)) = search(None) else {
         panic!("expected a page");
     };
+    assert_eq!(page.entries[0].title, "r/rust");
     assert_eq!(
         page.entries[0].icon,
         crate::model::SubscriptionIcon::Url("https://styles.redditmedia.com/rust.png".into()),
-        "a community result carries its listing icon"
+        "a community result carries its icon"
     );
+    let Ok(Response::Page(next)) = search(page.after.clone()) else {
+        panic!("the page's own cursor must load");
+    };
+    assert_eq!((next.entries.len(), next.after), (1, None));
+    for foreign in [
+        "https://example.com/svc/shreddit/search/?q=x&type=communities&cursor=n",
+        "/svc/shreddit/feeds/home-feed?cursor=n",
+        "/svc/shreddit/search/?q=other&type=communities&cursor=n",
+    ] {
+        assert!(search(Some(foreign.into())).is_err(), "{foreign}");
+    }
 }
 
 #[test]

@@ -330,19 +330,7 @@ fn when_two_obsolete_feeds_are_in_flight_the_current_feed_should_not_wait_for_th
     let server = crate::reddit::tests::local_http_server();
     let base = format!("http://{}", server.server_addr());
     let (mut app, messages) = app_at(&base, &["first", "second", "current"]);
-    let receive = |timeout: Duration| {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let request = server
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .unwrap()?;
-            if request.method() == &tiny_http::Method::Head {
-                request.respond(tiny_http::Response::empty(200)).unwrap();
-            } else {
-                return Some(request);
-            }
-        }
-    };
+    let receive = |timeout: Duration| server.recv_timeout(timeout).unwrap();
     app.switch_tab(tab_index(&app, "first"));
     let first = receive(Duration::from_secs(2)).unwrap();
     app.feed_settle.last_move = None;
@@ -353,17 +341,17 @@ fn when_two_obsolete_feeds_are_in_flight_the_current_feed_should_not_wait_for_th
 
     let current = receive(Duration::from_millis(1200));
     for request in [first, second] {
-        let _ = request.respond(tiny_http::Response::from_string(include_str!(
-            "../../../tests/fixtures/sub.json"
-        )));
+        let _ = request.respond(crate::reddit::tests::served::Response::from_string(
+            include_str!("../../../tests/fixtures/sub.json"),
+        ));
     }
     let bypassed = current.is_some();
     let current = current.unwrap_or_else(|| receive(Duration::from_secs(2)).unwrap());
     assert!(current.url().starts_with("/r/current/"));
     current
-        .respond(tiny_http::Response::from_string(include_str!(
-            "../../../tests/fixtures/sub.json"
-        )))
+        .respond(crate::reddit::tests::served::Response::from_string(
+            include_str!("../../../tests/fixtures/sub.json"),
+        ))
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     while !app.active_tab().feed.loaded {

@@ -33,7 +33,7 @@ impl Fake {
             PAGE,
             &Cancellation::default(),
             self.program.as_os_str(),
-            Duration::from_secs(2),
+            TIMEOUT,
         )
     }
 }

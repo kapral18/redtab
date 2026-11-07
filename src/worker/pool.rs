@@ -23,6 +23,10 @@ pub(super) struct Queues {
     pub(super) group_cache: Sender<Work>,
     pub(super) images: Sender<Work>,
     pub(super) thumbs: Sender<Work>,
+    /// Stills taken from video with ffmpeg, which can wait seconds on a stream: they
+    /// run beside pictures, never ahead of them. The open post's frames have their own.
+    pub(super) foreground_frames: Sender<Work>,
+    pub(super) frames: Sender<Work>,
     pub(super) icons: Sender<Work>,
 }
 
@@ -43,13 +47,11 @@ pub(super) enum CachePolicy {
 impl Queues {
     pub(super) fn submit(&self, work: Work) {
         let queue = match work.job {
-            Job::Thumb { .. } | Job::VideoThumb { .. } => &self.thumbs,
-            Job::VideoFrame {
-                background: true, ..
-            } => &self.images,
+            Job::Thumb { .. } => &self.thumbs,
             Job::VideoFrame {
                 background: false, ..
-            } => &self.foreground_images,
+            } => &self.foreground_frames,
+            Job::VideoFrame { .. } | Job::VideoThumb { .. } => &self.frames,
             Job::Icon { .. } => &self.icons,
             Job::Image {
                 background: true, ..
@@ -140,6 +142,8 @@ impl Pool {
         let (background_tx, background_rx) = channel::<Work>();
         let (images_tx, images_rx) = channel::<Work>();
         let (thumbs_tx, thumbs_rx) = channel::<Work>();
+        let (foreground_frames_tx, foreground_frames_rx) = channel::<Work>();
+        let (frames_tx, frames_rx) = channel::<Work>();
         let (icons_tx, icons_rx) = channel::<Work>();
         let (msg_tx, msg_rx) = sync_channel::<Msg>(8);
         let wanted = Arc::<Wanted>::default();
@@ -162,6 +166,8 @@ impl Pool {
             background: cached(background_tx),
             images: cached(images_tx),
             thumbs: cached(thumbs_tx),
+            foreground_frames: cached(foreground_frames_tx),
+            frames: cached(frames_tx),
             icons: cached(icons_tx),
         };
         let background_threads = threads.saturating_sub(PRIORITY_THREADS).max(1);
@@ -173,6 +179,8 @@ impl Pool {
             (background_rx, background_threads),
             (images_rx, 2),
             (thumbs_rx, THUMB_THREADS),
+            (foreground_frames_rx, 1),
+            (frames_rx, 2),
             (icons_rx, ICON_THREADS),
         ] {
             let rx: SharedRx = Arc::new(Mutex::new(rx));

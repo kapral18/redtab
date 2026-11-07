@@ -191,3 +191,19 @@ fn a_failed_user_follow_should_reconcile_without_confusing_a_same_named_communit
             .is_some_and(|status| status.error && status.text == "follow denied")
     );
 }
+
+#[test]
+fn a_membership_write_answered_after_sign_out_should_settle_instead_of_waiting() {
+    let mut app = app_with(&[]);
+    app.reddit = Reddit::disconnected(false).unwrap();
+    app.membership = Some(crate::app::membership::MembershipChange {
+        generation: 7,
+        target: MembershipTarget::Community("rust".into()),
+        join: true,
+        checking: false,
+        error: None,
+    });
+    app.on_membership(7, Ok(()));
+    assert!(app.membership.is_none(), "nothing could ever confirm it");
+    assert!(app.status.as_ref().is_some_and(|status| status.error));
+}

@@ -17,7 +17,7 @@ pub fn label(keys: &str) -> String {
         )
 }
 
-/// Tab and Shift+Tab switch Posts / Communities / People anywhere inside Search: its
+/// Tab and Shift+Tab switch the search kind anywhere inside Search: its
 /// results, a post opened from them, and a feed opened beside them. The sidebar keeps
 /// buffer switching.
 pub fn search_kind_keys(app: &App) -> bool {

@@ -15,7 +15,13 @@ use url::Url;
 
 use super::transport::{MediaStatus, Reader, Transport};
 
+/// Connections reading their request or answering a playlist or HEAD request.
 const MAX_REQUESTS: usize = 32;
+/// Media responses streaming at once; each holds its slot for the whole response, apart
+/// from the accept slots, so a playlist never waits on a stream.
+const MAX_STREAMS: usize = 32;
+/// Media requests waiting for a stream slot; more are answered 503.
+const MAX_WAITING_STREAMS: usize = 32;
 const HEADER_LIMIT: usize = 16 * 1024;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(3);
 /// Longest wait for a player connection between stop checks.
@@ -30,11 +36,11 @@ struct Request {
     range: Option<String>,
 }
 
-struct Response {
-    status: u16,
-    headers: Vec<(&'static str, String)>,
-    body: Box<dyn Read + Send>,
-    len: Option<u64>,
+pub(in crate::reddit) struct Response {
+    pub(in crate::reddit) status: u16,
+    pub(in crate::reddit) headers: Vec<(&'static str, String)>,
+    pub(in crate::reddit) body: Box<dyn Read + Send>,
+    pub(in crate::reddit) len: Option<u64>,
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<Request> {
@@ -116,10 +122,10 @@ fn respond(stream: &mut TcpStream, response: Response, head: bool) -> io::Result
 struct RequestSlot(Arc<AtomicUsize>);
 
 impl RequestSlot {
-    fn acquire(active: &Arc<AtomicUsize>) -> Option<Self> {
+    fn acquire(active: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
         active
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                (count < MAX_REQUESTS).then_some(count + 1)
+                (count < limit).then_some(count + 1)
             })
             .ok()
             .map(|_| Self(active.clone()))
@@ -139,6 +145,8 @@ pub(super) struct Relay {
 
 impl Relay {
     pub fn start(transport: Transport) -> Result<Self> {
+        #[cfg(test)]
+        let transport_for_tests = transport.clone();
         let listener = TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let base = format!(
@@ -151,8 +159,10 @@ impl Relay {
         let local_base = base.clone();
         std::thread::spawn(move || {
             let active = Arc::new(AtomicUsize::new(0));
+            let streams = Arc::new(AtomicUsize::new(0));
+            let waiting = Arc::new(AtomicUsize::new(0));
             while !stopped.load(Ordering::Relaxed) {
-                let Some(slot) = RequestSlot::acquire(&active) else {
+                let Some(slot) = RequestSlot::acquire(&active, MAX_REQUESTS) else {
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
                 };
@@ -170,25 +180,41 @@ impl Relay {
                 };
                 let transport = transport.clone();
                 let base = local_base.clone();
+                let (streams, waiting, stopped) =
+                    (streams.clone(), waiting.clone(), stopped.clone());
                 std::thread::spawn(move || {
-                    let _slot = slot;
+                    let mut slot = Some(slot);
                     if stream.set_nonblocking(false).is_err() {
                         return;
                     }
                     let request = read_request(&mut stream);
                     let head = request.as_ref().is_ok_and(|request| request.head);
-                    let response = request
-                        .and_then(|request| serve(&transport, &base, &request))
-                        .unwrap_or_else(|error| Response {
-                            status: error.downcast_ref::<MediaStatus>().map_or(502, |s| s.0),
-                            headers: Vec::new(),
-                            body: Box::new(Cursor::new(b"Media unavailable")),
-                            len: Some(17),
-                        });
+                    let _stream_slot = match &request {
+                        Ok(request) if !request.head && !playlist(request) => {
+                            drop(slot.take());
+                            let Some(stream_slot) =
+                                stream_slot(&streams, &waiting, &stopped, &stream)
+                            else {
+                                let _ = respond(&mut stream, unavailable(503), false);
+                                return;
+                            };
+                            Some(stream_slot)
+                        }
+                        _ => None,
+                    };
+                    let response = request.map_or_else(
+                        |_| unavailable(502),
+                        |request| answer(&transport, &base, &request),
+                    );
                     let _ = respond(&mut stream, response, head);
                 });
             }
         });
+        #[cfg(test)]
+        LOCAL
+            .lock()
+            .unwrap()
+            .push((base.clone(), transport_for_tests));
         Ok(Self { base, stop })
     }
 
@@ -202,6 +228,109 @@ impl Drop for Relay {
         // The threads are detached: active streams end when their local player closes,
         // and must not block terminal restoration while an external player is still open.
         self.stop.store(true, Ordering::Relaxed);
+        #[cfg(test)]
+        LOCAL.lock().unwrap().retain(|(base, _)| *base != self.base);
+    }
+}
+
+/// Live relays by base URL, so tests answer relay URLs in process: the test binary
+/// connects to no socket, which a host firewall would hold for every new build.
+#[cfg(test)]
+static LOCAL: std::sync::LazyLock<std::sync::Mutex<Vec<(String, Transport)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// When a live relay serves `url`, its answer as a player would receive it.
+#[cfg(test)]
+pub(in crate::reddit) fn answer_local(
+    url: &str,
+    range: Option<String>,
+) -> Option<impl FnOnce() -> Response + Send + 'static> {
+    let (base, transport) = LOCAL
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(base, _)| url.starts_with(base.as_str()))
+        .cloned()?;
+    let parsed = Url::parse(url).ok()?;
+    let path = match parsed.query() {
+        Some(query) => format!("{}?{query}", parsed.path()),
+        None => parsed.path().to_string(),
+    };
+    Some(move || {
+        let request = Request {
+            head: false,
+            url: path,
+            range,
+        };
+        answer(&transport, &base, &request)
+    })
+}
+
+fn answer(transport: &Transport, base: &str, request: &Request) -> Response {
+    serve(transport, base, request).unwrap_or_else(|error| {
+        unavailable(error.downcast_ref::<MediaStatus>().map_or(502, |s| s.0))
+    })
+}
+
+/// A request for a playlist, which the relay reads whole and answers at once.
+fn playlist(request: &Request) -> bool {
+    request
+        .url
+        .split('?')
+        .next()
+        .is_some_and(|path| path.ends_with(".m3u8"))
+}
+
+/// Waits for a media stream slot; `None` when too many already wait, the relay stops or
+/// the player hangs up, so a gone player neither keeps a waiting place nor takes a slot.
+fn stream_slot(
+    streams: &Arc<AtomicUsize>,
+    waiting: &Arc<AtomicUsize>,
+    stopped: &AtomicBool,
+    client: &TcpStream,
+) -> Option<RequestSlot> {
+    let _waiting = RequestSlot::acquire(waiting, MAX_WAITING_STREAMS)?;
+    loop {
+        if let Some(slot) = RequestSlot::acquire(streams, MAX_STREAMS) {
+            return Some(slot);
+        }
+        if stopped.load(Ordering::Relaxed) || hung_up(client) {
+            return None;
+        }
+    }
+}
+
+/// Waits up to 10 ms for the player to close its connection.
+fn hung_up(client: &TcpStream) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd: client.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one initialized pollfd for a descriptor `client` keeps open; the timeout
+    // bounds the call.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, 10) };
+    if ready <= 0 {
+        return false;
+    }
+    if descriptor.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+        return true;
+    }
+    // Readable: end of stream when nothing more arrives, else a pipelined request.
+    let mut byte = [0; 1];
+    let gone = !matches!(client.peek(&mut byte), Ok(n) if n > 0);
+    if !gone {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    gone
+}
+
+fn unavailable(status: u16) -> Response {
+    Response {
+        status,
+        headers: Vec::new(),
+        body: Box::new(Cursor::new(b"Media unavailable")),
+        len: Some(17),
     }
 }
 

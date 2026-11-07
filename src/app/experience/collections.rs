@@ -1,14 +1,15 @@
 use super::*;
 
 impl App {
-    pub(super) fn cancel_collection_refresh(&mut self) {
+    /// A background re-read of the shown list yields to any request the user makes.
+    pub(in crate::app) fn cancel_collection_refresh(&mut self) {
         if std::mem::take(&mut self.experience.refreshing) {
             self.experience.pending = None;
             self.pool.want_experience(None);
         }
     }
 
-    pub(super) fn read_experience(&mut self, query: Query, after: Option<String>) {
+    pub(in crate::app) fn read_experience(&mut self, query: Query, after: Option<String>) {
         self.cancel_collection_refresh();
         if self.experience.pending.is_some() {
             return;
@@ -237,6 +238,14 @@ impl App {
 
     pub(super) fn experience_back(&mut self) {
         if self.experience.writing() {
+            return;
+        }
+        // Closing a menu over a list leaves that list's background re-read running.
+        if self.experience.refreshing
+            && matches!(self.experience.screens.last(), Some(Screen::Menu { .. }))
+        {
+            self.experience.error = None;
+            self.experience.screens.pop();
             return;
         }
         self.experience.pending = None;

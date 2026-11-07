@@ -35,7 +35,7 @@ impl Reddit {
         )
     }
 
-    /// Non-www hosts (search, r/all) get only `.reddit.com` cookies; when those are missing
+    /// Non-www hosts (Posts search, community listings, r/all) get only `.reddit.com` cookies; when those are missing
     /// from a live session, only that request fails.
     pub(super) fn cookie(&self, url: &Url, www: bool) -> Result<wreq::header::HeaderValue> {
         let header = self.0.session.header(url.path(), www, session::now());
@@ -131,9 +131,10 @@ impl Reddit {
             }
             let sent = Instant::now();
             let response = transport::wait(
-                wreq::RequestBuilder::from_parts(self.0.transport.client.clone(), outgoing)
-                    .timeout(available)
-                    .send(),
+                transport::send(
+                    wreq::RequestBuilder::from_parts(self.0.transport.client.clone(), outgoing),
+                    Some(available),
+                ),
                 cancelled.as_ref(),
             )?
             .map_err(|_| {

@@ -18,6 +18,8 @@ pub(super) fn entries(app: &App) -> Vec<(String, String)> {
                 match app.search.kind {
                     crate::reddit::experience::SearchKind::Posts => "Search posts",
                     crate::reddit::experience::SearchKind::Communities => "Search communities",
+                    crate::reddit::experience::SearchKind::Comments => "Search comments",
+                    crate::reddit::experience::SearchKind::Media => "Search media posts",
                     crate::reddit::experience::SearchKind::People => "Search people",
                 }
             }
@@ -57,7 +59,10 @@ pub(super) fn entries(app: &App) -> Vec<(String, String)> {
                     "Enter",
                     "Run a pending search and leave the query for the results",
                 );
-                add("Tab / S-Tab", "Switch Posts / Communities / People");
+                add(
+                    "Tab / S-Tab",
+                    "Switch Posts / Communities / Comments / Media / People",
+                );
                 add("Esc", "Leave the query for list keys");
                 add("Left / Right · Home / End · C-a / C-e", "Move the cursor");
                 add("Delete", "Delete the next character");
@@ -126,7 +131,10 @@ pub(super) fn entries(app: &App) -> Vec<(String, String)> {
             }
         }
         Context::List if bindings::search_kind_keys(app) => {
-            add("Tab / S-Tab", "Switch Posts / Communities / People");
+            add(
+                "Tab / S-Tab",
+                "Switch Posts / Communities / Comments / Media / People",
+            );
         }
         _ => {}
     }

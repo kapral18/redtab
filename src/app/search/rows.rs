@@ -3,6 +3,12 @@ use super::*;
 impl App {
     pub(super) fn schedule_search(&mut self, now: Instant) {
         self.search.due = Some(now + DEBOUNCE);
+        // The query or kind changed: the shown query's empty answer is not asked again,
+        // and the same text, typed back, is searched afresh.
+        if self.search.empty_retry.take().is_some() {
+            self.search.searched = None;
+        }
+        self.search.preview_forced = false;
     }
 
     pub(super) fn schedule_preview(&mut self, now: Instant) {
@@ -69,11 +75,15 @@ impl App {
         self.retire_search_rows(false);
         self.search.searched = Some((text.clone(), kind));
         let list = match kind {
-            SearchKind::Posts => {
+            SearchKind::Posts | SearchKind::Media => {
                 self.search.results = Rows::default();
+                let media = kind == SearchKind::Media;
+                if self.tabs[SEARCH_TAB].feed.search_media != media {
+                    self.clear_search_feed();
+                }
                 let feed = &mut self.tabs[SEARCH_TAB].feed;
                 let kept = (feed.search_sort, feed.search_time);
-                feed.set_search(text.clone());
+                feed.set_search(text.clone(), media);
                 if self.search.posts_text.as_deref() == Some(text.as_str()) {
                     (feed.search_sort, feed.search_time) = kept;
                 }
@@ -82,18 +92,11 @@ impl App {
                 return true;
             }
             SearchKind::Communities => ListSearch::Communities,
+            SearchKind::Comments => ListSearch::Comments,
             SearchKind::People => ListSearch::People,
         };
         self.clear_search_feed();
-        self.request_rows(
-            false,
-            Query::Search {
-                text,
-                kind: list,
-                time: crate::model::TimeRange::All,
-            },
-            None,
-        );
+        self.request_rows(false, Query::Search { text, kind: list }, None);
         true
     }
 
@@ -155,7 +158,7 @@ impl App {
         self.request_rows(discovery, query, Some(after));
     }
 
-    /// Rows replace Posts results: a fresh feed also drops a Posts request still in flight.
+    /// Rows replace post results: a fresh feed also drops a post request still in flight.
     pub(super) fn clear_search_feed(&mut self) {
         let feed = &mut self.tabs[SEARCH_TAB].feed;
         if feed.search.is_none() && feed.posts.is_empty() {
@@ -217,40 +220,33 @@ impl App {
         rows.loading = false;
         let appending = std::mem::take(&mut rows.appending);
         let mut icons = Vec::new();
-        let mut profiles = Vec::new();
         match result {
             Ok(Response::Page(page)) => {
                 icons = page
                     .entries
                     .iter()
-                    .filter_map(|entry| match (&entry.query, &entry.icon) {
-                        (Some(Query::Community(name)), SubscriptionIcon::Url(url)) => {
-                            Some((name.clone(), Some(url.clone())))
+                    .filter_map(|entry| {
+                        let name = match (&entry.query, &entry.target) {
+                            (Some(Query::Community(name)), _) => name,
+                            (Some(Query::Thread(_)), Some(target)) => &target.subreddit,
+                            _ => return None,
+                        };
+                        match &entry.icon {
+                            SubscriptionIcon::Url(url) => Some((name.clone(), Some(url.clone()))),
+                            SubscriptionIcon::Missing => Some((name.clone(), None)),
+                            _ => None,
                         }
-                        (Some(Query::Community(name)), SubscriptionIcon::Missing) => {
-                            Some((name.clone(), None))
-                        }
-                        _ => None,
                     })
                     .collect();
                 let entries: Vec<Row> = page.entries.iter().filter_map(row).collect();
-                profiles = entries
-                    .iter()
-                    .filter_map(|row| match (&row.target, &row.profile) {
-                        (FeedTarget::User(name), Some(profile)) => {
-                            Some((name.clone(), profile.clone()))
-                        }
-                        _ => None,
-                    })
-                    .collect();
                 let entries = entries.into_iter();
                 if appending {
                     for entry in entries {
-                        if !rows
-                            .entries
-                            .iter()
-                            .any(|known| known.target == entry.target)
-                        {
+                        if !rows.entries.iter().any(|known| {
+                            known.target == entry.target
+                                && known.comment.as_ref().map(|c| &c.permalink)
+                                    == entry.comment.as_ref().map(|c| &c.permalink)
+                        }) {
                             rows.entries.push(entry);
                         }
                     }
@@ -266,10 +262,6 @@ impl App {
             Ok(_) => rows.error = Some("Reddit returned an unexpected answer".into()),
             Err(error) => rows.error = Some(error),
         }
-        // People results spare their tabs an `about.json` lookup.
-        for (name, profile) in profiles {
-            self.observe_profile(&name, profile);
-        }
         // Listing icons spare an `about.json` lookup per row; known icons stay.
         for (name, url) in icons {
             if !self.icons.contains_key(&name.to_ascii_lowercase()) {
@@ -283,10 +275,10 @@ impl App {
 
     /// `r` on rows: ask again for the shown results, discovery list and preview.
     pub(in crate::app) fn reload_search(&mut self) {
-        let current = self
-            .search
-            .selected_row()
-            .is_some_and(|row| self.search.preview.target.as_ref() == Some(&row.target));
+        let row = self.search.selected_row();
+        let comment = row.as_ref().is_some_and(|row| row.comment.is_some());
+        let current = !comment
+            && row.is_some_and(|row| self.search.preview.target.as_ref() == Some(&row.target));
         if current && let Some(posts) = self.search.preview.update.take() {
             self.search.preview.posts = posts;
             self.search.preview.first_page_len = self.search.preview.posts.len();
@@ -302,7 +294,7 @@ impl App {
             self.run_search();
         }
         self.search.preview = Preview::default();
-        self.search.preview_forced = true;
+        self.search.preview_forced = !comment;
         self.request_preview();
     }
 
@@ -312,10 +304,14 @@ impl App {
         self.search.results = Rows::default();
         self.search.discovered = Rows::default();
         self.search.preview = Preview::default();
-        self.search.searched = None;
-        self.search.due = (self.active == SEARCH_TAB
-            && !self.search.exploring()
-            && self.search.kind != SearchKind::Posts)
-            .then(Instant::now);
+        // Post results keep their pages: reset_pending_loads already asked for them again.
+        if !self.search.kind.feed() || self.search.text().is_empty() {
+            self.search.searched = None;
+        }
+        self.search.empty_retry = None;
+        self.search.preview_forced = false;
+        self.search.due =
+            (self.active == SEARCH_TAB && !self.search.exploring() && !self.search.kind.feed())
+                .then(Instant::now);
     }
 }

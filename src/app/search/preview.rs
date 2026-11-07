@@ -4,20 +4,21 @@ impl App {
     /// Each Search tab frame reports whether it drew the preview pane.
     pub fn search_preview_drawn(&mut self, shown: bool) {
         self.search.preview_shown = shown;
-        let stale = self
-            .search
-            .selected_row()
-            .is_some_and(|row| self.search.preview.target.as_ref() != Some(&row.target));
+        let stale = self.search.selected_row().is_some_and(|row| {
+            row.comment.is_none() && self.search.preview.target.as_ref() != Some(&row.target)
+        });
         if shown && stale && self.search.preview.due.is_none() {
             self.schedule_preview(Instant::now());
         }
     }
 
     /// After `r` the next request skips the cached copy, even when the rows reload first.
+    /// A comment row's preview is the comment itself: nothing to load.
     pub(super) fn request_preview(&mut self) {
         let Some(row) = self
             .search
             .selected_row()
+            .filter(|row| row.comment.is_none())
             .filter(|_| self.search.shows_rows())
             .filter(|_| self.active == SEARCH_TAB && self.search.preview_shown)
         else {
@@ -36,6 +37,9 @@ impl App {
             ..Preview::default()
         };
         let forced = std::mem::take(&mut self.search.preview_forced);
+        if let FeedTarget::User(name) = &row.target {
+            self.request_profile(name, forced);
+        }
         if !forced
             && let Some(index) =
                 (0..self.tabs.len()).find(|&index| self.preview_matches_feed(index))
@@ -151,7 +155,6 @@ impl App {
                             after: preview.after.clone(),
                         },
                         freshness,
-                        stable: false,
                     },
                     true,
                 );

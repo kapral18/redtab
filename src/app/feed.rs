@@ -48,6 +48,8 @@ pub struct Feed {
     pub sort: Sort,
     pub time: TimeRange,
     pub search: Option<String>,
+    /// The Search tab's search asks for media posts rather than all posts.
+    pub search_media: bool,
     pub search_sort: crate::reddit::experience::SearchSort,
     pub search_time: TimeRange,
     pub(super) failures: HashMap<Option<String>, FeedFailure>,
@@ -79,7 +81,6 @@ pub struct Feed {
 pub(super) struct FeedUpdate {
     pub(super) listing: Listing,
     pub(super) freshness: Freshness,
-    pub(super) stable: bool,
 }
 
 #[derive(Debug)]
@@ -106,12 +107,13 @@ pub(super) struct FeedPage {
 impl Feed {
     /// A new query starts at relevance over all time and drops a held answer to the old
     /// query; the same query keeps its sort and time.
-    pub(super) fn set_search(&mut self, query: String) {
+    pub(super) fn set_search(&mut self, query: String, media: bool) {
         if self.search.as_deref() != Some(query.as_str()) {
             self.search_sort = Default::default();
             self.search_time = TimeRange::All;
             self.update = None;
         }
+        self.search_media = media;
         self.search = Some(query);
         self.selected = 0;
         self.cards = CardScroll::default();
@@ -119,6 +121,11 @@ impl Feed {
 
     pub(super) fn query(&self) -> FeedQuery {
         match &self.search {
+            Some(q) if self.search_media => FeedQuery::Media {
+                query: q.clone(),
+                sort: self.search_sort,
+                time: self.search_time,
+            },
             Some(q) => FeedQuery::Search {
                 query: q.clone(),
                 sort: self.search_sort,
@@ -142,14 +149,6 @@ impl Feed {
 
     pub(super) fn leads_with_new(&self, posts: &[Post], config: &Config) -> bool {
         feed_has_new(config, &self.posts, posts)
-    }
-
-    pub(super) fn first_page_changed(&self, incoming: &[Post], config: &Config) -> bool {
-        let len = self.pages.first().map_or(self.posts.len(), |page| page.len);
-        !config
-            .visible(&self.posts[..len])
-            .map(|post| &post.id)
-            .eq(config.visible(incoming).map(|post| &post.id))
     }
 
     pub fn has_new_posts(&self, config: &Config) -> bool {

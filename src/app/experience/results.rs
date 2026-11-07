@@ -87,10 +87,20 @@ impl App {
                         page: shown,
                         pagination,
                         ..
-                    }) = self.experience.screens.last_mut()
+                    }) = self
+                        .experience
+                        .screens
+                        .iter_mut()
+                        .rev()
+                        // A menu opened over the list keeps its place; the list updates.
+                        .find(|screen| !matches!(screen, Screen::Menu { .. }))
                     && *current == query
-                    && !shown.entries.is_empty()
                 {
+                    // A list with nothing shown, or a text page, takes the answer whole.
+                    if shown.entries.is_empty() {
+                        *shown = page;
+                        return;
+                    }
                     let fresh: HashMap<_, _> = page
                         .entries
                         .iter()
@@ -128,16 +138,26 @@ impl App {
                 };
                 let post = page.post.clone();
                 let link = post.permalink.clone();
-                self.overlay = None;
+                // A Comments search result reads beside its rows on the Search tab.
+                let from_search = self.active == SEARCH_TAB
+                    && matches!(&request, Request::Read { query: Query::Thread(read), .. }
+                        if self.search.reading_comment.as_ref() == Some(read));
+                self.search.reading_comment = None;
+                self.leave_experience();
                 self.focus_main();
-                if let Some(user) = post.profile_user() {
-                    self.open_user(user);
-                } else {
-                    self.open_subreddit(&post.subreddit);
+                if !from_search {
+                    match post.profile_user() {
+                        Some(user) => self.open_user(user),
+                        None => self.open_subreddit(&post.subreddit),
+                    }
                 }
                 self.cancel_reveal();
                 if let Some(generation) = self.show_post(post, &link) {
                     self.focus = Focus::Post;
+                    // The result already showed the comment; a spoiler cover would hide it.
+                    if from_search && let Some(view) = &mut self.post_view {
+                        view.reveal_spoilers = true;
+                    }
                     self.on_snapshot(
                         Msg::Post {
                             generation,
@@ -182,7 +202,7 @@ impl App {
                 } else if matches!(self.experience.screens.last(), Some(Screen::Browse { .. })) {
                     self.reread_list();
                 } else {
-                    self.overlay = None;
+                    self.leave_experience();
                 }
             }
         }
@@ -341,22 +361,22 @@ impl App {
                 self.open_subreddit(&sub);
             }
             Command::MarkCommunityRead(sub) => {
-                self.overlay = None;
+                self.leave_experience();
                 self.mark_community_read(&sub);
             }
             Command::Sort(sort) => {
-                self.overlay = None;
+                self.leave_experience();
                 self.sort_comments(&sort);
             }
             Command::Target(target, post) => {
                 if let Some(comment) = target.comment()
                     && self.select_loaded_comment(comment)
                 {
-                    self.overlay = None;
+                    self.leave_experience();
                     return;
                 }
                 if let Some(post) = post {
-                    self.overlay = None;
+                    self.leave_experience();
                     self.open_post_permalink(post, target.permalink);
                     self.focus = Focus::Post;
                 } else if !target.permalink.is_empty() {

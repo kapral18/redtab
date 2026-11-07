@@ -23,9 +23,10 @@ fn search_tab_post_results_should_name_each_posts_community() {
     assert!(shown.contains("r/vim"), "{shown}");
     key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
     assert!(
-        help::entries(&app).iter().any(
-            |(key, text)| key == "Tab / S-Tab" && text == "Switch Posts / Communities / People"
-        ),
+        help::entries(&app)
+            .iter()
+            .any(|(key, text)| key == "Tab / S-Tab"
+                && text == "Switch Posts / Communities / Comments / Media / People"),
         "list help names the kind keys"
     );
     app.tabs[crate::app::SEARCH_TAB].feed.after = Some("next".into());
@@ -54,12 +55,14 @@ fn long_explore_descriptions_should_show_visible_summaries_and_later_entries() {
     app.search.discovered.entries = vec![
         crate::app::search::Row {
             profile: None,
+            comment: None,
             label: "r/long_description".into(),
             detail: "A descriptive word ".repeat(60),
             target: crate::worker::FeedTarget::Subreddit("long_description".into()),
         },
         crate::app::search::Row {
             profile: None,
+            comment: None,
             label: "r/second".into(),
             detail: "A short description".into(),
             target: crate::worker::FeedTarget::Subreddit("second".into()),
@@ -128,6 +131,7 @@ fn search_revision_should_keep_incremental_panes_and_restore_parent_lists() {
         app.search.discovered.loading = false;
         app.search.discovered.entries.push(crate::app::search::Row {
             profile: None,
+            comment: None,
             label: "r/zig".into(),
             detail: "Community summary marker".into(),
             target: crate::worker::FeedTarget::Subreddit("zig".into()),
@@ -357,4 +361,26 @@ fn an_empty_search_answer_should_be_asked_again_before_it_counts_as_no_matches()
     retried(&mut app, 3050);
     answer(&mut app, &[]);
     assert!(screen(&mut app, 200, 24).contains("No matches"));
+
+    // Typing another query drops the old query's ask-again.
+    let mut app = searched();
+    answer(&mut app, &[]);
+    press(&mut app, '/');
+    crate::keys::paste(&mut app, "x");
+    assert!(app.search.empty_retry().is_none());
+
+    // Away from Search the ask-again waits, and runs again on return.
+    let mut app = searched();
+    answer(&mut app, &[]);
+    app.switch_tab(0);
+    let away = app.search.results_generation();
+    std::thread::sleep(std::time::Duration::from_millis(1050));
+    app.tick();
+    assert_eq!(app.search.results_generation(), away, "asked while away");
+    app.switch_tab(crate::app::SEARCH_TAB);
+    assert_ne!(
+        app.search.results_generation(),
+        away,
+        "asked again on return"
+    );
 }

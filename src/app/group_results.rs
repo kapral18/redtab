@@ -92,9 +92,6 @@ impl App {
         let selected = selected_post.as_ref().map(|post| post.id.clone());
         let at_top = self.island_at_top(selected.as_deref());
         let group = &mut self.all_subs.groups[index];
-        let cached_refresh = group.loading
-            && group.freshness.is_some_and(|shown| shown.source.cached)
-            && !freshness.source.cached;
         group.loading = refreshing;
         let manual = group.manual;
         if !freshness.source.cached {
@@ -137,14 +134,11 @@ impl App {
                 } else {
                     std::mem::take(&mut listing.posts)
                 };
-                let held = displayed
-                    && (island_has_new(&self.config, &group.posts, &incoming)
-                        || cached_refresh && island_changed(&self.config, &group.posts, &incoming));
+                let held = displayed && island_has_new(&self.config, &group.posts, &incoming);
                 let revealed = manual && held;
                 if !held || manual {
                     group.posts = incoming;
                     group.arrivals = None;
-                    group.stable_arrivals = false;
                 } else {
                     // The island keeps its posts and order until `r`; content still updates.
                     let fresh: HashMap<_, _> = incoming
@@ -157,7 +151,6 @@ impl App {
                         }
                     }
                     group.arrivals = Some(incoming);
-                    group.stable_arrivals = cached_refresh;
                 }
                 group.error = None;
                 self.state.observe(
