@@ -15,17 +15,57 @@ cargo deny check advisories bans licenses sources
 CI runs these on Ubuntu 24.04 and macOS 26: stable for formatting, tests and clippy,
 Rust 1.90.0 for the minimum-version check, and `cargo deny` on Ubuntu with
 [deny.toml](../deny.toml). CI runs tests with `--test-threads=1` because many tests
-measure real time and miss their margins on busy runners. Pushing a `v*` tag runs
-[release.yml](../.github/workflows/release.yml): tests, release builds, archives,
-`SHA256SUMS`, build attestations and a GitHub release, then publishes the crate to
-crates.io through trusted publishing (no stored token) from the `release`
-environment. A tag with a `-` (such as `v0.2.0-rc.1`) makes a GitHub prerelease
-and skips crates.io. Set `version` in `Cargo.toml` to the tag without its `v` (for
-example `0.2.0-rc.1` for `v0.2.0-rc.1`); the release stops before building otherwise.
-After the release, update `Formula/redtab.rb` in
-[kapral18/homebrew-tap](https://github.com/kapral18/homebrew-tap) with the new
-URLs and `SHA256SUMS`. Build a debug binary with
-`cargo build --locked`.
+measure real time and miss their margins on busy runners. Build a debug binary
+with `cargo build --locked`.
+
+## Releases
+
+Releases are automated with [release-plz](https://release-plz.dev) and
+[release.yml](../.github/workflows/release.yml); nobody pushes tags by hand.
+
+1. Every push to `main` that changes the packaged crate updates a pull request
+   named `chore: release v<version>` that bumps `version` in `Cargo.toml` and adds
+   a `CHANGELOG.md` entry. The next version comes from the
+   [Conventional Commits](https://www.conventionalcommits.org) since the last
+   release, following Cargo's SemVer rules: while the version is `0.x`, a breaking
+   change (`feat!:` or a `BREAKING CHANGE:` footer) bumps the minor and anything
+   else bumps the patch; from `1.0`, `feat:` bumps the minor and a breaking change
+   bumps the major.
+2. Whenever the `version` in `Cargo.toml` on `main` has no tag, the workflow
+   releases that commit. Merging the release pull request is how that normally
+   happens. The workflow tests and builds the commit for the four targets, and
+   only if that passes tags it `v<version>` and publishes the GitHub release with
+   the archives, `SHA256SUMS` and build attestations. After that, two jobs run side
+   by side: one publishes the crate to crates.io through trusted publishing from
+   the `release` environment, the other rewrites `Formula/redtab.rb` in
+   [kapral18/homebrew-tap](https://github.com/kapral18/homebrew-tap) with the new
+   URLs and checksums.
+
+Only one run of the workflow is active at a time, and GitHub keeps only the newest
+waiting run, so a push during a release updates the release pull request only
+after that release is done. Merge the release pull request when it is up to date
+with `main`: commits that land between its last update and the start of its run
+ship in that release without a changelog line. A version that is not higher than
+the latest one on crates.io stops the workflow.
+
+If a release job fails for a temporary reason (a network error), re-run the failed
+jobs or all jobs; a run finishes the release at the commit it tagged and skips what
+is already done. If GitHub drops a waiting run (for example because a re-run took
+its place), start the Release workflow on `main` from the Actions tab; it releases
+or updates the release pull request from the current state. If the build fails
+before tagging, push the fix to `main`; the version is still untagged, so that
+push releases it. A tag never moves: if a step after tagging needs a code fix,
+commit the fix together with a higher `version` in `Cargo.toml` and its
+`CHANGELOG.md` entry. While a tagged version is missing from crates.io, the release
+pull request job fails on every push, so re-run the failed release first;
+publishing by hand is not the fix, because the crate accepts only trusted
+publishing. Prerelease versions (with a `-`) stop the workflow, and the Homebrew
+formula is never moved back to an older version.
+
+Commit messages on `main` must follow Conventional Commits. Squash-merge
+contributor pull requests and give them a conventional title, because the title
+becomes the commit message. The release pull request is opened by GitHub Actions,
+so its CI runs start only after a maintainer approves them on the pull request.
 
 ## Tests
 

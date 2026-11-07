@@ -9,7 +9,7 @@ repository = "https://github.com/kapral18/redtab"
 readme = "README.md"
 keywords = ["reddit", "tui", "terminal", "ratatui", "cli"]
 categories = ["command-line-utilities"]
-exclude = [".github/", "deny.toml", "docs/"]
+exclude = [".github/", "deny.toml", "docs/", "release-plz.toml"]
 
 [dependencies]
 anyhow = "1"

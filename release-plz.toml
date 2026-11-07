@@ -1,0 +1,3 @@
+[workspace]
+git_tag_name = "v{{ version }}"
+semver_check = false
