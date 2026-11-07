@@ -136,6 +136,7 @@ jobs:
 
   crate:
     needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-24.04
     environment: release
     timeout-minutes: 30
