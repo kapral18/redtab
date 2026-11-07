@@ -29,11 +29,11 @@ jobs:
       version: ${{ steps.next.outputs.version }}
       tag: ${{ steps.next.outputs.tag }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68
         with:
           tool: git-cliff@2.14.2
       - name: Next version from commits since the last tag
@@ -70,7 +70,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Install Linux build prerequisites
@@ -168,10 +168,10 @@ jobs:
     outputs:
       released: ${{ steps.tag.outputs.released }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68
         with:
           tool: git-cliff@2.14.2
       - name: Push release commit and tag
@@ -262,7 +262,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.plan.outputs.tag }}
           persist-credentials: false
@@ -301,7 +301,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.plan.outputs.tag }}
         run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: kapral18/homebrew-tap
           ssh-key: ${{ secrets.HOMEBREW_TAP_KEY }}
