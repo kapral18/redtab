@@ -13,8 +13,9 @@ cargo install --git https://github.com/kapral18/redtab --locked
 redtab
 ```
 
-Select a signed-in browser profile, allow OS access if prompted, and confirm your
-Reddit username. See [Accounts](accounts.md) if importing the session fails.
+On first launch, press `Enter` on **Sign in in a new login window** (needs Chrome,
+Chromium, Brave or Edge), sign in there and confirm your username. See
+[Accounts](accounts.md) for importing from a browser profile instead.
 
 Optional programs:
 
@@ -25,6 +26,29 @@ Optional programs:
 | `ffplay` | Sound during inline playback |
 | `mpv` | Opening videos with `O` |
 | `secret-tool` | Saved sessions on Linux; included in Debian/Ubuntu's `libsecret-tools` |
+
+### Prebuilt binaries
+
+[Releases](https://github.com/kapral18/redtab/releases) hold one
+`redtab-<tag>-<target>.tar.gz` per target, for example
+`redtab-v0.1.0-aarch64-apple-darwin.tar.gz`. Targets: `aarch64-apple-darwin`,
+`x86_64-apple-darwin`, `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`.
+Linux builds need glibc 2.35 or newer. `SHA256SUMS` lists every archive, and each archive has a
+GitHub build attestation. Verify before running:
+
+```sh
+sha256sum -c SHA256SUMS --ignore-missing           # Linux
+shasum -a 256 -c SHA256SUMS --ignore-missing       # macOS
+gh attestation verify redtab-<tag>-<target>.tar.gz --repo kapral18/redtab
+```
+
+The archive holds `redtab`, its `LICENSE`, `README.md` and
+`THIRD_PARTY_LICENSES`. macOS builds are not notarized. If macOS refuses to run a
+binary downloaded with a browser, run:
+
+```sh
+xattr -d com.apple.quarantine redtab-<tag>-<target>/redtab
+```
 
 ## Documentation
 

@@ -9,10 +9,14 @@ cargo +stable fmt --check
 cargo +stable test --locked --all-targets
 cargo +stable clippy --locked --all-targets -- -D warnings
 cargo +1.90.0 check --locked --all-targets
+cargo deny check advisories bans licenses sources
 ```
 
 CI runs these on Ubuntu 24.04 and macOS 14: stable for formatting, tests and clippy;
-Rust 1.90.0 for the minimum-version check. Build a debug binary with
+Rust 1.90.0 for the minimum-version check; `cargo deny` on Ubuntu with
+[deny.toml](../deny.toml). Pushing a `v*` tag runs
+[release.yml](../.github/workflows/release.yml): tests, release builds, archives,
+`SHA256SUMS`, build attestations and a GitHub release. Build a debug binary with
 `cargo build --locked`.
 
 ## Tests

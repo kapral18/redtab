@@ -1,0 +1,44 @@
+[graph]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2026-0370", reason = "zbus 5 sub-crate via rookie-cookies; merged into zbus 6, no fixed 5.x release" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus 5 sub-crate via rookie-cookies; merged into zbus 6, no fixed 5.x release" },
+    { id = "RUSTSEC-2026-0372", reason = "zbus 5 sub-crate via rookie-cookies; merged into zbus 6, no fixed 5.x release" },
+]
+
+[licenses]
+version = 2
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+exceptions = [{ allow = ["LGPL-3.0"], crate = "wreq-util" }]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

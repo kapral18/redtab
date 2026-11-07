@@ -9,21 +9,36 @@ Reddit in your terminal, with tabs, inline media and keyboard controls.
 - Search Reddit, follow comment threads, vote, save, reply and post.
 - Switch accounts, bookmark posts and keep unread counts across restarts.
 
-Sign in with your browser's Reddit session, saved in your OS credential store.
 No Reddit API registration is needed.
-Reddit can change the browser endpoints redtab uses; updates may be needed when it does.
+
+## Before you sign in
+
+- redtab uses your Reddit web session and Reddit's website endpoints, not the
+  official API, and identifies itself as Chrome. Reddit can restrict or suspend
+  accounts it flags as automated, and can change these endpoints at any time.
+- The saved session has your account's full web access. It is stored in the macOS
+  Keychain or Linux Secret Service, never in a plain file.
+- The default sign-in opens a separate login window and never reads your browser's
+  cookies. Importing from a Chromium profile on macOS instead asks you to let redtab
+  use "<Browser> Safe Storage", which decrypts that browser's cookies and saved
+  passwords; redtab decrypts only reddit.com cookies, in its own process
+  ([details](docs/accounts.md#os-prompts)).
 
 ## Get started
 
-Requires Rust 1.90+, CMake, a C/C++ compiler and libclang.
-See [installation](docs/guide.md#install) for platform requirements.
+Download a build for macOS or Linux (x86_64, arm64) from
+[Releases](https://github.com/kapral18/redtab/releases) and
+[verify it](docs/guide.md#prebuilt-binaries), or build from source with Rust 1.90+,
+CMake, a C/C++ compiler and libclang:
 
 ```sh
 cargo install --git https://github.com/kapral18/redtab --locked
 redtab
 ```
 
-On first launch, select your signed-in browser profile and confirm your account.
+On first launch, **Connect Reddit** preselects **Sign in in a new login window**
+(needs Chrome, Chromium, Brave or Edge). Press `Enter`, sign in there and confirm
+your account.
 Press `Space` for action groups and `?` for help. Install `ffmpeg` for inline video.
 
 ## Documentation

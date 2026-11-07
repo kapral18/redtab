@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Install Linux build prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev pkg-config
+      - name: Install macOS build prerequisites
+        if: runner.os == 'macOS'
+        run: brew list cmake >/dev/null 2>&1 || brew install cmake
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+      - name: Test
+        run: cargo +stable test --locked --all-targets
+      - name: Build
+        run: cargo +stable build --release --locked --target ${{ matrix.target }}
+      - name: Fetch license texts
+        env:
+          SPDX_COMMIT: 31846481de7ea17d92f2f46fad76abe58b2e9bb0
+        run: |
+          mkdir licenses
+          while read -r sum id; do
+            curl -fsSL --retry 3 -o "licenses/$id.txt" \
+              "https://raw.githubusercontent.com/spdx/license-list-data/$SPDX_COMMIT/text/$id.txt"
+            echo "$sum  licenses/$id.txt" | shasum -a 256 -c -
+          done <<'TEXTS'
+          b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5 MIT
+          5a93d5831e1297ab10fe643e1a631e83be392896da14ee2951285a79012df69d BSD-3-Clause
+          074e6e32c86a4c0ef8b3ed25b721ca23aca83df277cd88106ef7177c354615ff Apache-2.0
+          66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172 MPL-2.0
+          fb981668c18a279e285fc4d83fba1e836cc84dd4daa73c9697d3cfd2d8aca6e0 GPL-3.0-only
+          TEXTS
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          name="redtab-${VERSION}-${TARGET}"
+          mkdir "$name"
+          cp "target/${TARGET}/release/redtab" LICENSE README.md "$name/"
+          cargo metadata --locked --format-version 1 --filter-platform "$TARGET" \
+            | jq -r '.packages[] | select(.source != null) | [.manifest_path, .name, .version, (.license // "see license file"), (.authors | join(", ")), (.repository // "crates.io")] | join("\u001f")' \
+            | sort -u \
+            | while IFS=$'\x1f' read -r manifest crate version license authors repository; do
+                test -f "$manifest"
+                dir=$(dirname "$manifest")
+                printf '\n=== %s %s (%s)\nAuthors: %s\nSource: %s\n' "$crate" "$version" "$license" "$authors" "$repository"
+                found=0
+                for file in "$dir"/LICENSE* "$dir"/LICENCE* "$dir"/COPYING* "$dir"/NOTICE*; do
+                  if [ -f "$file" ]; then
+                    found=1
+                    printf -- '--- %s\n' "$(basename "$file")"
+                    cat "$file"
+                  fi
+                done
+                if [ "$found" = 0 ]; then
+                  for id in $(printf '%s' "$license" | tr '()/' '   '); do
+                    if [ -f "licenses/$id.txt" ]; then
+                      printf -- '--- %s (crate ships no license file)\n' "$id"
+                      cat "licenses/$id.txt"
+                    fi
+                  done
+                fi
+              done > "$name/THIRD_PARTY_LICENSES"
+          printf '\n=== GNU GPL 3.0 (required by LGPL-3.0 section 4 for wreq-util)\n' >> "$name/THIRD_PARTY_LICENSES"
+          cat licenses/GPL-3.0-only.txt >> "$name/THIRD_PARTY_LICENSES"
+          test -s "$name/THIRD_PARTY_LICENSES"
+          tar -czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ${{ matrix.target }}
+          path: redtab-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum redtab-*.tar.gz > SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: dist/redtab-*.tar.gz
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          prerelease=()
+          if [[ "$TAG" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$TAG" dist/redtab-*.tar.gz dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" --generate-notes --verify-tag "${prerelease[@]}"
