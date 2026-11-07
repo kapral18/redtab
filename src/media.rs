@@ -168,14 +168,20 @@ fn copy_with_deadline(
         && Instant::now() < deadline
         && !cancelled.load(std::sync::atomic::Ordering::Acquire)
     {
+        let mut writing = false;
         if let Some(stdin) = &mut input {
+            writing = true;
             match stdin.write(&text.as_bytes()[written..]) {
                 Ok(count) => written += count,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                    ) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    let mut ready = libc::pollfd {
+                        fd: stdin.as_raw_fd(),
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    unsafe { libc::poll(&mut ready, 1, 5) };
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => break,
             }
             if written == text.len() {
@@ -185,7 +191,8 @@ fn copy_with_deadline(
         match child.try_wait() {
             Ok(Some(status)) if status.success() && written == text.len() => return true,
             Ok(Some(_)) => break,
-            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) if !writing => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {}
             Err(_) => break,
         }
     }
