@@ -12,7 +12,7 @@ cargo +1.90.0 check --locked --all-targets
 cargo deny check advisories bans licenses sources
 ```
 
-CI runs these on Ubuntu 24.04 and macOS 14: stable for formatting, tests and clippy;
+CI runs these on Ubuntu 24.04 and macOS 15: stable for formatting, tests and clippy;
 Rust 1.90.0 for the minimum-version check; `cargo deny` on Ubuntu with
 [deny.toml](../deny.toml). Pushing a `v*` tag runs
 [release.yml](../.github/workflows/release.yml): tests, release builds, archives,
