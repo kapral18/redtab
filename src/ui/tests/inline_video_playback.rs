@@ -191,8 +191,8 @@ fn a_resized_video_starts_again_as_it_was_once_the_size_holds() {
         first,
         "a size passing by changes nothing"
     );
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    step(&mut app, 40);
+    screen(&mut app, 100, 40);
+    app.tick_at(std::time::Instant::now() + std::time::Duration::from_millis(300));
     let player = app.video.as_ref().unwrap();
     assert_ne!(player.area, first, "sized for the new area");
     assert!(player.paused(), "still paused");

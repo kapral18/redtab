@@ -76,10 +76,13 @@ because the title becomes the commit message.
 - Each test guards a behavior a user or caller relies on, with its own check. Don't
   add one that repeats another test's check; extend that test's table instead.
   Check what users or callers see (screen text, messages, requests); read internal
-  state only when the visible result would need a real wait.
+  state only when the visible result would need a real wait, or would look the same
+  with the guarded behavior removed.
 - Don't sleep for timing logic: pass the time (`App::tick_at`), age content with
-  the test clock in `ui`, or shrink the wait or budget in the test. Real waits are
-  for real processes, sockets and file locks, and stay as short as their check
+  the test clock in `ui`, or shrink the wait or budget in the test. Wait for real
+  only when no test seam reaches the timing: the code reads the real clock (request
+  pacing, the gap between two quick moves), or the check is what another thread
+  or process does, or doesn't do, in time. Keep each wait as short as its check
   allows.
 - Keep inputs small: use the smallest image, font or budget that still triggers the
   behavior.

@@ -32,8 +32,8 @@ fn when_a_frame_shrinks_the_drawn_video_the_decoder_should_not_restart() {
     app.video = Some(player);
 
     step(&mut app);
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    step(&mut app);
+    screen(&mut app, 100, 30);
+    app.tick_at(std::time::Instant::now() + std::time::Duration::from_millis(300));
 
     let player = app.video.as_ref().unwrap();
     assert!(

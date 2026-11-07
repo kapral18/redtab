@@ -372,11 +372,10 @@ fn an_empty_search_answer_should_be_asked_again_before_it_counts_as_no_matches()
     answer(&mut app, &[]);
     app.switch_tab(0);
     let away = app.search.results_generation();
-    // Returning checks the deadline against the real clock.
-    std::thread::sleep(std::time::Duration::from_millis(1050));
-    app.tick();
+    app.tick_at(std::time::Instant::now() + std::time::Duration::from_millis(1050));
     assert_eq!(app.search.results_generation(), away, "asked while away");
     app.switch_tab(crate::app::SEARCH_TAB);
+    app.tick_at(std::time::Instant::now() + crate::app::NAV_SETTLE);
     assert_ne!(
         app.search.results_generation(),
         away,

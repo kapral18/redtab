@@ -32,7 +32,7 @@ fn a_subreddit_icon_shows_in_sidebar_and_home_card() {
     });
     app.switch_tab(crate::app::ALL_SUBS_TAB);
     // Two quick tab switches hold new icons until they settle.
-    std::thread::sleep(crate::app::NAV_SETTLE);
+    app.tick_at(std::time::Instant::now() + crate::app::NAV_SETTLE);
 
     let s = screen(&mut app, 120, 30);
 

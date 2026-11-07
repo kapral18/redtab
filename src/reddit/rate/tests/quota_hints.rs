@@ -2,14 +2,14 @@ use super::*;
 
 #[test]
 fn when_quota_is_unknown_the_same_pool_should_keep_conservative_pacing() {
-    let rate = Rate::new(Duration::from_millis(300));
+    let rate = Rate::new(Duration::from_millis(600));
     let url = Url::parse("https://www.reddit.com/r/rust/hot.json").unwrap();
     let started = Instant::now();
     rate.admit(&url, Priority::Listing, true, || false).unwrap();
 
     rate.admit(&url, Priority::Listing, true, || false).unwrap();
 
-    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert!(started.elapsed() >= Duration::from_millis(600));
 }
 
 #[test]
