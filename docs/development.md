@@ -79,8 +79,10 @@ comments the reason and leaves the pull request open: Dependabot does not
 propose a closed update's version again. It needs the secrets
 `COPILOT_GITHUB_TOKEN` (Copilot Requests) and `DEPENDABOT_MERGE_TOKEN`
 (Contents, Pull requests and Workflows write on this repository), each stored
-as both an Actions and a Dependabot secret. After editing the `.md`, run
-`gh aw compile` and commit the `.lock.yml`.
+as both an Actions and a Dependabot secret. The repository variable
+`GH_AW_MODEL_AGENT_COPILOT=sonnet` pins the agent to the newest Claude Sonnet
+in the Copilot plan. After editing the `.md`, run `gh aw compile` and commit the
+`.lock.yml`.
 
 ## Tests
 
