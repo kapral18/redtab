@@ -79,27 +79,10 @@ safe-outputs:
               echo "::error::DEPENDABOT_MERGE_TOKEN is not set"
               exit 1
             fi
-            # Threat detection can warn and still pass its job; act only on a clean result.
-            if [ "$DETECTION_SUCCESS" != "true" ]; then
-              echo "::warning::Threat detection did not pass: #$PR left open"
-              exit 0
-            fi
-            # gh-aw sanitized the summary (mentions, links, markup) when it collected it.
-            item=$(jq -c '[.items[] | select(.type == "dependabot_decision")] | last' "$GH_AW_AGENT_OUTPUT")
-            VERDICT=$(jq -r '.verdict' <<<"$item")
-            if [ "${GH_AW_SAFE_OUTPUTS_STAGED:-}" = "true" ]; then
-              echo "Staged verdict: $VERDICT"
-              exit 0
-            fi
-            SUMMARY="$RUNNER_TEMP/summary.md"
-            jq -r '.summary' <<<"$item" > "$SUMMARY"
-            printf '\n\n---\nAudit run: %s/%s/actions/runs/%s\n' \
-              "$GITHUB_SERVER_URL" "$REPO" "$GITHUB_RUN_ID" >> "$SUMMARY"
             if [ -z "$PR" ]; then
               echo "::notice::The CI run has no pull request in this repository"
               exit 0
             fi
-
             state=$(gh pr view "$PR" --repo "$REPO" --json author,state,headRefOid \
               --jq 'select(.author.login == "app/dependabot" and .headRefOid == env.SHA) | .state')
             if [ "$state" != "OPEN" ]; then
@@ -107,9 +90,30 @@ safe-outputs:
               exit 0
             fi
 
+            RUN="$GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID"
+            SUMMARY="$RUNNER_TEMP/summary.md"
+            # Leave the pull request open for a person, saying why on it.
+            leave_open() {
+              echo "::warning::#$PR left open: $1"
+              { printf '**Left open for review:** %s\n\n' "$1"; cat "$SUMMARY"; } > "$RUNNER_TEMP/comment.md"
+              gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/comment.md"
+              exit 0
+            }
+            printf 'Audit run: %s\n' "$RUN" > "$SUMMARY"
+
+            # Threat detection can warn and still pass its job; the agent's text is then
+            # not posted.
+            if [ "$DETECTION_SUCCESS" != "true" ]; then
+              leave_open "threat detection did not pass"
+            fi
+            # gh-aw sanitized the summary (mentions, links, markup) when it collected it.
+            item=$(jq -c '[.items[] | select(.type == "dependabot_decision")] | last' "$GH_AW_AGENT_OUTPUT")
+            VERDICT=$(jq -r '.verdict' <<<"$item")
+            { jq -r '.summary' <<<"$item"; printf '\n\n---\nAudit run: %s\n' "$RUN"; } > "$SUMMARY"
+
             case "$VERDICT" in
               reject) gh pr close "$PR" --repo "$REPO" --comment "$(cat "$SUMMARY")"; exit 0 ;;
-              hold) gh pr comment "$PR" --repo "$REPO" --body-file "$SUMMARY"; exit 0 ;;
+              hold) leave_open "the audit could not complete a check" ;;
               approve) ;;
               *) echo "::error::Unknown verdict: $VERDICT"; exit 1 ;;
             esac
@@ -117,22 +121,22 @@ safe-outputs:
             # Approve only what Dependabot alone wrote, in the files its ecosystem owns.
             authors=$(gh api "repos/$REPO/pulls/$PR/commits" --paginate --jq '.[].author.login')
             if grep -vqx 'dependabot\[bot\]' <<<"$authors"; then
-              echo "::notice::#$PR has commits not authored by Dependabot: left open"
-              exit 0
+              leave_open "it has commits not authored by Dependabot"
             fi
             case "$BRANCH" in
               dependabot/github_actions/*) allowed='^\.github/workflows/[^/]+\.ya?ml$' ;;
               dependabot/cargo/*) allowed='^Cargo\.(toml|lock)$' ;;
-              *) echo "::notice::#$PR is from an unknown ecosystem: left open"; exit 0 ;;
+              *) leave_open "it is from an ecosystem this audit does not merge" ;;
             esac
             files=$(gh pr view "$PR" --repo "$REPO" --json files --jq '.files[].path')
             if grep -vqE "$allowed" <<<"$files" || grep -qE '\.lock\.yml$' <<<"$files"; then
-              echo "::notice::#$PR changes files outside its ecosystem: left open"
-              exit 0
+              leave_open "it changes files outside its ecosystem"
             fi
 
             gh pr review "$PR" --repo "$REPO" --approve --body-file "$SUMMARY"
             gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$SHA"
+  # The agent must record a verdict; ending without one is a failed run.
+  noop: false
   threat-detection:
     report-as-issue: false
   report-missing-tool: false

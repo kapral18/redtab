@@ -74,9 +74,10 @@ CI passes on one, [dependabot-audit](../.github/workflows/dependabot-audit.md)
 tags, release notes against how the workflows use each action, crate advisories,
 lockfile changes and crate source diffs. It then approves and squash-merges the
 pull request, which releases a cargo fix as a patch, or closes it with the
-reasons. When it cannot finish a check, it comments and leaves the pull request
-open: Dependabot does not propose a closed update's version again. It needs the
-secrets `COPILOT_GITHUB_TOKEN` (Copilot Requests) and `DEPENDABOT_MERGE_TOKEN`
+reasons. When it cannot finish a check, or a safety gate refuses the merge, it
+comments the reason and leaves the pull request open: Dependabot does not
+propose a closed update's version again. It needs the secrets
+`COPILOT_GITHUB_TOKEN` (Copilot Requests) and `DEPENDABOT_MERGE_TOKEN`
 (Contents, Pull requests and Workflows write on this repository), each stored
 as both an Actions and a Dependabot secret. After editing the `.md`, run
 `gh aw compile` and commit the `.lock.yml`.
