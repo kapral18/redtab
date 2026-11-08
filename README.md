@@ -28,23 +28,30 @@ No Reddit API registration is needed.
   passwords; redtab decrypts only reddit.com cookies, in its own process
   ([details](docs/accounts.md#os-prompts)).
 
-## Get started
+## Install
 
-Install with Homebrew on macOS or Linux:
+With Homebrew on macOS or Linux:
 
 ```sh
 brew install kapral18/tap/redtab
-redtab
 ```
 
 Or download a build from [Releases](https://github.com/kapral18/redtab/releases)
 and [verify it](docs/guide.md#prebuilt-binaries), or build from source with
 Rust 1.90+, CMake, a C/C++ compiler and libclang: `cargo install redtab --locked`.
 
+Install `ffmpeg` for inline video.
+
+## Usage
+
+```sh
+redtab
+```
+
 On first launch, **Connect Reddit** preselects **Sign in in a new login window**
 (needs Chrome, Chromium, Brave or Edge). Press `Enter`, sign in there and confirm
 your account.
-Press `Space` for action groups and `?` for help. Install `ffmpeg` for inline video.
+Press `Space` for action groups and `?` for help.
 
 ## Documentation
 
