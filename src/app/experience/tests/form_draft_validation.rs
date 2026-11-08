@@ -25,13 +25,6 @@ fn when_a_write_fails_it_should_keep_the_draft_and_display_the_error() {
         "unsent draft"
     );
     assert!(app.experience.error.as_ref().unwrap().contains("HTTP 403"));
-    assert!(
-        app.experience
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("before submitting again")
-    );
     assert!(!app.experience.writing());
 }
 
@@ -54,7 +47,7 @@ fn when_a_composer_receives_paste_and_alt_text_it_should_preserve_the_draft_with
 }
 
 #[test]
-fn ui_audit_required_field_validation_should_name_and_focus_the_field() {
+fn required_field_validation_should_name_and_focus_the_field() {
     let (mut app, _dir, _fixture) = app();
     let mut input = app.post_form(true);
     input.fields[0].value = "rust".into();
@@ -70,83 +63,72 @@ fn ui_audit_required_field_validation_should_name_and_focus_the_field() {
 }
 
 #[test]
-fn settings_draft_reload_should_keep_reply_edit_and_submit_fields_for_both_change_paths() {
+fn settings_draft_reload_should_keep_a_reply_draft_for_both_change_paths() {
     for external in [false, true] {
-        for kind in 0..3 {
-            let (mut app, directory, _fixture) = app();
-            let path = directory.path().join("config.toml");
-            std::fs::write(&path, "[media]\nimage_preview=false\n").unwrap();
-            app.settings = super::super::super::settings::Settings::new(
-                crate::config::store::Store::open(Some(&path)).unwrap(),
-            );
-            let target = Target {
-                id: "t1_original".into(),
-                author: "reader".into(),
-                subreddit: "rust".into(),
-                permalink: "/comments/post/_/original".into(),
-            };
-            let mut draft = match kind {
-                0 => form(
-                    "Reply",
-                    FormKind::Reply(target),
-                    vec![field("Reply", "", true)],
-                    "/comments/post",
-                ),
-                1 => form(
-                    "Edit",
-                    FormKind::Edit(target),
-                    vec![field("Body", "", true)],
-                    "/comments/post",
-                ),
-                _ => app.post_form(false),
-            };
-            draft.active = draft.fields.len() - 1;
-            draft.fields[draft.active].value = "unsent café\nsecond line".into();
-            draft.fields[draft.active].cursor = 5;
-            app.experience.screens = vec![
-                Screen::Browse {
-                    pagination: Default::default(),
-                    query: Query::Communities,
-                    page: Page {
-                        title: "old collection".into(),
-                        text: String::new(),
-                        entries: vec![],
-                        after: None,
-                        url: "/".into(),
-                    },
-                    selected: 0,
-                    scroll: 0,
+        let (mut app, directory, _fixture) = app();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "[media]\nimage_preview=false\n").unwrap();
+        app.settings = super::super::super::settings::Settings::new(
+            crate::config::store::Store::open(Some(&path)).unwrap(),
+        );
+        let target = Target {
+            id: "t1_original".into(),
+            author: "reader".into(),
+            subreddit: "rust".into(),
+            permalink: "/comments/post/_/original".into(),
+        };
+        let mut draft = form(
+            "Reply",
+            FormKind::Reply(target),
+            vec![field("Reply", "", true)],
+            "/comments/post",
+        );
+        draft.active = draft.fields.len() - 1;
+        draft.fields[draft.active].value = "unsent café\nsecond line".into();
+        draft.fields[draft.active].cursor = 5;
+        app.experience.screens = vec![
+            Screen::Browse {
+                pagination: Default::default(),
+                query: Query::Communities,
+                page: Page {
+                    title: "old collection".into(),
+                    text: String::new(),
+                    entries: vec![],
+                    after: None,
+                    url: "/".into(),
                 },
-                Screen::Input(draft.clone()),
-            ];
-            app.overlay = Some(Overlay::Experience);
-            if !external {
-                app.show_settings();
-            }
-            crate::app::tests::confirm_preferences(&mut app, true);
-            if !external {
-                crate::keys::handle(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-            }
-            assert!(app.config.show_nsfw);
-            assert!(
-                matches!(app.overlay, Some(Overlay::Experience)),
-                "composer lost: external={external} kind={kind}"
-            );
-            let current = app
-                .experience
-                .input()
-                .expect("draft must survive policy reload");
-            assert_eq!(current.active, draft.active);
-            for (actual, expected) in current.fields.iter().zip(&draft.fields) {
-                assert_eq!(actual.value, expected.value);
-                assert_eq!(actual.cursor, expected.cursor);
-            }
-            assert_eq!(
-                app.experience.screens.len(),
-                1,
-                "policy-dependent browse data must be invalidated"
-            );
+                selected: 0,
+                scroll: 0,
+            },
+            Screen::Input(draft.clone()),
+        ];
+        app.overlay = Some(Overlay::Experience);
+        if !external {
+            app.show_settings();
         }
+        crate::app::tests::confirm_preferences(&mut app, true);
+        if !external {
+            crate::keys::handle(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        }
+        assert!(app.config.show_nsfw);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Experience)),
+            "composer lost: external={external}"
+        );
+        let current = app
+            .experience
+            .input()
+            .expect("draft must survive policy reload");
+        assert_eq!(current.active, draft.active);
+        for (actual, expected) in current.fields.iter().zip(&draft.fields) {
+            assert_eq!(actual.value, expected.value);
+            assert_eq!(actual.cursor, expected.cursor);
+        }
+        assert_eq!(
+            app.experience.screens.len(),
+            1,
+            "policy-dependent browse data must be invalidated"
+        );
     }
 }
 

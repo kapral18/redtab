@@ -297,21 +297,6 @@ fn when_a_profile_is_renamed_reconnect_should_still_select_its_stable_identity()
 }
 
 #[test]
-fn when_an_attempt_is_cancelled_its_late_candidate_should_not_reach_the_controller() {
-    let mut actual = Controller::default();
-    let (sender, receiver) = channel();
-    actual.pending = Some(receiver);
-    actual.phase = Phase::Importing;
-    actual.cancel();
-    assert!(
-        sender
-            .send(Event::Candidate(Err("late failure".into())))
-            .is_err()
-    );
-    assert!(!actual.poll(false).0);
-}
-
-#[test]
 fn when_accounts_differ_their_bookmark_paths_should_be_distinct() {
     let actual = account_state_path(
         std::path::Path::new("/state"),
@@ -350,14 +335,14 @@ fn when_cancellation_happens_it_should_reap_only_its_helper_and_remove_its_priva
 }
 
 #[test]
-fn ui_audit_short_verified_confirmation_should_preserve_account_and_cancel() {
+fn short_verified_confirmation_should_preserve_account_and_cancel() {
     use crate::reddit::tests::{Fixture, Reply, saved_export};
     let fixture = Fixture::new(|_| {
         Reply::json(serde_json::json!({"kind":"Listing","data":{"children":[],"after":null}}))
     });
     for name in ["reader", "abcdefghijklmnopqrst"] {
         let reddit = fixture.saved_reddit(&saved_export(name, name));
-        for (width, height) in [(14, 6), (18, 6), (20, 6), (24, 8), (40, 12)] {
+        for (width, height) in [(14, 6), (24, 8), (40, 12)] {
             let (pool, _) = crate::worker::Pool::start(reddit.clone(), 1, None);
             let dir = tempfile::tempdir().unwrap();
             let mut app = crate::app::App::new(

@@ -117,7 +117,7 @@ fn footer_activity_should_keep_the_same_keys_in_the_same_cells() {
 }
 
 #[test]
-fn ui_audit_narrow_loading_and_text_only_views_should_show_applicable_controls() {
+fn narrow_loading_and_text_only_views_should_show_applicable_controls() {
     use crate::app::experience::Screen;
     use crate::reddit::experience::{Page, Query, Request};
     for width in [20, 24, 40, 72] {
@@ -156,7 +156,7 @@ fn ui_audit_narrow_loading_and_text_only_views_should_show_applicable_controls()
 }
 
 #[test]
-fn ui_audit_feedback_should_precede_background_activity() {
+fn feedback_should_precede_background_activity() {
     let mut app = feed_app(Picker::halfblocks());
     app.show_sidebar = false;
     app.images.insert(

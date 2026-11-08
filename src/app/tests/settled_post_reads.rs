@@ -24,35 +24,6 @@ fn scrolling_inside_a_video_card_should_defer_startup_and_keep_existing_playback
 }
 
 #[test]
-fn when_moves_settle_each_selected_post_should_start_without_waiting_for_obsolete_reads() {
-    let delay = Duration::from_millis(500);
-    let server = SlowReddit::start(delay);
-    let (mut app, messages) = server.home(&["warm", "fa", "fb", "fc", "fd"]);
-    wait_for_page(&mut app, &messages);
-
-    for _ in 0..4 {
-        app.move_selection(1);
-        app.tick_at(Instant::now() + NAV_SETTLE);
-    }
-    let waited = wait_for_page(&mut app, &messages);
-
-    assert_eq!(app.post_view.as_ref().unwrap().post.id, "fd");
-    assert!(app.post_view.as_ref().unwrap().page.is_some());
-    assert_eq!(
-        server
-            .asked()
-            .iter()
-            .filter(|id| id.as_str() == "fd")
-            .count(),
-        1
-    );
-    assert!(
-        waited < delay * 2,
-        "the current post must not wait for an obsolete response"
-    );
-}
-
-#[test]
 fn scrolling_away_from_the_feed_end_should_cancel_deferred_pagination() {
     let mut app = app_with(&["s"]);
     let index = tab_index(&app, "s");

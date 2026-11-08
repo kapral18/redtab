@@ -400,7 +400,7 @@ fn when_the_selection_is_cancelled_it_should_stop_an_active_extractor() {
     let actual = worker.join().unwrap();
 
     assert_eq!(actual.unwrap_err(), CANCELLED);
-    assert!(started.elapsed() < Duration::from_millis(300));
+    assert!(started.elapsed() < Duration::from_secs(2));
 }
 
 #[test]

@@ -28,14 +28,6 @@ impl Server {
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::ErrorKind::BrokenPipe.into()),
         }
     }
-
-    pub(crate) fn recv(&self) -> io::Result<Request> {
-        self.requests
-            .lock()
-            .unwrap()
-            .recv()
-            .map_err(|_| io::ErrorKind::BrokenPipe.into())
-    }
 }
 
 pub(crate) struct Header {

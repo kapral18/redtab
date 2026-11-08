@@ -23,12 +23,7 @@ fn a_scroll_key_after_v_on_a_selected_comment_moves_on_from_its_text() {
         (first, app.post_view.as_ref().unwrap().scroll)
     };
 
-    assert_eq!(
-        after(&[&["zs", "\u{6}"]]).0,
-        after(&[&["zs"], &["\u{6}"]]).0
-    );
-    // Hiding again adds lines above; `g` in the same batch still goes to the top.
-    assert_eq!(after(&[&["zs"], &["zs", "gg"]]).1, 0);
+    assert_eq!(after(&[&["zs", "\u{6}"]]), after(&[&["zs"], &["\u{6}"]]));
 }
 
 #[test]

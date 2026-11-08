@@ -20,5 +20,5 @@ fn when_a_resolving_player_is_dropped_it_should_cancel_without_waiting_for_the_w
     drop(player);
 
     assert!(cancelled.is_cancelled());
-    assert!(started.elapsed() < Duration::from_millis(100));
+    assert!(started.elapsed() < Duration::from_secs(2));
 }

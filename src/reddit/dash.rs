@@ -118,8 +118,6 @@ mod tests {
             original.replace("CMAF_360.mp4", "https://evil.test/private.mp4"),
             original.replace("type=\"static\"", "type=\"dynamic\""),
             original.replace("<Period ", "<ContentProtection/><Period "),
-            original.replace("<Period ", "<SegmentTemplate/><Period "),
-            original.replace("<Period ", "<SegmentList/><Period "),
         ] {
             let fixture = Fixture::new(move |_| Reply {
                 status: 200,

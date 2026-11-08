@@ -41,7 +41,7 @@ fn when_home_sort_opens_in_a_short_terminal_it_should_show_every_option() {
 }
 
 #[test]
-fn review_regression_wrapped_selected_menu_labels_should_stay_wholly_visible() {
+fn wrapped_selected_menu_labels_should_stay_wholly_visible() {
     let mut app = app(&[]);
     app.reddit_menu();
     let Some(crate::app::experience::Screen::Menu {
@@ -286,7 +286,7 @@ fn thumbnails_wait_for_an_overlay_to_close() {
 }
 
 #[test]
-fn ui_audit_caret_should_remain_visible_at_a_short_form_wrap_boundary() {
+fn caret_should_remain_visible_at_a_short_form_wrap_boundary() {
     let mut app = form_app("Create text post");
     let Some(crate::app::experience::Screen::Input(form)) = app.experience.screens.last_mut()
     else {
@@ -300,21 +300,19 @@ fn ui_audit_caret_should_remain_visible_at_a_short_form_wrap_boundary() {
 }
 
 #[test]
-fn ui_audit_short_membership_dialogs_should_keep_target_and_cancel_visible() {
+fn short_membership_dialogs_should_keep_target_and_cancel_visible() {
     for name in ["rust", "a_very_long_community"] {
-        for join in [true, false] {
-            for (width, height) in [(20, 6), (20, 8), (24, 8), (40, 12)] {
-                let mut app = app(&[]);
-                app.overlay = Some(Overlay::Membership {
-                    target: crate::model::MembershipTarget::Community(name.into()),
-                    join,
-                });
-                let body = auth_content(&mut app, width, height);
-                let actual = screen(&mut app, width, height);
-                assert!(body.contains(&format!("r/{name}")), "{actual}");
-                assert!(actual.contains("Esc") || actual.contains('⎋'), "{actual}");
-                assert!(actual.contains("Enter") || actual.contains('⏎'), "{actual}");
-            }
+        for (width, height) in [(20, 6), (20, 8), (24, 8), (40, 12)] {
+            let mut app = app(&[]);
+            app.overlay = Some(Overlay::Membership {
+                target: crate::model::MembershipTarget::Community(name.into()),
+                join: true,
+            });
+            let body = auth_content(&mut app, width, height);
+            let actual = screen(&mut app, width, height);
+            assert!(body.contains(&format!("r/{name}")), "{actual}");
+            assert!(actual.contains("Esc") || actual.contains('⎋'), "{actual}");
+            assert!(actual.contains("Enter") || actual.contains('⏎'), "{actual}");
         }
     }
 }

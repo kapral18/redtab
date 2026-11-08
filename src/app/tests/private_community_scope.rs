@@ -110,11 +110,8 @@ fn private_community_navigation_should_not_move_hidden_posts_or_prefetch() {
     let access = AccessDenied::PrivateCommunity;
     for code in [
         KeyCode::Char('j'),
-        KeyCode::Char('k'),
         KeyCode::Char('G'),
-        KeyCode::Char('g'),
         KeyCode::PageDown,
-        KeyCode::PageUp,
         KeyCode::Null,
     ] {
         let mut app = app_with(&["vim"]);

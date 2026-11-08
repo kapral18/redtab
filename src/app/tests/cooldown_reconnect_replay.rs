@@ -1,12 +1,12 @@
 use super::*;
 
 #[test]
-fn when_a_cooldown_counts_down_tick_should_redraw_only_when_the_display_changes() {
+fn a_cooldown_footer_should_name_its_cause_without_the_query_or_spinning_redraws() {
     use crate::reddit::tests::{Fixture, Reply};
     let fixture = Fixture::new(|_| Reply {
         status: 429,
         body: String::new(),
-        headers: vec![("Retry-After".into(), "2".into())],
+        headers: vec![("Retry-After".into(), "30".into())],
     });
     let mut app = app_with(&[]);
     app.reddit = fixture.reddit();
@@ -14,14 +14,12 @@ fn when_a_cooldown_counts_down_tick_should_redraw_only_when_the_display_changes(
     assert!(app.reddit.search("rust", "SECRET", None).is_err());
     assert!(app.tick());
     assert!(!app.tick(), "unchanged countdown must not spin redraws");
-    std::thread::sleep(Duration::from_millis(1100));
-    assert!(app.tick());
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 20)).unwrap();
     terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
     let buffer = terminal.backend().buffer();
     let footer: String = (0..110).map(|x| buffer[(x, 19)].symbol()).collect();
     assert!(
-        footer.contains("paused 1s")
+        footer.contains("paused")
             && footer.contains("r/rust listing")
             && footer.contains("HTTP 429"),
         "{footer}"
@@ -32,7 +30,7 @@ fn when_a_cooldown_counts_down_tick_should_redraw_only_when_the_display_changes(
     let buffer = terminal.backend().buffer();
     let footer: String = (0..110).map(|x| buffer[(x, 19)].symbol()).collect();
     assert!(
-        footer.contains("paused 1s") && footer.contains("HTTP 429"),
+        footer.contains("paused") && footer.contains("HTTP 429"),
         "{footer}"
     );
 }

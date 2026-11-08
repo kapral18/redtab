@@ -93,14 +93,14 @@ fn alt_letters_in_a_text_box_neither_close_it_nor_run_list_keys() {
 }
 
 #[test]
-fn ui_audit_optional_description_should_be_identified_before_submission() {
+fn optional_description_should_be_identified_before_submission() {
     let mut app = form_app("Create a custom feed");
     let actual = screen(&mut app, 80, 24);
     assert!(actual.contains("Description (optional)"), "{actual}");
 }
 
 #[test]
-fn ui_audit_scrolled_multiline_input_should_keep_its_field_label_visible() {
+fn scrolled_multiline_input_should_keep_its_field_label_visible() {
     let mut app = form_app("Create text post");
     let Some(crate::app::experience::Screen::Input(form)) = app.experience.screens.last_mut()
     else {
@@ -117,7 +117,7 @@ fn ui_audit_scrolled_multiline_input_should_keep_its_field_label_visible() {
 }
 
 #[test]
-fn ui_audit_direct_inputs_should_backspace_complete_graphemes() {
+fn direct_inputs_should_backspace_complete_graphemes() {
     for (input, expected) in [("cafe\u{301}", "caf"), ("x👩‍💻", "x"), ("x🇮🇪", "x"), ("", "")]
     {
         for picker in [false, true] {
@@ -142,7 +142,7 @@ fn ui_audit_direct_inputs_should_backspace_complete_graphemes() {
 }
 
 #[test]
-fn ui_audit_failed_forms_should_keep_correction_visible() {
+fn failed_forms_should_keep_correction_visible() {
     for label in [
         "Open a user profile",
         "Create text post",
@@ -189,7 +189,7 @@ fn ui_audit_failed_forms_should_keep_correction_visible() {
 }
 
 #[test]
-fn ui_audit_compact_dialogs_should_keep_input_and_cancel_visible() {
+fn compact_dialogs_should_keep_input_and_cancel_visible() {
     for (width, height) in [(14, 6), (20, 6), (20, 8), (24, 8), (40, 12)] {
         for kind in ["jump", "search", "sort", "help", "form", "composer"] {
             let mut app = app(&["rust"]);

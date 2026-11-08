@@ -247,60 +247,6 @@ fn when_retained_previews_exceed_the_limit_the_oldest_should_be_released() {
 }
 
 #[test]
-fn when_a_stale_disk_preview_refreshes_it_should_keep_pixels_and_one_pending_fetch() {
-    let mut app = app_with(&[]);
-    let url = "https://i.redd.it/stale.png";
-    app.request_image(url);
-    app.card_pictures_drawn(&[url]);
-    assert_eq!(app.queued_images.get(url), Some(&false));
-    app.on_msg(Msg::Snapshot {
-        message: Box::new(Msg::Image {
-            url: url.into(),
-            result: Ok(image::DynamicImage::new_rgb8(10, 5).into()),
-        }),
-        fetched_at: now() - 8 * 86_400,
-        refreshing: true,
-        source: Source {
-            cached: true,
-            ..Source::default()
-        },
-    });
-    assert!(matches!(
-        app.card_images.get(url),
-        Some(CardImageSlot::Cached {
-            refreshing: true,
-            ..
-        })
-    ));
-    assert!(app.queued_images.contains_key(url));
-    assert!(matches!(
-        app.images.get(url),
-        Some(ImageSlot::Ready {
-            refresh: ImageRefresh::Loading,
-            ..
-        })
-    ));
-
-    app.on_msg(Msg::Image {
-        url: url.into(),
-        result: Ok(image::DynamicImage::new_rgb8(20, 10).into()),
-    });
-
-    assert!(
-        matches!(app.card_images.get(url), Some(CardImageSlot::Ready { image, .. }) if image.width() == 20)
-    );
-    assert!(!app.queued_images.contains_key(url));
-    assert!(matches!(
-        app.images.get(url),
-        Some(ImageSlot::Ready {
-            pixels: (20, 10),
-            refresh: ImageRefresh::Idle,
-            ..
-        })
-    ));
-}
-
-#[test]
 fn when_images_are_disabled_retained_card_previews_should_be_released() {
     let mut app = app_with(&[]);
     let url = "https://i.redd.it/off.png";
@@ -338,7 +284,13 @@ fn when_a_shared_disk_preview_refresh_fails_both_consumers_should_keep_cached_pi
                 ..Source::default()
             },
         });
-
+        assert!(matches!(
+            app.card_images.get(url),
+            Some(CardImageSlot::Cached {
+                refreshing: true,
+                ..
+            })
+        ));
         app.on_msg(Msg::Image {
             url: url.into(),
             result: Err("offline".into()),

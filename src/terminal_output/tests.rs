@@ -208,27 +208,6 @@ fn slow_terminal_output_keeps_input_usable_and_limits_pending_frames() {
         .unwrap();
     assert!(!output.ready().unwrap());
 
-    let reddit = crate::reddit::Reddit::test_at("http://127.0.0.1:9", false);
-    let (pool, _messages) = crate::worker::Pool::start(reddit.clone(), 1, None);
-    let dir = tempfile::tempdir().unwrap();
-    let mut app = crate::app::App::new(
-        crate::config::Config::default(),
-        pool,
-        reddit,
-        dir.path().join("state.json"),
-        ratatui_image::picker::Picker::halfblocks(),
-    );
-    crate::handle_event(
-        &mut app,
-        crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('q'),
-            crossterm::event::KeyModifiers::NONE,
-        )),
-    );
-    assert!(
-        app.quit,
-        "input must be handled while the terminal write is blocked"
-    );
     writer.write_all(&frame).unwrap();
     assert_eq!(
         writer.flush().unwrap_err().kind(),

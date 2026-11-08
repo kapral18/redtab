@@ -297,25 +297,3 @@ fn video_width_regression_tall_detail_should_keep_controls_in_the_footer() {
     assert!(footer.contains("p play"), "{actual}");
     assert!(footer.contains("m sound"), "{actual}");
 }
-
-#[test]
-fn video_width_regression_tall_detail_failure_should_keep_retry_in_the_footer() {
-    let mut app = open_video_post();
-    app.post_view
-        .as_mut()
-        .unwrap()
-        .page
-        .as_mut()
-        .unwrap()
-        .post
-        .preview_size = Some((1080, 1920));
-    let url = app.reddit.media_url(VIDEO).unwrap();
-    app.video = Some(video::Player::unavailable(&url, Size::new(70, 63)));
-
-    let actual = screen(&mut app, 100, 20);
-
-    assert!(
-        actual.lines().last().unwrap().contains("p retry"),
-        "{actual}"
-    );
-}

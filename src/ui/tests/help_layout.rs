@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn ui_audit_help_should_remain_discoverable_in_a_narrow_main_footer() {
+fn help_should_remain_discoverable_in_a_narrow_main_footer() {
     let mut app = feed_app(Picker::halfblocks());
     app.show_sidebar = false;
     app.health = Health::Up;

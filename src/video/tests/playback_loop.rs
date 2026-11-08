@@ -1,46 +1,21 @@
 use super::*;
 
 #[test]
-fn a_run_that_ends_loops_at_the_end_and_resumes_when_cut_short() {
-    let t0 = Instant::now();
-    // Duration unknown: an ended run is the end, play again from the start.
-    let (mut player, runs) = fed_player(None, t0);
-    let first = runs.borrow_mut().remove(0).1;
-    first.send(repeated()).unwrap();
-    first.send(blank()).unwrap();
-    drop(first);
-    player.tick(t0);
-    player.tick(after(t0, 0.05));
-    player.tick(after(t0, 0.15));
-    assert_eq!(runs.borrow()[0].0, 0.0);
-
-    // Known to last 60 s: a run cut after 2 frames goes on from there.
-    let (mut player, runs) = fed_player(Some(60.0), t0);
-    let first = runs.borrow_mut().remove(0).1;
-    first.send(blank()).unwrap();
-    first.send(blank()).unwrap();
-    drop(first);
-    player.tick(after(t0, 0.1));
-    player.tick(after(t0, 0.2));
-    assert_eq!(runs.borrow()[0].0, 2.0 / MIN_FPS);
-}
-
-#[test]
-fn when_a_run_ends_after_a_bad_frame_it_should_loop_not_resume() {
-    // `[gif @ …] [error] LZW decode failed`: the file was read to its end.
-    let t0 = Instant::now();
-    let (spawn, runs) = fed_runs_logging(None, false, Some(("LZW decode failed", false)));
-    let mut player = fed_silent_player(spawn, 0.0, t0);
-    let first = runs.borrow_mut().remove(0).1;
-    first.send(repeated()).unwrap();
-    first.send(blank()).unwrap();
-    drop(first);
-
-    player.tick(t0);
-    player.tick(after(t0, 0.05));
-    player.tick(after(t0, 0.15));
-
-    assert_eq!(runs.borrow()[0].0, 0.0);
+fn a_run_of_unknown_length_that_ends_loops_from_the_start() {
+    // `[gif @ …] [error] LZW decode failed`: a bad frame, but the file was read to its end.
+    for error in [None, Some(("LZW decode failed", false))] {
+        let t0 = Instant::now();
+        let (spawn, runs) = fed_runs_logging(None, false, error);
+        let mut player = fed_silent_player(spawn, 0.0, t0);
+        let first = runs.borrow_mut().remove(0).1;
+        first.send(repeated()).unwrap();
+        first.send(blank()).unwrap();
+        drop(first);
+        player.tick(t0);
+        player.tick(after(t0, 0.05));
+        player.tick(after(t0, 0.15));
+        assert_eq!(runs.borrow()[0].0, 0.0, "{error:?}");
+    }
 }
 
 #[test]

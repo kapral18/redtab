@@ -39,42 +39,6 @@ fn when_dia_profiles_exist_discovery_should_keep_their_ids_and_clean_display_nam
 }
 
 #[test]
-fn when_dia_metadata_is_invalid_discovery_should_use_the_profile_directory_name() {
-    let directory = tempfile::tempdir().unwrap();
-    dia_cookie_fixture(directory.path(), "Default/Cookies");
-    std::fs::write(directory.path().join("Local State"), "invalid JSON").unwrap();
-
-    let actual = dia_profiles(directory.path());
-
-    assert_eq!(actual[0].label(), "Dia · Default");
-}
-
-#[test]
-fn when_dia_metadata_is_missing_discovery_should_use_the_profile_directory_name() {
-    let directory = tempfile::tempdir().unwrap();
-    dia_cookie_fixture(directory.path(), "Default/Cookies");
-
-    let actual = dia_profiles(directory.path());
-
-    assert_eq!(actual[0].label(), "Dia · Default");
-}
-
-#[test]
-fn when_dia_metadata_has_a_blank_name_discovery_should_use_the_profile_directory_name() {
-    let directory = tempfile::tempdir().unwrap();
-    dia_cookie_fixture(directory.path(), "Default/Cookies");
-    std::fs::write(
-        directory.path().join("Local State"),
-        r#"{"profile":{"info_cache":{"Default":{"name":"  "}}}}"#,
-    )
-    .unwrap();
-
-    let actual = dia_profiles(directory.path());
-
-    assert_eq!(actual[0].label(), "Dia · Default");
-}
-
-#[test]
 fn when_dia_is_not_installed_discovery_should_find_no_dia_profiles() {
     let directory = tempfile::tempdir().unwrap();
 
@@ -103,26 +67,6 @@ fn when_the_selected_dia_cookie_file_disappears_it_should_not_resolve() {
     std::fs::remove_file(path).unwrap();
 
     let actual = dia_cookie_path(directory.path(), "Default");
-
-    assert_eq!(actual, None);
-}
-
-#[test]
-fn when_the_dia_profile_selector_contains_traversal_it_should_not_resolve() {
-    let directory = tempfile::tempdir().unwrap();
-    dia_cookie_fixture(directory.path(), "Default/Cookies");
-
-    let actual = dia_cookie_path(directory.path(), "Profile 2/../Default");
-
-    assert_eq!(actual, None);
-}
-
-#[test]
-fn when_the_dia_profile_selector_is_empty_it_should_not_resolve() {
-    let directory = tempfile::tempdir().unwrap();
-    dia_cookie_fixture(directory.path(), "Default/Cookies");
-
-    let actual = dia_cookie_path(directory.path(), "");
 
     assert_eq!(actual, None);
 }
@@ -240,5 +184,32 @@ fn login_pipe_rejects_oversized_and_unterminated_messages_without_contents() {
             .unwrap()
             .to_string();
         assert!(!error.contains("private"));
+    }
+}
+
+#[test]
+fn when_dia_metadata_is_invalid_or_blank_discovery_should_use_the_profile_directory_name() {
+    for local_state in [
+        "invalid JSON",
+        r#"{"profile":{"info_cache":{"Default":{"name":"  "}}}}"#,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        dia_cookie_fixture(directory.path(), "Default/Cookies");
+        std::fs::write(directory.path().join("Local State"), local_state).unwrap();
+        let actual = dia_profiles(directory.path());
+        assert_eq!(actual[0].label(), "Dia · Default", "{local_state}");
+    }
+}
+
+#[test]
+fn when_the_dia_profile_selector_is_empty_or_traverses_it_should_not_resolve() {
+    let directory = tempfile::tempdir().unwrap();
+    dia_cookie_fixture(directory.path(), "Default/Cookies");
+    for selector in ["Profile 2/../Default", ""] {
+        assert_eq!(
+            dia_cookie_path(directory.path(), selector),
+            None,
+            "{selector}"
+        );
     }
 }

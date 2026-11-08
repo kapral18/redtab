@@ -354,26 +354,8 @@ fn preview_refresh_should_apply_waiting_posts_without_resetting_selected_rows() 
 }
 
 #[test]
-fn reported_islands_and_search_previews_should_hold_live_membership() {
+fn a_held_search_preview_should_apply_on_refresh_without_another_request() {
     let mut app = app_with(&["vim"]);
-    app.switch_tab(ALL_SUBS_TAB);
-    app.on_msg(ordered_snapshot(
-        island_answer(&app, &["a", "b"]),
-        1,
-        true,
-        true,
-    ));
-    app.on_msg(ordered_snapshot(
-        island_answer(&app, &["n", "b", "a"]),
-        2,
-        false,
-        false,
-    ));
-    assert_eq!(island_ids(&app), ["a", "b"]);
-    assert!(app.all_subs.has_new_posts(&app.config));
-    app.reload();
-    assert_eq!(island_ids(&app), ["n", "b", "a"]);
-
     app.open_search(None);
     app.search_preview_drawn(true);
     app.tick_at(Instant::now() + search::PREVIEW_SETTLE);

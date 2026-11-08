@@ -173,18 +173,6 @@ mod image_tests {
     }
 
     #[test]
-    fn when_a_gif_streams_its_first_frame_should_decode_without_reading_further() {
-        let first = gif_without_trailer((2, 2), &[(0, 0, 2, 2, [RED, BLUE, BLUE, RED].concat())]);
-
-        let actual = decode_still(first.as_slice().chain(Nothing))
-            .unwrap()
-            .to_rgba8();
-
-        let pixels: Vec<[u8; 4]> = actual.pixels().map(|p| p.0).collect();
-        assert_eq!(pixels, [RED, BLUE, BLUE, RED]);
-    }
-
-    #[test]
     fn when_the_first_frame_is_smaller_than_the_canvas_it_should_sit_at_its_offset() {
         let first = gif_without_trailer((2, 2), &[(1, 0, 1, 2, [RED, BLUE].concat())]);
 

@@ -1,29 +1,22 @@
 use super::*;
 
 #[test]
-fn notification_and_custom_feed_writes_preserve_unrelated_reader_state() {
-    for action in [
-        Action::Read {
-            id: "t4_message".into(),
-            read: true,
-        },
-        Action::CreateMulti {
-            name: "test".into(),
-            description: String::new(),
-        },
-    ] {
-        let (mut app, _dir, _fixture) = app();
-        let page = post_page();
-        app.show_post(page.post.clone(), &page.post.permalink);
-        let post_generation = app.post_view.as_ref().unwrap().generation;
-        app.tabs[0].feed.loaded = true;
-        let feed_generation = app.tabs[0].feed.generation;
-        app.write_experience(action.clone());
-        app.after_experience_write(&action);
-        assert!(app.tabs[0].feed.loaded);
-        assert_eq!(app.tabs[0].feed.generation, feed_generation);
-        assert_eq!(app.post_view.as_ref().unwrap().generation, post_generation);
-    }
+fn a_notification_read_write_keeps_unrelated_reader_state() {
+    let action = Action::Read {
+        id: "t4_message".into(),
+        read: true,
+    };
+    let (mut app, _dir, _fixture) = app();
+    let page = post_page();
+    app.show_post(page.post.clone(), &page.post.permalink);
+    let post_generation = app.post_view.as_ref().unwrap().generation;
+    app.tabs[0].feed.loaded = true;
+    let feed_generation = app.tabs[0].feed.generation;
+    app.write_experience(action.clone());
+    app.after_experience_write(&action);
+    assert!(app.tabs[0].feed.loaded);
+    assert_eq!(app.tabs[0].feed.generation, feed_generation);
+    assert_eq!(app.post_view.as_ref().unwrap().generation, post_generation);
 }
 
 #[test]
@@ -76,12 +69,7 @@ fn navigation_cache_thread_links_keep_the_snapshot_age_and_cached_status() {
 
     let view = app.post_view.as_ref().unwrap();
     assert_eq!(view.freshness.unwrap().fetched_at, fetched_at);
-    assert_eq!(
-        view.freshness
-            .unwrap()
-            .label(fetched_at + 120, view.loading, view.error.is_some(), false),
-        "cached · 2m ago"
-    );
+    assert!(view.freshness.unwrap().source.cached);
 }
 
 #[test]

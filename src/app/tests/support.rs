@@ -1,18 +1,5 @@
 use super::*;
 
-pub(super) fn app_with_pending_pagination() -> App {
-    let mut app = app_with(&["s"]);
-    app.switch_tab(4);
-    app.on_msg(Msg::Feed {
-        tab: app.tabs[4].id,
-        generation: app.tabs[4].feed.generation,
-        append: false,
-        result: Ok(listing("s", &["existing"], Some("next"))),
-    });
-    app.load_feed(4, true);
-    app
-}
-
 pub(super) fn card_playback_app() -> App {
     let mut app = app_with(&[]);
     app.active = 0;

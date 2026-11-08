@@ -175,13 +175,6 @@ impl Player {
         )
     }
 
-    /// As if its frames came at `rate` per second.
-    #[cfg(test)]
-    pub fn at_rate(mut self, rate: f64) -> Self {
-        self.rate = rate;
-        self
-    }
-
     /// ffplay failing to start, as the sound would see it.
     #[cfg(test)]
     pub fn fail_sound(&mut self) {

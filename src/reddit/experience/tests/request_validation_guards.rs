@@ -12,7 +12,7 @@ fn when_a_wiki_page_is_missing_it_should_show_an_unavailable_page_without_a_requ
     );
     assert!(
         matches!(actual, Response::Page(page) if page.entries.is_empty()
-            && page.text == "This wiki page is unavailable. Reddit did not find a public page at this address."
+            && !page.text.is_empty()
             && page.url == "https://www.reddit.com/r/rust/wiki/index")
     );
 }

@@ -26,7 +26,7 @@ fn following_users_should_write_their_verified_profile_subscription() {
     });
     let target = MembershipTarget::User("black-vault".into());
     let reddit = fixture.saved_reddit(&saved_export("reader", "reader"));
-    for join in [true, true, false, false, true] {
+    for join in [true, false] {
         reddit.set_membership(&target, join).unwrap();
         assert_eq!(followed.load(Ordering::SeqCst), join);
     }

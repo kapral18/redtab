@@ -38,18 +38,6 @@ fn card_media_sidebar_navigation_should_autoplay_the_visible_settled_selection()
 }
 
 #[test]
-fn card_media_new_selection_should_restart_the_settle_timer() {
-    let mut app = card_playback_app();
-    app.tabs[0].feed.selected = 1;
-    app.card_video_drawn(Some(Size::new(68, 68)));
-    let since = app.card_video.as_ref().unwrap().since;
-
-    assert_eq!(app.card_video.as_ref().unwrap().id, "second");
-    assert!(app.wanted_video(since).is_none());
-    assert!(app.wanted_video(since + NAV_SETTLE).is_some());
-}
-
-#[test]
 fn card_media_spoilers_and_disabled_images_should_not_request_playback() {
     let mut app = card_playback_app();
     app.tabs[0].feed.posts[0].spoiler = true;

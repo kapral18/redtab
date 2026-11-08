@@ -59,7 +59,7 @@ fn when_a_mutation_is_pending_account_switching_and_escape_should_not_drop_it() 
 }
 
 #[test]
-fn ui_audit_editor_navigation_and_deletion_should_preserve_grapheme_boundaries() {
+fn editor_navigation_and_deletion_should_preserve_grapheme_boundaries() {
     let (mut app, _dir, _fixture) = app();
     app.experience.screens.push(Screen::Input(form(
         "User profile",

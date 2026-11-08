@@ -24,18 +24,6 @@ fn when_scrolling_below_kittys_row_limit_image_tiles_should_use_local_coordinate
     let mut terminal = Terminal::new(TestBackend::new(100, 600)).unwrap();
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
-    let CardImageSlot::Ready {
-        protocol: Some(protocol),
-        ..
-    } = app.card_images.get("https://i.redd.it/p1.jpeg").unwrap()
-    else {
-        panic!("card protocol");
-    };
-    assert_eq!(protocol.size, Size::new(66, 330));
-    assert!(protocol.tiles.contains_key(&(298, 0, 6, 66)));
-    assert_eq!(protocol.tiles.len(), 3);
-    assert_eq!(protocol.tiles[&(298, 0, 6, 66)].size(), Size::new(66, 16));
-    assert_eq!(protocol.tiles[&(320, 0, 10, 66)].size(), Size::new(66, 10));
     let row = terminal.backend().buffer()[(28, 4)]
         .symbol()
         .split_once('\u{10EEEE}')

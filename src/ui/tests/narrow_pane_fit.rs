@@ -25,7 +25,7 @@ fn when_a_retained_preview_is_rounded_to_one_pixel_wide_it_should_keep_the_origi
 }
 
 #[test]
-fn ui_audit_narrow_headers_should_prioritize_failure_and_retry() {
+fn narrow_headers_should_prioritize_failure_and_retry() {
     let mut subs = app(&["s"]);
     subs.show_sidebar = false;
     subs.all_subs.groups[0].posts = vec![post_with("p", Media::None)];
@@ -81,7 +81,7 @@ fn ui_audit_narrow_headers_should_prioritize_failure_and_retry() {
 }
 
 #[test]
-fn ui_audit_long_post_title_should_leave_room_to_read_the_document() {
+fn long_post_title_should_leave_room_to_read_the_document() {
     let (mut app, _) = open_long_post(|_| {});
     app.show_sidebar = false;
     let view = app.post_view.as_mut().unwrap();
@@ -98,7 +98,7 @@ fn ui_audit_long_post_title_should_leave_room_to_read_the_document() {
 }
 
 #[test]
-fn ui_audit_deep_comment_body_should_fit_the_available_columns() {
+fn deep_comment_body_should_fit_the_available_columns() {
     let (mut app, _) = open_long_post(|_| {});
     app.show_sidebar = false;
     let view = app.post_view.as_mut().unwrap();
@@ -165,7 +165,7 @@ fn partial_bottom_posts_should_render_without_hiding_selected_metadata() {
 }
 
 #[test]
-fn ui_audit_safety_labels_should_precede_a_long_author_in_compact_rows() {
+fn safety_labels_should_precede_a_long_author_in_compact_rows() {
     let mut app = feed_app(Picker::halfblocks());
     app.show_sidebar = false;
     app.config.show_nsfw = true;

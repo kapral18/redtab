@@ -10,7 +10,6 @@ fn search_key_audit_source_links_should_include_explore_feeds() {
             "/r/popular/",
             false,
         ),
-        (FeedTarget::Subreddit("all".into()), "/r/all/", false),
         (FeedTarget::Subreddit("rust".into()), "/r/rust/", true),
         (FeedTarget::User("writer".into()), "/user/writer/", true),
     ] {

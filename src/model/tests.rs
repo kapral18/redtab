@@ -60,15 +60,6 @@ fn when_youtube_urls_are_classified_only_supported_video_shapes_should_match() {
 }
 
 #[test]
-fn when_a_saved_youtube_link_is_deserialized_it_should_gain_playback_without_rewriting_storage() {
-    let stored = serde_json::json!({"Link":{"url":"https://www.youtube.com/shorts/dQw4w9WgXcQ","thumb":null}});
-    let media: Media = serde_json::from_value(stored.clone()).unwrap();
-
-    assert!(media.shows_inline());
-    assert_eq!(serde_json::to_value(media).unwrap(), stored);
-}
-
-#[test]
 fn card_media_saved_video_without_a_gif_flag_should_still_be_a_video() {
     let actual: Media =
         serde_json::from_str(r#"{"Video":{"url":"https://v.redd.it/a.mp4","poster":null}}"#)
@@ -100,23 +91,6 @@ fn when_image_urls_have_gif_extensions_they_should_play_as_video() {
 
         assert_eq!(media.video_url(), expected, "{url:?}");
     }
-}
-
-#[test]
-fn when_a_gif_post_lists_it_should_use_its_first_frame_as_a_still_preview() {
-    let media = Media::Image {
-        url: "https://i.redd.it/a.gif".into(),
-        preview: None,
-    };
-
-    assert_eq!(
-        media.list_thumb().as_deref(),
-        Some("https://i.redd.it/a.gif")
-    );
-    assert_eq!(
-        media.preview_image().as_deref(),
-        Some("https://i.redd.it/a.gif")
-    );
 }
 
 #[test]

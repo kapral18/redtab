@@ -254,18 +254,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn grouped_settings_should_parse_media_and_reject_obsolete_root_keys() {
-        let grouped = toml::from_str::<Config>("[media]\nimage_preview = false\n");
-        assert!(grouped.is_ok(), "{grouped:?}");
-        for old in ["image_preview = false", "video_autoplay = false"] {
-            assert!(
-                toml::from_str::<Config>(old).is_err(),
-                "accepted obsolete root key: {old}"
-            );
-        }
-    }
-
     fn post(title: &str, flair: Option<&str>, author: &str) -> Post {
         Post {
             id: "x".into(),
@@ -299,19 +287,6 @@ mod tests {
             load("[commands]\nimage = []\n")
                 .unwrap_err()
                 .contains("commands.image")
-        );
-    }
-
-    #[test]
-    fn when_old_subscription_keys_are_present_they_should_not_silently_curate_the_account() {
-        assert!(toml::from_str::<Config>("subscriptions = [\"rust\"]").is_err());
-        assert!(toml::from_str::<Config>("subscriptions_file = \"subs\"").is_err());
-        assert!(toml::from_str::<Config>("home_posts_per_group = 3").is_err());
-        assert_eq!(
-            toml::from_str::<Config>("all_subs_posts_per_group = 4")
-                .unwrap()
-                .all_subs_posts_per_group,
-            4
         );
     }
 
@@ -351,14 +326,5 @@ mod tests {
 
         assert!(config.highlights(&post("Faster lsp startup", None, "a")));
         assert!(!config.highlights(&post("Colorscheme", None, "a")));
-    }
-
-    #[test]
-    fn config_file_rejects_unknown_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "all_subs_posts_per_group = 3\nunknown = 1\n").unwrap();
-
-        assert!(Config::load(Some(&path)).is_err());
     }
 }

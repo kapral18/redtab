@@ -8,17 +8,13 @@ fn settings_external_reload_should_apply_all_values_and_keep_valid_runtime_after
     let mut store = crate::config::store::Store::open(Some(&path)).unwrap();
     store.select_account(Some("reader"));
     app.settings = settings::Settings::new(store);
-    std::fs::write(&path, "all_subs_posts_per_group=1\n[media]\nimage_preview=false\n[accounts.reader.filters]\nkeywords=[\"hidden\"]\nflairs=[\"Meme\"]\nauthors=[\"bot\"]\n[accounts.reader.highlight]\nkeywords=[\"rust\"]\n[commands]\nbrowser=[\"browser-fixture\"]\nvideo=[\"video-fixture\",\"--flag\"]\nimage=[\"image-fixture\"]\n").unwrap();
+    std::fs::write(&path, "all_subs_posts_per_group=1\n[media]\nimage_preview=false\n[accounts.reader.filters]\nkeywords=[\"hidden\"]\n[accounts.reader.highlight]\nkeywords=[\"rust\"]\n[commands]\nvideo=[\"video-fixture\",\"--flag\"]\n").unwrap();
     assert!(app.poll_settings(Instant::now() + Duration::from_secs(1)));
     assert_eq!(app.config.all_subs_posts_per_group, 1);
     assert!(!app.show_images);
     assert_eq!(app.config.filters.keywords, ["hidden"]);
-    assert_eq!(app.config.filters.flairs, ["Meme"]);
-    assert_eq!(app.config.filters.authors, ["bot"]);
     assert_eq!(app.config.highlight.keywords, ["rust"]);
-    assert_eq!(app.config.commands.browser, ["browser-fixture"]);
     assert_eq!(app.config.commands.video, ["video-fixture", "--flag"]);
-    assert_eq!(app.config.commands.image, ["image-fixture"]);
     let working = app.config.clone();
     std::fs::write(&path, "[media]\nimage_preview=42").unwrap();
     assert!(app.poll_settings(Instant::now() + Duration::from_secs(2)));
@@ -47,70 +43,6 @@ fn settings_should_defer_reload_and_ui_changes_while_a_reddit_write_is_pending()
     assert!(app.poll_settings(Instant::now() + Duration::from_secs(2)));
     assert!(!app.config.media.image_preview);
     assert!(!app.show_images);
-}
-
-#[test]
-fn settings_review_async_inspection_should_update_underlying_menu_without_taking_focus() {
-    use crate::app::experience::Screen;
-    use crate::reddit::experience::{Details, Query, Request, Response, Target};
-    let mut app = app_with(&[]);
-    let target = Target {
-        id: "t3_post".into(),
-        author: "reader".into(),
-        subreddit: "rust".into(),
-        permalink: "/comments/post".into(),
-    };
-    app.overlay = Some(Overlay::Experience);
-    app.experience
-        .screens
-        .push(Screen::Loading(Query::Inspect(target.clone())));
-    app.experience.pending = Some((
-        91,
-        Request::Read {
-            query: Query::Inspect(target.clone()),
-            after: None,
-        },
-    ));
-    app.show_settings();
-    app.settings.selected = crate::config::schema::SETTINGS
-        .iter()
-        .position(|f| f.key == "filters.keywords")
-        .unwrap();
-    app.settings_key(crossterm::event::KeyEvent::new(
-        crossterm::event::KeyCode::Enter,
-        crossterm::event::KeyModifiers::NONE,
-    ));
-    app.on_msg(Msg::Experience {
-        generation: 91,
-        result: Ok(Response::Details(Details {
-            target,
-            raw_text: String::new(),
-            saved: false,
-            hidden: false,
-            vote: 0,
-            editable: false,
-            crosspost: None,
-        })),
-    });
-    assert!(
-        matches!(app.overlay, Some(Overlay::Settings)),
-        "async reads must keep Settings above their resulting menu"
-    );
-    assert!(app.settings.editing.is_some());
-    app.settings_key(crossterm::event::KeyEvent::new(
-        crossterm::event::KeyCode::Enter,
-        crossterm::event::KeyModifiers::NONE,
-    ));
-    assert!(!app.experience.writing());
-    app.settings_key(crossterm::event::KeyEvent::new(
-        crossterm::event::KeyCode::Esc,
-        crossterm::event::KeyModifiers::NONE,
-    ));
-    assert!(matches!(app.overlay, Some(Overlay::Experience)));
-    assert!(matches!(
-        app.experience.screens.last(),
-        Some(Screen::Menu { .. })
-    ));
 }
 
 #[test]

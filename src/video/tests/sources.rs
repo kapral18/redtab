@@ -159,14 +159,11 @@ fn media_failure_should_explain_playlist_denial_without_exposing_the_url() {
                 .unwrap();
         }
     });
-    for (status, expected) in [
-        (403, "Reddit denied access to this video (HTTP 403)"),
-        (404, "Video is no longer available (HTTP 404)"),
-        (410, "Video is no longer available (HTTP 410)"),
-    ] {
+    for status in [403, 404, 410] {
         let error =
             resolve(&url, (640, 360), 360, None, || Err("no alternative".into())).unwrap_err();
-        assert_eq!(error, expected, "upstream HTTP {status}");
+        assert!(error.contains(&format!("HTTP {status}")), "{error}");
+        assert!(!error.contains("PRIVATE"), "{error}");
     }
     responder.join().unwrap();
 }

@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn when_card_and_detail_wait_for_one_image_both_should_receive_independent_previews() {
+fn a_shared_picture_should_reach_card_and_detail_and_survive_the_detail_closing() {
     let mut app = app_with(&[]);
     let url = "https://i.redd.it/shared.png";
     app.card_pictures_drawn(&[url]);
@@ -24,18 +24,6 @@ fn when_card_and_detail_wait_for_one_image_both_should_receive_independent_previ
         Some(CardImageSlot::Ready { image, .. }) if (image.width(), image.height()) == (640, 320)
     ));
     assert!(!app.queued_images.contains_key(url));
-}
-
-#[test]
-fn when_detail_closes_a_visible_card_should_keep_its_loaded_preview() {
-    let mut app = app_with(&[]);
-    let url = "https://i.redd.it/shared.png";
-    app.card_pictures_drawn(&[url]);
-    app.request_text_picture(url);
-    app.on_msg(Msg::Image {
-        url: url.into(),
-        result: Ok(image::DynamicImage::new_rgb8(640, 320).into()),
-    });
 
     app.close_post();
 

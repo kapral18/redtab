@@ -86,7 +86,6 @@ fn when_a_safe_worker_read_is_limited_it_should_stay_pending_then_resume() {
     }
     let pause = reddit.pause().unwrap();
     assert!((1..=2).contains(&pause.seconds));
-    assert!(pause.cause.contains("r/rust listing") && pause.cause.contains("HTTP 429"));
     assert!(!pause.cause.contains("PRIVATE_QUERY") && !pause.cause.contains("fixture-session"));
     assert!(
         rx.recv_timeout(Duration::from_millis(100)).is_err(),

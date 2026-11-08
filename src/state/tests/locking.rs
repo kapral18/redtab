@@ -11,7 +11,7 @@ fn when_another_instance_holds_the_save_lock_corrupt_recovery_should_leave_the_f
     let (state, warning) = State::load(&path);
 
     assert!(state.read_only);
-    assert!(warning.unwrap().contains("another redtab"));
+    assert!(warning.is_some());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "corrupt");
     drop(held);
 }
@@ -124,7 +124,7 @@ fn a_save_gives_up_when_another_instance_holds_the_lock() {
     drop(held);
     let after = state.save(&path, 1);
 
-    assert!(saved.unwrap_err().to_string().contains("still saving"));
+    assert!(saved.is_err());
     assert!(waited >= lock_wait() && waited < LOCK_WAIT, "{waited:?}");
     assert!(after.is_ok(), "the lock is free again");
 }

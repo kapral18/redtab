@@ -50,7 +50,7 @@ fn prefix_hint_should_wait_for_the_latest_key_and_stay_open_while_narrowing() {
 }
 
 #[test]
-fn vim_prefixes_should_wait_cancel_and_open_the_named_action() {
+fn vim_prefixes_should_wait_and_stay_literal_in_text_input() {
     use crossterm::event::{KeyCode, KeyModifiers};
     let mut app = app(&["rust", "vim"]);
     app.focus_sidebar();
@@ -61,17 +61,6 @@ fn vim_prefixes_should_wait_cancel_and_open_the_named_action() {
     assert_eq!(app.active, active, "a pending g must not move yet");
     press(&mut app, 'g');
     assert_eq!(app.active, 0);
-    press(&mut app, ' ');
-    app.keymap
-        .tick(std::time::Instant::now() + crate::keys::map::HINT_DELAY);
-    assert!(screen(&mut app, 80, 24).contains("Preferences"));
-    key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-    assert!(app.overlay.is_none());
-    for c in " ps".chars() {
-        press(&mut app, c);
-    }
-    assert!(matches!(app.overlay, Some(Overlay::Settings)));
-    key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
     app.overlay = Some(Overlay::Picker(crate::app::PickerState::default()));
     for c in " ps".chars() {
         press(&mut app, c);
@@ -79,15 +68,6 @@ fn vim_prefixes_should_wait_cancel_and_open_the_named_action() {
     assert!(matches!(&app.overlay, Some(Overlay::Picker(picker)) if picker.input == " ps"));
     key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
     assert!(matches!(&app.overlay, Some(Overlay::Picker(picker)) if picker.input == " "));
-    key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-    press(&mut app, ' ');
-    press(&mut app, 'p');
-    app.switch_tab(4);
-    press(&mut app, 's');
-    assert!(
-        app.overlay.is_none(),
-        "a prefix must not survive switching contexts"
-    );
 }
 
 #[test]

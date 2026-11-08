@@ -282,6 +282,10 @@ mod tests {
     }
     #[test]
     fn editing_validates_types_ranges_and_executable() {
+        let config = Config {
+            active_account: Some("reader".into()),
+            ..Config::default()
+        };
         for (key, input) in [
             ("show_nsfw", "1"),
             ("all_subs_posts_per_group", "11"),
@@ -291,10 +295,7 @@ mod tests {
         ] {
             let field = SETTINGS.iter().find(|f| f.key == key).unwrap();
             let doc: toml::Table = toml::from_str(&format!("v = {input}")).unwrap();
-            assert!(
-                field.set(&Config::default(), doc["v"].clone()).is_err(),
-                "{key}"
-            );
+            assert!(field.set(&config, doc["v"].clone()).is_err(), "{key}");
         }
     }
 }

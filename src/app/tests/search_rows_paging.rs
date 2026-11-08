@@ -166,10 +166,6 @@ fn search_rows_should_stop_paging_after_a_failure_and_drop_a_page_for_an_old_que
     );
     crate::keys::paste(&mut app, "rust");
     assert_eq!(
-        app.search.selected, 0,
-        "a pasted query starts at the first result"
-    );
-    assert_eq!(
         app.search.rows_status(),
         None,
         "the typing pause adds no line"

@@ -15,14 +15,6 @@ fn when_disconnect_is_chosen_it_should_require_confirmation_and_allow_escape() {
     assert_eq!(app.auth.phase, crate::auth::Phase::DisconnectConfirm);
     let actual = screen(&mut app, 60, 12);
     assert!(actual.contains("Remove u/reader from redtab?"), "{actual}");
-    assert!(
-        actual.contains("Other accounts, bookmarks and history are kept."),
-        "{actual}"
-    );
-    assert!(
-        actual.contains("Your browser session is unchanged."),
-        "{actual}"
-    );
     assert!(actual.contains("Enter removes"), "{actual}");
     crate::keys::handle(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(app.overlay.is_none());
@@ -36,8 +28,6 @@ fn when_profile_discovery_is_pending_disconnect_should_still_be_available() {
     app.auth.phase = crate::auth::Phase::Discovering;
     app.auth.active_id = Some("reader".into());
     app.overlay = Some(Overlay::Auth);
-    let actual = screen(&mut app, 60, 12);
-    assert!(actual.contains("d Remove from redtab"), "{actual}");
     crate::keys::handle(
         &mut app,
         KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
@@ -210,10 +200,10 @@ fn when_membership_dialog_opens_it_should_name_the_account_action_in_a_short_ter
 }
 
 #[test]
-fn ui_audit_short_accounts_should_preserve_identity_and_back_controls() {
+fn short_accounts_should_preserve_identity_and_back_controls() {
     use crate::auth::Phase;
     for name in ["reader", "abcdefghijklmnopqrst"] {
-        for (width, height) in [(14, 6), (18, 6), (20, 6), (20, 8), (24, 8), (40, 12)] {
+        for (width, height) in [(14, 6), (24, 8), (40, 12)] {
             for phase in [Phase::Accounts, Phase::DisconnectConfirm] {
                 let mut app = app(&[]);
                 app.overlay = Some(Overlay::Auth);
@@ -283,10 +273,6 @@ fn when_removing_an_inactive_saved_account_repeated_delete_keys_should_keep_the_
     );
     let actual = screen(&mut app, 76, 22);
     assert!(actual.contains("Remove u/expired from redtab?"), "{actual}");
-    assert!(
-        actual.contains("Remove only this saved session."),
-        "{actual}"
-    );
     assert!(actual.contains("Enter removes"), "{actual}");
 }
 

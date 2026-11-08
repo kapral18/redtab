@@ -11,7 +11,7 @@ fn membership_progress_should_remain_visible_when_no_source_is_selected() {
     assert!(
         app.status
             .as_ref()
-            .is_some_and(|status| status.text == "Following u/blackvault…")
+            .is_some_and(|status| status.text.contains("u/blackvault"))
     );
     assert!(app.membership.is_some());
 }

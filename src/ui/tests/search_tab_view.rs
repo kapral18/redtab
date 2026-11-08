@@ -55,7 +55,7 @@ fn search_tab_rows_should_keep_the_preview_beside_them_at_common_widths() {
 }
 
 #[test]
-fn ui_audit_a_narrow_search_tab_should_keep_the_query_above_its_kinds() {
+fn a_narrow_search_tab_should_keep_the_query_above_its_kinds() {
     let mut app = form_app("Search posts across Reddit");
     assert_eq!(app.active, crate::app::SEARCH_TAB);
     let actual = screen(&mut app, 32, 12);

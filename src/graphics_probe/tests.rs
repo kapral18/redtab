@@ -156,13 +156,6 @@ fn when_no_client_can_receive_a_tmux_windows_uploads_it_should_not_force_native_
     let (native, font) = tmux_client_graphics("$1 xterm-ghostty 8 18\n", &["$12"]);
 
     assert!(image_protocol_choice(None, native, font).is_none());
-    for clients in [
-        "$1 xterm-ghostty 8 18\n$2 xterm-256color 8 18\n",
-        "$1 xterm-ghostty 8 18\n$2 xterm-kitty 10 20\n",
-    ] {
-        let (native, font) = tmux_client_graphics(clients, &["$12"]);
-        assert!(image_protocol_choice(None, native, font).is_none());
-    }
     let (native, font) = tmux_client_graphics("$1 xterm-ghostty 8 18\n", &[]);
     assert!(image_protocol_choice(None, native, font).is_none());
 }

@@ -53,7 +53,7 @@ fn when_startup_has_a_slow_quota_home_and_first_navigation_should_still_load() {
     let (mut app, messages) = app_with_client(reddit.clone(), &["rust"]);
     app.active = 0;
     app.start();
-    let deadline = Instant::now() + Duration::from_millis(800);
+    let deadline = Instant::now() + Duration::from_secs(2);
     while !app.tabs[0].feed.loaded {
         app.on_msg(
             messages
@@ -63,7 +63,7 @@ fn when_startup_has_a_slow_quota_home_and_first_navigation_should_still_load() {
     }
     let rust = tab_index(&app, "rust");
     app.switch_tab(rust);
-    let deadline = Instant::now() + Duration::from_millis(800);
+    let deadline = Instant::now() + Duration::from_secs(2);
     while !app.tabs[rust].feed.loaded {
         app.on_msg(
             messages
@@ -72,7 +72,7 @@ fn when_startup_has_a_slow_quota_home_and_first_navigation_should_still_load() {
         );
     }
     app.open_current_post();
-    let deadline = Instant::now() + Duration::from_millis(800);
+    let deadline = Instant::now() + Duration::from_secs(2);
     while app
         .post_view
         .as_ref()

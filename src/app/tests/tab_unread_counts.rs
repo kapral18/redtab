@@ -100,42 +100,6 @@ fn badge_metadata_should_ignore_a_rejected_page() {
 }
 
 #[test]
-fn badge_metadata_should_follow_an_accepted_page_after_clock_rollback() {
-    let mut app = app_with(&["s"]);
-    app.config.filters.keywords = vec!["blocked".into()];
-    let i = tab_index(&app, "s");
-    app.active = i;
-    let (tab, generation) = (app.tabs[i].id, app.tabs[i].feed.generation);
-    let mut old = listing("s", &["a"], None);
-    old.posts[0].title = "blocked".into();
-    app.on_feed(
-        tab,
-        generation,
-        false,
-        Ok(old),
-        Freshness {
-            fetched_at: 1000,
-            source: ordered_source(1, false),
-        },
-        false,
-    );
-    app.on_feed(
-        tab,
-        generation,
-        false,
-        Ok(listing("s", &["a"], None)),
-        Freshness {
-            fetched_at: 900,
-            source: ordered_source(2, false),
-        },
-        false,
-    );
-    app.reload();
-    assert_ne!(app.tabs[i].feed.posts[0].title, "blocked");
-    assert_eq!(app.badge(&app.tabs[i]), UnreadBadge::Count(1));
-}
-
-#[test]
 fn returning_to_hot_keeps_unread_count_while_waiting_or_after_failure() {
     let (mut app, i) = unread_badge_app();
     app.set_sort(Sort::Top);

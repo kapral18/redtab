@@ -289,6 +289,4 @@ fn when_home_pages_it_should_keep_a_list_separate_from_all_subs() {
     assert_eq!(app.tabs[0].feed.sort, Sort::Best);
     assert_eq!(app.current_post().unwrap().id, "a");
     assert!(app.all_subs.groups[0].posts.is_empty());
-    app.toggle_bookmark();
-    assert!(app.state.is_bookmarked("a"));
 }

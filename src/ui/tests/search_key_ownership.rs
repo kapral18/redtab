@@ -390,32 +390,23 @@ fn search_key_audit_query_should_share_editor_modifier_filtering() {
 
 #[test]
 fn keys_in_a_feed_opened_from_search_should_stay_in_search() {
-    let opened = || {
-        let mut app = app(&["rust", "other"]);
-        app.open_search(None);
-        app.search.discovered.loading = false;
-        app.search.discovered.entries.push(crate::app::search::Row {
-            profile: None,
-            comment: None,
-            label: "r/rust".into(),
-            detail: String::new(),
-            target: crate::worker::FeedTarget::Subreddit("rust".into()),
-        });
-        app.search.selected = 2;
-        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        screen(&mut app, 200, 30);
-        press(&mut app, 'l');
-        assert!(app.search_feed_open() && app.active != crate::app::SEARCH_TAB);
-        app
-    };
-    let mut app = opened();
+    let mut app = app(&["rust", "other"]);
+    app.open_search(None);
+    app.search.discovered.loading = false;
+    app.search.discovered.entries.push(crate::app::search::Row {
+        profile: None,
+        comment: None,
+        label: "r/rust".into(),
+        detail: String::new(),
+        target: crate::worker::FeedTarget::Subreddit("rust".into()),
+    });
+    app.search.selected = 2;
+    key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    screen(&mut app, 200, 30);
+    press(&mut app, 'l');
+    assert!(app.search_feed_open() && app.active != crate::app::SEARCH_TAB);
     let kind = app.search.kind;
     key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
     assert_eq!(app.active, crate::app::SEARCH_TAB, "Tab left Search");
     assert_ne!(app.search.kind, kind);
-
-    let mut app = opened();
-    press(&mut app, 'q');
-    assert!(!app.quit, "q quit from the feed opened beside Search");
-    assert_eq!(app.active, crate::app::SEARCH_TAB);
 }

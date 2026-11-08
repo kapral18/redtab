@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn ui_audit_empty_jump_results_should_explain_the_empty_list() {
+fn empty_jump_results_should_explain_the_empty_list() {
     let mut app = app(&[]);
     app.overlay = Some(Overlay::Picker(crate::app::PickerState {
         input: "not a reddit name!".into(),

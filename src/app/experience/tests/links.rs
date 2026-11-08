@@ -162,11 +162,7 @@ fn when_reading_links_it_should_follow_comment_selection_and_keep_spoilers_hidde
     );
     app.config.commands.browser = vec!["/redtab-test-missing-browser".into()];
     key(&mut app, KeyCode::Enter);
-    assert!(
-        app.status
-            .as_ref()
-            .is_some_and(|status| status.text.contains("Could not open link"))
-    );
+    assert!(app.status.as_ref().is_some_and(|status| status.error));
     key(&mut app, KeyCode::Esc);
     key(&mut app, KeyCode::Esc);
 

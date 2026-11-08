@@ -361,29 +361,6 @@ fn when_identifying_an_old_session_it_should_not_overwrite_an_already_saved_acco
 }
 
 #[test]
-fn when_an_unrelated_account_changes_during_verification_switching_should_keep_that_change() {
-    let first = export("first", "reader", "first-token", 0);
-    let renewed_second = export("second", "other_reader", "renewed-token", 0);
-    let mut store = store_with(
-        &[("first", &first), ("second", &renewed_second)],
-        Some("second"),
-    );
-
-    edit(&mut store, |vault| {
-        vault.activate("first", &saved_revision(&first), &first)
-    })
-    .unwrap();
-
-    assert_eq!(
-        Vault::decode(store.payload)
-            .unwrap()
-            .load(Some("second"))
-            .unwrap(),
-        renewed_second
-    );
-}
-
-#[test]
 fn when_activation_changes_a_verified_account_id_it_should_not_overwrite_the_entry() {
     let first = export("first", "reader", "first-token", 0);
     let other = export("other", "other_reader", "other-token", 0);

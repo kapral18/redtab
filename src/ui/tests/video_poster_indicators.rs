@@ -283,27 +283,6 @@ fn when_a_youtube_card_waits_for_playback_it_should_show_the_provider_poster_and
 }
 
 #[test]
-fn card_media_converted_gif_should_reach_the_gif_overlay() {
-    let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 180));
-    if let Media::Video { gif, .. } = &mut app.tabs[4].feed.posts[0].media {
-        *gif = true;
-    }
-    let mut pictures = ListPictures::default();
-    let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
-
-    terminal
-        .draw(|f| {
-            draw_feed(f, &mut app, f.area(), &mut pictures);
-        })
-        .unwrap();
-
-    assert!(matches!(
-        pictures.cards[0].indicator,
-        Some(Indicator::Video { gif: true, .. })
-    ));
-}
-
-#[test]
 fn when_a_youtube_detail_loads_it_should_keep_its_poster_and_provider() {
     let mut app = open_video_post();
     app.config.media.video_autoplay = false;

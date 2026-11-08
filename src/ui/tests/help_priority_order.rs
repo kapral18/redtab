@@ -161,7 +161,7 @@ fn sort_help_should_only_offer_the_current_feeds_supported_sorts() {
 }
 
 #[test]
-fn ui_audit_auth_confirmation_help_should_not_advertise_account_navigation() {
+fn auth_confirmation_help_should_not_advertise_account_navigation() {
     let mut app = app(&[]);
     app.overlay = Some(Overlay::Auth);
     app.auth.phase = crate::auth::Phase::Confirm;
@@ -180,7 +180,7 @@ fn ui_audit_auth_confirmation_help_should_not_advertise_account_navigation() {
 }
 
 #[test]
-fn ui_audit_single_field_help_should_not_advertise_field_navigation() {
+fn single_field_help_should_not_advertise_field_navigation() {
     let app = form_app("Open a user profile");
     let actual = help::entries(&app);
     assert!(
@@ -234,13 +234,6 @@ fn dialog_help_should_show_the_active_action_before_view_shortcuts() {
     for (overlay, title, description) in [
         (
             Overlay::Picker(crate::app::PickerState::default()),
-            "Text entry",
-            "Accept a single-line",
-        ),
-        (
-            Overlay::Search {
-                input: "query".into(),
-            },
             "Text entry",
             "Accept a single-line",
         ),

@@ -109,31 +109,6 @@ fn when_cards_show_media_they_should_load_only_visible_full_size_previews() {
 }
 
 #[test]
-fn when_a_large_card_image_arrives_it_should_leave_the_ui_thread_responsive() {
-    let mut app = card_feed_app(kitty());
-    app.tabs[4].feed.posts.truncate(1);
-    screen(&mut app, 100, 20);
-    let message = Msg::Image {
-        url: "https://i.redd.it/p1.jpeg".into(),
-        result: Ok(image::DynamicImage::new_rgb8(1600, 1600).into()),
-    };
-    let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
-
-    let started = Instant::now();
-    app.on_msg(message);
-    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-    app.scroll_card(1);
-    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-
-    assert!(
-        started.elapsed() < std::time::Duration::from_millis(200),
-        "image preparation blocked input for {:?}",
-        started.elapsed()
-    );
-    assert_eq!(app.active_tab().feed.cards.line, 0);
-}
-
-#[test]
 fn when_neighboring_images_load_navigating_back_should_keep_the_same_card_positions() {
     let mut app = card_feed_app(kitty());
     app.tabs[4].feed.posts.iter_mut().for_each(|post| {

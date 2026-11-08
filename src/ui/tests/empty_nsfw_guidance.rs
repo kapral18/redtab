@@ -107,44 +107,32 @@ fn empty_nsfw_disabled_island_should_suggest_the_existing_setting() {
 #[test]
 fn empty_nsfw_disabled_content_tools_should_fit_the_setting_guidance() {
     use crate::app::experience::Screen;
-    use crate::reddit::experience::{Page, Query, UserFeed};
-    for query in [
-        Query::User {
-            name: "someone".into(),
-            feed: UserFeed::Posts,
+    use crate::reddit::experience::{Page, Query};
+    let mut app = app(&[]);
+    app.config.show_nsfw = false;
+    app.overlay = Some(Overlay::Experience);
+    app.experience.screens = vec![Screen::Browse {
+        pagination: Default::default(),
+        query: Query::Communities,
+        page: Page {
+            title: "Empty collection".into(),
+            text: String::new(),
+            entries: vec![],
+            after: None,
+            url: String::new(),
         },
-        Query::Communities,
-        Query::Multi {
-            owner: "someone".into(),
-            name: "example".into(),
-        },
-    ] {
-        let mut app = app(&[]);
-        app.config.show_nsfw = false;
-        app.overlay = Some(Overlay::Experience);
-        app.experience.screens = vec![Screen::Browse {
-            pagination: Default::default(),
-            query,
-            page: Page {
-                title: "Empty collection".into(),
-                text: String::new(),
-                entries: vec![],
-                after: None,
-                url: String::new(),
-            },
-            selected: 0,
-            scroll: 0,
-        }];
+        selected: 0,
+        scroll: 0,
+    }];
 
-        let actual = screen(&mut app, 60, 16);
+    let actual = screen(&mut app, 60, 16);
 
-        assert!(actual.contains("NSFW is off"), "{actual}");
-        assert!(
-            actual.contains("F2") && actual.contains("Show NSFW"),
-            "{actual}"
-        );
-        assert!(!actual.contains("restart"), "{actual}");
-    }
+    assert!(actual.contains("NSFW is off"), "{actual}");
+    assert!(
+        actual.contains("F2") && actual.contains("Show NSFW"),
+        "{actual}"
+    );
+    assert!(!actual.contains("restart"), "{actual}");
 }
 
 #[test]

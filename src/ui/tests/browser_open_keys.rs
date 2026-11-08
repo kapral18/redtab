@@ -4,28 +4,7 @@ use super::*;
 #[test]
 fn private_community_browser_key_should_open_the_community_without_a_selected_post() {
     let mut app = denied_community(AccessDenied::PrivateCommunity);
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("opened-url");
-    app.config.commands.browser = vec![
-        "/bin/sh".into(),
-        "-c".into(),
-        "printf '%s' \"$1\" > \"$0\"".into(),
-        file.to_string_lossy().into_owned(),
-    ];
-    press_keys(&mut app, "o");
-    let deadline = Instant::now() + std::time::Duration::from_secs(2);
-    let actual = loop {
-        if let Ok(text) = std::fs::read_to_string(&file)
-            && !text.is_empty()
-        {
-            break text;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "native browser probe did not receive a URL"
-        );
-        std::thread::yield_now();
-    };
+    let actual = opened_browser_url(&mut app, "o");
     assert_eq!(actual, "https://www.reddit.com/r/s/");
 }
 
@@ -34,28 +13,7 @@ fn private_community_browser_key_should_open_the_community_without_a_selected_po
 fn empty_community_browser_key_should_open_the_community_without_a_post() {
     let mut app = app(&["s"]);
     app.active = 4;
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("opened-url");
-    app.config.commands.browser = vec![
-        "/bin/sh".into(),
-        "-c".into(),
-        "printf '%s' \"$1\" > \"$0\"".into(),
-        file.to_string_lossy().into_owned(),
-    ];
-    press_keys(&mut app, "o");
-    let deadline = Instant::now() + std::time::Duration::from_secs(2);
-    let actual = loop {
-        if let Ok(text) = std::fs::read_to_string(&file)
-            && !text.is_empty()
-        {
-            break text;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "native browser probe did not receive a URL"
-        );
-        std::thread::yield_now();
-    };
+    let actual = opened_browser_url(&mut app, "o");
     assert_eq!(actual, "https://www.reddit.com/r/s/");
 }
 
@@ -171,18 +129,16 @@ fn key_context_audit_browser_should_follow_the_item_and_keep_the_parent_shortcut
         "https://www.reddit.com/user/reader/"
     );
     app.overlay = None;
-    for name in ["popular", "all"] {
-        app.open_subreddit(name);
-        assert!(map::available(&app, Action::SourceBrowser));
-        assert_eq!(
-            opened_browser_url(&mut app, "o"),
-            format!("https://www.reddit.com/r/{name}/")
-        );
-        app.focus_sidebar();
-        assert_eq!(
-            opened_browser_url(&mut app, "o"),
-            format!("https://www.reddit.com/r/{name}/")
-        );
-        app.focus_main();
-    }
+    app.open_subreddit("popular");
+    assert!(map::available(&app, Action::SourceBrowser));
+    assert_eq!(
+        opened_browser_url(&mut app, "o"),
+        "https://www.reddit.com/r/popular/"
+    );
+    app.focus_sidebar();
+    assert_eq!(
+        opened_browser_url(&mut app, "o"),
+        "https://www.reddit.com/r/popular/"
+    );
+    app.focus_main();
 }

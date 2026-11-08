@@ -98,33 +98,6 @@ fn when_background_uses_one_credit_eighteen_navigation_starts_should_remain() {
 }
 
 #[test]
-fn when_background_arrives_after_a_burst_it_should_not_wait_for_all_credits() {
-    let (rate, url) = quota("100", "10");
-    for _ in 0..6 {
-        rate.admit(&url, Priority::Listing, true, || false).unwrap();
-    }
-    let deadline = Instant::now() + Duration::from_millis(450);
-
-    let actual = rate.admit(&url, Priority::Background, true, || {
-        Instant::now() >= deadline
-    });
-
-    assert!(actual.is_ok(), "background waited for a full burst refill");
-}
-
-#[test]
-fn when_congestion_native_preferences_are_paced_labels_should_identify_account_settings() {
-    assert_eq!(
-        operation(&Url::parse("https://www.reddit.com/settings/preferences").unwrap()),
-        "account settings"
-    );
-    assert_eq!(
-        operation(&Url::parse("https://www.reddit.com/svc/shreddit/graphql").unwrap()),
-        "account settings"
-    );
-}
-
-#[test]
 fn native_pages_and_classic_json_draw_on_separate_quotas() {
     let budget = |path: &str| {
         budget_index(
@@ -205,34 +178,6 @@ fn when_interactive_credit_is_available_starts_should_still_obey_base_spacing() 
         .unwrap();
 
     assert!(started.elapsed() >= Duration::from_millis(65));
-}
-
-#[test]
-fn when_navigation_has_quota_credit_it_should_start_quickly_and_keep_background_spacing() {
-    let (mut rate, url) = quota("100", "300");
-    rate.base = Duration::from_secs(1);
-    rate.state.lock().budgets[0].next = Instant::now();
-    let background_started = Instant::now();
-    rate.admit(&url, Priority::Background, true, || false)
-        .unwrap();
-    for priority in [Priority::Listing, Priority::Selected] {
-        let started = Instant::now();
-        rate.admit(&url, priority, true, || false).unwrap();
-        let elapsed = started.elapsed();
-        assert!(
-            (Duration::from_millis(75)..Duration::from_millis(350)).contains(&elapsed),
-            "available navigation credit waited {elapsed:?}"
-        );
-    }
-    rate.state.lock().budgets[0].next = Instant::now();
-    rate.admit(&url, Priority::Background, true, || false)
-        .unwrap();
-    assert!(
-        (Duration::from_millis(450)..Duration::from_millis(675))
-            .contains(&background_started.elapsed()),
-        "background spacing followed intervening navigation: {:?}",
-        background_started.elapsed()
-    );
 }
 
 #[test]

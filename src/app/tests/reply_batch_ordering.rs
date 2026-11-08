@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn review_regression_focused_descendant_expansion_should_keep_an_existing_sibling() {
+fn focused_descendant_expansion_should_keep_an_existing_sibling() {
     use crate::reddit::tests::{Fixture, Reply};
     use serde_json::json;
     let fixture = Fixture::new(|request| {

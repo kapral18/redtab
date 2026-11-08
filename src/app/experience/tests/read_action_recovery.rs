@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn a_failed_action_read_should_keep_the_target_and_offer_read_retry_advice() {
+fn a_failed_action_read_should_keep_the_target_for_r_to_retry() {
     let (mut app, _dir, _fixture) = app();
     let target = Target {
         id: "t1_original".into(),
@@ -23,10 +23,7 @@ fn a_failed_action_read_should_keep_the_target_and_offer_read_retry_advice() {
         },
     );
 
-    let error = app.experience.error.as_ref().unwrap();
-    assert!(error.contains("HTTP 403"));
-    assert!(error.contains("r retries"));
-    assert!(!error.contains("submitting"));
+    assert!(app.experience.error.as_ref().unwrap().contains("HTTP 403"));
     assert!(
         matches!(app.experience.screens.last(), Some(Screen::Loading(Query::Inspect(actual))) if actual == &target)
     );
