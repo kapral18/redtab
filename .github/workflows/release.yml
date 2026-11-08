@@ -3,13 +3,12 @@ name: Release
 on:
   push:
     branches: [main]
-  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 defaults:
@@ -18,7 +17,6 @@ defaults:
 
 jobs:
   ci:
-    if: github.ref == 'refs/heads/main'
     uses: ./.github/workflows/ci.yml
 
   plan:
