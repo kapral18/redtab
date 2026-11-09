@@ -260,8 +260,7 @@ impl App {
         let settle = self.video_resize.map(|(_, since)| {
             VIDEO_RESIZE_SETTLE.saturating_sub(now.saturating_duration_since(since))
         });
-        self.video
-            .as_ref()
+        self.video()
             .and_then(|p| p.wake_in(now))
             .map(|wait| {
                 if rendering {

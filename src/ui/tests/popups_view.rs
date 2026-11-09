@@ -219,7 +219,7 @@ fn popup_media_jump_should_keep_the_paused_detail_video_frame() {
     };
     let mut player = video::Player::showing(&url, frame);
     player.area = app.video_area.unwrap().as_size();
-    app.video = Some(player);
+    app.set_video(Some(player));
     press_keys(&mut app, "p");
     press_keys(&mut app, " bb");
     app.tick();
@@ -227,15 +227,15 @@ fn popup_media_jump_should_keep_the_paused_detail_video_frame() {
     let actual = placeholder_cells(&mut app, 100, 40);
 
     assert!(!actual.is_empty());
-    assert!(app.video.as_ref().unwrap().hidden());
-    assert!(app.video.as_ref().unwrap().paused());
+    assert!(app.video().unwrap().hidden());
+    assert!(app.video().unwrap().paused());
     crate::keys::handle(
         &mut app,
         crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
     );
     app.tick();
-    assert!(app.video.as_ref().unwrap().paused());
-    assert!(!app.video.as_ref().unwrap().hidden());
+    assert!(app.video().unwrap().paused());
+    assert!(!app.video().unwrap().hidden());
 }
 
 #[test]

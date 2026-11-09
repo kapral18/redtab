@@ -5,7 +5,7 @@ fn search_key_audit_ownership_sidebar_should_keep_the_active_nested_feed() {
     let mut app = app(&["rust"]);
     app.config.show_nsfw = true;
     app.open_search(None);
-    app.search.discovered.loading = false;
+    app.search.discovered.fetch = Default::default();
     app.search.discovered.entries.push(crate::app::search::Row {
         profile: None,
         comment: None,
@@ -74,7 +74,7 @@ fn search_key_audit_ownership_empty_feeds_should_focus_list_for_local_controls()
     let mut app = app(&["rust"]);
     app.config.show_nsfw = true;
     app.open_search(None);
-    app.search.discovered.loading = false;
+    app.search.discovered.fetch = Default::default();
     app.search.discovered.entries.push(crate::app::search::Row {
         profile: None,
         comment: None,
@@ -392,7 +392,7 @@ fn search_key_audit_query_should_share_editor_modifier_filtering() {
 fn keys_in_a_feed_opened_from_search_should_stay_in_search() {
     let mut app = app(&["rust", "other"]);
     app.open_search(None);
-    app.search.discovered.loading = false;
+    app.search.discovered.fetch = Default::default();
     app.search.discovered.entries.push(crate::app::search::Row {
         profile: None,
         comment: None,

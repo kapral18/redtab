@@ -36,7 +36,7 @@ fn when_cached_images_are_delivered_they_should_release_only_terminal_claims() {
         let mut claim = ImageClaim {
             wanted: &pool.wanted,
             url: Some(&url),
-            ticket: Some(&ticket),
+            ticket: Some(ticket.claim()),
             claimed: false,
         };
         let (sender, receiver) = sync_channel(1);

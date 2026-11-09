@@ -40,8 +40,7 @@ fn when_opening_a_community_feed_from_the_sidebar_it_should_focus_the_feed() {
     key(&mut app, KeyCode::Enter);
 
     assert_eq!(app.focus, Focus::List);
-    assert!(!app.sidebar_peek);
-    assert!(!app.show_sidebar);
+    assert_eq!(app.sidebar_width(), 0);
     assert!(app.overlay.is_none());
 }
 

@@ -137,11 +137,11 @@ fn h_shows_a_hidden_sidebar_only_while_it_has_focus() {
     app.toggle_sidebar();
 
     press(&mut app, 'h');
-    let shown = app.show_sidebar;
+    let shown = app.sidebar_width() > 0;
     press(&mut app, 'j');
     press(&mut app, 'l');
 
     assert!(shown);
-    assert!(!app.show_sidebar);
+    assert_eq!(app.sidebar_width(), 0);
     assert_eq!(app.active, 1, "the tab picked in the sidebar stays active");
 }

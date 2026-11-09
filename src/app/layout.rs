@@ -88,8 +88,12 @@ impl App {
         self.overlay.is_some() || self.help_scroll.is_some() || self.keymap.hint_visible()
     }
 
+    fn sidebar_visible(&self) -> bool {
+        self.show_sidebar || self.focus == Focus::Sidebar
+    }
+
     pub fn sidebar_width(&self) -> u16 {
-        if !self.show_sidebar {
+        if !self.sidebar_visible() {
             0
         } else if self.width >= 110 {
             SIDEBAR_WIDE
@@ -110,11 +114,10 @@ impl App {
     }
 
     pub fn toggle_sidebar(&mut self) {
-        self.show_sidebar = !self.show_sidebar;
+        self.show_sidebar = !self.sidebar_visible();
         if self.focus == Focus::Sidebar {
             self.focus_main();
         }
-        self.sidebar_peek = false;
         self.resize(self.width);
     }
 
@@ -139,19 +142,11 @@ impl App {
 
     /// `h` in a list: move focus to the sidebar, showing it while focused if hidden.
     pub fn focus_sidebar(&mut self) {
-        if !self.show_sidebar {
-            self.show_sidebar = true;
-            self.sidebar_peek = true;
-        }
         self.focus = Focus::Sidebar;
     }
 
     pub fn focus_main(&mut self) {
         self.focus = Focus::List;
-        if self.sidebar_peek {
-            self.show_sidebar = false;
-            self.sidebar_peek = false;
-        }
         self.resize(self.width);
     }
 

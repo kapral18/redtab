@@ -123,7 +123,7 @@ fn bookmark_and_search_preview_videos_load_their_first_frame_with_autoplay_off()
             pixel[0] > 200 && pixel[1] < 40 && pixel[2] < 40,
             "{pixel:?}"
         );
-        assert!(app.video.is_none());
+        assert!(app.video().is_none());
     }
 }
 
@@ -178,8 +178,8 @@ fn card_media_same_item_scroll_should_keep_pause_and_decoder_geometry() {
     app.sync_video_with(later, |url, area, _| Player::silent(&url, area));
     app.toggle_video_pause();
 
-    let decoder_area = app.video.as_ref().unwrap().area;
-    let before = app.video.as_ref().unwrap().position(later);
+    let decoder_area = app.video().unwrap().area;
+    let before = app.video().unwrap().position(later);
     app.scroll_card(3);
     terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
     app.sync_video_with(later, |_, _, _| panic!("same card must keep its player"));
@@ -294,8 +294,8 @@ fn card_media_offscreen_player_should_hide_without_forgetting_pause() {
     app.card_video_drawn(None);
     app.sync_video_with(later, |_, _, _| panic!("offscreen must keep its player"));
 
-    assert!(app.video.as_ref().unwrap().hidden());
-    assert!(app.video.as_ref().unwrap().paused());
+    assert!(app.video().unwrap().hidden());
+    assert!(app.video().unwrap().paused());
 }
 
 #[test]

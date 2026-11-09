@@ -51,11 +51,9 @@ impl App {
         if tab.feed_target().is_some()
             && !tab.feed.loading()
             && !(tab.feed.request_query.as_ref() == Some(&tab.feed.query())
-                && tab
-                    .feed
-                    .requests
-                    .iter()
-                    .any(|(id, cursor)| cursor.is_none() && tab.feed.refreshing.contains(id)))
+                && tab.feed.requests.values().any(|request| {
+                    request.cursor.is_none() && request.phase == RequestPhase::Refreshing
+                }))
             && (!tab.feed.loaded
                 || tab
                     .feed
@@ -107,8 +105,10 @@ impl App {
         let before = self.tabs[self.active].feed.generation;
         self.fetch_feed(self.active, after, true);
         let feed = &mut self.tabs[self.active].feed;
-        if feed.generation != before {
-            feed.manual.insert(feed.generation);
+        if feed.generation != before
+            && let Some(request) = feed.requests.get_mut(&feed.generation)
+        {
+            request.manual = true;
         }
     }
 
@@ -134,10 +134,6 @@ impl App {
         let query = feed.query();
         if feed.request_query.as_ref() != Some(&query) {
             feed.requests.clear();
-            feed.pending.clear();
-            feed.refreshing.clear();
-            feed.forced.clear();
-            feed.manual.clear();
             feed.deferred.clear();
             feed.update = None;
             feed.failures
@@ -152,17 +148,15 @@ impl App {
         {
             feed.failures.remove(&after);
         }
-        feed.requests.retain(|_, cursor| *cursor != after);
-        feed.pending.retain(|id| feed.requests.contains_key(id));
-        feed.refreshing.retain(|id| feed.requests.contains_key(id));
-        feed.forced.retain(|id| feed.requests.contains_key(id));
-        feed.manual.retain(|id| feed.requests.contains_key(id));
-        feed.requests.insert(generation, after.clone());
-        feed.pending.insert(generation);
+        feed.requests.retain(|_, request| request.cursor != after);
+        feed.requests.insert(
+            generation,
+            FeedRequest {
+                forced: force,
+                ..FeedRequest::new(after.clone(), RequestPhase::Pending)
+            },
+        );
         feed.deferred.remove(&after);
-        if force {
-            feed.forced.insert(generation);
-        }
         let job = Job::Feed {
             tab: tab.id,
             generation,
@@ -256,10 +250,8 @@ impl App {
                 let generation = self.all_subs.next_group_generation;
                 self.all_subs.next_group_generation += 1;
                 for g in &mut self.all_subs.groups {
-                    g.loading = false;
-                    g.needs_refresh = true;
+                    g.invalidate(generation);
                     g.manual = true;
-                    g.generation = generation;
                 }
             }
             TabKind::Bookmarks => {}
@@ -377,7 +369,7 @@ impl App {
             return;
         };
         let feed = &self.tabs[index].feed;
-        if !(feed.pending.contains(&generation) || feed.refreshing.contains(&generation)) {
+        if feed.in_flight(generation).is_none() {
             return;
         }
         let retain = feed.shows_current_query()

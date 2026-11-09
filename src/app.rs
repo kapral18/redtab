@@ -155,14 +155,13 @@ pub struct App {
     last_save: Instant,
     feed_poll: Instant,
     pub show_images: bool,
+    /// The user's sidebar choice; a hidden sidebar still shows while it has focus.
     pub show_sidebar: bool,
     /// NO_COLOR is set: half-block images, which are only colors, are not drawn.
     pub no_color: bool,
     pub focus: Focus,
     /// Last drawable terminal width, shared by layout and key dispatch.
     width: u16,
-    /// The sidebar was hidden and is shown only while it has focus.
-    sidebar_peek: bool,
     pub image_picker: Picker,
     pub images: HashMap<String, ImageSlot>,
     /// Full-size list previews have their own protocols so split detail can draw the same URL.
@@ -187,18 +186,15 @@ pub struct App {
     icon_demands: HashSet<String>,
     /// People's avatars and profile summaries, keyed by lowercase username.
     profiles: HashMap<String, crate::model::UserProfile>,
-    /// Profiles on their way; a failed one waits for `r` on its tab.
-    profile_loading: HashSet<String>,
-    profile_failed: HashSet<String>,
+    /// Profile lookups on their way or failed; a failed one waits for `r` on its tab.
+    profile_lookups: HashMap<String, Lookup>,
     pending_media: HashSet<String>,
     /// Cache warnings a draw has shown; a broken or busy cache repeats them per job.
     cache_warnings: HashSet<String>,
-    /// The open post's inline video while it plays (or loads, or failed).
-    pub video: Option<Player>,
+    /// The selected post's inline video while it plays (or loads, or failed).
+    video: Option<ActiveVideo>,
     card_video: Option<CardPlayback>,
     video_requested: Option<String>,
-    video_post_id: Option<String>,
-    video_is_card: bool,
     video_previews: VecDeque<VideoPreview>,
     /// Requested sound; a fresh card selection starts muted.
     video_sound_on: bool,
@@ -268,7 +264,6 @@ impl App {
             no_color: false,
             focus: Focus::List,
             width: 0,
-            sidebar_peek: false,
             image_picker,
             images: HashMap::new(),
             card_images: HashMap::new(),
@@ -284,15 +279,12 @@ impl App {
             icon_lookups: HashSet::new(),
             icon_demands: HashSet::new(),
             profiles: HashMap::new(),
-            profile_loading: HashSet::new(),
-            profile_failed: HashSet::new(),
+            profile_lookups: HashMap::new(),
             pending_media: HashSet::new(),
             cache_warnings: HashSet::new(),
             video: None,
             card_video: None,
             video_requested: None,
-            video_post_id: None,
-            video_is_card: false,
             video_previews: VecDeque::new(),
             video_sound_on: false,
             video_area: None,

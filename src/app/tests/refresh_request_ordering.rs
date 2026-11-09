@@ -239,8 +239,8 @@ fn reload_recovers_a_failed_revalidation_of_a_loaded_page() {
         .feed
         .requests
         .iter()
-        .filter(|(id, _)| app.tabs[i].feed.pending.contains(id))
-        .map(|(id, cursor)| (*id, cursor.clone()))
+        .filter(|(_, request)| request.phase == RequestPhase::Pending)
+        .map(|(id, request)| (*id, request.cursor.clone()))
         .collect();
     for (generation, cursor) in requests {
         let response = if cursor.is_none() {

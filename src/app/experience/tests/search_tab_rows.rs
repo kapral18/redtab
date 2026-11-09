@@ -167,7 +167,7 @@ fn search_tab_should_search_as_you_type_preview_rows_and_open_them() {
     key(&mut app, KeyCode::Tab);
     assert_eq!(app.search.kind, SearchKind::Communities);
     let _ = app.tick_at(Instant::now() + DEBOUNCE);
-    assert!(app.search.results.loading);
+    assert!(app.search.results.loading());
     let generation = app.search.results_generation();
     app.on_search(
         generation,
@@ -208,7 +208,7 @@ fn search_tab_should_search_as_you_type_preview_rows_and_open_them() {
     key(&mut app, KeyCode::Down);
     assert_eq!(app.search.selected, 1, "arrows choose while typing");
     assert!(
-        app.search.results.loading && app.search.rows().len() == 2,
+        app.search.results.loading() && app.search.rows().len() == 2,
         "the end of the rows asks for the next page and keeps them"
     );
     app.on_search(
@@ -296,7 +296,7 @@ fn search_tab_should_search_as_you_type_preview_rows_and_open_them() {
     assert!(app.search.preview.update.is_none());
     sequence(&mut app, "r");
     assert!(
-        app.search.results.loading && app.search.preview_forced(),
+        app.search.results.loading() && app.search.preview_forced(),
         "r asks again and keeps the preview's skip-the-cache request"
     );
     app.on_search(

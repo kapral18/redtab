@@ -220,9 +220,6 @@ impl App {
         for tab in &mut self.tabs {
             tab.feed.generation = invalid_generation;
             tab.feed.requests.clear();
-            tab.feed.pending.clear();
-            tab.feed.refreshing.clear();
-            tab.feed.forced.clear();
             tab.feed.deferred.clear();
             tab.feed.update = None;
             tab.feed.loaded = false;
@@ -242,9 +239,7 @@ impl App {
             {
                 let generation = self.all_subs.next_group_generation;
                 self.all_subs.next_group_generation += 1;
-                group.generation = generation;
-                group.loading = false;
-                group.needs_refresh = true;
+                group.invalidate(generation);
             }
         }
         if let Action::Hide { id, hide: false } = action

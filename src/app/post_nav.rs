@@ -189,10 +189,13 @@ impl App {
     pub(super) fn apply_update(&mut self, index: usize, update: FeedUpdate, manual: bool) {
         let generation = self.generation();
         let feed = &mut self.tabs[index].feed;
-        feed.requests.insert(generation, None);
-        if manual {
-            feed.manual.insert(generation);
-        }
+        feed.requests.insert(
+            generation,
+            FeedRequest {
+                manual,
+                ..FeedRequest::new(None, RequestPhase::Answered)
+            },
+        );
         let tab_id = self.tabs[index].id;
         self.on_feed(
             tab_id,
@@ -304,8 +307,12 @@ impl App {
 
     /// Moving ends what `r` was waiting to show: later answers keep the new position.
     pub(super) fn cancel_reveal(&mut self) {
-        for tab in &mut self.tabs {
-            tab.feed.manual.clear();
+        for request in self
+            .tabs
+            .iter_mut()
+            .flat_map(|tab| tab.feed.requests.values_mut())
+        {
+            request.manual = false;
         }
         if let Some(view) = &mut self.post_view {
             view.reveal = false;

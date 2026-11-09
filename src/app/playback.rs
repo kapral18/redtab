@@ -7,6 +7,19 @@ pub(super) struct CardPlayback {
     pub(super) shown: bool,
 }
 
+/// The one live Player and the post that owns it, in a card or in the post view.
+pub(super) struct ActiveVideo {
+    pub(super) player: Player,
+    pub(super) post: String,
+    pub(super) card: bool,
+}
+
+impl ActiveVideo {
+    pub(super) fn plays(&self, post: &str, card: bool, url: &str) -> bool {
+        self.post == post && self.card == card && self.player.url == url
+    }
+}
+
 pub(super) struct VideoPreview {
     pub(super) post: String,
     pub(super) url: String,
@@ -66,15 +79,51 @@ impl App {
         }
     }
 
-    pub(super) fn video_matches_selection(&self) -> bool {
-        self.video_post_id
+    pub fn video(&self) -> Option<&Player> {
+        self.video.as_ref().map(|active| &active.player)
+    }
+
+    #[cfg(test)]
+    pub fn video_mut(&mut self) -> Option<&mut Player> {
+        self.video.as_mut().map(|active| &mut active.player)
+    }
+
+    /// Plays `player` for the selected post (if any), as the playback sync would start it.
+    #[cfg(test)]
+    pub fn set_video(&mut self, player: Option<Player>) {
+        let post = self.video_control_post().map(|post| post.id);
+        let card = self.post_view.is_none();
+        self.video = player.map(|player| ActiveVideo {
+            player,
+            post: post.unwrap_or_default(),
+            card,
+        });
+    }
+
+    /// The live Player belongs to the selected post.
+    fn video_owned_by_selection(&self) -> bool {
+        self.video.as_ref().is_some_and(|active| {
+            self.video_control_post()
+                .is_some_and(|post| post.id == active.post)
+        })
+    }
+
+    fn selected_active(&self) -> Option<&ActiveVideo> {
+        self.video
             .as_ref()
-            .is_none_or(|id| self.video_control_post().is_some_and(|post| post.id == *id))
+            .filter(|_| self.video_owned_by_selection())
+    }
+
+    pub(super) fn selected_player_mut(&mut self) -> Option<&mut Player> {
+        if !self.video_owned_by_selection() {
+            return None;
+        }
+        self.video.as_mut().map(|active| &mut active.player)
     }
 
     pub fn selected_video(&self) -> Option<&Player> {
-        if self.video_matches_selection() && self.video.is_some() {
-            return self.video.as_ref();
+        if let Some(active) = self.selected_active() {
+            return Some(&active.player);
         }
         let post = self.video_control_post()?;
         let url = self.playback_url(post.media.video_url()?)?;
@@ -118,9 +167,10 @@ impl App {
     #[cfg(test)]
     pub fn card_player(&self) -> Option<&Player> {
         let card = self.card_video.as_ref()?;
-        (self.video_is_card && self.video_post_id.as_deref() == Some(&card.id))
-            .then_some(self.video.as_ref())
-            .flatten()
+        self.video
+            .as_ref()
+            .filter(|active| active.card && active.post == card.id)
+            .map(|active| &active.player)
     }
 
     /// Selected pixels stay drawable while playback settles or a decoder restarts.
@@ -154,12 +204,8 @@ impl App {
         let url = self.playback_url(source)?;
         self.video
             .as_ref()
-            .filter(|player| {
-                self.video_is_card
-                    && self.video_post_id.as_deref() == Some(post)
-                    && player.url == url
-            })
-            .and_then(Player::frame)
+            .filter(|active| active.plays(post, true, &url))
+            .and_then(|active| active.player.frame())
             .or_else(|| {
                 self.video_previews
                     .iter()
@@ -177,9 +223,12 @@ impl App {
         else {
             return false;
         };
-        if let Some(player) = self.video.as_ref().filter(|player| {
-            player.url == url && self.video_post_id.as_ref().is_none_or(|id| *id == post.id)
-        }) {
+        if let Some(active) = self
+            .video
+            .as_ref()
+            .filter(|active| active.player.url == url && active.post == post.id)
+        {
+            let player = &active.player;
             return player.error().is_some() && player.frame().is_none();
         }
         self.video_previews
@@ -204,13 +253,15 @@ impl App {
     }
 
     pub(super) fn retire_video(&mut self, now: Instant) -> bool {
-        let post = self.video_post_id.take();
-        let Some(mut player) = self.video.take() else {
+        let Some(ActiveVideo {
+            mut player,
+            post,
+            card,
+        }) = self.video.take()
+        else {
             return false;
         };
-        if let Some(post) = post
-            && self.inline_images_on()
-        {
+        if self.inline_images_on() {
             // Manual play and autoplay-off retirement also need the selected
             // preview to survive pruning, before a replacement Player exists.
             let protected = self
@@ -229,7 +280,7 @@ impl App {
                 resume: player.resume(now),
                 frame: player.frame().cloned(),
                 player: None,
-                card: self.video_is_card,
+                card,
             };
             if !player.resolving() && (player.frame().is_some() || player.error().is_some()) {
                 preview.player = Some(player);
@@ -285,11 +336,10 @@ impl App {
             self.playback_url(view.page.as_ref()?.post.media.video_url()?)
         } else {
             let card = self.card_video.as_ref()?;
-            let playing = self.video_post_id.as_deref() == Some(card.id.as_str())
-                && self
-                    .video
-                    .as_ref()
-                    .is_some_and(|player| player.url == card.url);
+            let playing = self
+                .video
+                .as_ref()
+                .is_some_and(|active| active.post == card.id && active.player.url == card.url);
             if card.id != post.id
                 || (!card.shown && self.video.is_none())
                 || (!requested

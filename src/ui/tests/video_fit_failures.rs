@@ -45,7 +45,7 @@ fn video_width_regression_portrait_detail_should_fit_height_and_scroll_with_cont
 fn video_width_regression_unknown_portrait_should_use_the_first_frame_shape() {
     let mut app = open_video_post();
     let url = app.reddit.media_url(VIDEO).unwrap();
-    app.video = Some(video::Player::showing(
+    app.set_video(Some(video::Player::showing(
         &url,
         video::Frame {
             width: 180,
@@ -55,7 +55,7 @@ fn video_width_regression_unknown_portrait_should_use_the_first_frame_shape() {
             ))),
             same_as_first: false,
         },
-    ));
+    )));
 
     let actual = detail_pictures(&mut app, 80, 30);
 
@@ -67,7 +67,7 @@ fn video_width_regression_unknown_portrait_should_use_the_first_frame_shape() {
 fn media_failure_without_a_poster_or_frame_should_not_reserve_a_blank_picture() {
     let mut app = open_video_post();
     let url = app.reddit.media_url(VIDEO).unwrap();
-    app.video = Some(video::Player::unavailable(&url, Size::new(70, 63)));
+    app.set_video(Some(video::Player::unavailable(&url, Size::new(70, 63))));
 
     let pictures = detail_pictures(&mut app, 100, 50);
     assert!(pictures.iter().all(|p| p.size.height == 0));
@@ -83,7 +83,7 @@ fn media_failure_without_a_poster_or_frame_should_not_reserve_a_blank_picture() 
 fn media_failure_from_an_old_source_should_not_hide_the_current_video() {
     let mut app = open_video_post();
     let url = app.reddit.media_url(VIDEO).unwrap();
-    app.video = Some(video::Player::unavailable(&url, Size::new(70, 63)));
+    app.set_video(Some(video::Player::unavailable(&url, Size::new(70, 63))));
     let media = &mut app
         .post_view
         .as_mut()
@@ -135,7 +135,7 @@ fn video_width_regression_split_detail_should_leave_the_list_poster_static() {
     })
     .into();
     let url = app.reddit.media_url(VIDEO).unwrap();
-    app.video = Some(video::Player::showing(
+    app.set_video(Some(video::Player::showing(
         &url,
         video::Frame {
             width: 160,
@@ -145,7 +145,7 @@ fn video_width_regression_split_detail_should_leave_the_list_poster_static() {
             ))),
             same_as_first: false,
         },
-    ));
+    )));
 
     let actual = screen(&mut app, 200, 40);
 
@@ -185,7 +185,7 @@ fn when_a_video_frame_is_decoded_smaller_it_should_still_be_drawn_at_full_size()
             same_as_first: false,
         };
         let url = app.reddit.media_url(VIDEO).unwrap();
-        app.video = Some(video::Player::showing(&url, frame));
+        app.set_video(Some(video::Player::showing(&url, frame)));
         detail_pictures(&mut app, 100, 40)[0].size
     };
 
@@ -283,7 +283,7 @@ fn video_width_regression_tall_detail_should_keep_controls_in_the_footer() {
     if !player.paused() {
         player.toggle_pause(Instant::now());
     }
-    app.video = Some(player);
+    app.set_video(Some(player));
 
     let actual = screen(&mut app, 100, 20);
 

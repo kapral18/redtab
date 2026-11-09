@@ -96,7 +96,7 @@ fn post_notice_preview_should_announce_only_new_leading_posts() {
     ] {
         let mut app = app(&[]);
         app.open_search(None);
-        app.search.discovered.loading = false;
+        app.search.discovered.fetch = Default::default();
         app.search.preview.target = Some(app.search.selected_row().unwrap().target);
         app.search.preview.posts = vec![post_with("a", Media::None), post_with("b", Media::None)];
         app.search.preview.update = Some(
@@ -119,7 +119,7 @@ fn post_notice_preview_status_should_belong_to_the_selected_source() {
     let mut app = app(&[]);
     app.open_search(None);
     key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-    app.search.discovered.loading = false;
+    app.search.discovered.fetch = Default::default();
     app.search.preview.target = Some(app.search.selected_row().unwrap().target);
     app.search.preview.posts = vec![post_with("a", Media::None)];
     app.search.preview.update = Some(vec![post_with("leader", Media::None)]);

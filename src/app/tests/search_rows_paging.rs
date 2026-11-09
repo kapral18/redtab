@@ -189,7 +189,7 @@ fn search_rows_should_stop_paging_after_a_failure_and_drop_a_page_for_an_old_que
     app.tick_at(Instant::now() + Duration::from_secs(1));
     assert_eq!(app.search.rows(), rows);
     assert_eq!(app.search.selected, selected);
-    assert!(app.search.results.loading);
+    assert!(app.search.results.loading());
     assert_ne!(app.search.results_generation(), interrupted);
     let failed = app.search.results_generation();
     app.on_search(failed, Err("offline".into()));
@@ -201,7 +201,7 @@ fn search_rows_should_stop_paging_after_a_failure_and_drop_a_page_for_an_old_que
     press(&mut app, crossterm::event::KeyCode::Up);
     press(&mut app, crossterm::event::KeyCode::Down);
     assert!(
-        app.search.results_generation() == failed && !app.search.results.loading,
+        app.search.results_generation() == failed && !app.search.results.loading(),
         "a failed page is not asked for again by moving"
     );
 
@@ -233,13 +233,13 @@ fn search_rows_should_stop_paging_after_a_failure_and_drop_a_page_for_an_old_que
     app.reset_search_loads();
     app.tick_at(Instant::now() + Duration::from_secs(1));
     assert!(
-        !app.search.results.loading,
+        !app.search.results.loading(),
         "pool reset must not restart hidden Search work"
     );
     app.switch_tab(SEARCH_TAB);
     app.tick_at(Instant::now() + Duration::from_secs(1));
     app.tick_at(Instant::now() + Duration::from_secs(1));
-    assert!(app.search.results.loading);
+    assert!(app.search.results.loading());
     assert_eq!(app.search.text(), "rust next");
 }
 

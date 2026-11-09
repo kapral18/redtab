@@ -29,7 +29,8 @@ pub struct Store {
     baseline: Config,
     target: Option<PathBuf>,
     existed: bool,
-    reload_failed: bool,
+    /// The message a failed reload showed; a later successful reload clears only that one.
+    reload_error: Option<String>,
     unverified: Option<super::managed::Verification>,
     pub persistence: Persistence,
     pub error: Option<String>,
@@ -43,7 +44,7 @@ impl Store {
             current: config,
             target: None,
             existed: false,
-            reload_failed: false,
+            reload_error: None,
             unverified: None,
             persistence: Persistence::Temporary,
             error: None,
@@ -64,7 +65,7 @@ impl Store {
                     current: config,
                     target: Some(resolve(&path)?),
                     existed: true,
-                    reload_failed: false,
+                    reload_error: None,
                     unverified: None,
                     persistence: Persistence::Saved,
                     error: None,
@@ -228,22 +229,23 @@ impl Store {
         match result {
             Err(error) => {
                 self.failed(error);
-                self.reload_failed = true;
+                self.reload_error = self.error.clone();
             }
             Ok(()) if self.unverified.is_some() => {
                 self.persistence = Persistence::Unsaved;
-                self.reload_failed = false;
+                self.reload_error = None;
             }
             Ok(()) if !self.dirty() => {
                 self.persistence = Persistence::Saved;
                 self.error = None;
-                self.reload_failed = false;
+                self.reload_error = None;
             }
             Ok(()) => {
-                if self.reload_failed {
+                if let Some(shown) = self.reload_error.take()
+                    && self.error.as_ref() == Some(&shown)
+                {
                     self.error = None;
                 }
-                self.reload_failed = false;
                 if self.persistence == Persistence::Temporary
                     && fs::metadata(&self.current.path)
                         .is_ok_and(|meta| readonly(&self.current.path, &meta))
@@ -258,7 +260,6 @@ impl Store {
                     );
                 }
                 self.persistence = Persistence::Unsaved;
-                self.reload_failed = false;
             }
         }
     }

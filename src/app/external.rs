@@ -110,7 +110,7 @@ impl App {
         };
         if video
             && result.is_ok()
-            && let Some(player) = &mut self.video
+            && let Some(ActiveVideo { player, .. }) = &mut self.video
             && playing.as_deref() == Some(player.url.as_str())
             && !player.paused()
         {

@@ -98,9 +98,12 @@ fn when_an_append_is_retired_it_should_resume_its_cursor_without_reloading_the_h
     let feed = &app.tabs[index].feed;
     assert_eq!(
         feed.requests.get(&feed.generation),
-        Some(&Some("next".into()))
+        Some(&FeedRequest::new(
+            Some("next".into()),
+            RequestPhase::Pending
+        ))
     );
-    assert_eq!(feed.pending.len(), 1);
+    assert_eq!(feed.requests.values().filter(|r| r.in_flight()).count(), 1);
     assert_eq!(feed.posts[0].id, "head");
     assert!(feed.error().is_none());
 }

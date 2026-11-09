@@ -181,21 +181,16 @@ impl App {
                     let feed = &mut tab.feed;
                     // Pending first pages stay: a newer one replaces this response; an
                     // older one is rejected by its source.
-                    feed.requests.retain(|id, cursor| {
-                        cursor.is_some()
-                            || feed.pending.contains(id)
-                            || feed.refreshing.contains(id)
-                    });
-                    feed.pending.retain(|id| match feed.requests.get(id) {
-                        Some(None) => {
-                            feed.refreshing.insert(*id);
-                            false
+                    feed.requests
+                        .retain(|_, request| request.cursor.is_some() || request.in_flight());
+                    for request in feed.requests.values_mut() {
+                        if request.cursor.is_none() && request.phase == RequestPhase::Pending {
+                            request.phase = RequestPhase::Refreshing;
                         }
-                        Some(Some(_)) => true,
-                        None => false,
-                    });
+                    }
                     feed.generation = generation;
-                    feed.requests.insert(generation, None);
+                    feed.requests
+                        .insert(generation, FeedRequest::new(None, RequestPhase::Answered));
                     feed.request_query = Some(query);
                     let tab_id = tab.id;
                     self.on_feed(tab_id, generation, false, Ok(listing), freshness, false);

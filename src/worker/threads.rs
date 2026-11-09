@@ -36,7 +36,7 @@ pub(super) fn spawn_worker(
                         Job::Image { url, .. } | Job::VideoFrame { url, .. } => Some(url),
                         _ => None,
                     },
-                    ticket: image_ticket.as_ref(),
+                    ticket: image_ticket.as_ref().map(ImageTicket::claim),
                     claimed: false,
                 };
                 if !claim.acquire() {

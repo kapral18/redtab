@@ -110,14 +110,12 @@ impl App {
         };
         if let Some(after) = &after {
             rows.visited.insert(after.clone());
-            rows.loading = true;
-            rows.suspended = false;
-            rows.appending = true;
+            rows.fetch = Fetch::Loading { more: true };
             rows.error = None;
             rows.generation = generation;
         } else {
             *rows = Rows {
-                loading: true,
+                fetch: Fetch::Loading { more: false },
                 generation,
                 query: Some(query.clone()),
                 ..Rows::default()
@@ -149,7 +147,7 @@ impl App {
         } else {
             &self.search.results
         };
-        if rows.loading || rows.suspended || rows.error.is_some() {
+        if rows.fetch != Fetch::Idle || rows.error.is_some() {
             return;
         }
         let (Some(query), Some(after)) = (rows.query.clone(), rows.after.clone()) else {
@@ -188,8 +186,7 @@ impl App {
     pub(in crate::app) fn on_search(&mut self, generation: u64, result: Result<Response, String>) {
         let results = &self.search.results;
         if results.generation == generation
-            && results.loading
-            && !results.appending
+            && results.fetch == (Fetch::Loading { more: false })
             && matches!(results.query, Some(Query::Search { .. }))
             && let Ok(Response::Page(page)) = &result
             && page.entries.is_empty()
@@ -201,7 +198,7 @@ impl App {
                 .as_ref()
                 .map_or(0, |retry| retry.attempt);
             if let Some(delay) = EMPTY_RETRY_DELAYS.get(attempt) {
-                self.search.results.loading = false;
+                self.search.results.fetch = Fetch::Idle;
                 self.search.empty_retry = Some(EmptyRetry {
                     attempt: attempt + 1,
                     due: Some(Instant::now() + *delay),
@@ -209,16 +206,18 @@ impl App {
                 return;
             }
         }
-        let rows = if self.search.results.generation == generation && self.search.results.loading {
+        let rows = if self.search.results.generation == generation && self.search.results.loading()
+        {
             &mut self.search.results
-        } else if self.search.discovered.generation == generation && self.search.discovered.loading
+        } else if self.search.discovered.generation == generation
+            && self.search.discovered.loading()
         {
             &mut self.search.discovered
         } else {
             return;
         };
-        rows.loading = false;
-        let appending = std::mem::take(&mut rows.appending);
+        let appending = rows.fetch == (Fetch::Loading { more: true });
+        rows.fetch = Fetch::Idle;
         let mut icons = Vec::new();
         match result {
             Ok(Response::Page(page)) => {
@@ -285,7 +284,7 @@ impl App {
             return;
         }
         if self.search.exploring() {
-            if !self.search.discovered.loading {
+            if !self.search.discovered.loading() {
                 self.search.discovered = Rows::default();
             }
             self.ensure_discovered();

@@ -277,9 +277,7 @@ impl App {
         self.all_subs.next_group_generation += 1;
         for group in &mut self.all_subs.groups {
             if group.loading || group.error.is_some() || group.freshness.is_none() {
-                group.loading = false;
-                group.needs_refresh = true;
-                group.generation = generation;
+                group.invalidate(generation);
             }
         }
         let mut feeds = Vec::new();
@@ -290,9 +288,9 @@ impl App {
             let mut cursors: HashSet<_> = tab
                 .feed
                 .requests
-                .iter()
-                .filter(|(id, _)| tab.feed.pending.contains(id) || tab.feed.refreshing.contains(id))
-                .map(|(_, cursor)| cursor)
+                .values()
+                .filter(|request| request.in_flight())
+                .map(|request| &request.cursor)
                 .chain(tab.feed.failures.keys())
                 .chain(tab.feed.deferred.keys())
                 .cloned()
@@ -301,11 +299,7 @@ impl App {
                 cursors.insert(None);
             }
             feeds.extend(cursors.into_iter().map(|cursor| (index, cursor)));
-            tab.feed.pending.clear();
-            tab.feed.refreshing.clear();
             tab.feed.requests.clear();
-            tab.feed.forced.clear();
-            tab.feed.manual.clear();
             tab.feed.deferred.clear();
             tab.feed
                 .failures
@@ -326,8 +320,7 @@ impl App {
         self.queued_images.clear();
         self.icon_lookups.clear();
         self.icon_demands.clear();
-        self.profile_loading.clear();
-        self.profile_failed.clear();
+        self.profile_lookups.clear();
         // The old pool's refreshes never answer: the next draw asks again.
         for slots in [&mut self.images, &mut self.thumbs] {
             slots.retain(|_, slot| matches!(slot, ImageSlot::Ready { .. }));
@@ -353,7 +346,6 @@ impl App {
         self.video = None;
         self.card_video = None;
         self.video_requested = None;
-        self.video_post_id = None;
         self.video_previews.clear();
         self.post_settle = Settle::default();
         self.feed_settle = Settle::default();

@@ -109,7 +109,7 @@ fn search_key_audit_parent_retry_guidance_should_not_target_the_child_feed() {
     let mut app = app(&[]);
     app.open_search(None);
     key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-    app.search.discovered.loading = false;
+    app.search.discovered.fetch = Default::default();
     app.search.discovered.error = Some("parent failed".into());
     screen(&mut app, 200, 24);
     press(&mut app, 'l');
@@ -202,7 +202,7 @@ fn reported_search_reverse_navigation_should_keep_the_viewport() {
     let mut app = app(&[]);
     app.open_search(None);
     key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-    app.search.discovered.loading = false;
+    app.search.discovered.fetch = Default::default();
     app.search.discovered.entries = (0..60)
         .map(|i| crate::app::search::Row {
             profile: None,

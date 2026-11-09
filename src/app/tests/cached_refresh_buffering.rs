@@ -118,7 +118,7 @@ fn when_a_cached_page_refresh_streams_it_should_keep_the_suffix_and_selected_pos
     );
     assert_eq!(feed.posts[feed.selected].id, "b");
     assert_eq!(feed.after.as_deref(), Some("next"));
-    assert!(feed.loading() && feed.forced.contains(&generation));
+    assert!(feed.loading() && feed.requests[&generation].forced);
     assert!(feed.freshness.unwrap().source.cached);
 }
 
@@ -158,7 +158,7 @@ fn when_a_forced_cached_feed_refresh_is_retired_it_should_resume_forced_on_retur
 
     let feed = &app.tabs[index].feed;
     assert!(
-        feed.forced.contains(&feed.generation),
+        feed.requests[&feed.generation].forced,
         "return must preserve explicit reload intent"
     );
     assert!(feed.loading() && feed.error().is_none());

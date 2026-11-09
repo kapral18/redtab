@@ -220,12 +220,16 @@ impl App {
             }
             Msg::Profile { user, result } => {
                 let key = user.to_ascii_lowercase();
-                self.profile_loading.remove(&key);
                 match result {
-                    Ok(profile) => self.observe_profile(&user, profile),
-                    Err(error) if error == crate::reddit::REQUEST_CANCELLED => {}
+                    Ok(profile) => {
+                        self.profile_lookups.remove(&key);
+                        self.observe_profile(&user, profile);
+                    }
+                    Err(error) if error == crate::reddit::REQUEST_CANCELLED => {
+                        self.profile_lookups.remove(&key);
+                    }
                     Err(_) => {
-                        self.profile_failed.insert(key);
+                        self.profile_lookups.insert(key, Lookup::Failed);
                     }
                 }
             }

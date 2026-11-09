@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Lookup {
+    Loading,
+    Failed,
+}
+
 pub(super) struct IconMetadata {
     pub(super) url: Option<String>,
     pub(super) source: Source,
@@ -27,20 +33,20 @@ impl App {
     /// Asks once per session for a shown person's profile; `r` on their tab asks again.
     pub(super) fn request_profile(&mut self, user: &str, again: bool) {
         let key = user.to_ascii_lowercase();
-        if self.profile_loading.contains(&key)
-            || (!again && (self.profiles.contains_key(&key) || self.profile_failed.contains(&key)))
-        {
-            return;
+        match self.profile_lookups.get(&key) {
+            Some(Lookup::Loading) => return,
+            Some(Lookup::Failed) if !again => return,
+            None if !again && self.profiles.contains_key(&key) => return,
+            _ => {}
         }
-        self.profile_failed.remove(&key);
-        self.profile_loading.insert(key);
+        self.profile_lookups.insert(key, Lookup::Loading);
         self.pool.submit(Job::Profile {
             user: user.to_string(),
         });
     }
 
     pub fn profile_failed(&self, user: &str) -> bool {
-        self.profile_failed.contains(&user.to_ascii_lowercase())
+        self.profile_lookups.get(&user.to_ascii_lowercase()) == Some(&Lookup::Failed)
     }
 
     pub(crate) fn observe_profile(&mut self, user: &str, profile: crate::model::UserProfile) {

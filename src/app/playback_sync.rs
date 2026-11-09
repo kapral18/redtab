@@ -45,6 +45,7 @@ impl App {
                 && let Some(player) = self
                     .video
                     .as_mut()
+                    .map(|active| &mut active.player)
                     .filter(|p| p.frame().is_some() && !p.resolving())
             {
                 player.set_hidden(true, now);
@@ -57,37 +58,31 @@ impl App {
         };
         let card = self.post_view.is_none();
         let id = self.video_control_post().map(|post| post.id).unwrap();
-        let same_post = self.video_post_id.as_ref().is_none_or(|old| *old == id);
         let mut changed = false;
         if let Some(area) = self.video_area.map(Rect::as_size) {
             let start = match &self.video {
-                Some(player)
-                    if same_post
-                        && self.video_is_card == card
-                        && player.url == url
-                        && player.area == area =>
-                {
+                Some(active) if active.plays(&id, card, &url) && active.player.area == area => {
                     self.video_resize = None;
                     false
                 }
                 // A new size: wait until it holds still (a window drag passes many).
-                Some(player) if same_post && self.video_is_card == card && player.url == url => {
-                    match self.video_resize {
-                        Some((size, since)) if size == area => {
-                            now.saturating_duration_since(since) >= VIDEO_RESIZE_SETTLE
-                        }
-                        _ => {
-                            self.video_resize = Some((area, now));
-                            false
-                        }
+                Some(active) if active.plays(&id, card, &url) => match self.video_resize {
+                    Some((size, since)) if size == area => {
+                        now.saturating_duration_since(since) >= VIDEO_RESIZE_SETTLE
                     }
-                }
+                    _ => {
+                        self.video_resize = Some((area, now));
+                        false
+                    }
+                },
                 _ => true,
             };
             if start {
                 // Same video, new size: go on from where it was.
-                let continuing = self.video_post_id.as_deref() == Some(&id)
-                    && self.video.as_ref().is_some_and(|player| player.url == url);
+                let continuing = self
+                    .video
+                    .as_ref()
+                    .is_some_and(|active| active.post == id && active.player.url == url);
                 // Protect the destination before retirement can evict an old entry.
                 let previous = self.take_video_preview(&id, &url);
                 self.retire_video(now);
@@ -113,9 +108,11 @@ impl App {
                     player.toggle_sound(now);
                 }
                 player.retain_frame(previous.and_then(|preview| preview.frame));
-                self.video = Some(player);
-                self.video_post_id = Some(id);
-                self.video_is_card = card;
+                self.video = Some(ActiveVideo {
+                    player,
+                    post: id,
+                    card,
+                });
                 if card {
                     self.video_sound_on = resume.sound;
                 }
@@ -132,7 +129,7 @@ impl App {
                 self.post_view.as_ref().is_some_and(|v| v.image_shown)
             };
         let rendering = self.card_renderer.pending();
-        if let Some(player) = &mut self.video {
+        if let Some(ActiveVideo { player, .. }) = &mut self.video {
             player.set_hidden(!shown, now);
             // Keep audio-clock catch-up independent of tile preparation.
             changed |= player.tick(now) && !rendering;
@@ -163,9 +160,10 @@ impl App {
             return;
         };
         let card = self.post_view.is_none();
-        if self.video_post_id.as_deref() == Some(&post.id)
-            && self.video_is_card == card
-            && self.video.as_ref().is_some_and(|player| player.url == url)
+        if self
+            .video
+            .as_ref()
+            .is_some_and(|active| active.plays(&post.id, card, &url))
         {
             return;
         }
@@ -186,9 +184,11 @@ impl App {
         } else if player.sound() != self.video_sound_on {
             player.toggle_sound(now);
         }
-        self.video = Some(player);
-        self.video_post_id = Some(post.id);
-        self.video_is_card = card;
+        self.video = Some(ActiveVideo {
+            player,
+            post: post.id,
+            card,
+        });
         self.video_resize = None;
     }
 
@@ -201,24 +201,18 @@ impl App {
             self.video_requested = Some(post.id.clone());
         }
         if self
-            .video_post_id
+            .video
             .as_ref()
-            .is_some_and(|id| post.as_ref().is_none_or(|post| *id != post.id))
+            .is_some_and(|active| post.as_ref().is_none_or(|post| active.post != post.id))
         {
             self.retire_video(Instant::now());
         }
-        if self
-            .video
-            .as_ref()
-            .is_some_and(|player| player.error().is_some())
-        {
-            self.video = None;
-            let id = self.video_post_id.as_deref();
+        if let Some(active) = self.video.take_if(|active| active.player.error().is_some()) {
             self.video_previews
-                .retain(|preview| Some(preview.post.as_str()) != id);
+                .retain(|preview| preview.post != active.post);
         }
         match &mut self.video {
-            Some(player) => player.toggle_pause(Instant::now()),
+            Some(active) => active.player.toggle_pause(Instant::now()),
             None => {
                 if let Some(post) = self
                     .video_control_post()
@@ -251,20 +245,17 @@ impl App {
     /// The mute action toggles this video's sound; fresh cards start muted.
     pub fn toggle_video_sound(&mut self) {
         self.restore_selected_video(Instant::now());
-        if !self.video_matches_selection() {
-            self.info("No video plays here");
-            return;
-        }
-        let Some(player) = &mut self.video else {
+        let wanted = !self.video_sound_on;
+        let Some(player) = self.selected_player_mut() else {
             self.info("No video plays here");
             return;
         };
-        let wanted = !self.video_sound_on;
         if player.sound() != wanted {
             player.toggle_sound(Instant::now());
         }
+        let notice = player.take_notice();
         self.video_sound_on = wanted;
-        match player.take_notice() {
+        match notice {
             Some((text, true)) => {
                 self.video_sound_on = false;
                 self.error(text);
@@ -281,20 +272,20 @@ impl App {
 
     pub fn seek_video(&mut self, forward: bool) {
         self.restore_selected_video(Instant::now());
-        if !self.video_matches_selection() {
-            self.info("No video plays here");
-            return;
-        }
         let by = if forward {
             video::SEEK_STEP
         } else {
             -video::SEEK_STEP
         };
-        match &mut self.video {
-            Some(player) if player.error().is_some() => self.info("The video is unavailable"),
-            Some(player) if player.ready() => player.seek(by, Instant::now()),
-            Some(_) => self.info("The video is still loading"),
-            None => self.info("No video plays here"),
-        }
+        let notice = match self.selected_player_mut() {
+            None => "No video plays here",
+            Some(player) if player.error().is_some() => "The video is unavailable",
+            Some(player) if player.ready() => {
+                player.seek(by, Instant::now());
+                return;
+            }
+            Some(_) => "The video is still loading",
+        };
+        self.info(notice);
     }
 }

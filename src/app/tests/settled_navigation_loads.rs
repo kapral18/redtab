@@ -30,7 +30,7 @@ fn when_sidebar_navigation_crosses_several_tabs_only_the_settled_tab_should_load
     let [a, b, c] = ["a", "b", "c"].map(|name| tab_index(&app, name));
     assert_eq!(app.active, c);
     assert!(
-        !app.search.discovered.loading,
+        !app.search.discovered.loading(),
         "Search passed over asks for nothing"
     );
     assert!(!app.tabs[a].feed.loading());

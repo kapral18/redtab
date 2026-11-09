@@ -102,6 +102,13 @@ pub struct Group {
 }
 
 impl Group {
+    /// Drops the load in flight; the group is asked for again under `generation`.
+    pub(super) fn invalidate(&mut self, generation: u64) {
+        self.loading = false;
+        self.needs_refresh = true;
+        self.generation = generation;
+    }
+
     /// Shows the waiting first page, if any.
     pub(super) fn apply_arrivals(&mut self) -> bool {
         let Some(posts) = self.arrivals.take() else {

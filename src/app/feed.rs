@@ -65,16 +65,45 @@ pub struct Feed {
     pub freshness: Option<Freshness>,
     pub(super) pages: Vec<FeedPage>,
     pub(super) request_query: Option<FeedQuery>,
-    pub(super) requests: HashMap<u64, Option<String>>,
-    pub(super) pending: HashSet<u64>,
-    pub(super) refreshing: HashSet<u64>,
-    pub(super) forced: HashSet<u64>,
-    /// Requests from `r`: their arrivals show at once, from the list top.
-    pub(super) manual: HashSet<u64>,
+    /// Requests by generation; an answered one still accepts its later live answer.
+    pub(super) requests: HashMap<u64, FeedRequest>,
     pub(super) deferred: HashMap<Option<String>, bool>,
     /// A first-page answer waiting behind the notice.
     pub(super) update: Option<FeedUpdate>,
     pub(super) displaced_sources: HashMap<String, Source>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RequestPhase {
+    Pending,
+    /// A cached answer is shown and the live one is still due.
+    Refreshing,
+    Answered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FeedRequest {
+    pub(super) cursor: Option<String>,
+    pub(super) phase: RequestPhase,
+    /// Bypasses cached content.
+    pub(super) forced: bool,
+    /// From `r`: its arrivals show at once, from the list top.
+    pub(super) manual: bool,
+}
+
+impl FeedRequest {
+    pub(super) fn new(cursor: Option<String>, phase: RequestPhase) -> Self {
+        Self {
+            cursor,
+            phase,
+            forced: false,
+            manual: false,
+        }
+    }
+
+    pub(super) fn in_flight(&self) -> bool {
+        self.phase != RequestPhase::Answered
+    }
 }
 
 #[derive(Debug)]
@@ -144,7 +173,22 @@ impl Feed {
     }
 
     pub fn refreshing(&self) -> bool {
-        !self.refreshing.is_empty()
+        self.requests
+            .values()
+            .any(|request| request.phase == RequestPhase::Refreshing)
+    }
+
+    /// The request of `generation` while its answer is still due.
+    pub(super) fn in_flight(&self, generation: u64) -> Option<&FeedRequest> {
+        self.requests
+            .get(&generation)
+            .filter(|request| request.in_flight())
+    }
+
+    pub(super) fn requested(&self, cursor: &Option<String>) -> bool {
+        self.requests
+            .values()
+            .any(|request| request.in_flight() && request.cursor == *cursor)
     }
 
     pub(super) fn leads_with_new(&self, posts: &[Post], config: &Config) -> bool {
@@ -184,25 +228,19 @@ impl Feed {
     }
 
     pub fn loading(&self) -> bool {
-        !self.pending.is_empty()
+        self.requests
+            .values()
+            .any(|request| request.phase == RequestPhase::Pending)
     }
 
     pub fn loading_more(&self) -> bool {
-        self.requests.iter().any(|(id, cursor)| {
-            cursor.is_some()
-                && *cursor == self.after
-                && (self.pending.contains(id) || self.refreshing.contains(id))
-        })
+        self.after.is_some() && self.requested(&self.after)
     }
 
     pub fn receiving(&self) -> bool {
-        self.pages.iter().any(|page| {
-            !page.complete
-                && self.requests.iter().any(|(id, cursor)| {
-                    *cursor == page.cursor
-                        && (self.pending.contains(id) || self.refreshing.contains(id))
-                })
-        })
+        self.pages
+            .iter()
+            .any(|page| !page.complete && self.requested(&page.cursor))
     }
 
     pub(super) fn failure(&self) -> Option<&FeedFailure> {

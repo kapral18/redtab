@@ -1,5 +1,14 @@
 use super::*;
 
+/// The key hint of a pending chord: due after `HINT_DELAY`, then shown until it ends.
+#[derive(Default, Clone, Copy)]
+pub(super) enum Hint {
+    #[default]
+    Off,
+    Due(Instant),
+    Shown,
+}
+
 #[derive(Default)]
 pub struct State {
     pub prefix: String,
@@ -8,8 +17,7 @@ pub struct State {
     pub hint_rows: usize,
     pub help_rows: usize,
     pub(super) scope: Option<Scope>,
-    pub(super) hint_since: Option<Instant>,
-    pub(super) hint_visible: bool,
+    pub(super) hint: Hint,
 }
 
 impl State {
@@ -19,35 +27,36 @@ impl State {
         self.scope = None;
         self.help_g = false;
         self.hint_rows = 0;
-        self.hint_since = None;
-        self.hint_visible = false;
+        self.hint = Hint::Off;
     }
 
     pub fn hint_visible(&self) -> bool {
-        self.hint_visible
+        matches!(self.hint, Hint::Shown)
     }
 
     pub(crate) fn schedule_hint(&mut self, now: Instant) {
-        if !self.hint_visible {
-            self.hint_since = Some(now);
+        if !self.hint_visible() {
+            self.hint = Hint::Due(now);
         }
     }
 
     pub(crate) fn tick(&mut self, now: Instant) -> bool {
-        if self
-            .hint_since
-            .is_some_and(|since| now.saturating_duration_since(since) >= HINT_DELAY)
-        {
-            self.hint_since = None;
-            self.hint_visible = true;
-            return true;
+        match self.hint {
+            Hint::Due(since) if now.saturating_duration_since(since) >= HINT_DELAY => {
+                self.hint = Hint::Shown;
+                true
+            }
+            _ => false,
         }
-        false
     }
 
     pub(crate) fn wake_in(&self, now: Instant) -> Option<Duration> {
-        self.hint_since
-            .map(|since| HINT_DELAY.saturating_sub(now.saturating_duration_since(since)))
+        match self.hint {
+            Hint::Due(since) => {
+                Some(HINT_DELAY.saturating_sub(now.saturating_duration_since(since)))
+            }
+            _ => None,
+        }
     }
 }
 

@@ -31,7 +31,7 @@ pub(super) fn cache_reader(
                 if work
                     .image_ticket
                     .as_ref()
-                    .is_some_and(|ticket| ticket.load(Ordering::Acquire))
+                    .is_some_and(|ticket| ticket.claim().load(Ordering::Acquire))
                 {
                     continue;
                 }
@@ -51,7 +51,7 @@ pub(super) fn cache_reader(
                             Job::Image { url, .. } | Job::VideoFrame { url, .. } => Some(url),
                             _ => None,
                         },
-                        ticket: work.image_ticket.as_ref(),
+                        ticket: work.image_ticket.as_ref().map(ImageTicket::claim),
                         claimed: false,
                     };
                     if let Some(message) = skipped_image(job, &wanted) {

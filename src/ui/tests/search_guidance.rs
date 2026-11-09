@@ -92,7 +92,7 @@ fn search_key_audit_posts_guidance_should_follow_editor_sidebar_and_auth_ownersh
         let old = post_with("existing", Media::None);
         let incoming = post_with("incoming", Media::None);
         if preview {
-            app.search.discovered.loading = false;
+            app.search.discovered.fetch = Default::default();
             app.search.preview.target = Some(app.search.selected_row().unwrap().target);
             app.search.preview.posts = vec![old.clone()];
             app.search.preview.update = Some(vec![incoming, old]);

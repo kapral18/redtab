@@ -59,7 +59,7 @@ fn when_resizing_video_scrolls_offscreen_its_settle_deadline_should_be_cancelled
     let start = Instant::now() - Duration::from_secs(2);
     app.card_video.as_mut().unwrap().since = start - NAV_SETTLE;
     app.sync_video_with(start, |url, area, _| Player::silent(&url, area));
-    assert!(app.video.is_some());
+    assert!(app.video().is_some());
     app.card_video_drawn(Some(Size::new(40, 80)));
     let resized = start + Duration::from_millis(1);
     app.sync_video_with(resized, |_, _, _| {
@@ -70,7 +70,7 @@ fn when_resizing_video_scrolls_offscreen_its_settle_deadline_should_be_cancelled
     app.sync_video_with(resized + VIDEO_RESIZE_SETTLE, |_, _, _| {
         panic!("offscreen video must not restart")
     });
-    assert!(app.video.as_ref().unwrap().hidden());
+    assert!(app.video().unwrap().hidden());
     assert!(
         app.video_resize.is_none(),
         "an absent video area cannot finish a pending resize"
@@ -89,7 +89,7 @@ fn when_resizing_video_scrolls_offscreen_its_settle_deadline_should_be_cancelled
         Player::silent(&url, area)
     });
     assert!(app.video_resize.is_none());
-    assert_eq!(app.video.as_ref().unwrap().area, Size::new(40, 80));
+    assert_eq!(app.video().unwrap().area, Size::new(40, 80));
 }
 
 #[test]

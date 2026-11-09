@@ -272,8 +272,7 @@ impl App {
         self.icon_lookups.clear();
         // Profiles were read under the old policy; shown tabs ask again.
         self.profiles.clear();
-        self.profile_loading.clear();
-        self.profile_failed.clear();
+        self.profile_lookups.clear();
         self.icon_demands.clear();
         self.images.clear();
         self.thumbs.clear();

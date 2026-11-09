@@ -103,7 +103,7 @@ fn when_disconnecting_it_should_clear_account_payloads_and_preserve_saved_histor
     assert!(app.state.bookmarks().is_empty());
     assert!(app.images.is_empty());
     assert!(app.pending_media.is_empty());
-    assert!(app.video.is_none());
+    assert!(app.video().is_none());
     assert!(app.post_view.is_none());
     assert!(!app.auth.busy());
     assert!(app.overlay.is_none());

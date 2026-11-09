@@ -101,7 +101,7 @@ fn search_tab_reload_should_show_loading_and_failures() {
         }
         let failed = app.search.discovered_generation();
         press(&mut app, 'r');
-        assert!(app.search.discovered.loading);
+        assert!(app.search.discovered.loading());
         assert_ne!(app.search.discovered_generation(), failed);
         assert!(
             app.search.text().is_empty(),

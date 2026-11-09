@@ -16,11 +16,11 @@ fn card_media_detail_sidebar_should_offer_return_instead_of_play_keys() {
 #[test]
 fn card_media_pause_key_should_control_the_selected_card() {
     let mut app = video_card_with_poster(image::DynamicImage::new_rgb8(320, 180));
-    app.video = Some(video::Player::silent(VIDEO, Size::new(68, 17)));
+    app.set_video(Some(video::Player::silent(VIDEO, Size::new(68, 17))));
 
     press_keys(&mut app, "p");
 
-    assert!(app.video.as_ref().unwrap().paused());
+    assert!(app.video().unwrap().paused());
 }
 
 #[test]

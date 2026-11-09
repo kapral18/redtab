@@ -17,7 +17,7 @@ fn when_a_frame_shrinks_the_drawn_video_the_decoder_should_not_restart() {
     };
     step(&mut app);
     let (url, decoding) = {
-        let player = app.video.as_ref().unwrap();
+        let player = app.video().unwrap();
         (player.url.clone(), player.area)
     };
     // A very wide frame takes far fewer rows than the box it was decoded for.
@@ -29,13 +29,13 @@ fn when_a_frame_shrinks_the_drawn_video_the_decoder_should_not_restart() {
     };
     let mut player = video::Player::showing(&url, frame);
     player.area = decoding;
-    app.video = Some(player);
+    app.set_video(Some(player));
 
     step(&mut app);
     screen(&mut app, 100, 30);
     app.tick_at(std::time::Instant::now() + std::time::Duration::from_millis(300));
 
-    let player = app.video.as_ref().unwrap();
+    let player = app.video().unwrap();
     assert!(
         player.frame().is_some(),
         "the same player, not a restarted one"
@@ -53,12 +53,12 @@ fn a_video_frame_goes_to_the_terminal_once() {
         same_as_first: false,
     };
     let url = app.reddit.media_url(VIDEO).unwrap();
-    app.video = Some(video::Player::showing(&url, frame()));
+    app.set_video(Some(video::Player::showing(&url, frame())));
     let sends = |app: &mut App| screen(app, 100, 40).matches("_Ga=T").count();
 
     assert_eq!(sends(&mut app), 2);
     assert_eq!(sends(&mut app), 0, "a redraw repeats the cells only");
-    app.video.as_mut().unwrap().show(frame());
+    app.video_mut().unwrap().show(frame());
     assert_eq!(
         sends(&mut app),
         2,

@@ -30,12 +30,12 @@ fn refetching_a_next_page_from_a_new_end_bypasses_the_cache() {
         answer(&mut app, generation, false, &["a", "t"], Some("t3_t"));
 
         let feed = &app.tabs[i].feed;
-        let (generation, _) = feed
+        let request = feed
             .requests
-            .iter()
-            .find(|(_, cursor)| cursor.as_deref() == Some("t3_t"))
+            .values()
+            .find(|request| request.cursor.as_deref() == Some("t3_t"))
             .unwrap();
-        assert!(feed.forced.contains(generation), "forced {forced}");
+        assert!(request.forced, "forced {forced}");
     }
 }
 
@@ -109,7 +109,7 @@ fn a_row_leaving_the_first_page_leaves_once_the_next_page_answers_without_it() {
     app.reload();
     let generation = app.tabs[i].feed.generation;
     assert_ne!(generation, restitching);
-    assert_eq!(app.tabs[i].feed.requests.get(&generation), Some(&None));
+    assert_eq!(app.tabs[i].feed.requests[&generation].cursor, None);
     answer(&mut app, false, &["a", "c", "b"], Some("t3_b"));
     answer(&mut app, true, &["d"], None);
 
@@ -235,7 +235,7 @@ fn rows_kept_below_the_first_page_stay_until_the_refetched_next_page_answers() {
             .feed
             .requests
             .values()
-            .any(|cursor| cursor.as_deref() == Some("t3_t"))
+            .any(|request| request.cursor.as_deref() == Some("t3_t"))
     );
     app.load_feed(i, false);
     answer(&mut app, false, &["a", "u"], Some("t3_u"));
@@ -244,7 +244,7 @@ fn rows_kept_below_the_first_page_stay_until_the_refetched_next_page_answers() {
         .feed
         .requests
         .values()
-        .filter_map(|cursor| cursor.as_deref())
+        .filter_map(|request| request.cursor.as_deref())
         .collect();
     assert_eq!(next, ["t3_u"]);
 

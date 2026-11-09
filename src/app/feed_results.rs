@@ -15,10 +15,10 @@ impl App {
             return;
         };
         let feed = &mut tab.feed;
-        if !(feed.pending.contains(&generation) || feed.refreshing.contains(&generation)) {
-            return;
-        }
-        let Some(cursor) = feed.requests.get(&generation).cloned() else {
+        let Some(cursor) = feed
+            .in_flight(generation)
+            .map(|request| request.cursor.clone())
+        else {
             return;
         };
         let same_query = feed.shows_current_query();
@@ -95,20 +95,20 @@ impl App {
         if !feed.accepts(generation) {
             return;
         }
-        feed.pending.remove(&generation);
-        feed.refreshing.remove(&generation);
-        let forced = feed.forced.contains(&generation);
-        let manual = feed.manual.contains(&generation);
-        if !refreshing {
-            feed.forced.remove(&generation);
-            feed.manual.remove(&generation);
-        }
+        let (forced, manual, requested) = match feed.requests.get_mut(&generation) {
+            Some(request) => {
+                request.phase = RequestPhase::Answered;
+                let flags = (request.forced, request.manual, request.cursor.clone());
+                if !refreshing {
+                    request.forced = false;
+                    request.manual = false;
+                }
+                flags
+            }
+            None => (false, false, None),
+        };
         let cursor = if append {
-            feed.requests
-                .get(&generation)
-                .cloned()
-                .flatten()
-                .or_else(|| feed.after.clone())
+            requested.or_else(|| feed.after.clone())
         } else {
             None
         };
@@ -200,7 +200,7 @@ impl App {
                             .filter(|after| {
                                 feed.requests
                                     .values()
-                                    .any(|requested| requested.as_ref() == Some(after))
+                                    .any(|request| request.cursor.as_ref() == Some(after))
                             })
                             .map(Some),
                     };
@@ -293,10 +293,7 @@ impl App {
                         if let Some(page) = feed.pages.get_mut(index + 1) {
                             page.cursor = after.clone();
                         }
-                        feed.requests.retain(|_, requested| *requested != next);
-                        feed.pending.retain(|id| feed.requests.contains_key(id));
-                        feed.refreshing.retain(|id| feed.requests.contains_key(id));
-                        feed.forced.retain(|id| feed.requests.contains_key(id));
+                        feed.requests.retain(|_, request| request.cursor != next);
                         if let Some(failure) = feed.failures.remove(&next) {
                             feed.failures.insert(after.clone(), failure);
                         }

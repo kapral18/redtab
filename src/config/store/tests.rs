@@ -310,3 +310,29 @@ fn settings_review_array_edits_should_keep_internal_and_removed_element_comments
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn a_save_failure_should_stay_shown_after_an_earlier_failed_reload_recovers() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let dir = directory.path().join("cfg");
+    fs::create_dir(&dir).unwrap();
+    let path = dir.join("config.toml");
+    fs::write(&path, "all_subs_posts_per_group = 3\n").unwrap();
+    let mut store = Store::open(Some(&path)).unwrap();
+    let field = SETTINGS
+        .iter()
+        .find(|f| f.key == "all_subs_posts_per_group")
+        .unwrap();
+    store.current = field.set(&store.current, toml::Value::Integer(5)).unwrap();
+    fs::write(&path, "not = = toml").unwrap();
+    store.reload();
+    fs::write(&path, "all_subs_posts_per_group = 3\n").unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    store.save();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let save_error = store.error.clone().unwrap();
+    store.reload();
+    assert_eq!(store.error.as_deref(), Some(save_error.as_str()));
+}

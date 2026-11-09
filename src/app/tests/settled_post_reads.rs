@@ -10,7 +10,7 @@ fn scrolling_inside_a_video_card_should_defer_startup_and_keep_existing_playback
     app.sync_video_with(Instant::now(), |_, _, _| {
         panic!("scrolling must hold a new player")
     });
-    assert!(app.video.is_none());
+    assert!(app.video().is_none());
     app.sync_video_with(Instant::now() + NAV_SETTLE, |url, area, _| {
         Player::silent(&url, area)
     });

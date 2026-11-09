@@ -41,7 +41,7 @@ fn video_startup_should_stay_visible_over_posters_and_retained_frames_until_play
                 video::Player::silent(&url, Size::new(32, 18))
             };
             player.retain_frame(Some(frame.clone()));
-            app.video = Some(player);
+            app.set_video(Some(player));
 
             let actual = screen(&mut app, 100, height);
             assert!(
@@ -58,17 +58,17 @@ fn video_startup_should_stay_visible_over_posters_and_retained_frames_until_play
             );
         }
 
-        app.video.as_mut().unwrap().show(frame.clone());
+        app.video_mut().unwrap().show(frame.clone());
         let actual = screen(&mut app, 100, height);
         assert!(!actual.contains("loading video"), "{actual}");
         assert!(!app.loading_active());
 
-        app.video = Some(video::Player::unavailable(&url, Size::new(32, 18)));
+        app.set_video(Some(video::Player::unavailable(&url, Size::new(32, 18))));
         let actual = screen(&mut app, 100, height);
         assert!(!actual.contains("loading video"), "{actual}");
         assert!(!app.loading_active());
 
-        app.video = None;
+        app.set_video(None);
         app.config.media.video_autoplay = false;
         let actual = screen(&mut app, 100, height);
         assert!(!actual.contains("loading video"), "{actual}");

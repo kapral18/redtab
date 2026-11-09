@@ -62,7 +62,7 @@ fn when_a_loaded_video_is_deselected_its_frame_should_remain_visible() {
         has_frame(&render(&mut app)),
         "the retired frame must replace the failed still preview"
     );
-    assert!(app.video.is_none());
+    assert!(app.video().is_none());
 
     if let Media::Video { url, .. } = &mut app.tabs[0].feed.posts[0].media {
         *url = Some("https://v.redd.it/changed.mp4".into());
@@ -177,7 +177,7 @@ fn when_recent_video_frames_are_revisited_they_should_stay_bounded_and_match_the
         );
         app.show_images = false;
         app.sync_video_with(Instant::now(), |_, _, _| panic!("images off"));
-        assert!(app.video.is_none());
+        assert!(app.video().is_none());
         assert!(app.video_previews.is_empty());
     }
 }
@@ -271,7 +271,10 @@ fn when_no_card_remains_a_loaded_video_should_retire() {
     app.sync_video_with(start, |_, _, _| {
         panic!("an empty view must not start video")
     });
-    assert!(app.video.is_none(), "no card remains to resume the decoder");
+    assert!(
+        app.video().is_none(),
+        "no card remains to resume the decoder"
+    );
     assert!(app.video_preview(true).is_none());
 }
 
@@ -361,7 +364,7 @@ fn when_a_cached_frame_covers_pending_resolution_leaving_should_still_retire_it(
     app.card_video_drawn(Some(Size::new(68, 68)));
     app.sync_video_with(start, |_, _, _| panic!("an image cannot start video"));
     assert!(
-        app.video.is_none(),
+        app.video().is_none(),
         "a retained preview must not keep obsolete extraction alive"
     );
 }

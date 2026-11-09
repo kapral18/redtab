@@ -88,8 +88,7 @@ fn when_a_pasted_thread_loads_navigation_should_follow_its_source_and_keep_comme
             assert!(
                 matches!(&app.active_tab().kind, TabKind::User { name, .. } if name == "writer")
             );
-            assert!(!app.sidebar_peek);
-            assert!(!app.show_sidebar);
+            assert_eq!(app.sidebar_width(), 0);
         } else {
             assert_eq!(app.active_tab().id, existing.unwrap());
             assert_eq!(app.active_tab().subreddit(), Some("Neovim"));

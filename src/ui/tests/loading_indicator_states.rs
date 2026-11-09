@@ -159,7 +159,7 @@ fn video_frame_preparation_should_not_show_image_loading_activity() {
         pixels: video::Pixels::Raw(std::sync::Arc::new(image::DynamicImage::new_rgb8(16, 9))),
         same_as_first: false,
     };
-    app.video = Some(video::Player::showing(&url, frame()));
+    app.set_video(Some(video::Player::showing(&url, frame())));
     for _ in 0..2 {
         let actual = first_screen(&mut app, 100, 40);
         assert!(app.card_renderer.pending(), "keep graphics backpressure");
@@ -182,7 +182,7 @@ fn video_frame_preparation_should_not_show_image_loading_activity() {
         );
         assert!(app.card_renderer.poll());
         assert!(!app.card_renderer.pending());
-        app.video.as_mut().unwrap().show(frame());
+        app.video_mut().unwrap().show(frame());
     }
 }
 

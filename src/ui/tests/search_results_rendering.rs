@@ -51,7 +51,7 @@ fn long_explore_descriptions_should_show_visible_summaries_and_later_entries() {
     let mut app = app(&[]);
     app.open_search(None);
     key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-    app.search.discovered.loading = false;
+    app.search.discovered.fetch = Default::default();
     app.search.discovered.entries = vec![
         crate::app::search::Row {
             profile: None,
@@ -110,7 +110,7 @@ fn search_revision_should_prefetch_from_the_visible_window_before_the_last_rows(
     app.search.selected = 0;
     screen(&mut app, 160, 30);
     assert!(
-        app.search.discovered.loading,
+        app.search.discovered.loading(),
         "keep another API page ready while the first page is being read"
     );
     let generation = app.search.discovered_generation();
@@ -128,7 +128,7 @@ fn search_revision_should_keep_incremental_panes_and_restore_parent_lists() {
         let mut app = app(&[]);
         app.open_search(None);
         key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        app.search.discovered.loading = false;
+        app.search.discovered.fetch = Default::default();
         app.search.discovered.entries.push(crate::app::search::Row {
             profile: None,
             comment: None,
@@ -272,7 +272,7 @@ fn reported_explore_should_fill_its_pane_and_wrap_descriptions() {
     });
     let actual = screen(&mut app, 62, 36);
     assert!(
-        app.search.discovered.loading,
+        app.search.discovered.loading(),
         "an underfilled Explore pane should load the next page"
     );
     assert!(
@@ -298,7 +298,7 @@ fn reported_explore_should_fill_its_pane_and_wrap_descriptions() {
     });
     screen(&mut app, 62, 36);
     assert!(
-        !app.search.discovered.loading,
+        !app.search.discovered.loading(),
         "a repeated cursor must stop automatic paging"
     );
 }

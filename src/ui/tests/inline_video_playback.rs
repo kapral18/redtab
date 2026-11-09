@@ -40,7 +40,7 @@ fn an_unselected_video_without_autoplay_loads_and_displays_a_still_frame() {
     assert!(actual.contains('\u{10EEEE}'), "{actual}");
     assert!(!actual.contains("select to preview"), "{actual}");
     assert!(
-        app.video.is_none(),
+        app.video().is_none(),
         "a still preview must not start playback"
     );
 }
@@ -55,10 +55,10 @@ fn reported_failed_video_card_should_compact_and_retry_without_resizing() {
     };
     screen(&mut app, 100, 30);
     let url = app.reddit.media_url(VIDEO).unwrap();
-    app.video = Some(video::Player::unavailable(
+    app.set_video(Some(video::Player::unavailable(
         &url,
         app.video_area.unwrap().as_size(),
-    ));
+    )));
     let actual = screen(&mut app, 100, 30);
     assert!(
         app.active_tab().feed.cards.height <= 7,
@@ -79,15 +79,15 @@ fn the_video_plays_only_while_its_post_shows_it() {
     let mut app = open_video_post();
     let step = |app: &mut App| {
         screen(app, 100, 30);
-        if app.video.is_none()
+        if app.video().is_none()
             && app.inline_images_on()
             && let Some(area) = app.video_area
         {
             let url = app.reddit.media_url(VIDEO).unwrap();
-            app.video = Some(video::Player::silent(&url, area.as_size()));
+            app.set_video(Some(video::Player::silent(&url, area.as_size())));
         }
         app.tick();
-        app.video.as_ref().map(|p| p.hidden())
+        app.video().map(|p| p.hidden())
     };
 
     assert_eq!(step(&mut app), Some(false), "starts with the post");
@@ -127,10 +127,7 @@ fn when_a_gif_post_opens_it_should_play_inline_without_an_image_download() {
     screen(&mut app, 100, 30);
     app.tick();
 
-    let player = app
-        .video
-        .as_ref()
-        .expect("GIF should start the video player");
+    let player = app.video().expect("GIF should start the video player");
     assert_eq!(
         player.url,
         app.reddit
@@ -151,21 +148,21 @@ fn a_sets_the_sound_for_later_videos_and_a_missing_ffplay_clears_it() {
     screen(&mut app, 100, 30);
     app.tick();
     let (url, area) = {
-        let player = app.video.as_ref().unwrap();
+        let player = app.video().unwrap();
         (player.url.clone(), player.area)
     };
-    app.video = Some(video::Player::silent(&url, area));
+    app.set_video(Some(video::Player::silent(&url, area)));
 
     // A video without sound: `a` still turns the setting over; this one stays silent.
     press_keys(&mut app, "m");
     assert!(app.video_sound_wanted());
-    assert!(!app.video.as_ref().unwrap().sound());
+    assert!(!app.video().unwrap().sound());
     press_keys(&mut app, "m");
     assert!(!app.video_sound_wanted(), "and back off");
 
     // ffplay failing, even at a later frame, leaves later videos silent too.
     press_keys(&mut app, "m");
-    app.video.as_mut().unwrap().fail_sound();
+    app.video_mut().unwrap().fail_sound();
     app.tick();
     assert!(!app.video_sound_wanted());
 }
@@ -178,22 +175,22 @@ fn a_resized_video_starts_again_as_it_was_once_the_size_holds() {
         app.tick();
     };
     step(&mut app, 30);
-    let first = app.video.as_ref().unwrap().area;
+    let first = app.video().unwrap().area;
     let url = app.reddit.media_url(VIDEO).unwrap();
-    app.video = Some(video::Player::silent(&url, first));
+    app.set_video(Some(video::Player::silent(&url, first)));
     press_keys(&mut app, "p");
 
     // Two draws at once at the new size: it has not held still yet.
     step(&mut app, 40);
     step(&mut app, 40);
     assert_eq!(
-        app.video.as_ref().unwrap().area,
+        app.video().unwrap().area,
         first,
         "a size passing by changes nothing"
     );
     screen(&mut app, 100, 40);
     app.tick_at(std::time::Instant::now() + std::time::Duration::from_millis(300));
-    let player = app.video.as_ref().unwrap();
+    let player = app.video().unwrap();
     assert_ne!(player.area, first, "sized for the new area");
     assert!(player.paused(), "still paused");
 

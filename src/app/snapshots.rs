@@ -24,11 +24,11 @@ impl App {
                 result,
             } => {
                 self.on_feed(tab, generation, append, result, freshness, refreshing);
-                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab)
-                    && tab.feed.accepts(generation)
-                    && refreshing
+                if refreshing
+                    && let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab)
+                    && let Some(request) = tab.feed.requests.get_mut(&generation)
                 {
-                    tab.feed.refreshing.insert(generation);
+                    request.phase = RequestPhase::Refreshing;
                 }
             }
             Msg::Group {

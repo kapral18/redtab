@@ -27,19 +27,36 @@ pub enum RowsStatus {
     DiscoveryFailed,
 }
 
+/// A row request; `more` adds a page below the shown entries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Fetch {
+    #[default]
+    Idle,
+    Loading {
+        more: bool,
+    },
+    /// Left the tab before its answer (or with a retry due): asked again on return.
+    Suspended {
+        more: bool,
+    },
+}
+
 #[derive(Default)]
 pub struct Rows {
     pub entries: Vec<Row>,
-    pub loading: bool,
+    pub fetch: Fetch,
     pub error: Option<String>,
     pub(super) generation: u64,
     /// The request these rows answer, and Reddit's cursor for its next page.
     pub(super) query: Option<Query>,
     pub(super) after: Option<String>,
-    /// The loading request adds a page below the shown entries.
-    pub(super) appending: bool,
-    pub(super) suspended: bool,
     pub(super) visited: HashSet<String>,
+}
+
+impl Rows {
+    pub fn loading(&self) -> bool {
+        matches!(self.fetch, Fetch::Loading { .. })
+    }
 }
 
 #[derive(Default)]
@@ -202,10 +219,9 @@ impl Search {
     /// Whether the rows the user sees are still on their way.
     pub fn rows_loading(&self) -> bool {
         if self.exploring() {
-            self.discovered.loading || self.discovered.suspended
+            self.discovered.fetch != Fetch::Idle
         } else {
-            self.results.loading
-                || self.results.suspended
+            self.results.fetch != Fetch::Idle
                 || self.due.is_some()
                 || self
                     .empty_retry
@@ -229,9 +245,9 @@ impl Search {
         } else {
             &self.results
         };
-        if rows.loading && rows.appending {
+        if rows.fetch == (Fetch::Loading { more: true }) {
             Some(RowsStatus::LoadingMore)
-        } else if self.exploring() && rows.loading {
+        } else if self.exploring() && rows.loading() {
             Some(RowsStatus::Discovering)
         } else if rows.error.is_some() && rows.after.is_some() {
             Some(RowsStatus::MoreFailed)

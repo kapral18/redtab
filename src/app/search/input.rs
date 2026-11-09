@@ -46,7 +46,7 @@ impl App {
             .as_mut()
             .is_some_and(|retry| retry.due.take().is_some())
         {
-            self.search.results.suspended = true;
+            self.search.results.fetch = Fetch::Suspended { more: false };
         }
         self.search.due = None;
         self.search.preview.due = None;
@@ -66,9 +66,8 @@ impl App {
         if let Some(query) = &rows.query {
             self.pool.want_search(query, None);
         }
-        if rows.loading {
-            rows.loading = false;
-            rows.suspended = true;
+        if let Fetch::Loading { more } = rows.fetch {
+            rows.fetch = Fetch::Suspended { more };
         }
     }
 
@@ -78,13 +77,13 @@ impl App {
         } else {
             &self.search.results
         };
-        if !rows.suspended {
+        let Fetch::Suspended { more } = rows.fetch else {
             return false;
-        }
+        };
         let Some(query) = rows.query.clone() else {
             return false;
         };
-        let after = rows.appending.then(|| rows.after.clone()).flatten();
+        let after = more.then(|| rows.after.clone()).flatten();
         self.request_rows(discovery, query, after);
         true
     }

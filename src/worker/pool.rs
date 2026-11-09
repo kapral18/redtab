@@ -34,7 +34,39 @@ pub(super) struct Work {
     pub(super) job: Job,
     pub(super) force: bool,
     pub(super) cache_policy: CachePolicy,
-    pub(super) image_ticket: Option<Arc<AtomicBool>>,
+    pub(super) image_ticket: Option<ImageTicket>,
+}
+
+/// Queued copies of one image job share its claim. The last copy to go unclaimed
+/// removes the URL's entry, so skipped jobs leave nothing behind.
+pub(super) struct ImageTicket {
+    wanted: Arc<Wanted>,
+    url: String,
+    claim: Option<Arc<AtomicBool>>,
+}
+
+impl ImageTicket {
+    pub(super) fn claim(&self) -> &Arc<AtomicBool> {
+        self.claim.as_ref().expect("a live ticket holds its claim")
+    }
+}
+
+impl Drop for ImageTicket {
+    fn drop(&mut self) {
+        // Copies are made and dropped under this lock, so the count is exact here.
+        let Ok(mut tickets) = self.wanted.image_tickets.lock() else {
+            return;
+        };
+        let claim = self.claim.take().expect("a live ticket holds its claim");
+        if Arc::strong_count(&claim) == 2
+            && tickets
+                .get(&self.url)
+                .is_some_and(|current| Arc::ptr_eq(current, &claim))
+        {
+            tickets.remove(&self.url);
+        }
+        drop(claim);
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -247,15 +279,20 @@ impl Pool {
             self.want_search(query, Some(*generation));
         }
         let image_ticket = match &job {
-            Job::Image { url, .. } | Job::VideoFrame { url, .. } => {
-                self.wanted.image_tickets.lock().ok().map(|mut tickets| {
-                    Arc::clone(
+            Job::Image { url, .. } | Job::VideoFrame { url, .. } => self
+                .wanted
+                .image_tickets
+                .lock()
+                .ok()
+                .map(|mut tickets| ImageTicket {
+                    wanted: Arc::clone(&self.wanted),
+                    url: url.clone(),
+                    claim: Some(Arc::clone(
                         tickets
                             .entry(url.clone())
                             .or_insert_with(|| Arc::new(AtomicBool::new(false))),
-                    )
-                })
-            }
+                    )),
+                }),
             _ => None,
         };
         if cache_policy != CachePolicy::Only

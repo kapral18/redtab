@@ -34,7 +34,7 @@ fn a_content_policy_restart_should_ask_the_search_tab_again() {
     let directory = tempfile::tempdir().unwrap();
     let mut app = app(&fixture, Config::default(), directory.path());
     app.open_search(None);
-    let asked = app.search.discovered.loading;
+    let asked = app.search.discovered.loading();
     app.search_preview_drawn(true);
     let _ = app.tick_at(std::time::Instant::now() + crate::app::search::PREVIEW_SETTLE);
     assert!(asked && app.search.preview.loading);
@@ -42,7 +42,7 @@ fn a_content_policy_restart_should_ask_the_search_tab_again() {
     app.reload_content_policy();
 
     assert!(
-        app.search.discovered.loading,
+        app.search.discovered.loading(),
         "discovery is asked of the new pool"
     );
     assert!(!app.search.preview.loading && app.search.preview.target.is_none());

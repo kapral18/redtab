@@ -232,7 +232,7 @@ fn when_video_waits_for_graphics_the_input_poll_should_not_spin_on_overdue_frame
         directory.path().join("state.json"),
         picker.clone(),
     );
-    app.video = Some(player);
+    app.set_video(Some(player));
     let image = Arc::new(image::DynamicImage::new_rgb8(16, 16));
     let key = Key::new("lag-probe", &picker, Size::new(2, 1), (16, 16), 0, 1, 0);
     app.card_renderer.begin();
