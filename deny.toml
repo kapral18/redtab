@@ -13,6 +13,7 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zbus 5 sub-crate via rookie-cookies; merged into zbus 6, no fixed 5.x release" },
     { id = "RUSTSEC-2026-0371", reason = "zbus 5 sub-crate via rookie-cookies; merged into zbus 6, no fixed 5.x release" },
     { id = "RUSTSEC-2026-0372", reason = "zbus 5 sub-crate via rookie-cookies; merged into zbus 6, no fixed 5.x release" },
+    { id = "RUSTSEC-2026-0459", reason = "bundled SQLite via rookie-cookies' rusqlite =0.40.2 pin; only reads a private copy of the user's own browser cookie database" },
 ]
 
 [licenses]
